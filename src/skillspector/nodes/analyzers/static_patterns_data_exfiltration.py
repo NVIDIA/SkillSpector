@@ -32,6 +32,7 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
 from .common import (
+    LOGICAL_LINE_BREAK,
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
     apply_import_aliases,
@@ -223,8 +224,17 @@ def _is_literal_cloud_download(
         content, offset, ()
     ):
         return False
+    preamble = content[:offset]
+    if any(
+        separator.group(0) not in {"\n", "\r\n"}
+        for separator in LOGICAL_LINE_BREAK.finditer(preamble)
+    ):
+        # Shells end a line, and so a comment, only at a newline. Splitting at a
+        # form feed, lone CR or Unicode separator would hide the rest of that
+        # shell line (such as a function rebinding the cloud command) as a comment.
+        return False
     directory_changed = False
-    for line in content[:offset].splitlines():
+    for line in preamble.split("\n"):
         setup = line.strip(" \t\r")
         if not setup or setup.startswith("#"):
             continue

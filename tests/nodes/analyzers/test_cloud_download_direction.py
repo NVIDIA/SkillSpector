@@ -296,13 +296,41 @@ def test_unproved_preamble_keeps_cloud_finding(setup: str, transfer: str, newlin
     ],
 )
 @pytest.mark.parametrize("file_type", ["shell", "markdown", "text"])
-def test_supported_preamble_preserves_download_exemption(setup: str, file_type: str) -> None:
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_supported_preamble_preserves_download_exemption(
+    setup: str, file_type: str, newline: str
+) -> None:
     findings = data_exfiltration.analyze(
-        f"{setup}\naws s3 cp s3://example-bucket/public.csv ./public.csv\n",
+        f"{setup}{newline}aws s3 cp s3://example-bucket/public.csv ./public.csv{newline}",
         "download.sh",
         file_type,
     )
     assert not any(finding.rule_id == "E5" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "separator", ["\f", "\v", "\r", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
+)
+@pytest.mark.parametrize("before", ["", "set -e", "cd /tmp"])
+@pytest.mark.parametrize(
+    "transfer",
+    [
+        "aws s3 cp s3://example-bucket/public.csv /tmp/public.csv",
+        "gsutil cp gs://example-bucket/public.csv /tmp/public.csv",
+    ],
+)
+def test_non_newline_break_cannot_hide_a_rebinding_as_a_comment(
+    separator: str, before: str, transfer: str
+) -> None:
+    # Shells end a comment only at a newline, so "<break># ; aws() {...}" still
+    # defines aws() and the later transfer runs the rebound command.
+    command = transfer.split()[0]
+    findings = data_exfiltration.analyze(
+        f'{before}{separator}# ; {command}() {{ custom "$@"; }}\n{transfer}\n',
+        "download.sh",
+        "shell",
+    )
+    assert any(finding.rule_id == "E5" for finding in findings)
 
 
 def test_prior_download_can_replace_a_later_cloud_executable() -> None:
