@@ -502,12 +502,20 @@ initialize hang reported in issue #199 still applies there.
 
 The server exposes a single tool:
 
-- **`scan_skill(target, use_llm=true, output_format="json")`** — scans a Git
+- **`scan_skill(target, use_llm=true, output_format="json", include_report=true)`** — scans a Git
   URL, file URL, `.zip`, `.md` file, or directory and returns a structured
   verdict: `risk_score` (0-100), `severity`, `recommendation`,
   `safe_to_install`, and `findings`. It also reports `llm_used` / `scan_mode`
   so a low score from a static-only scan is never mistaken for a clean full
   scan.
+
+Set `include_report=false` when you only need the structured verdict. This
+omits the rendered `report` string and retains every other response field,
+including all findings and their occurrences, analysis completeness, and LLM
+accounting. The default still includes the full report. Report-only details,
+such as components, skill metadata, and suppressed findings, are unavailable
+in the compact response. Scanning and report generation still run normally;
+`output_format` must remain one of `json`, `markdown`, `sarif`, or `terminal`.
 
 Register it with Claude Code via:
 
