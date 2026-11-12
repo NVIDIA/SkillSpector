@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import io
+import os
 import tempfile
 import zipfile
 from pathlib import Path
@@ -107,8 +108,57 @@ def test_resolve_input_empty_input_returns_none_skill_path() -> None:
     assert update["skill_path"] is None
     assert update.get("temp_dir_for_cleanup") is None
 
-    update2 = resolve_input({"input_path": "  ", "skill_path": ""})
+    update2 = resolve_input({"input_path": "", "skill_path": ""})
     assert update2["skill_path"] is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows normalizes trailing spaces in filenames")
+@pytest.mark.parametrize("key", ["input_path", "skill_path"])
+@pytest.mark.parametrize("name", ["skill ", " skill", "\u2003skill\u2003", "  "])
+def test_local_input_preserves_literal_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str, name: str
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    selected = tmp_path / name
+    selected.mkdir()
+    (selected / "SKILL.md").write_text("# Selected skill")
+    if name.strip():
+        sibling = tmp_path / name.strip()
+        sibling.mkdir()
+        (sibling / "SKILL.md").write_text("# Different skill")
+    update = resolve_input({key: name})
+    assert update["skill_path"] == str(selected.resolve())
+    assert update["selected_source_identity"] == name
+    assert (Path(update["skill_path"]) / "SKILL.md").read_text() == "# Selected skill"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows normalizes trailing spaces in filenames")
+def test_missing_whitespace_path_does_not_scan_trimmed_sibling(tmp_path: Path) -> None:
+    sibling = tmp_path / "skill"
+    sibling.mkdir()
+    (sibling / "SKILL.md").write_text("# Wrong skill")
+    with pytest.raises((FileNotFoundError, ValueError)):
+        resolve_input({"input_path": str(sibling) + " "})
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows normalizes trailing spaces in filenames")
+def test_file_source_identity_preserves_parent_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from skillspector.input_handler import InputHandler
+
+    monkeypatch.chdir(tmp_path)
+    selected = Path(" selected ")
+    selected.mkdir()
+    (selected / "SKILL.md").write_text("# Selected skill")
+    update = resolve_input({"input_path": str(selected / "SKILL.md")})
+    try:
+        assert update["selected_source_identity"] == selected.name
+        assert (Path(update["skill_path"]) / "SKILL.md").read_text() == "# Selected skill"
+    finally:
+        handler = InputHandler()
+        handler._temp_dir = Path(update["temp_dir_for_cleanup"])
+        handler.cleanup()
 
 
 def test_workflow_budget_starts_before_input_materialization(
