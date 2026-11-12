@@ -3611,6 +3611,8 @@ def _has_shell_command_word_exhaustion(
     complete_context: bool = True,
     native_argument_spans: tuple[tuple[int, int], ...] = (),
     native_argument_work: list[int] | None = None,
+    markdown_header_spans: tuple[tuple[int, int], ...] = (),
+    markdown_inline_spans: tuple[tuple[int, int], ...] = (),
 ) -> StaticParserDiagnostic | None:
     """Find candidate command words whose deterministic parse hit a safety bound.
 
@@ -4177,6 +4179,38 @@ def _has_shell_command_word_exhaustion(
         command_string = command.content
         if command_string is None:
             assert command.diagnostic is not None
+            diagnostic = command.diagnostic
+            if (
+                file_type == "markdown"
+                and complete_context
+                and markdown_header_spans
+                and diagnostic.cause is ParserCause.BOUNDARY_UNRESOLVED
+                and diagnostic.check is ParserCheck.COMMAND_WORD_BOUNDARY
+            ):
+                check_runtime()
+                header_index = (
+                    bisect_right(markdown_header_spans, (diagnostic.start, len(content))) - 1
+                )
+                if header_index >= 0:
+                    start, end = markdown_header_spans[header_index]
+                    inline_index = bisect_left(markdown_inline_spans, (end, 0)) - 1
+                    if (
+                        diagnostic.end <= end
+                        and end - start <= 512
+                        and not (
+                            inline_index >= 0 and markdown_inline_spans[inline_index][1] > start
+                        )
+                        and content[diagnostic.start : diagnostic.end].strip(" \t").casefold()
+                        in {"command", "builtin"}
+                        and re.fullmatch(
+                            r"[ \t]*(?:command|builtin)[ \t]+\([\w .\t-]+\)[ \t]*",
+                            content[start:end],
+                            re.IGNORECASE,
+                        )
+                    ):
+                        # A proven header label supplies no executable operand.
+                        check_runtime()
+                        continue
             return command.diagnostic
         if _command_string_depth >= 8:
             return StaticParserDiagnostic(
@@ -9068,6 +9102,7 @@ def _tm1_candidates(
             fence_boundaries=option_markdown_fences,
             fence_regions=option_fence_regions,
             inline_regions=option_host_ranges,
+            markdown_examples=True,
         )
     option_host_ranges.extend(
         (start, end)
@@ -9310,6 +9345,8 @@ def _markdown_shell_text(
     powershell_blocks: list[tuple[int, int]] | None = None,
     inline_code_ranges: list[tuple[int, int]] | None = None,
     inline_possessive_apostrophes: set[int] | None = None,
+    table_header_ranges: list[tuple[int, int]] | None = None,
+    markdown_examples: bool = False,
 ) -> str:
     """Mask Markdown delimiters while retaining code and exact source offsets.
 
@@ -9326,6 +9363,8 @@ def _markdown_shell_text(
     newlines fold into spaces rather than ending a command.
     ``shell_fence_ranges`` receives closed, explicitly labelled shell bodies
     whose quote ownership can be checked independently of surrounding prose.
+    ``markdown_examples`` projects closed column-zero md/markdown examples
+    once, replacing their container region with the child's exact native roles.
     """
     output = list(content)
     prose_apostrophes: set[int] = set()
@@ -9333,6 +9372,57 @@ def _markdown_shell_text(
     runs: list[tuple[int, int]] = []
     list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
     backtick_runs = re.compile(r"`+")
+
+    def project_markdown_example(start: int, end: int) -> None:
+        # Closed root bodies are disjoint; the child cannot recurse again.
+        check_runtime()
+        collectors = {
+            "fence_boundaries": fence_boundaries,
+            "fence_regions": fence_regions,
+            "inline_regions": inline_regions,
+            "shell_fence_ranges": shell_fence_ranges,
+            "hardware_apostrophe_locations": hardware_apostrophe_locations,
+            "powershell_blocks": powershell_blocks,
+            "inline_code_ranges": inline_code_ranges,
+            "table_header_ranges": table_header_ranges,
+        }
+        children = {name: [] for name, target in collectors.items() if target is not None}
+        child_possessives: set[int] | None = (
+            set() if inline_possessive_apostrophes is not None else None
+        )
+        child_ambiguity = [False] if hardware_apostrophe_ambiguity is not None else None
+        projected = _markdown_shell_text(
+            content[start:end],
+            check_runtime,
+            complete_context=True,
+            word_apostrophes=word_apostrophes,
+            inline_possessive_apostrophes=child_possessives,
+            hardware_apostrophe_ambiguity=child_ambiguity,
+            markdown_examples=False,
+            **children,
+        )
+        check_runtime()
+        assert len(projected) == end - start
+        output[start:end] = projected
+        for name, rows in children.items():
+            target = collectors[name]
+            assert target is not None
+            for row in rows:
+                check_runtime()
+                if name == "fence_boundaries":
+                    target.append(start + row)
+                elif name == "fence_regions":
+                    target.append((start + row[0], start + row[1], row[2]))
+                else:
+                    target.append((start + row[0], start + row[1]))
+        if child_possessives is not None:
+            assert inline_possessive_apostrophes is not None
+            for offset in child_possessives:
+                check_runtime()
+                inline_possessive_apostrophes.add(start + offset)
+        if child_ambiguity is not None and child_ambiguity[0]:
+            assert hardware_apostrophe_ambiguity is not None
+            hardware_apostrophe_ambiguity[0] = True
 
     def complete_inline_code_pairs(
         source: str,
@@ -9450,6 +9540,7 @@ def _markdown_shell_text(
     # Container/HTML bodies with uncertain inline ownership remain literal.
     fence: tuple[str, int, int, str] | None = None
     fence_body_start = 0
+    markdown_example_root = False
     fence_literal_apostrophes: list[int] = []
     fence_literal_ownership = True
     fence_has_literal_apostrophe = False
@@ -9596,12 +9687,14 @@ def _markdown_shell_text(
                 and closing_fence[1][0] == fence[0]
                 and len(closing_fence[1]) >= fence[1]
             ):
+                if markdown_example_root:
+                    project_markdown_example(fence_body_start, offset)
                 begin, end = closing_fence.span(1)
                 body_start = offset + len(stripped) - len(fence_body)
                 output[body_start + begin : body_start + end] = " " * (end - begin)
                 if fence_boundaries is not None:
                     fence_boundaries.append(body_start + begin)
-                if fence_regions is not None:
+                if fence_regions is not None and not markdown_example_root:
                     fence_regions.append((fence_body_start, offset, fence[3]))
                 if (
                     powershell_blocks is not None
@@ -9613,6 +9706,7 @@ def _markdown_shell_text(
                     shell_fence_ranges.append((shell_fence_start, offset))
                 shell_fence_start = None
                 fence = None
+                markdown_example_root = False
                 fence_literal_apostrophes.clear()
                 fence_literal_ownership = True
                 fence_has_literal_apostrophe = False
@@ -9704,6 +9798,7 @@ def _markdown_shell_text(
                 info.split(maxsplit=1)[0].casefold() if info else "",
             )
             fence_body_start = offset + len(line)
+            markdown_example_root = False
             fence_literal_apostrophes.clear()
             fence_literal_ownership = True
             fence_has_literal_apostrophe = False
@@ -9713,10 +9808,9 @@ def _markdown_shell_text(
             not leading
             or list_indented
             or indentation >= 4
-            and has_list_marker
-            or indentation >= 4
             and not (
-                paragraph_in_list
+                has_list_marker
+                or paragraph_in_list
                 and 0 <= indentation - paragraph_list_indent <= 3
                 # A continuation uses the proven content margin. A nested
                 # marker or a new block needs its own container proof.
@@ -9757,6 +9851,15 @@ def _markdown_shell_text(
                     len(opening[1]),
                     column if has_list_marker else 0,
                     language,
+                )
+                markdown_example_root = (
+                    markdown_examples
+                    and complete_context
+                    and indentation == 0
+                    and prefix == 0
+                    and not has_list_marker
+                    and not paragraph_in_list
+                    and info in {"md", "markdown"}
                 )
                 fence_body_start = offset + len(line)
                 fence_literal_apostrophes.clear()
@@ -9810,6 +9913,11 @@ def _markdown_shell_text(
                                 # GFM drops excess body cells: no rendered
                                 # inline node can grant ownership to their ticks.
                                 break
+                            if (
+                                table_header_ranges is not None
+                                and line_index == table_delimiter_line - 1
+                            ):
+                                table_header_ranges.append((offset + cell_start, offset + cell_end))
                             for match in backtick_runs.finditer(stripped, cell_start, cell_end):
                                 check_runtime()
                                 runs.append((offset + match.start(), offset + match.end()))
@@ -11875,7 +11983,9 @@ def _markdown_owned_commands_diagnostic(
             source_view=source_view,
         )
     ranges: list[tuple[int, int]] = []
-    projected = _markdown_shell_text(content, check_runtime, inline_code_ranges=ranges)
+    projected = _markdown_shell_text(
+        content, check_runtime, inline_code_ranges=ranges, markdown_examples=True
+    )
     remaining_work = [8 * len(content) + _ROOT_GLOB_COMMAND_CHARS]
     property_bindings_proven = False
     if "$(" in content and '"' in content:
@@ -12094,6 +12204,8 @@ def _has_bounded_parse_exhaustion(
     # -replace values have their own narrowly proven expression context.
     structural_quote_closers = None
     projected_continuations: list[int] = []
+    markdown_headers: list[tuple[int, int]] = []
+    markdown_inlines: list[tuple[int, int]] = []
     if file_type == "powershell" and complete_context:
         # Only a complete script proves token ownership. A fragment may begin
         # inside a string or comment and would invert code and literal bytes.
@@ -12230,6 +12342,9 @@ def _has_bounded_parse_exhaustion(
             hardware_apostrophe_ambiguity=hardware_apostrophe_ambiguity,
             hardware_apostrophe_locations=hardware_apostrophe_locations,
             powershell_blocks=powershell_blocks,
+            table_header_ranges=markdown_headers if complete_context else None,
+            inline_regions=markdown_inlines if complete_context else None,
+            markdown_examples=True,
         )
         if hardware_apostrophe_ambiguity[0]:
             start, end = hardware_apostrophe_locations[0]
@@ -12347,6 +12462,14 @@ def _has_bounded_parse_exhaustion(
         file_type=file_type,
         source_commands=source_commands if file_type == "shell" and complete_context else None,
         complete_context=complete_context,
+        **(
+            {
+                "markdown_header_spans": tuple(markdown_headers),
+                "markdown_inline_spans": tuple(markdown_inlines),
+            }
+            if markdown_headers
+            else {}
+        ),
         **(
             {
                 "native_argument_spans": native_argument_spans,

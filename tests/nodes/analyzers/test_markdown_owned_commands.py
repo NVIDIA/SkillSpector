@@ -863,3 +863,409 @@ def test_cancellation_during_native_property_argument_read_propagates(monkeypatc
     monkeypatch.setattr(tm, "_parse_shell_command_word", parse)
     with pytest.raises(TimeoutError, match="native argument deadline"):
         tm.bounded_parse_diagnostic(_PATH_VALUE_DOCUMENT, expired, file_type="markdown")
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("depth", [2, 3])
+def test_nested_list_markers_keep_native_inline_delimiters(depth: int, newline: str) -> None:
+    source = "# 比較\n\n- Outer item\n"
+    for level in range(1, depth):
+        source += "  " * level + "- Verification:\n"
+    source += "  " * depth + "- Run `make -f Makefile_{TARGET} run`.\n"
+    source = source.replace("\n", newline)
+    ranges = []
+    projected = tm._markdown_shell_text(source, lambda: None, inline_code_ranges=ranges)
+    opening = source.index("`make")
+    closing = source.index("`", opening + 1)
+    assert (opening + 1, closing) in ranges
+    assert projected[opening] == projected[closing] == " "
+    assert projected[opening + 1 : closing] == source[opening + 1 : closing]
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": source}}, [tm]
+    )
+    assert not any(event["outcome"] == "partial" for event in result["inspection_ledger"])
+
+
+def test_tab_indentation_can_reuse_a_proven_list_container() -> None:
+    source = "- Parent item\n\t- Run `make -f Makefile_{TARGET} run`.\n"
+    ranges = []
+    tm._markdown_shell_text(source, lambda: None, inline_code_ranges=ranges)
+    assert (source.index("`") + 1, source.rindex("`")) in ranges
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "    - Run `make -f Makefile_{TARGET} run`.\n",
+        "\t- Run `make -f Makefile_{TARGET} run`.\n",
+        "-     Run `make -f Makefile_{TARGET} run`.\n",
+        "```text\n    - Run `make -f Makefile_{TARGET} run`.\n```\n",
+        "<pre>\n    - Run `make -f Makefile_{TARGET} run`.\n</pre>\n",
+        ">     - Run `make -f Makefile_{TARGET} run`.\n",
+    ],
+)
+def test_list_container_proof_does_not_reclassify_literal_blocks(source: str) -> None:
+    ranges = []
+    projected = tm._markdown_shell_text(source, lambda: None, inline_code_ranges=ranges)
+    opening = source.index("`make")
+    assert not any(start <= opening < end for start, end in ranges)
+    assert projected[opening] == "`"
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    "label", ["Command (on the host)", "command (local host)", "Builtin (local)"]
+)
+def test_proven_table_header_parenthetical_labels_are_not_wrapper_invocations(
+    label: str, newline: str
+) -> None:
+    source = (
+        "# 比較\n\n| Check | " + label + " | Expected |\n"
+        "|---|---|---|\n| Link | `ip link show` | UP |\n"
+    ).replace("\n", newline)
+    headers = []
+    tm._markdown_shell_text(source, lambda: None, table_header_ranges=headers)
+    assert any(source[start:end].strip() == label for start, end in headers)
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+    assert (
+        tm.bounded_parse_diagnostic(
+            source, lambda: None, file_type="markdown", complete_context=False
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        'command <"$PAYLOAD"',
+        "command -p (on the host)",
+        "Command ($PAYLOAD)",
+        'command eval "$PAYLOAD"',
+        'sh -c "$PAYLOAD"',
+        'eval "$PAYLOAD"',
+        "`Command (on the host)`",
+        '`sh -c "$PAYLOAD"`',
+    ],
+)
+def test_table_headers_keep_native_redirection_option_and_execution_uncertainty(head: str) -> None:
+    source = "| " + head + " | Result |\n|---|---|\n| Local | Data |\n"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.cause in {ParserCause.BOUNDARY_UNRESOLVED, ParserCause.RUNTIME_DEPENDENT}
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "| Command (on the host) | Result |\n| invalid | row |\n",
+        "```text\n| Command (on the host) | Result |\n|---|---|\n```\n",
+        "| Command (" + "a" * 512 + ") | Result |\n|---|---|\n",
+    ],
+)
+def test_header_label_proof_requires_a_bounded_native_header(source: str) -> None:
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is not None
+
+
+@pytest.mark.parametrize("wrapper", ["sh -c", "eval"])
+def test_header_label_grant_is_not_forwarded_to_executed_children(
+    monkeypatch, wrapper: str
+) -> None:
+    child = "command (on the host)"
+    observed = []
+    original = tm._has_shell_command_word_exhaustion
+
+    def exhaustion(content, *args, **kwargs):
+        if content == child:
+            observed.append(kwargs.get("markdown_header_spans", ()))
+        return original(content, *args, **kwargs)
+
+    monkeypatch.setattr(tm, "_has_shell_command_word_exhaustion", exhaustion)
+    source = (
+        "| Command (on the host) | Result |\n|---|---|\n\n"
+        "Run ``" + wrapper + " '" + child + "'``.\n"
+    )
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is not None
+    assert observed and all(spans == () for spans in observed)
+
+
+def test_nested_and_header_proofs_preserve_later_runtime_bounds_and_raw_high() -> None:
+    source = (
+        "# 比較\n\n- Parent\n  - Check:\n    - Run `make -f Makefile_{TARGET} run`.\n\n"
+        "| Command (on the host) | Result |\n|---|---|\n\n"
+        'Run `sh -c "$PAYLOAD"`.\nRun `rm -rf /`.\n'
+    )
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+    assert source.index("sh -c") <= diagnostic.start < diagnostic.end <= source.index("`.\nRun")
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": source}}, [tm]
+    )
+    assert any(
+        finding.rule_id == "TM1"
+        and finding.severity == "HIGH"
+        and finding.file == "guide.md"
+        and finding.start_line == source.count("\n", 0, source.index("rm -rf /")) + 1
+        for finding in result["findings"]
+    )
+
+
+def test_cancellation_inside_table_header_label_proof_propagates(monkeypatch) -> None:
+    entered = False
+    original = tm._shell_command_strings
+
+    def commands(*args, **kwargs):
+        nonlocal entered
+        for command in original(*args, **kwargs):
+            entered = True
+            yield command
+
+    def expired() -> None:
+        if entered:
+            raise TimeoutError("header label deadline")
+
+    monkeypatch.setattr(tm, "_shell_command_strings", commands)
+    with pytest.raises(TimeoutError, match="header label deadline"):
+        tm.bounded_parse_diagnostic(
+            "| Command (on the host) | Result |\n|---|---|\n",
+            expired,
+            file_type="markdown",
+        )
+
+
+@pytest.mark.parametrize("language", ["md", "markdown"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_closed_root_markdown_example_retains_inner_native_roles(
+    language: str, newline: str
+) -> None:
+    source = (
+        "# 比較\n\n````" + language + "\n"
+        "Use `local-build` as the name.\n\n"
+        "```bash\necho done\n```\n\n"
+        "| Command (on the host) | Result |\n|---|---|\n"
+        "````\n\n" + "Ordinary trailing text.\n" * 256
+    ).replace("\n", newline)
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": source}}, [tm]
+    )
+    assert not any(event["outcome"] == "partial" for event in result["inspection_ledger"])
+
+
+def test_closed_markdown_example_rebases_all_owned_metadata_without_overlapping_fences() -> None:
+    source = (
+        "# 比較\n\n````markdown\n"
+        "A `literal`'s description.\n\n"
+        "```bash\nprintf '%s' 'done'\n```\n"
+        '```powershell\nWrite-Output "done"\n```\n'
+        "```verilog\nassign word = 8'hff;\n$display('x');\n```\n"
+        "| Command (on the host) | Result |\n|---|---|\n"
+        "````\n"
+    )
+    collectors = {
+        name: []
+        for name in (
+            "fence_boundaries",
+            "fence_regions",
+            "inline_regions",
+            "shell_fence_ranges",
+            "powershell_blocks",
+            "inline_code_ranges",
+            "table_header_ranges",
+            "hardware_apostrophe_locations",
+        )
+    }
+    possessives = set()
+    ambiguous = [False]
+    projected = tm._markdown_shell_text(
+        source,
+        lambda: None,
+        markdown_examples=True,
+        inline_possessive_apostrophes=possessives,
+        hardware_apostrophe_ambiguity=ambiguous,
+        **collectors,
+    )
+    assert len(projected) == len(source)
+    regions = collectors["fence_regions"]
+    assert [language for _, _, language in regions] == ["bash", "powershell", "verilog"]
+    assert all(left[1] <= right[0] for left, right in zip(regions, regions[1:], strict=False))
+    assert collectors["fence_boundaries"] == sorted(collectors["fence_boundaries"])
+    assert [source[start:end] for start, end in collectors["shell_fence_ranges"]] == [
+        "printf '%s' 'done'\n"
+    ]
+    assert [source[start:end] for start, end in collectors["powershell_blocks"]] == [
+        'Write-Output "done"\n'
+    ]
+    assert [source[start:end] for start, end in collectors["inline_code_ranges"]] == ["literal"]
+    assert collectors["inline_regions"] == collectors["inline_code_ranges"]
+    assert possessives == {source.index("'s description")}
+    assert ambiguous == [True]
+    assert collectors["hardware_apostrophe_locations"]
+    assert all(
+        "$display" in source[start:end]
+        for start, end in collectors["hardware_apostrophe_locations"]
+    )
+    assert any(
+        source[start:end].strip() == "Command (on the host)"
+        for start, end in collectors["table_header_ranges"]
+    )
+    assert all(
+        0 <= start < end <= len(source)
+        for name, rows in collectors.items()
+        if name != "fence_boundaries"
+        for start, end, *_ in rows
+    )
+
+
+@pytest.mark.parametrize(
+    "opener, closer, complete",
+    [
+        ("````markdown", "````", False),
+        (" ````markdown", " ````", True),
+        ("- Item\n  ````markdown", "  ````", True),
+        ("````markdown example", "````", True),
+        ("````text", "````", True),
+        ("````markdown", "", True),
+    ],
+)
+def test_markdown_example_projection_requires_complete_closed_root_ownership(
+    opener: str, closer: str, complete: bool
+) -> None:
+    body_indent = "  " if opener.startswith("- Item") else ""
+    source = opener + "\n" + body_indent + "Use `local-build`.\n" + closer + "\n"
+    ranges = []
+    projected = tm._markdown_shell_text(
+        source,
+        lambda: None,
+        complete_context=complete,
+        inline_code_ranges=ranges,
+        markdown_examples=True,
+    )
+    opening = source.index("`local-build")
+    assert projected[opening] == "`"
+    assert not any(start <= opening + 1 < end for start, end in ranges)
+
+
+def test_markdown_examples_are_default_off_and_do_not_recurse_a_second_level() -> None:
+    source = "`````markdown\n````markdown\nUse `local-build`.\n````\n`````\n"
+    opening = source.index("`local-build")
+    for enabled in [False, True]:
+        ranges = []
+        projected = tm._markdown_shell_text(
+            source, lambda: None, inline_code_ranges=ranges, markdown_examples=enabled
+        )
+        assert projected[opening] == "`"
+        assert not any(start <= opening + 1 < end for start, end in ranges)
+
+
+@pytest.mark.parametrize("language, escape", [("bash", "\\"), ("powershell", "`")])
+@pytest.mark.parametrize(
+    "head, tail, option",
+    [
+        ("chmod", "a+rwx ./local", "a+rwx"),
+        ("git", "push --force", "--force"),
+        ("curl", "https://example.invalid -k", "-k"),
+        ("curl", "https://example.invalid --insecure", "--insecure"),
+        ("wget", "https://example.invalid --no-check-certificate", "--no-check-certificate"),
+    ],
+)
+def test_nested_shell_option_consumers_keep_exact_raw_continuations(
+    language: str, escape: str, head: str, tail: str, option: str
+) -> None:
+    command = head + escape + "\n " + tail
+    source = "# 比較\n\n````markdown\n```" + language + "\n" + command + "\n```\n````\n"
+    expected = command[: command.index(option) + len(option)]
+    findings = [
+        finding
+        for finding in tm.analyze(source, "guide.md", "markdown")
+        if finding.rule_id == "TM1" and finding.complete_match == expected
+    ]
+    assert findings
+    assert all(finding.location.start_line == 5 for finding in findings)
+
+
+@pytest.mark.parametrize("language", ["bash", "powershell"])
+def test_nested_native_option_consumer_preserves_a_quoted_pipe(language: str) -> None:
+    command = "curl --url 'https://example.invalid/a|b' --insecure"
+    source = "````markdown\n```" + language + "\n" + command + "\n```\n````\n"
+    assert any(
+        finding.rule_id == "TM1" and finding.complete_match == command
+        for finding in tm.analyze(source, "guide.md", "markdown")
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "```bash\ncurl https://example.invalid\n```\nUse --insecure as a label.\n",
+        "```bash\ncurl https://example.invalid\nprintf '%s' --insecure\n```\n",
+        "```bash\ncurl https://example.invalid | cat --insecure\n```\n",
+    ],
+)
+def test_nested_option_consumer_does_not_borrow_a_later_command_or_fence(body: str) -> None:
+    source = "````markdown\n" + body + "````\n"
+    assert not any(
+        finding.rule_id == "TM1" for finding in tm.analyze(source, "guide.md", "markdown")
+    )
+
+
+def test_nested_example_preserves_inner_runtime_and_raw_high_source_coordinates() -> None:
+    source = (
+        "# 比較\n\n````markdown\nReference `local-build`.\n\n"
+        'Run `sh -c "$PAYLOAD"`.\n\n```bash\nrm -rf /\n```\n````\n'
+    )
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+    assert (
+        source.index("sh -c")
+        <= diagnostic.start
+        < diagnostic.end
+        <= source.index("`.\n", source.index("sh -c"))
+    )
+    findings = tm.analyze(source, "guide.md", "markdown")
+    assert any(
+        finding.rule_id == "TM1"
+        and finding.severity == "HIGH"
+        and finding.location.start_line == 9
+        and finding.complete_match == "rm -rf /"
+        for finding in findings
+    )
+
+
+def test_markdown_example_projection_has_one_disjoint_child_pass(monkeypatch) -> None:
+    body = "Reference `local-build`.\n"
+    source = ("````markdown\n" + body + "````\n\n") * 64
+    children = []
+    original = tm._markdown_shell_text
+
+    def project(content, *args, **kwargs):
+        if not kwargs.get("markdown_examples", False):
+            children.append(content)
+        return original(content, *args, **kwargs)
+
+    monkeypatch.setattr(tm, "_markdown_shell_text", project)
+    project(source, lambda: None, markdown_examples=True)
+    assert children == [body] * 64
+    assert sum(map(len, children)) <= len(source)
+
+
+def test_cancellation_inside_the_bounded_markdown_child_projection_propagates(monkeypatch) -> None:
+    entered = False
+    original = tm._markdown_shell_text
+
+    def project(content, *args, **kwargs):
+        nonlocal entered
+        entered = entered or not kwargs.get("markdown_examples", False)
+        return original(content, *args, **kwargs)
+
+    def expired() -> None:
+        if entered:
+            raise TimeoutError("Markdown example deadline")
+
+    monkeypatch.setattr(tm, "_markdown_shell_text", project)
+    with pytest.raises(TimeoutError, match="Markdown example deadline"):
+        project("````markdown\nReference `local-build`.\n````\n", expired, markdown_examples=True)
