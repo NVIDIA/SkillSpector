@@ -49,6 +49,35 @@ def test_resolve_input_with_skill_path_only(tmp_path: Path) -> None:
     assert update.get("selected_source_identity") == tmp_path.name
 
 
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_zip_baseline_loading_failure_cleans_extraction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupted: bool
+) -> None:
+    """Loading fails inside the materializer's cleanup boundary, including interruption."""
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("SKILL.md", "# Skill")
+        bundle.writestr(".skillspector-baseline.yaml", "version: 2\nrules: [{}]\n")
+    created: list[Path] = []
+    original = tempfile.mkdtemp
+
+    def mkdtemp(**kwargs: object) -> str:
+        path = original(dir=tmp_path, **kwargs)
+        created.append(Path(path))
+        return path
+
+    monkeypatch.setattr("skillspector.input_handler.tempfile.mkdtemp", mkdtemp)
+    if interrupted:
+
+        def interrupt(_path: Path) -> None:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("skillspector.nodes.resolve_input.load_baseline", interrupt)
+    with pytest.raises(KeyboardInterrupt if interrupted else ValueError):
+        resolve_input({"input_path": str(archive), "use_shipped_baseline": True})
+    assert created and all(not path.exists() for path in created)
+
+
 def test_resolve_input_rejects_skill_path_with_symlinked_parent(tmp_path: Path) -> None:
     """The skill_path-only route must enforce the same symlink policy as input_path."""
     external_skill = tmp_path / "external" / "skill"
