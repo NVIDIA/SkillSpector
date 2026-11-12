@@ -72,7 +72,7 @@ from typing import Any
 
 import yaml
 
-from skillspector.file_output import open_output_parent
+from skillspector.file_output import open_output_parent, restrict_temporary_access
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 
@@ -656,40 +656,7 @@ def build_baseline_dict(
 
 def _restrict_baseline_temporary(descriptor: int) -> None:
     """Remove inherited access before a temporary file receives baseline data."""
-    if os.name == "posix":
-        # Also masks named-user/group ACL grants on POSIX ACL implementations.
-        os.fchmod(descriptor, 0o600)
-    if sys.platform != "darwin":
-        return
-
-    # macOS extended ACL grants are independent of permission bits. Use the
-    # already-open descriptor so clearing them cannot follow a swapped path.
-    import ctypes
-
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        init_acl = libc.acl_init
-        set_acl = libc.acl_set_fd_np
-        free_acl = libc.acl_free
-    except AttributeError:
-        # Filesystems/platforms without extended ACL support need only mode bits.
-        return
-    init_acl.argtypes = [ctypes.c_int]
-    init_acl.restype = ctypes.c_void_p
-    set_acl.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
-    set_acl.restype = ctypes.c_int
-    free_acl.argtypes = [ctypes.c_void_p]
-    free_acl.restype = ctypes.c_int
-    empty_acl = init_acl(0)
-    if not empty_acl:
-        raise OSError(ctypes.get_errno(), "Could not initialize baseline ACL")
-    try:
-        if set_acl(descriptor, empty_acl, 0x100) != 0:  # ACL_TYPE_EXTENDED
-            error = ctypes.get_errno()
-            if error not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
-                raise OSError(error, "Could not clear inherited baseline ACLs")
-    finally:
-        free_acl(empty_acl)
+    restrict_temporary_access(descriptor, output_kind="baseline")
 
 
 def _preserve_baseline_acl(source: int, destination: int) -> None:

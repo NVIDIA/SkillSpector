@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded lexical ownership for Node assertion template-message delimiters.
+"""Bounded JavaScript ownership for shell-completeness checks.
 
-This is not a JavaScript parser or a shell-sink/dataflow model. Only a direct
-diagnostic argument of one unaliased built-in assertion import may borrow
-ownership. Unsupported source keeps its original conservative shell reading.
+Assertion messages require a proved receiver. General template ownership also
+requires a complete syntax tree and retains conservative shell-execution checks.
+Original source bytes remain the input to security matching.
 """
 
 from __future__ import annotations
@@ -15,11 +15,11 @@ from bisect import bisect_left
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import Any
 
-import esprima  # type: ignore[import-untyped]
+from tree_sitter import Node
 
-from skillspector.python_ast import MAX_PYTHON_AST_SOURCE_CHARS
+from skillspector.javascript_ast import NODE_SHEBANG as _NODE_SHEBANG
+from skillspector.javascript_ast import JavaScriptProgram, parse_javascript_source
 
 _MAX_SOURCE_CHARS = 1_000_000
 _MAX_TOKENS = 100_000
@@ -30,7 +30,6 @@ _IDENTIFIER = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
 _TEMPLATE_VALUE = re.compile(
     r"\s*[A-Za-z_$][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_$][A-Za-z0-9_$]*)*\s*\Z"
 )
-_NODE_SHEBANG = re.compile(r"#![ \t]*(?:\S*/)?(?:env[ \t]+)?node(?:js)?(?=[ \t\r\n]|$)")
 _ASSERT_MODULES = frozenset({"node:assert", "node:assert/strict"})
 _ASSERT_MODULE_ALIASES = _ASSERT_MODULES | {"assert", "assert/strict"}
 _MESSAGE_ARGUMENTS = {
@@ -1474,6 +1473,7 @@ def browser_escaped_list_shell_text(content: str, check_runtime: Callable[[], No
 
 JavaScriptTemplateSpans = tuple[tuple[int, ...], tuple[int, ...]]
 
+
 _SHELL_EXECUTION_CALLS = frozenset(
     {
         "exec",
@@ -1481,6 +1481,7 @@ _SHELL_EXECUTION_CALLS = frozenset(
         "execfilesync",
         "execsync",
         "eval",
+        "function",
         "execa",
         "spawn",
         "spawnfile",
@@ -1496,64 +1497,70 @@ _SHELL_EXECUTION_MODULES = frozenset({"child_process", "execa", "shelljs", "zx"}
 def javascript_template_spans(
     content: str,
     check_runtime: Callable[[], None],
+    *,
+    unresolved_executables: list[int] | None = None,
+    regex_literals: list[tuple[int, int]] | None = None,
 ) -> JavaScriptTemplateSpans | None:
-    """Return template literal ranges only when a complete script parses.
+    """Prove host delimiters while retaining unresolved executable templates.
 
-    Unsupported or malformed JavaScript returns ``None`` so callers retain
-    their conservative parse bounds. A file with a template and a shell
-    execution call also keeps those bounds because this parser does not
-    establish whether that template supplies the executed command.
+    Modern syntax is parsed unchanged. Dynamic values in a file with a shell
+    execution surface stay unresolved: a CST is not a dataflow proof. Static
+    command templates retain the ordinary bounded shell inspection instead of
+    gaining a delimiter exemption. Raw finding checks always keep the source.
     """
-    if "`" not in content or len(content) > MAX_PYTHON_AST_SOURCE_CHARS:
+    if "`" not in content:
         return None
-    check_runtime()
-    options = {"range": True}
-    try:
-        try:
-            program = esprima.parseScript(content, options)
-        except esprima.Error:
-            program = esprima.parseModule(content, options)
-    except (esprima.Error, RecursionError, ValueError, TypeError):
+    program = parse_javascript_source(content, check_runtime)
+    if program is None:
+        if unresolved_executables is not None:
+            unresolved_executables.append(content.index("`"))
         return None
-    check_runtime()
-
-    templates: list[tuple[int, int, bool]] = []
-    for node in _walk_nodes(program, check_runtime):
-        if node.type == "TemplateLiteral":
-            source_range = getattr(node, "range", None)
-            if not isinstance(source_range, list) or len(source_range) != 2:
-                return None
-            start, end = source_range
-            if (
-                not isinstance(start, int)
-                or not isinstance(end, int)
-                or start < 0
-                or end > len(content)
-                or start >= end
-                or content[start] != "`"
-                or content[end - 1] != "`"
-            ):
-                # Esprima offsets must map back to the exact source. A mismatch
-                # (for example after an astral Unicode character) proves no
-                # ownership for this artifact.
-                return None
-            templates.append((start, end, bool(node.expressions)))
-
+    executable = None
+    if regex_literals is not None and any(node.type == "regex" for node in program.nodes):
+        # A lexical boundary cannot replace unresolved behavior. Apply the
+        # existing execution barrier even when the source has no templates.
+        executable = _has_shell_execution_call(program, check_runtime)
+        if not executable:
+            regex_literals.extend(_plain_regex_value_spans(program, check_runtime))
+    templates = [node for node in program.nodes if node.type == "template_string"]
     if not templates:
         return None
-
-    if _has_shell_execution_call(program, check_runtime):
+    projected = assertion_template_shell_text(content, check_runtime)
+    if executable is None:
+        executable = _has_shell_execution_call(program, check_runtime)
+    if executable:
+        for node in templates:
+            check_runtime()
+            start, end = program.span(node)
+            if projected[start] != content[start] and projected[end - 1] != content[end - 1]:
+                # Existing Node assertion proof owns this diagnostic argument,
+                # even when an unrelated literal shell command shares the file.
+                continue
+            if unresolved_executables is not None and (
+                any(child.type == "template_substitution" for child in node.named_children)
+                or "$" in program.text(node)
+                or (
+                    node.parent is not None
+                    and node.parent.type == "call_expression"
+                    and node.parent.child_by_field_name("arguments") == node
+                )
+            ):
+                unresolved_executables.append(start)
         return None
-
-    if _has_unproven_assertion_template_call(content, program, templates, check_runtime):
+    if _has_unproven_assertion_template_call(content, projected, program, templates, check_runtime):
         return None
-
-    # Nested template literals occur inside interpolation expressions. The
-    # outer literal owns all of those bytes, so retain only disjoint outermost
-    # spans for the shell parser's offset-based ownership checks.
     starts: list[int] = []
     ends: list[int] = []
-    for start, end, _dynamic in sorted(templates):
+    for node in templates:
+        check_runtime()
+        start, end = program.span(node)
+        if (
+            not (0 <= start < end <= len(content))
+            or content[start] != "`"
+            or content[end - 1] != "`"
+        ):
+            return None
+        # Nested templates share their outer literal's proven delimiter range.
         if starts and start < ends[-1]:
             if end <= ends[-1]:
                 continue
@@ -1563,72 +1570,880 @@ def javascript_template_spans(
     return tuple(starts), tuple(ends)
 
 
-def _walk_nodes(value: Any, check_runtime: Callable[[], None]) -> Iterator[Any]:
-    pending = [value]
-    visited = 0
-    while pending:
-        visited += 1
-        if visited % 256 == 0:
-            check_runtime()
-        current = pending.pop()
-        if isinstance(current, (list, tuple)):
-            pending.extend(reversed(current))
-        elif hasattr(current, "type"):
-            yield current
-            children = [
-                child
-                for name, child in vars(current).items()
-                if name not in {"type", "range", "loc", "tokens", "comments"}
-            ]
-            pending.extend(reversed(children))
+def _plain_regex_value_spans(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> list[tuple[int, int]]:
+    """Bound lexical regex candidates after the execution barrier.
 
-
-def _has_shell_execution_call(program: Any, check_runtime: Callable[[], None]) -> bool:
-    for node in _walk_nodes(program, check_runtime):
-        if node.type == "ImportDeclaration" and _is_shell_execution_module(
-            getattr(node.source, "value", "")
-        ):
-            return True
-        if node.type in {"CallExpression", "NewExpression"}:
-            if _is_shell_execution_callee(node.callee):
-                return True
+    Only direct String values and immutable top-level String bindings supply
+    native matching receivers. Explicit overrides retain the shell fallback.
+    """
+    matching = {"match", "matchAll", "search", "split", "replace", "replaceAll"}
+    references: dict[str, list[Node]] = {}
+    candidates: dict[str, tuple[Node, Node]] = {}
+    overrides = {
+        "String",
+        "RegExp",
+        "Reflect",
+        "prototype",
+        "constructor",
+        "__proto__",
+        "defineProperty",
+        "defineProperties",
+        "getPrototypeOf",
+        "setPrototypeOf",
+        "__defineGetter__",
+        "__defineSetter__",
+    }
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return []
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            references.setdefault(program.text(node), []).append(node)
+        if node.type == "variable_declarator":
+            binding = node.child_by_field_name("name")
+            value = node.child_by_field_name("value")
+            declaration = node.parent
             if (
-                node.callee.type == "Identifier"
-                and node.callee.name == "require"
-                and node.arguments
-                and _is_shell_execution_module(getattr(node.arguments[0], "value", ""))
+                binding is not None
+                and binding.type == "identifier"
+                and value is not None
+                and value.type == "string"
+                and declaration is not None
+                and declaration.type == "lexical_declaration"
+                and declaration.children[0].type == "const"
+                and declaration.parent == program.root_node
+            ):
+                candidates[program.text(binding)] = (binding, node)
+        if node.type in {"identifier", "property_identifier", "string"} and (
+            program.text(node).strip("\"'") in overrides
+        ):
+            return []
+        if node.type in {"method_definition", "pair"}:
+            name = node.child_by_field_name("name") or node.child_by_field_name("key")
+            if name is not None and (
+                name.type == "computed_property_name" or program.text(name).strip("\"'") in matching
+            ):
+                return []
+        if node.type in {"assignment_expression", "augmented_assignment_expression"}:
+            target = node.child_by_field_name("left")
+            if target is not None and (
+                target.type == "subscript_expression"
+                or target.type == "member_expression"
+                and _callable_member(program, target) in matching
+            ):
+                return []
+    for node in program.nodes:
+        check_runtime()
+        property_node = node.child_by_field_name("property") or node.child_by_field_name("index")
+        if node.type in {"member_expression", "subscript_expression"} and (
+            _callable_member(program, node) == "source"
+            or property_node is not None
+            and "\\" in program.text(property_node)
+            or node.type == "subscript_expression"
+            and (property_node is None or property_node.type not in {"string", "number"})
+        ):
+            # Source extraction needs a separate use proof before a pattern
+            # can stop lending boundaries to executable text.
+            return []
+    string_references: set[int] = set()
+    budget = _MAX_TOKENS * 4
+    for name, (binding, declaration) in candidates.items():
+        owned = {binding.id}
+        for reference in references[name]:
+            budget -= 1
+            if budget < 0:
+                return []
+            check_runtime()
+            if reference == binding:
+                continue
+            member = reference.parent
+            call = None if member is None else member.parent
+            if not (
+                reference.type == "identifier"
+                and reference.start_byte >= declaration.end_byte
+                and member is not None
+                and member.type == "member_expression"
+                and member.child_by_field_name("object") == reference
+                and _callable_member(program, member) in matching
+                and call is not None
+                and call.type == "call_expression"
+                and call.child_by_field_name("function") == member
+            ):
+                break
+            owned.add(reference.id)
+        else:
+            string_references.update(owned)
+    spans: list[tuple[int, int]] = []
+    for node in program.nodes:
+        check_runtime()
+        if node.type != "regex":
+            continue
+        pattern = node.child_by_field_name("pattern")
+        flags = node.child_by_field_name("flags")
+        flag_text = program.text(flags) if flags is not None else ""
+        if (
+            pattern is None
+            or len(set(flag_text)) != len(flag_text)
+            or set(flag_text) - set("dgimsuvy")
+            or {"u", "v"} <= set(flag_text)
+        ):
+            continue
+        start, end = program.span(node)
+        pattern_end = program.span(pattern)[1]
+        if (
+            program.content[start : start + 1] != "/"
+            or program.content[pattern_end : pattern_end + 1] != "/"
+        ):
+            continue
+        arguments = node.parent
+        call = None if arguments is None else arguments.parent
+        member = None if call is None else call.child_by_field_name("function")
+        receiver = None if member is None else member.child_by_field_name("object")
+        previous = node.prev_named_sibling
+        while previous is not None and previous.type == "comment":
+            check_runtime()
+            previous = previous.prev_named_sibling
+        if (
+            arguments is not None
+            and arguments.type == "arguments"
+            and previous is None
+            and call is not None
+            and call.type == "call_expression"
+            and member is not None
+            and member.type == "member_expression"
+            and _callable_member(program, member) in matching
+            and receiver is not None
+            and (receiver.type == "string" or receiver.id in string_references)
+        ):
+            spans.append((start, end))
+    return spans
+
+
+def _scalar_template_identifiers(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> set[int]:
+    """Own exact references to unique immutable scalars used only in templates."""
+    candidates: dict[str, tuple[Node, int]] = {}
+    references: dict[str, list[Node]] = {}
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return set()
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            name = program.text(node)
+            if name.casefold() in _SHELL_EXECUTION_CALLS:
+                references.setdefault(name, []).append(node)
+        if node.type != "variable_declarator":
+            continue
+        declaration = node.parent
+        binding = node.child_by_field_name("name")
+        value = node.child_by_field_name("value")
+        if (
+            declaration is not None
+            and declaration.type == "lexical_declaration"
+            and declaration.children[0].type == "const"
+            and declaration.parent == program.root_node
+            and binding is not None
+            and binding.type == "identifier"
+            and value is not None
+            and value.type in {"number", "string", "true", "false", "null"}
+        ):
+            name = program.text(binding)
+            # CST parsing does not establish strict-mode intrinsic binding rules.
+            if name.casefold() in _SHELL_EXECUTION_CALLS - {"eval", "function"}:
+                candidates[name] = (binding, node.end_byte)
+    owned: set[int] = set()
+    for name, (binding, declaration_end) in candidates.items():
+        identifiers: set[int] = set()
+        for node in references[name]:
+            check_runtime()
+            if node.id != binding.id and not (
+                node.type == "identifier"
+                and node.start_byte > declaration_end
+                and node.parent is not None
+                and node.parent.type == "template_substitution"
+                and node.parent.named_children == [node]
+            ):
+                break
+            identifiers.add(node.id)
+        else:
+            owned.update(identifiers)
+    return owned
+
+
+_PATH_FUNCTIONS = frozenset(
+    {
+        "basename",
+        "dirname",
+        "extname",
+        "format",
+        "isAbsolute",
+        "join",
+        "normalize",
+        "parse",
+        "relative",
+        "resolve",
+        "toNamespacedPath",
+    }
+)
+
+
+def _ordinary_native_calls(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> tuple[set[int], set[int]]:
+    """Prove direct native calls without granting ownership to escaped methods.
+
+    As with the existing browser/assertion proofs, ordinary built-ins are
+    assumed. Explicit overrides, reflection, shadowing and escaping references
+    cannot borrow that assumption. Raw finding inspection remains unchanged.
+    """
+    references: dict[str, list[Node]] = {}
+    path_bindings: dict[str, tuple[Node, bool]] = {}
+    regex_calls: list[Node] = []
+    regex_bindings: dict[str, Node] = {}
+    intrinsic_override = False
+    path_unproven = False
+    path_imports = 0
+    override_names = {
+        "RegExp",
+        "Reflect",
+        "constructor",
+        "__proto__",
+        "defineProperty",
+        "defineProperties",
+        "getPrototypeOf",
+        "setPrototypeOf",
+        "getOwnPropertyDescriptor",
+        "getOwnPropertyDescriptors",
+        "__defineGetter__",
+        "__defineSetter__",
+    }
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return set(), set()
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            references.setdefault(program.text(node), []).append(node)
+        if node.type in {"identifier", "property_identifier", "string"}:
+            spelling = program.text(node).strip("\"'")
+            if spelling in override_names:
+                intrinsic_override = True
+            if spelling in {"syncBuiltinESMExports", "require", "getBuiltinModule"}:
+                path_unproven = True
+            if spelling == "prototype":
+                # A direct hasOwnProperty.call read does not expose a prototype
+                # to an uploaded mutator. Other prototype uses remain unproved.
+                owner = node.parent
+                method = None if owner is None else owner.parent
+                helper = None if method is None else method.parent
+                call = None if helper is None else helper.parent
+                if not (
+                    owner is not None
+                    and owner.type == "member_expression"
+                    and program.text(owner.child_by_field_name("object")) == "Object"
+                    and method is not None
+                    and method.type == "member_expression"
+                    and _callable_member(program, method) == "hasOwnProperty"
+                    and helper is not None
+                    and helper.type == "member_expression"
+                    and _callable_member(program, helper) == "call"
+                    and call is not None
+                    and call.type == "call_expression"
+                    and call.child_by_field_name("function") == helper
+                ):
+                    intrinsic_override = True
+        if node.type == "this":
+            intrinsic_override = True
+        if node.type == "regex":
+            member = node.parent
+            call = None if member is None else member.parent
+            if (
+                member is not None
+                and member.type == "member_expression"
+                and member.child_by_field_name("object") == node
+                and _callable_member(program, member) in {"exec", "test"}
+                and call is not None
+                and call.type == "call_expression"
+                and call.child_by_field_name("function") == member
+                and call.child_by_field_name("arguments") is not None
+                and call.child_by_field_name("arguments").type != "template_string"
+            ):
+                if _callable_member(program, member) == "exec":
+                    regex_calls.append(member)
+            elif member is not None and member.type == "variable_declarator":
+                binding = member.child_by_field_name("name")
+                declaration = member.parent
+                if (
+                    binding is not None
+                    and binding.type == "identifier"
+                    and member.child_by_field_name("value") == node
+                    and declaration is not None
+                    and declaration.type == "lexical_declaration"
+                    and declaration.children[0].type == "const"
+                    and declaration.parent is not None
+                    and declaration.parent.type in {"program", "statement_block"}
+                ):
+                    regex_bindings[program.text(binding)] = binding
+                else:
+                    intrinsic_override = True
+            else:
+                # Even an argument can expose the shared RegExp prototype.
+                intrinsic_override = True
+        if node.type == "call_expression":
+            callee = node.child_by_field_name("function")
+            arguments = node.child_by_field_name("arguments")
+            if callee is not None and program.text(callee) in {"require", "import"}:
+                args = [] if arguments is None else arguments.named_children
+                if (
+                    len(args) != 1
+                    or args[0].type != "string"
+                    or program.text(args[0]).strip("\"'") in {"node:path", "path"}
+                ):
+                    path_unproven = True
+        if node.type != "import_statement":
+            continue
+        source = node.child_by_field_name("source")
+        module = "" if source is None else program.text(source).strip("\"'")
+        if module.removeprefix("node:").startswith("path/"):
+            path_unproven = True
+        if module not in {"node:path", "path"}:
+            continue
+        path_imports += 1
+        for clause in node.named_children:
+            if clause.type == "import_clause" and any(
+                child.type != "named_imports" for child in clause.named_children
+            ):
+                path_unproven = True
+        pending = list(node.named_children)
+        while pending:
+            check_runtime()
+            specifier = pending.pop()
+            if specifier.type == "import_specifier":
+                original = specifier.child_by_field_name("name")
+                binding = specifier.child_by_field_name("alias") or original
+                if original is not None and binding is not None:
+                    name = program.text(original)
+                    if program.text(binding).casefold() in {"eval", "function"}:
+                        path_unproven = True
+                        continue
+                    if name in _PATH_FUNCTIONS or name in {"posix", "win32"}:
+                        path_bindings[program.text(binding)] = (binding, name in {"posix", "win32"})
+                    else:
+                        path_unproven = True
+            pending.extend(specifier.named_children)
+    for name, binding in regex_bindings.items():
+        for reference in references[name]:
+            check_runtime()
+            if reference == binding:
+                continue
+            member = reference.parent
+            call = None if member is None else member.parent
+            if not (
+                member is not None
+                and member.type == "member_expression"
+                and member.child_by_field_name("object") == reference
+                and _callable_member(program, member) == "test"
+                and call is not None
+                and call.type == "call_expression"
+                and call.child_by_field_name("function") == member
+                and call.child_by_field_name("arguments") is not None
+                and call.child_by_field_name("arguments").type != "template_string"
+            ):
+                intrinsic_override = True
+                break
+    for reference in references.get("Object", ()):
+        parent = reference.parent
+        if (
+            parent is None
+            or parent.type != "member_expression"
+            or parent.child_by_field_name("object") != reference
+        ):
+            intrinsic_override = True
+    owned: set[int] = set()
+    native_calls: set[int] = set()
+    if not intrinsic_override:
+        for member in regex_calls:
+            owned.add(member.id)
+            property_node = member.child_by_field_name("property")
+            if property_node is not None:
+                owned.add(property_node.id)
+    path_calls: set[int] = set()
+    path_identifiers: set[int] = set()
+    for name, (binding, namespace) in path_bindings.items():
+        calls: set[int] = set()
+        identifiers = {binding.id}
+        for reference in references[name]:
+            check_runtime()
+            if reference == binding:
+                continue
+            callee = reference.parent if namespace else reference
+            if namespace and (
+                callee is None
+                or callee.type != "member_expression"
+                or callee.child_by_field_name("object") != reference
+                or _callable_member(program, callee) not in _PATH_FUNCTIONS
+            ):
+                path_unproven = True
+                break
+            call = None if callee is None else callee.parent
+            if (
+                call is None
+                or call.type != "call_expression"
+                or call.child_by_field_name("function") != callee
+                or call.child_by_field_name("arguments") is None
+                or call.child_by_field_name("arguments").type == "template_string"
+            ):
+                break
+            calls.add(call.id)
+            identifiers.add(reference.id)
+        else:
+            path_calls.update(calls)
+            path_identifiers.update(identifiers)
+            continue
+        path_unproven = True
+    if not path_unproven and path_imports == 1:
+        native_calls.update(path_calls)
+        owned.update(path_identifiers)
+    return owned, native_calls
+
+
+def _numeric_local_identifiers(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> set[int]:
+    """Resolve exact references to immutable local arithmetic helpers.
+
+    Other scopes can reuse the name. Shadowing, reassignment, escaping helpers
+    and bodies with calls/member reads cannot establish this narrower proof.
+    """
+    references: dict[str, list[Node]] = {}
+    candidates: list[tuple[Node, Node, Node]] = []
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return set()
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            references.setdefault(program.text(node), []).append(node)
+        if node.type != "variable_declarator":
+            continue
+        declaration = node.parent
+        binding = node.child_by_field_name("name")
+        function = node.child_by_field_name("value")
+        if (
+            declaration is None
+            or declaration.type != "lexical_declaration"
+            or declaration.children[0].type != "const"
+            or declaration.parent is None
+            or declaration.parent.type not in {"program", "statement_block"}
+            or binding is None
+            or binding.type != "identifier"
+            or program.text(binding).casefold() in {"eval", "function"}
+            or function is None
+            or function.type != "arrow_function"
+        ):
+            continue
+        parameters = function.child_by_field_name("parameters")
+        single = function.child_by_field_name("parameter")
+        params = [] if parameters is None else parameters.named_children
+        if single is not None:
+            params = [single]
+        if any(parameter.type != "identifier" for parameter in params):
+            continue
+        names = {program.text(parameter) for parameter in params}
+        if len(names) != len(params):
+            continue
+        body = function.child_by_field_name("body")
+        if body is None:
+            continue
+        pending = [body]
+        while pending:
+            check_runtime()
+            expression = pending.pop()
+            if expression.type == "identifier":
+                if program.text(expression) not in names:
+                    break
+            elif expression.type in {"unary_expression", "binary_expression"}:
+                operator = expression.child_by_field_name("operator")
+                if operator is None or program.text(operator) not in {
+                    "+",
+                    "-",
+                    "*",
+                    "/",
+                    "%",
+                    "**",
+                    "~",
+                    "&",
+                    "|",
+                    "^",
+                    "<<",
+                    ">>",
+                    ">>>",
+                }:
+                    break
+            elif expression.type not in {"number", "parenthesized_expression"}:
+                break
+            pending.extend(expression.named_children)
+        else:
+            candidates.append((binding, node, declaration.parent))
+    owned: set[int] = set()
+    budget = _MAX_TOKENS * 4
+    for binding, declaration, scope in candidates:
+        identifiers = {binding.id}
+        for reference in references[program.text(binding)]:
+            budget -= 1
+            if budget < 0:
+                return set()
+            check_runtime()
+            if reference == binding or not (
+                scope.start_byte <= reference.start_byte < scope.end_byte
+            ):
+                continue
+            call = reference.parent
+            if (
+                reference.start_byte < declaration.end_byte
+                or call is None
+                or call.type != "call_expression"
+                or call.child_by_field_name("function") != reference
+                or call.child_by_field_name("arguments") is None
+                or call.child_by_field_name("arguments").type == "template_string"
+            ):
+                break
+            identifiers.add(reference.id)
+        else:
+            owned.update(identifiers)
+    return owned
+
+
+def _pattern_binding_names(
+    program: JavaScriptProgram, pattern: Node, check_runtime: Callable[[], None]
+) -> set[str]:
+    """Collect the identifiers bound by a parameter or destructuring pattern.
+
+    Only binding positions count: the left side of assignment patterns, the
+    identifiers inside object and array patterns, and rest targets.
+    Default-value expressions, computed keys, and property names are
+    references, not bindings, so they are never descended into.
+    """
+    names: set[str] = set()
+    pending = [pattern]
+    while pending:
+        check_runtime()
+        node = pending.pop()
+        if node.type in {"identifier", "shorthand_property_identifier_pattern"}:
+            names.add(program.text(node))
+        elif node.type in {"assignment_pattern", "object_assignment_pattern"}:
+            left = node.child_by_field_name("left")
+            if left is not None:
+                pending.append(left)
+        elif node.type == "pair_pattern":
+            value = node.child_by_field_name("value")
+            if value is not None:
+                pending.append(value)
+        elif node.type == "rest_pattern":
+            pending.extend(node.named_children)
+        elif node.type in {"formal_parameters", "object_pattern", "array_pattern"}:
+            pending.extend(node.named_children)
+    return names
+
+
+def _has_shell_execution_call(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> bool:
+    scalar_identifiers = _scalar_template_identifiers(program, check_runtime)
+    ordinary_identifiers = _numeric_local_identifiers(program, check_runtime)
+    native_members, native_calls = _ordinary_native_calls(program, check_runtime)
+    owned_identifiers = scalar_identifiers | ordinary_identifiers | native_members
+    uncertain_bindings: set[str] = set()
+    global_objects = {"globalThis", "global", "window", "self"}
+    imported_callables: set[str] = set()
+    template_values: set[str] = set()
+    aliases: dict[str, set[str]] = {}
+    for node in program.nodes:
+        check_runtime()
+        target = None
+        value = None
+        if node.type == "variable_declarator":
+            target = node.child_by_field_name("name")
+            value = node.child_by_field_name("value")
+        elif node.type in {"assignment_expression", "augmented_assignment_expression"}:
+            target = node.child_by_field_name("left")
+            value = node.child_by_field_name("right")
+        elif node.type == "formal_parameters":
+            target = node
+        elif node.type == "arrow_function":
+            target = node.child_by_field_name("parameter")
+        elif node.type == "import_statement":
+            source = node.child_by_field_name("source")
+            if source is not None and program.text(source).strip("\"'") in _ASSERT_MODULE_ALIASES:
+                # The existing assertion projection separately proves message
+                # positions and refuses aliases or mutations of the binding.
+                continue
+            pending = list(node.named_children)
+            while pending:
+                check_runtime()
+                imported = pending.pop()
+                if imported.type == "identifier":
+                    imported_callables.add(program.text(imported))
+                pending.extend(imported.named_children)
+        if target is not None and target.type == "identifier" and value is not None:
+            name = program.text(target)
+            if node.type == "augmented_assignment_expression":
+                uncertain_bindings.add(name)
+            if value.type == "template_string":
+                template_values.add(name)
+            for origin in _callable_values(program, value, check_runtime):
+                if origin.type in {"identifier", "shorthand_property_identifier"}:
+                    aliases.setdefault(program.text(origin), set()).add(name)
+                elif origin.type in {"member_expression", "subscript_expression"}:
+                    # Extracting call/apply/bind retains the receiver's
+                    # provenance. Other member values remain unknown callables.
+                    if _callable_member(program, origin) not in {"call", "apply", "bind"}:
+                        uncertain_bindings.add(name)
+                elif origin.type not in {
+                    "identifier",
+                    "arrow_function",
+                    "function_expression",
+                    "generator_function",
+                    "number",
+                    "string",
+                    "template_string",
+                    "array",
+                    "object",
+                    "true",
+                    "false",
+                    "null",
+                }:
+                    uncertain_bindings.add(name)
+            continue
+        if target is not None:
+            if target.type in {
+                "formal_parameters",
+                "object_pattern",
+                "array_pattern",
+                "assignment_pattern",
+                "object_assignment_pattern",
+                "rest_pattern",
+                "pair_pattern",
+            }:
+                # Parameter and destructuring patterns bind only their
+                # binding positions. Identifiers in default-value
+                # expressions are references, not bindings: recording them
+                # would mark later ordinary calls to the same name as calls
+                # through an unknown callable.
+                uncertain_bindings.update(_pattern_binding_names(program, target, check_runtime))
+            else:
+                # Unknown callable origins include computed global members,
+                # injected parameters, aliases and reassigned local bindings.
+                pending = [target]
+                while pending:
+                    check_runtime()
+                    binding = pending.pop()
+                    if binding.type in {"identifier", "shorthand_property_identifier_pattern"}:
+                        uncertain_bindings.add(program.text(binding))
+                    pending.extend(binding.named_children)
+    for names in (
+        global_objects,
+        imported_callables,
+        template_values,
+        uncertain_bindings,
+    ):
+        pending_names = list(names)
+        while pending_names:
+            check_runtime()
+            for alias in aliases.get(pending_names.pop(), ()):
+                if alias not in names:
+                    names.add(alias)
+                    pending_names.append(alias)
+    for node in program.nodes:
+        check_runtime()
+        if node.type in {"identifier", "shorthand_property_identifier"} or (
+            node.type == "property_identifier"
+            and node.parent is not None
+            and node.parent.type == "member_expression"
+        ):
+            spelling = program.text(node)
+            # Escaped names and extracted callable aliases are not resolved here.
+            if (
+                "\\" in spelling
+                or spelling == "Reflect"
+                or (
+                    spelling.casefold() in _SHELL_EXECUTION_CALLS
+                    and node.id not in owned_identifiers
+                )
             ):
                 return True
-        if node.type == "TaggedTemplateExpression":
-            tag = node.tag
-            if _is_shell_execution_callee(tag) or (tag.type == "Identifier" and tag.name == "$"):
+        if node.type == "subscript_expression":
+            owner = node.child_by_field_name("object")
+            while owner is not None and owner.type in {"member_expression", "subscript_expression"}:
+                check_runtime()
+                owner = owner.child_by_field_name("object")
+            if _callable_member(program, node) in {"eval", "Function", "Reflect"} or (
+                owner is not None and program.text(owner) in global_objects
+            ):
+                # A computed global can supply eval/Function through an alias,
+                # including an object or array later destructured elsewhere.
+                return True
+        if node.type == "import_statement":
+            source = node.child_by_field_name("source")
+            if source is None or _is_shell_execution_module(program.text(source)):
+                return True
+        if node.type not in {"call_expression", "new_expression"}:
+            continue
+        callee = node.child_by_field_name("function") or node.child_by_field_name("constructor")
+        arguments = node.child_by_field_name("arguments")
+        if callee is None or arguments is None or arguments.type == "template_string":
+            return True
+        selected_names: set[str] = set()
+        callable_ids = {origin.id for origin in _callable_values(program, callee, check_runtime)}
+        for origin in _callable_values(program, callee, check_runtime, all_receivers=True):
+            if origin.type == "identifier":
+                name = program.text(origin)
+                selected_names.add(name)
+                if (
+                    origin.id in callable_ids
+                    and name in uncertain_bindings
+                    and origin.id not in ordinary_identifiers
+                ):
+                    return True
+            elif origin.type in {"call_expression", "new_expression"}:
+                # Unknown call results, including bound functions, cannot
+                # borrow the ordinary direct-call ownership heuristic.
+                if origin.id in callable_ids:
+                    return True
+            elif origin.type in {"member_expression", "subscript_expression"}:
+                member = _callable_member(program, origin)
+                if (
+                    member is not None
+                    and member.casefold() in _SHELL_EXECUTION_CALLS
+                    and origin.id not in native_members
+                ):
+                    return True
+                if member == "construct":
+                    return True
+                if (
+                    origin.id in callable_ids
+                    and origin.type == "subscript_expression"
+                    and member not in {"call", "apply", "bind"}
+                ):
+                    index = origin.child_by_field_name("index")
+                    if index is None or index.type not in {"number", "null", "true", "false"}:
+                        return True
+        if selected_names & imported_callables and node.id not in native_calls:
+            # An unresolved imported function may execute its argument. Keep
+            # direct template arguments and simple local aliases unowned;
+            # this does not claim interprocedural argument-flow analysis.
+            pending = list(arguments.named_children)
+            while pending:
+                check_runtime()
+                argument = pending.pop()
+                if argument.type == "template_string" or (
+                    argument.type == "identifier" and program.text(argument) in template_values
+                ):
+                    return True
+                pending.extend(argument.named_children)
+        if selected_names & {"require", "import"} or callee.type == "import":
+            args = arguments.named_children
+            if (
+                len(args) != 1
+                or args[0].type != "string"
+                or _is_shell_execution_module(program.text(args[0]))
+            ):
                 return True
     return False
 
 
+def _callable_member(program: JavaScriptProgram, node: Node) -> str | None:
+    member = node.child_by_field_name("property") or node.child_by_field_name("index")
+    if member is None or member.type not in {"property_identifier", "string"}:
+        return None
+    return program.text(member).strip("\"'")
+
+
+def _callable_values(
+    program: JavaScriptProgram,
+    value: Node,
+    check_runtime: Callable[[], None],
+    *,
+    all_receivers: bool = False,
+) -> Iterator[Node]:
+    """Walk selected values and function-helper receivers without executing code."""
+    pending = [value]
+    while pending:
+        check_runtime()
+        node = pending.pop()
+        if node.type in {"parenthesized_expression", "await_expression"}:
+            pending.extend(node.named_children)
+        elif (
+            node.type == "binary_expression"
+            and (operator := node.child_by_field_name("operator")) is not None
+            and program.text(operator) in {"&&", "||", "??"}
+        ):
+            pending.extend(node.named_children)
+        elif node.type == "ternary_expression":
+            for field in ("consequence", "alternative"):
+                child = node.child_by_field_name(field)
+                if child is not None:
+                    pending.append(child)
+        elif node.type in {"assignment_expression", "assignment_pattern"}:
+            child = node.child_by_field_name("right")
+            if child is not None:
+                pending.append(child)
+        elif node.type == "sequence_expression":
+            children = [child for child in node.named_children if child.type != "comment"]
+            if children:
+                pending.append(children[-1])
+        elif node.type != "comment":
+            yield node
+            if node.type in {"member_expression", "subscript_expression"} and (
+                all_receivers or _callable_member(program, node) in {"call", "apply", "bind"}
+            ):
+                owner = node.child_by_field_name("object")
+                if owner is not None:
+                    pending.append(owner)
+
+
 def _has_unproven_assertion_template_call(
     content: str,
-    program: Any,
-    templates: list[tuple[int, int, bool]],
+    projected: str,
+    program: JavaScriptProgram,
+    templates: list[Node],
     check_runtime: Callable[[], None],
 ) -> bool:
-    projected = assertion_template_shell_text(content, check_runtime)
     if "node:assert" in content and projected == content:
         return True
     unprojected_templates = sorted(
         (start, end)
-        for start, end, _dynamic in templates
+        for start, end in (program.span(node) for node in templates)
         if projected[start] == content[start] or projected[end - 1] == content[end - 1]
     )
     template_starts = [start for start, _end in unprojected_templates]
-    for node in _walk_nodes(program, check_runtime):
-        if node.type != "CallExpression" or not _is_assertion_like_callee(node.callee):
+    for node in program.nodes:
+        check_runtime()
+        if node.type != "call_expression":
             continue
-        for argument in node.arguments:
-            argument_range = getattr(argument, "range", None)
-            if not isinstance(argument_range, list) or len(argument_range) != 2:
-                continue
-            argument_start, argument_end = argument_range
+        callee = node.child_by_field_name("function")
+        arguments = node.child_by_field_name("arguments")
+        if callee is None or arguments is None or not _is_assertion_like_callee(program, callee):
+            continue
+        for argument in arguments.named_children:
+            argument_start, argument_end = program.span(argument)
             index = bisect_left(template_starts, argument_start)
             if (
                 index < len(unprojected_templates)
@@ -1639,32 +2454,19 @@ def _has_unproven_assertion_template_call(
     return False
 
 
-def _is_assertion_like_callee(callee: Any) -> bool:
-    if callee.type == "Identifier":
-        return callee.name.casefold() in {"assert", "check"}
-    if callee.type != "MemberExpression":
+def _is_assertion_like_callee(program: JavaScriptProgram, callee: Node) -> bool:
+    if callee.type == "identifier":
+        return program.text(callee).casefold() in {"assert", "check"}
+    if callee.type not in {"member_expression", "subscript_expression"}:
         return False
-    property_name = getattr(callee.property, "name", None)
-    if property_name is None:
-        property_name = getattr(callee.property, "value", None)
-    return isinstance(property_name, str) and property_name in _MESSAGE_ARGUMENTS
+    member = callee.child_by_field_name("property") or callee.child_by_field_name("index")
+    return member is not None and program.text(member).strip("\"'") in _MESSAGE_ARGUMENTS
 
 
-def _is_shell_execution_module(module: Any) -> bool:
-    if not isinstance(module, str):
-        return False
-    normalized = module.removeprefix("node:")
+def _is_shell_execution_module(module: str) -> bool:
+    if "\\" in module:
+        return True
+    normalized = module.strip("\"'").removeprefix("node:")
     return any(
         normalized == name or normalized.startswith(f"{name}/") for name in _SHELL_EXECUTION_MODULES
     )
-
-
-def _is_shell_execution_callee(callee: Any) -> bool:
-    if callee.type == "Identifier":
-        return callee.name.casefold() in _SHELL_EXECUTION_CALLS
-    if callee.type == "MemberExpression":
-        property_name = getattr(callee.property, "name", None)
-        if property_name is None:
-            property_name = getattr(callee.property, "value", None)
-        return isinstance(property_name, str) and property_name.casefold() in _SHELL_EXECUTION_CALLS
-    return False

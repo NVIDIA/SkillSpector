@@ -12,14 +12,17 @@ that was inspected.
 from __future__ import annotations
 
 import re
+import tarfile
+import threading
 import unicodedata
 from array import array
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import lru_cache
 from io import StringIO
-from typing import NotRequired
+from typing import NamedTuple, NotRequired
 
 from typing_extensions import TypedDict
 
@@ -105,6 +108,7 @@ class SecurityTextView:
     reconstructions: tuple[SecurityTextReconstruction, ...] = ()
     right_boundary_is_fixed: bool = False
     right_boundary_recovery_start: int | None = None
+    source_end_offsets: array[int] | None = None
 
     def source_offset(self, derived_offset: int) -> int:
         """Map a derived character offset to the corresponding source offset."""
@@ -114,6 +118,17 @@ class SecurityTextView:
             return 0
         index = min(max(derived_offset, 0), len(self.source_offsets) - 1)
         return self.source_offsets[index]
+
+    def source_end_offset(self, derived_offset: int) -> int:
+        """Return the exclusive original end of one projected character."""
+        if not self.text:
+            return 0
+        if self.source_end_offsets is None:
+            return self.source_offset(derived_offset) + 1
+        if not self.source_end_offsets:
+            return 0
+        index = min(max(derived_offset, 0), len(self.source_end_offsets) - 1)
+        return self.source_end_offsets[index]
 
     def reconstructed_source_spans(
         self,
@@ -198,6 +213,7 @@ _BINARY_MAGIC = (
     b"GIF87a",
     b"GIF89a",
     b"PK\x03\x04",
+    b"\x1f\x8b",
     b"\x7fELF",
     b"MZ",
     b"\x00asm",
@@ -214,6 +230,8 @@ _BINARY_EXTENSIONS = frozenset(
         ".pdf",
         ".zip",
         ".gz",
+        ".tar",
+        ".tgz",
         ".exe",
         ".dll",
         ".dex",
@@ -270,6 +288,8 @@ _PROMPT_SPACING_CANDIDATE = re.compile(
     re.UNICODE,
 )
 _MIN_LETTER_SPACING_RUN_LETTERS = 6
+_ASCII_ALPHABETIC_RUN = re.compile(r"[A-Za-z]+")
+_ASCII_LETTER_SPACING_START = re.compile(r"(?<![A-Za-z])[A-Za-z](?=[^A-Za-z0-9\r\n])")
 # Unicode 15.1.0 DerivedCoreProperties.txt: Default_Ignorable_Code_Point.
 _DEFAULT_IGNORABLE_RANGES = (
     (0x00AD, 0x00AD),
@@ -303,9 +323,13 @@ _DEFAULT_IGNORABLE_PATTERN = re.compile(
 )
 _DEFAULT_IGNORABLE_RUN_PATTERN = re.compile(_DEFAULT_IGNORABLE_PATTERN.pattern + "+")
 _REPEATED_CHARACTER_RUN_PATTERN = re.compile(r"(.)\1+")
-_ASCII_CONFUSABLE_PATTERN = re.compile(
-    "[" + "".join(re.escape(chr(codepoint)) for codepoint in ASCII_CONFUSABLE_SKELETON) + "]"
-)
+# The confusable skeleton maps 1,515 code points. A regex character class that
+# large is matched one code point at a time against every range in the class,
+# so searching a long CJK window costs seconds even when nothing matches.
+# Deleting the same set with str.translate is one C-level pass, and the length
+# only changes when a confusable character is actually present, so the check in
+# `_requires_normalized_security_view_uncached` stays exact without the regex.
+_CONFUSABLE_DELETION_TABLE = dict.fromkeys(ASCII_CONFUSABLE_SKELETON)
 _OBFUSCATED_INSTRUCTION_ACTIONS = (
     "ignore",
     "override",
@@ -314,8 +338,10 @@ _OBFUSCATED_INSTRUCTION_ACTIONS = (
     "forget",
 )
 _OBFUSCATED_ACTION_INITIALS = frozenset(action[0] for action in _OBFUSCATED_INSTRUCTION_ACTIONS)
+# An ASCII word character immediately before an idle candidate already makes
+# the exact boundary check reject it; active reconstruction states still walk it.
 _ASCII_OBFUSCATED_ACTION_START_PATTERN = re.compile(
-    "[" + re.escape("".join(sorted(_OBFUSCATED_ACTION_INITIALS))) + "]",
+    r"(?<![A-Za-z0-9_])[" + re.escape("".join(sorted(_OBFUSCATED_ACTION_INITIALS))) + "]",
     re.ASCII | re.IGNORECASE,
 )
 _OBFUSCATED_ACTION_START_PATTERN = re.compile(
@@ -360,10 +386,25 @@ def has_dex_magic(data: bytes) -> bool:
     return len(data) >= 8 and data.startswith(b"dex\n") and data[4:7].isdigit() and data[7] == 0
 
 
+def has_tar_header(data: bytes) -> bool:
+    """Validate a fixed TAR header without reading members or expanding metadata."""
+    if len(data) < tarfile.BLOCKSIZE:
+        return False
+    try:
+        tarfile.TarInfo.frombuf(data[: tarfile.BLOCKSIZE], "utf-8", "surrogateescape")
+    except tarfile.HeaderError:
+        return len(data) >= 1024 and data[:1024] == bytes(1024)
+    return True
+
+
 def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> ArtifactRecord:
     """Classify from bytes and decodability; an extension is never authoritative."""
     contains_nul = b"\x00" in data
-    has_binary_magic = has_dex_magic(data) or any(data.startswith(magic) for magic in _BINARY_MAGIC)
+    has_binary_magic = (
+        has_dex_magic(data)
+        or any(data.startswith(magic) for magic in _BINARY_MAGIC)
+        or has_tar_header(data)
+    )
     try:
         decoded = data.decode("utf-8")
         decodable = True
@@ -591,6 +632,7 @@ def _letter_spacing_run_spans(
     # character-by-character pass when no six-letter run can exist.
     if check_runtime is None and _LETTER_SPACING_CANDIDATE.search(text) is None:
         return
+    ascii_source = check_runtime is not None and text.isascii()
     next_runtime_check = 4096
 
     def check_progress(position: int) -> None:
@@ -602,6 +644,37 @@ def _letter_spacing_run_spans(
     offset = 0
     while offset < len(text):
         check_progress(offset)
+        if ascii_source:
+            seek_end = min(len(text), offset + 4096, next_runtime_check)
+            candidate = _ASCII_LETTER_SPACING_START.search(
+                text, offset, min(len(text), seek_end + 1)
+            )
+            if candidate is None:
+                offset = seek_end
+                # The exact scanner can rewind before a previously checked gap.
+                if check_runtime is not None and offset < len(text) and offset < next_runtime_check:
+                    check_runtime()
+                continue
+            offset = candidate.start()
+        # A letter touching another letter cannot start a single-letter run.
+        # Seek across ordinary ASCII words, stopping at the next cancellation
+        # checkpoint; non-ASCII letters retain the exact Unicode path below.
+        if (
+            text[offset].isascii()
+            and text[offset].isalpha()
+            and (
+                offset > 0
+                and text[offset - 1].isalpha()
+                or offset + 1 < len(text)
+                and text[offset + 1].isalpha()
+            )
+        ):
+            word = _ASCII_ALPHABETIC_RUN.match(
+                text, offset, next_runtime_check if check_runtime is not None else len(text)
+            )
+            if word is not None:
+                offset = word.end()
+                continue
         if not text[offset].isalpha() or (offset > 0 and text[offset - 1].isalpha()):
             offset += 1
             continue
@@ -663,6 +736,22 @@ def _concealed_instruction_run_spans(
     offset = 0
     while offset < len(text):
         check_progress(offset)
+        if (
+            text[offset].isascii()
+            and text[offset].isalpha()
+            and (
+                offset > 0
+                and text[offset - 1].isalpha()
+                or offset + 1 < len(text)
+                and text[offset + 1].isalpha()
+            )
+        ):
+            word = _ASCII_ALPHABETIC_RUN.match(
+                text, offset, next_runtime_check if check_runtime is not None else len(text)
+            )
+            if word is not None:
+                offset = word.end()
+                continue
         if not text[offset].isalpha() or (offset > 0 and text[offset - 1].isalpha()):
             offset += 1
             continue
@@ -1643,25 +1732,76 @@ def _letter_spacing_gap_offsets(
 
 
 def _compute_token_gap_character(ch: str) -> bool:
-    return (
-        _is_unconditionally_ignored(ch)
-        or is_default_ignorable(ch)
-        or _is_non_ascii_separator(ch)
-        or ch == "\ufffd"
-    )
+    """Return whether *ch* can start or continue a token-bridging gap run.
+
+    For a non-ASCII character this is one category lookup: the default
+    ignorables and the replacement character are checked first, and the rest
+    is exactly the Cf, Cc and Z categories (unconditionally ignored format and
+    control characters, and non-ASCII separators). ASCII characters keep the
+    precomputed table path in `_is_token_gap_character`, so the allowed format
+    characters (newline, carriage return, tab) stay non-gaps here.
+    """
+    if is_default_ignorable(ch) or ch == "\ufffd":
+        return True
+    if ch.isascii():
+        return _is_unconditionally_ignored(ch)
+    category = unicodedata.category(ch)
+    return category in {"Cf", "Cc"} or category.startswith("Z")
 
 
 _ASCII_TOKEN_GAP_CHARS = frozenset(
     ch for ch in map(chr, range(128)) if _compute_token_gap_character(ch)
 )
 
-# Any character that cannot be a token gap need not be examined at all. Every
-# ASCII character outside this class is settled by the table above, so a text
-# built only from them has no gap spans and the per-character walk below is
-# pure overhead.
-_TOKEN_GAP_CANDIDATE = re.compile(
-    "[^"
-    + "".join(re.escape(ch) for ch in map(chr, range(128)) if ch not in _ASCII_TOKEN_GAP_CHARS)
+# Every character `_is_token_gap_character` accepts, as ranges derived
+# exhaustively from that predicate over U+0000..U+10FFFF (Unicode 15.0
+# runtime; the default-ignorable subset matches the pinned Unicode 15.1.0
+# ranges in `_DEFAULT_IGNORABLE_RANGES`). The old whole-string skip only
+# excluded pure printable-ASCII text, so any CJK or Sinhala window passed it
+# and paid a per-character Python walk even when the text held no gap
+# character at all. This class is the exact gap set, so a non-match proves
+# the walk below would yield nothing. Regenerate the ranges if the Unicode
+# version changes; test_token_gap_fast_paths pins every range boundary.
+_TOKEN_GAP_RANGES = (
+    (0x0000, 0x0008),
+    (0x000B, 0x000C),
+    (0x000E, 0x001F),
+    (0x007F, 0x00A0),
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x115F, 0x1160),
+    (0x1680, 0x1680),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x2000, 0x200F),
+    (0x2028, 0x202F),
+    (0x205F, 0x206F),
+    (0x3000, 0x3000),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFFB),
+    (0xFFFD, 0xFFFD),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+_TOKEN_GAP_CHARACTER = re.compile(
+    "["
+    + "".join(
+        re.escape(chr(start)) if start == end else f"{re.escape(chr(start))}-{re.escape(chr(end))}"
+        for start, end in _TOKEN_GAP_RANGES
+    )
     + "]"
 )
 
@@ -1672,26 +1812,41 @@ def _is_token_gap_character(ch: str) -> bool:
     return _compute_token_gap_character(ch)
 
 
-def _token_bridging_gap_spans(
+def _iter_token_bridging_gap_spans(
     text: str,
     *,
-    require_word_boundaries: bool = True,
+    require_word_boundaries: bool,
     check_runtime: Callable[[], None] | None = None,
 ) -> Iterator[tuple[int, int]]:
-    """Yield contextual noise runs in one pass without crossing ASCII spaces."""
-    if _TOKEN_GAP_CANDIDATE.search(text) is None:
+    """Yield contextual noise runs incrementally, checking the deadline.
+
+    This is the walk body of `_token_bridging_gap_spans`: the text is only
+    walked when it contains at least one character from the exact gap set,
+    so gap-free mixed-script windows return immediately instead of paying
+    a per-character Python walk. The walk streams spans instead of
+    collecting them, and the caller's deadline is checked every 4096
+    offsets, so a dense or oversized input is abandoned promptly and a
+    consumer that only needs early spans never pays for the rest of the
+    walk. Callers pass window-bounded text when they can, but
+    `artifact_integrity._text_signals` may pass a whole cached file here,
+    so the walk itself must stay incremental and deadline-aware.
+    """
+    if _TOKEN_GAP_CHARACTER.search(text) is None:
         return
     offset = 0
+    next_check = 0
     while offset < len(text):
-        if check_runtime is not None and offset % 4096 == 0:
+        if check_runtime is not None and offset >= next_check:
             check_runtime()
+            next_check += 4096
         if not _is_token_gap_character(text[offset]):
             offset += 1
             continue
         start = offset
         while offset < len(text) and _is_token_gap_character(text[offset]):
-            if check_runtime is not None and offset % 4096 == 0:
+            if check_runtime is not None and offset >= next_check:
                 check_runtime()
+                next_check += 4096
             if is_default_ignorable(text[offset]):
                 run = _DEFAULT_IGNORABLE_RUN_PATTERN.match(text, offset)
                 if run is not None:
@@ -1707,6 +1862,139 @@ def _token_bridging_gap_spans(
         )
         if is_contextual:
             yield start, offset
+
+
+# Admission bound for the gap-span cache. A span costs one tuple plus two
+# integers (about 112 bytes), so 64 entries of at most this many spans retain
+# under 60 MB worst case. Alternating word and gap characters yield about
+# 128,000 spans per 256K window, so dense results are never admitted: they
+# are recomputed per call, which is the pre-cache behavior, while the
+# gap-free and sparse fast paths stay cached.
+_TOKEN_GAP_SPAN_CACHE_MAX_SPANS = 8192
+# The cache key holds the complete input text, so admission also bounds the
+# text itself. Windows are at most 256K characters; a whole cached file (up
+# to 16 MiB) is never admitted as a key, so successive distinct sparse files
+# cannot leave full artifacts retained across requests. Total retained key
+# text is bounded separately, with LRU eviction, so small windows still
+# share the fast path without unbounded retention.
+_TOKEN_GAP_SPAN_CACHE_MAX_TEXT_CHARS = 262144
+_TOKEN_GAP_SPAN_CACHE_MAX_RETAINED_CHARS = 8 * 1024 * 1024
+_TOKEN_GAP_SPAN_CACHE_LOCK = threading.Lock()
+_TOKEN_GAP_SPAN_CACHE: OrderedDict[tuple[str, bool], tuple[tuple[int, int], ...]] = OrderedDict()
+_TOKEN_GAP_SPAN_CACHE_STATS = {"hits": 0, "misses": 0, "retained_chars": 0}
+
+
+class _TokenGapSpanCacheInfo(NamedTuple):
+    hits: int
+    misses: int
+    maxsize: int
+    currsize: int
+
+
+def _cached_token_bridging_gap_spans(
+    text: str,
+    require_word_boundaries: bool,
+    check_runtime: Callable[[], None] | None = None,
+) -> Iterator[tuple[int, int]]:
+    """Yield one window's gap spans, memoizing only sparse small windows.
+
+    Cache hits yield the stored spans. On a miss the walk streams spans
+    incrementally with deadline checks every 4096 offsets, collecting at
+    most _TOKEN_GAP_SPAN_CACHE_MAX_SPANS spans; a denser result is never
+    stored and keeps streaming without first materializing the complete
+    list, so a dense or oversized input cannot trade the CPU stall for
+    unbounded retained memory. Texts longer than
+    _TOKEN_GAP_SPAN_CACHE_MAX_TEXT_CHARS are never admitted either: the
+    key would otherwise retain the whole input. A consumer that stops
+    pulling early simply leaves the entry unstored.
+    """
+    key = (text, require_word_boundaries)
+    with _TOKEN_GAP_SPAN_CACHE_LOCK:
+        cached = _TOKEN_GAP_SPAN_CACHE.get(key)
+        if cached is not None:
+            _TOKEN_GAP_SPAN_CACHE.move_to_end(key)
+            _TOKEN_GAP_SPAN_CACHE_STATS["hits"] += 1
+        else:
+            _TOKEN_GAP_SPAN_CACHE_STATS["misses"] += 1
+    if cached is not None:
+        yield from cached
+        return
+    collected: list[tuple[int, int]] = []
+    dense = False
+    for span in _iter_token_bridging_gap_spans(
+        text,
+        require_word_boundaries=require_word_boundaries,
+        check_runtime=check_runtime,
+    ):
+        if not dense:
+            collected.append(span)
+            if len(collected) > _TOKEN_GAP_SPAN_CACHE_MAX_SPANS:
+                dense = True
+                collected.clear()
+        yield span
+    if dense or len(text) > _TOKEN_GAP_SPAN_CACHE_MAX_TEXT_CHARS:
+        return
+    with _TOKEN_GAP_SPAN_CACHE_LOCK:
+        if key not in _TOKEN_GAP_SPAN_CACHE:
+            _TOKEN_GAP_SPAN_CACHE[key] = tuple(collected)
+            _TOKEN_GAP_SPAN_CACHE.move_to_end(key)
+            _TOKEN_GAP_SPAN_CACHE_STATS["retained_chars"] += len(text)
+            while (
+                len(_TOKEN_GAP_SPAN_CACHE) > _TEXT_PREDICATE_CACHE_SIZE
+                or _TOKEN_GAP_SPAN_CACHE_STATS["retained_chars"]
+                > _TOKEN_GAP_SPAN_CACHE_MAX_RETAINED_CHARS
+            ):
+                old_key, _old_spans = _TOKEN_GAP_SPAN_CACHE.popitem(last=False)
+                _TOKEN_GAP_SPAN_CACHE_STATS["retained_chars"] -= len(old_key[0])
+
+
+def _token_gap_span_cache_clear() -> None:
+    with _TOKEN_GAP_SPAN_CACHE_LOCK:
+        _TOKEN_GAP_SPAN_CACHE.clear()
+        _TOKEN_GAP_SPAN_CACHE_STATS["hits"] = 0
+        _TOKEN_GAP_SPAN_CACHE_STATS["misses"] = 0
+        _TOKEN_GAP_SPAN_CACHE_STATS["retained_chars"] = 0
+
+
+def _token_gap_span_cache_info() -> _TokenGapSpanCacheInfo:
+    with _TOKEN_GAP_SPAN_CACHE_LOCK:
+        return _TokenGapSpanCacheInfo(
+            hits=_TOKEN_GAP_SPAN_CACHE_STATS["hits"],
+            misses=_TOKEN_GAP_SPAN_CACHE_STATS["misses"],
+            maxsize=_TEXT_PREDICATE_CACHE_SIZE,
+            currsize=len(_TOKEN_GAP_SPAN_CACHE),
+        )
+
+
+_cached_token_bridging_gap_spans.cache_clear = _token_gap_span_cache_clear
+_cached_token_bridging_gap_spans.cache_info = _token_gap_span_cache_info
+
+
+def _token_bridging_gap_spans(
+    text: str,
+    *,
+    require_word_boundaries: bool = True,
+    check_runtime: Callable[[], None] | None = None,
+) -> Iterator[tuple[int, int]]:
+    """Yield contextual noise runs in one pass without crossing ASCII spaces.
+
+    Gap spans are memoized per text, since the same window texts are scanned
+    once per static analyzer (around fifteen times per artifact) and the
+    spans are pure functions of the text. Only sparse results from texts
+    within the window bound are retained: windows with more than
+    _TOKEN_GAP_SPAN_CACHE_MAX_SPANS spans, and texts longer than
+    _TOKEN_GAP_SPAN_CACHE_MAX_TEXT_CHARS, are recomputed on every call
+    instead of being cached, so dense text cannot retain unbounded span
+    tuples or whole-file keys. A cache miss streams spans with deadline
+    checks every 4096 offsets, so the walk is abandoned promptly and a
+    consumer that only needs early spans never pays for the rest.
+    """
+    for start, end in _cached_token_bridging_gap_spans(
+        text, require_word_boundaries=require_word_boundaries, check_runtime=check_runtime
+    ):
+        if check_runtime is not None:
+            check_runtime()
+        yield start, end
 
 
 def _is_contextual_default_ignorable_offset(text: str, offset: int) -> bool:
@@ -2308,8 +2596,12 @@ def _requires_normalized_security_view_uncached(
     if check_runtime is not None:
         check_runtime()
     # The confusable map has no ASCII keys; avoid a comparatively expensive
-    # regex pass over large plain-ASCII windows.
-    if not text.isascii() and _ASCII_CONFUSABLE_PATTERN.search(text) is not None:
+    # pass over large plain-ASCII windows. The old 1,515-entry regex character
+    # class cost about 0.8 seconds per 284K-character CJK window even when
+    # nothing matched; deleting the same set with str.translate is one C-level
+    # pass, and the length only changes when a confusable is present, so the
+    # result is exact.
+    if not text.isascii() and len(text.translate(_CONFUSABLE_DELETION_TABLE)) != len(text):
         return True
     if text.isprintable():
         return False

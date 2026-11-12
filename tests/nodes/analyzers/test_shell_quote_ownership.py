@@ -158,6 +158,157 @@ def test_here_string_keeps_following_quote_bounds(operator: str) -> None:
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
+@pytest.mark.parametrize("prefix", ["xargs", "xargs -0", "xargs -I '{}'", "xargs --", "xargs \\\n"])
+@pytest.mark.parametrize("operator", ["<<<", "0<<<", "<<< "])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_commandless_xargs_here_string_keeps_default_printing_semantics(
+    prefix: str, operator: str, newline: str
+) -> None:
+    source = f'echo "devices ($( {prefix} {operator}"$USERS"))."\n'
+    source += "# " + "." * 6000 + "\n"
+
+    assert not tm.has_bounded_parse_exhaustion(
+        source.replace("\n", newline), lambda: None, file_type="shell"
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix", ["xargs", "xargs -0", "xargs -a input", "xargs --arg-file input"]
+)
+@pytest.mark.parametrize("placement", ["before", "after"])
+def test_xargs_here_string_preserves_an_explicit_shell_utility(prefix: str, placement: str) -> None:
+    source = (
+        f"{prefix} <<< \"$VALUES\" sh -c '$CMD -rf /'"
+        if placement == "before"
+        else f"{prefix} sh -c '$CMD -rf /' <<< \"$VALUES\""
+    )
+
+    assert tm.has_bounded_parse_exhaustion(source + "\n", lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "xargs <<< \"$VALUES\" sh -c 'printf done')",
+        "xargs \\\n <<< \"$VALUES\" sh -c 'printf done')",
+        "xargs -- <<< \"$VALUES\" sh -c 'printf done')",
+    ],
+)
+def test_xargs_redirection_does_not_replace_the_explicit_command_string(source: str) -> None:
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, "printf done")
+
+
+@pytest.mark.parametrize("options", ["-I '{}'", "-I{}", "--replace", "--replace={}", "-i", "-i{}"])
+@pytest.mark.parametrize("template", ["{}", "printf '%s' '{}'", "echo safe; {}"])
+def test_xargs_replacement_keeps_runtime_command_templates_unresolved(
+    options: str, template: str
+) -> None:
+    source = f'xargs {options} <<< "$CMD" sh -c "{template}")'
+
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, None)
+
+
+def test_xargs_replacement_keeps_runtime_utility_unresolved() -> None:
+    assert tm._command_string_from_clause('xargs -I {} <<< "$CMD" {} -rf /)', 0, lambda: None) == (
+        True,
+        None,
+    )
+    assert tm._command_string_from_clause(
+        'xargs -I {} <<< "$VALUE" sh -c "printf done")', 0, lambda: None
+    ) == (True, "printf done")
+
+
+@pytest.mark.parametrize("wrapper", ["env", "sudo", "command", "builtin"])
+@pytest.mark.parametrize("separator", ["", "-- "])
+def test_xargs_replacement_cannot_escape_through_a_wrapper_separator(
+    wrapper: str, separator: str
+) -> None:
+    source = f'xargs -I {{}} <<< "$CMD" -- {wrapper} {separator}{{}} -rf /)'
+
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, None)
+
+
+def test_xargs_second_separator_is_a_literal_utility_name() -> None:
+    source = 'xargs -- -- sh -c "printf done")'
+
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (False, None)
+
+
+@pytest.mark.parametrize("options", ["-0I{}", "-tI{}", "-0i{}", "-0J{}", "-0n1", "--future-option"])
+def test_unproved_combined_xargs_options_cannot_hide_runtime_replacement(options: str) -> None:
+    source = f'xargs {options} <<< "$CMD" sh -c "{{}}")'
+
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, None)
+
+
+@pytest.mark.parametrize("options", ["-0rt", "--null", "--no-run-if-empty", "-n2", "--max-args=2"])
+def test_proven_xargs_options_keep_the_explicit_command_visible(options: str) -> None:
+    source = f'xargs {options} <<< "$VALUES" sh -c "printf done")'
+
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, "printf done")
+
+
+@pytest.mark.parametrize("continuation", ["\\\n", "\\\r\n"])
+def test_xargs_continued_gap_checks_the_runtime_deadline(continuation: str) -> None:
+    source = "xargs  " + continuation * 12000 + '<<< "$VALUES")'
+    checks = 0
+
+    def cancelled() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 4:
+            raise TimeoutError("continued gap deadline")
+
+    with pytest.raises(TimeoutError, match="continued gap deadline"):
+        tm._command_string_from_clause(source, 0, cancelled)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "xargs <<<)",
+        'xargs <<< "$VALUES"',
+        'xargs <<< "$VALUES" "$TOOL")',
+        'xargs <<< "unterminated)',
+        'xargs << "END")',
+        "xargs " + '<<< "input" ' * 33 + ")",
+    ],
+)
+def test_unproven_xargs_redirection_or_runtime_utility_stays_partial(source: str) -> None:
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, None)
+
+
+def test_xargs_here_string_keeps_destructive_substitutions_visible() -> None:
+    source = 'echo "devices ($(xargs <<< "$(rm -rf /)"))."\n'
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+@pytest.mark.parametrize("consumer", ["sh", "bash", "grep . | sh"])
+def test_xargs_here_string_pipeline_does_not_hide_runtime_loaded_code(consumer: str) -> None:
+    source = f'xargs <<< "$CMD" | {consumer}\n'
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("name", ["command", "builtin", "xargs", "sudo", "timeout", "eval"])
+def test_wrapper_named_function_declaration_is_not_an_invocation(name: str) -> None:
+    source = f'{name}() {{ printf "%s\\n" "$VALUE"; }}\n'
+
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+    assert tm.has_bounded_parse_exhaustion(
+        source + 'sh -c "$CMD -rf /"\n', lambda: None, file_type="shell"
+    )
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": f"{name}() {{ rm -rf /; }}\n"}},
+        [tm],
+    )
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -244,6 +395,30 @@ def test_heredoc_delimiter_can_end_at_eof(body: str) -> None:
     assert tm._skip_static_heredoc_bodies(
         body, 0, len(body), (("END", True, False),), lambda: None
     ) == len(body)
+
+
+@pytest.mark.parametrize(
+    "newline, closing, complete",
+    [
+        ("\n", "EOF\n", True),
+        ("\n", "EOF\r\n", False),
+        ("\r\n", "EOF\r\n", True),
+        ("\r\n", "EOF\n", False),
+        ("\n", "EOF", True),
+        ("\n", "EOF\r", False),
+        ("\r\n", "EOF", True),
+        ("\r\n", "EOF\r", False),
+    ],
+)
+def test_heredoc_delimiter_preserves_body_newline_style(
+    newline: str, closing: str, complete: bool
+) -> None:
+    content = "literal body" + newline + closing
+    end = tm._skip_static_heredoc_bodies(
+        content, 0, len(content), (("EOF", False, True),), lambda: None
+    )
+
+    assert (end == len(content)) is complete
 
 
 def test_large_continued_heredoc_checks_runtime_and_keeps_raw_commands() -> None:
@@ -571,10 +746,14 @@ def test_runtime_and_unresolved_controls_remain_partial(source: str, padding: in
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
-@pytest.mark.parametrize("file_type", ["markdown", "python", "powershell"])
-def test_ownership_does_not_apply_to_other_languages(file_type: str) -> None:
+@pytest.mark.parametrize(
+    "file_type, partial", [("markdown", True), ("python", True), ("powershell", False)]
+)
+def test_quote_ownership_respects_host_language(file_type: str, partial: bool) -> None:
     source = 'echo "hello $(printf x) ${DELAY}s"\n' + "#" * 6000
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type)
+    # Complete PowerShell has its own projection; other host languages cannot
+    # borrow shell ownership for this source.
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type) is partial
 
 
 def test_fragment_cannot_prove_initial_quote_state() -> None:
@@ -596,12 +775,111 @@ def test_unsupported_or_unresolved_source_discards_all_ownership(source: str) ->
     assert tm._shell_quoted_candidate_limits(source, lambda: None) == {}
 
 
+@pytest.mark.parametrize("body", ['"unowned\n', '"$($CMD -rf /)"\n'])
+def test_complete_heredoc_preserves_outer_quotes_and_executable_substitutions(
+    body: str,
+) -> None:
+    source = 'echo "prefix $(date) suffix"\ncat <<E\n' + body + "E\n"
+    limits = tm._shell_quoted_candidate_limits(source, lambda: None)
+    assert limits[source.index("$(")] == source.index('"\n')
+    assert all(end < source.index("cat <<E") for end in limits.values())
+    # Outer quote ownership does not bound the raw scanner's unmatched quote
+    # inside heredoc data. That case remains conservatively partial; the
+    # balanced-quote executable substitution must retain its runtime limit too.
+    assert tm.has_bounded_parse_exhaustion(
+        source + "# " + "." * 6000 + "\n", lambda: None, file_type="shell"
+    )
+
+
 def test_ownership_walk_obeys_runtime_budget() -> None:
     def cancel() -> None:
         raise TimeoutError("fixture budget")
 
     with pytest.raises(TimeoutError, match="fixture budget"):
         tm._shell_quoted_candidate_limits('echo "$(date)"\n', cancel)
+
+
+@pytest.mark.parametrize("padding", [0, 6000])
+def test_literal_trap_command_is_bounded_before_its_host_quote(padding: int) -> None:
+    source = """cat <<'DATA'
+"quoted data"
+DATA
+trap 'saved=$?; trap - EXIT; finish "$saved"; result=$?; exit "$result"' EXIT
+"""
+    source += "#" * padding + "\n"
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "$CMD -rf /",
+        'finish "$saved"; $CMD -rf /',
+        "echo \"$(bash -c '$CMD -rf /')\"",
+    ],
+)
+def test_literal_quote_bound_does_not_hide_runtime_destructive_commands(body: str) -> None:
+    # The third form is deliberately malformed shell quoting; it must also
+    # retain the conservative result rather than borrow an outer delimiter.
+    source = "cat <<'DATA'\nquoted data\nDATA\ntrap '" + body + "' EXIT\n" + "#" * 6000
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("file_type", ["shell", "markdown"])
+def test_quoted_assignment_value_owns_its_closing_quote(file_type: str) -> None:
+    command = 'tool --field "Description=ordinary value with <placeholders>" --show\n'
+    source = command if file_type == "shell" else "```bash\n" + command + "```\n"
+    source += "\nOrdinary trailing explanation.\n" * 300
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'bash -c "NAME=value; $CMD -rf /"',
+        "bash -c 'NAME=value; rm -rf /'",
+        "tool \"NAME=$(bash -c '$CMD -rf /')\"",
+        'tool "NAME=ordinary value"; $CMD -rf /',
+    ],
+)
+def test_quoted_assignment_delimiters_do_not_hide_executable_payloads(source: str) -> None:
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("depth", [1, 8, 32])
+def test_nested_command_substitutions_keep_shell_consumers_visible(depth: int) -> None:
+    command = "bash -c '$CMD -rf /'"
+    for _ in range(depth):
+        command = f'printf "%s" "$({command})"'
+    assert tm.has_bounded_parse_exhaustion(command, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "printf '%s' '$(bash -c \"$CMD -rf /\")'",
+        'printf "%s" "\\$(ordinary data)"',
+        'tool "NAME=$(printf %s safe)"',
+        "printf '%s' $'literal \\' $(bash -c \"$CMD -rf /\")'",
+    ],
+)
+def test_literal_and_benign_substitution_text_is_not_an_executable_shell_string(
+    source: str,
+) -> None:
+    assert list(tm._shell_command_strings(source, lambda: None)) == []
+
+
+@pytest.mark.parametrize(
+    "file_type,source",
+    [
+        ("javascript", "const message = \"$(bash -c '$CMD -rf /')\";"),
+        ("python", "message = \"$(bash -c '$CMD -rf /')\""),
+    ],
+)
+def test_host_strings_do_not_acquire_shell_substitution_semantics(
+    file_type: str, source: str
+) -> None:
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type)
 
 
 def test_quoted_helper_is_completely_inspected(tmp_path: Path) -> None:
@@ -661,6 +939,28 @@ def test_compound_adversarial_inputs_retain_security_signal(
             ), source
 
 
+def test_mixed_newline_heredoc_does_not_prove_a_false_closer() -> None:
+    source = "cat <<'EOF'\nbody\nEOF\r\necho \"quoted\"\n"
+    assert tm._shell_quoted_candidate_limits(source, lambda: None) == {}
+
+
+@pytest.mark.parametrize("statement", ["trap - EXIT", "trap '' EXIT", "trap -p", "trap -l"])
+def test_trap_reset_ignore_and_query_forms_have_no_executable_body(statement: str) -> None:
+    assert list(tm._shell_command_strings(statement + "\n", lambda: None)) == []
+
+
+def test_runtime_trap_body_remains_incomplete() -> None:
+    assert tm.has_bounded_parse_exhaustion(
+        'trap "$HANDLER" EXIT\n', lambda: None, file_type="shell"
+    )
+
+
+def test_unmatched_heredoc_data_quote_keeps_conservative_large_source_result() -> None:
+    # This separate limitation concerns data ownership, not trap-body parsing.
+    source = "cat <<'DATA'\n\"unmatched data quote\nDATA\n" + "#" * 6000
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
 def test_empty_shell_clauses_do_not_repeat_command_string_parsing() -> None:
     source = " \t\n" * 10000 + "bash -c 'echo ready'\n"
     checks = 0
@@ -707,6 +1007,41 @@ def test_quoted_printf_preserves_multiline_literal_value(newline: str) -> None:
     assert not tm.has_bounded_parse_exhaustion(
         f'test "$observed" = "{substitution}"\n', lambda: None, file_type="shell"
     )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    "prefix, argument, suffix, complete_context",
+    [
+        ("", '"$VALUE"', "", True),
+        ("", '"$($CMD -rf /)"', "", True),
+        ('printf() { "$CMD" "$@"; }\n', '"known value"', "", True),
+        ("", '"known value"', "$CMD -rf /\n", True),
+        ("", '"known value"', 'echo "\n' + "#" * 6000, True),
+        ("", '"known value"', "", False),
+    ],
+)
+def test_multiline_printf_quote_proof_keeps_unresolved_commands_partial(
+    prefix: str, argument: str, suffix: str, complete_context: bool, newline: str
+) -> None:
+    source = prefix + 'test x = "$(printf "%s\\n" "first value" \\\n  ' + argument + ')"\n' + suffix
+
+    assert tm.has_bounded_parse_exhaustion(
+        source.replace("\n", newline),
+        lambda: None,
+        file_type="shell",
+        complete_context=complete_context,
+    )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_multiline_printf_quote_proof_preserves_destructive_execution(newline: str) -> None:
+    source = '"$(printf "%s%s" r \\\n  m)" -rf /\n'.replace("\n", newline)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["run.sh"], "file_cache": {"run.sh": source}}, [tm]
+    )
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
 
 
 @pytest.mark.parametrize(
@@ -1063,3 +1398,471 @@ def test_startup_names_in_non_setter_operands_do_not_taint_child(prefix: str) ->
     source = prefix + "; bash -c 'printf %s ready'\n"
 
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        'xargs() { delegate "$@"; }',
+        'xargs ()\n{ delegate "$@"; }',
+        'xargs()\n\n{ delegate "$@"; }',
+        'xargs() # documented helper\n{ delegate "$@"; }',
+        "xargs()" + (" " * 300) + '{ delegate "$@"; }',
+        "xargs" + (" " * 300) + '() { delegate "$@"; }',
+        'function xargs { delegate "$@"; }',
+        'function xargs() { delegate "$@"; }',
+        "'xargs'() { delegate; }",
+        "x\\args() { delegate; }",
+        "alias xargs='delegate'",
+        "alias -- xargs='delegate'",
+        'alias "xargs=delegate"',
+        "builtin alias xargs='delegate'",
+        "builtin -- alias xargs='delegate'",
+        "command alias xargs='delegate'",
+        "command -p -- alias xargs='delegate'",
+        "command builtin alias xargs='delegate'",
+        "NAME=value builtin alias xargs='delegate'",
+        "builtin eval 'alias xargs=delegate'",
+        "builtin source setup.sh",
+        "enable -f extension.so xargs",
+    ],
+)
+@pytest.mark.parametrize("ending", ["", "\necho finished\n"])
+def test_redirected_xargs_cannot_assume_external_utility_after_source_override(binding, ending):
+    source = binding + '\nxargs <<< "$VALUE"' + ending
+    diagnostics = []
+    recognized, command = tm._command_string_from_clause(
+        source, source.rfind("\nxargs") + 1, lambda: None, diagnostics=diagnostics
+    )
+
+    assert recognized
+    assert command is None
+    assert diagnostics
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "helper() { echo ready; }",
+        "printf '%s' 'xargs() { delegate; }'",
+        "# xargs() { delegate; }",
+        "alias other='delegate'",
+    ],
+)
+def test_redirected_xargs_ignores_inert_or_other_bindings(prefix):
+    source = prefix + '\nxargs <<< "$VALUE"\necho finished\n'
+    assert not tm._xargs_has_source_override(source, lambda: None)
+
+
+def test_redirected_xargs_binding_scan_respects_cancellation():
+    def cancelled():
+        raise TimeoutError("cancelled")
+
+    with pytest.raises(TimeoutError, match="cancelled"):
+        tm._xargs_has_source_override('xargs <<< "$VALUE"', cancelled)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'xargs -I c <<< "c" sh -c "$CODE"',
+        'xargs -I c <<< "c" bash -c "$CODE"',
+        'xargs -I c <<< "c" sh -ec "$CODE"',
+        'xargs -I OPT <<< "-c" sh OPT "$CODE"',
+        'xargs -I o <<< "c" sh +o "$CODE"',
+        'xargs -I c <<< "c" env sh -c "$CODE"',
+    ],
+)
+def test_xargs_replacement_dependent_shell_options_stay_incomplete(command):
+    diagnostics = []
+    recognized, body = tm._command_string_from_clause(
+        command, 0, lambda: None, diagnostics=diagnostics
+    )
+    assert recognized
+    assert body is None
+    assert diagnostics
+    assert tm.has_bounded_parse_exhaustion(command, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("ending", ["", "\necho finished\n"])
+def test_redirected_xargs_keeps_unknown_startup_bindings_incomplete(ending):
+    diagnostics = []
+    recognized, body = tm._command_string_from_clause(
+        'xargs <<< "$VALUE"' + ending,
+        0,
+        lambda: None,
+        startup_exposure=[True],
+        diagnostics=diagnostics,
+    )
+    assert recognized
+    assert body is None
+    assert diagnostics
+
+
+def test_repeated_redirected_xargs_proves_each_source_scope_once(monkeypatch):
+    original = tm._xargs_has_source_override
+    seen = []
+
+    def counted(content, check_runtime):
+        seen.append(content)
+        return original(content, check_runtime)
+
+    monkeypatch.setattr(tm, "_xargs_has_source_override", counted)
+    source = 'xargs <<< "$VALUE"\n' * 30
+    list(tm._shell_command_strings(source, lambda: None))
+    assert seen == [source]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'printf "%s" "$(xargs() { delegate; }; xargs <<< \'value\')"',
+        'printf "%s" "`xargs() { delegate; }; xargs <<< \'value\'`"',
+    ],
+)
+def test_xargs_binding_proof_includes_executable_substitutions(source):
+    assert tm._xargs_has_source_override(source, lambda: None)
+
+
+def test_xargs_binding_proof_stays_conservative_at_its_wrapper_bound():
+    source = ("builtin " * 9) + "alias xargs=delegate\n"
+    assert tm._xargs_has_source_override(source, lambda: None)
+
+
+@pytest.mark.parametrize(
+    "registration",
+    [
+        "trap 'rm -rf \"$WORK\"' EXIT",
+        "trap 'printf \"%s\" done' EXIT",
+        "trap 'echo ready; printf \"%s\" done' INT",
+        "trap - EXIT",
+        "builtin trap 'rm -rf \"$WORK\"' EXIT",
+    ],
+)
+def test_literal_traps_retain_unproven_binding_effects(registration):
+    source = registration + '\nxargs <<< "$VALUE"\n'
+    assert tm._xargs_has_source_override(source, lambda: None)
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "registration",
+    [
+        'trap "$HANDLER" EXIT',
+        "trap 'eval \"$CODE\"' EXIT",
+        "trap 'alias xargs=bash' EXIT",
+        "trap '\"$COMMAND\"' EXIT",
+        "alias rm=eval\ntrap 'rm \"alias xargs=bash\"' EXIT",
+        "rm() { delegate; }\ntrap 'rm \"$WORK\"' EXIT",
+        "alias trap=eval\ntrap - EXIT",
+        "trap 'PATH=/tmp/controlled' EXIT",
+    ],
+)
+def test_unproven_handler_effects_and_callee_bindings_stay_incomplete(registration):
+    source = registration + '\nxargs <<< "$VALUE"\n'
+    assert tm._xargs_has_source_override(source, lambda: None)
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "PATH=/tmp/controlled",
+        "PATH=",
+        "export PATH=/tmp/controlled",
+        "export PATH=",
+        "declare -x PATH=/tmp/controlled",
+        "printf -v PATH '%s' /tmp/controlled",
+        "read -r PATH",
+        "declare -n pathref=PATH",
+        "hash -p /bin/bash xargs",
+        'hash -p "$TARGET" xargs',
+    ],
+)
+def test_external_lookup_changes_cannot_borrow_xargs_semantics(prefix):
+    source = prefix + '\nxargs <<< "$VALUE"\n'
+    assert tm._xargs_has_source_override(source, lambda: None)
+
+
+def test_literal_trap_ownership_preserves_raw_dangerous_findings():
+    source = "trap 'rm -rf /' EXIT\nxargs <<< \"$VALUE\"\n"
+    assert any(f.rule_id == "TM1" for f in tm.analyze(source, "control.sh", "shell"))
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        '`xargs <<< "$CODE"\n`',
+        '$(xargs <<< "$CODE"\n)',
+        '$(printf "%s" "`xargs <<< "$CODE"\n`")',
+        "eval 'xargs <<< \"$CODE\"\n'",
+        "bash -c 'xargs <<< \"$CODE\"\n'",
+    ],
+)
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "xargs() { bash; }",
+        "alias xargs=bash",
+        "PATH=/tmp/controlled",
+        "hash -p /bin/bash xargs",
+        'eval "$SETUP"',
+        "source setup.sh",
+    ],
+)
+def test_nested_xargs_keeps_enclosing_binding_uncertainty(expression, binding):
+    source = binding + "\n" + expression + "\n"
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("expression", ['`xargs <<< "$VALUE"\n`', '$(xargs <<< "$VALUE"\n)'])
+def test_naked_xargs_substitution_keeps_runtime_selected_outer_command_partial(expression):
+    diagnostic = tm.bounded_parse_diagnostic(expression, lambda: None, file_type="shell")
+    assert diagnostic is not None
+    assert diagnostic.cause is tm.ParserCause.RUNTIME_DEPENDENT
+
+
+@pytest.mark.parametrize("expression", ['`xargs <<< "$VALUE"\n`', '$(xargs <<< "$VALUE"\n)'])
+@pytest.mark.parametrize("context", ['echo "values ({})"\n', "result={}\n"])
+def test_unmodified_nested_xargs_still_proves_printed_or_assigned_data(expression, context):
+    source = context.format(expression)
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        "$SETUP 'alias xargs=bash'",
+        "\"$SETUP\" 'alias xargs=bash'",
+        "command \"$SETUP\" 'alias xargs=bash'",
+        "builtin \"$SETUP\" 'alias xargs=bash'",
+        "alias setup=eval\nsetup 'alias xargs=bash'",
+        "alias command=eval\ncommand 'alias xargs=bash'",
+        "alias builtin=eval\nbuiltin 'alias xargs=bash'",
+        "alias setup=source\nsetup setup.sh",
+        "alias setup=command\nsetup eval 'alias xargs=bash'",
+        "alias first=second\nalias second=eval\nfirst 'alias xargs=bash'",
+    ],
+)
+def test_indirect_binding_effects_cannot_borrow_external_xargs_semantics(setup):
+    source = setup + '\nxargs <<< "$CODE"\n'
+    assert tm._xargs_has_source_override(source, lambda: None)
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("wrapper", ["command", "builtin"])
+def test_literal_trap_cannot_hide_aliased_wrapper_binding_effects(wrapper):
+    source = (
+        "shopt -s expand_aliases\n"
+        f"alias {wrapper}=eval\n"
+        f"trap '{wrapper} \"xargs() {{ bash; }}\"' DEBUG\n"
+        'xargs <<< "$CODE"\n'
+    )
+    assert tm._xargs_has_source_override(source, lambda: None)
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        "-a /dev/null",
+        "--arg-file /dev/null",
+        "--arg-file=/dev/null",
+        "-a/dev/null",
+        "-o",
+        "--open-tty",
+    ],
+)
+@pytest.mark.parametrize(
+    "utility",
+    ["bash", "sh -s", "python3", "node", "env bash", "command bash", "sh -c bash"],
+)
+@pytest.mark.parametrize("placement", ["before", "after", "before-options"])
+def test_xargs_child_input_cannot_hide_runtime_shell_code(options, utility, placement):
+    source = (
+        f'xargs <<< "$CODE" {options} {utility}'
+        if placement == "before-options"
+        else f'xargs {options} <<< "$CODE" {utility}'
+        if placement == "before"
+        else f'xargs {options} {utility} <<< "$CODE"'
+    )
+    diagnostics = []
+    recognized, body = tm._command_string_from_clause(
+        source, 0, lambda: None, diagnostics=diagnostics
+    )
+    assert recognized
+    assert body is None
+    assert diagnostics
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "options", ["-a /dev/null", "--arg-file /dev/null", "--arg-file=/dev/null"]
+)
+def test_xargs_arg_file_keeps_dynamic_c_body_unresolved(options):
+    source = f'xargs {options} <<< "$VALUE" env sh -c "$CODE"'
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize(
+    "options", ["-a /dev/null", "--arg-file /dev/null", "--arg-file=/dev/null"]
+)
+def test_xargs_arg_file_still_inspects_literal_c_body(options):
+    source = f"xargs {options} env sh -c 'printf done'"
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, "printf done")
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "xargs() { bash; }",
+        "alias xargs=bash",
+        "builtin alias xargs=bash",
+        "source setup.sh",
+    ],
+)
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "xargs <<< \"$CODE\" sh -c 'printf done'",
+        "$(xargs <<< \"$CODE\" sh -c 'printf done')",
+        "`xargs <<< \"$CODE\" sh -c 'printf done'`",
+    ],
+)
+def test_explicit_xargs_utility_cannot_skip_enclosing_source_binding(binding, expression):
+    source = binding + "\n" + expression + "\n"
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("expression", ["sh -c 'printf done'", "env sh -c 'printf done'"])
+def test_explicit_xargs_utility_cannot_skip_startup_binding_context(expression):
+    source = 'xargs <<< "$CODE" ' + expression
+    diagnostics = []
+    recognized, body = tm._command_string_from_clause(
+        source, 0, lambda: None, startup_exposure=[True], diagnostics=diagnostics
+    )
+    assert recognized
+    assert body is None
+    assert diagnostics
+    assert tm.has_bounded_parse_exhaustion(
+        "BASH_ENV=setup.sh\n" + source, lambda: None, file_type="shell"
+    )
+
+
+@pytest.mark.parametrize("options", ["-a input", "--arg-file=input", "-o", "--open-tty"])
+@pytest.mark.parametrize("utility", ["sh -c 'printf done'", "sh -c bash", "python3", "node"])
+def test_xargs_special_input_modes_do_not_gain_here_string_support(options, utility):
+    source = f'xargs {options} {utility} 0<<< "$CODE"'
+    diagnostics = []
+    assert tm._command_string_from_clause(source, 0, lambda: None, diagnostics=diagnostics) == (
+        True,
+        None,
+    )
+    assert diagnostics[0].cause.value == "unsupported_syntax"
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "'<<<' )",
+        "'$(printf x) <<<' )",
+        "'printf done' > output)",
+        "'printf done'; cat <<< '$CODE'",
+        "'printf done'\ncat <<< '$CODE'",
+    ],
+)
+def test_arg_file_lookahead_respects_literal_words_redirections_and_clause_ends(suffix):
+    source = f"xargs -a input sh -c {suffix}"
+    assert tm._command_string_from_clause(source, 0, lambda: None)[1] is not None
+
+
+@pytest.mark.parametrize("tail", ["a " * 40, "x" * 9000, "\\\n" * 5000])
+def test_arg_file_lookahead_does_not_claim_unbounded_clause_support(tail):
+    source = "xargs -a input " + tail
+    diagnostics = []
+    assert tm._command_string_from_clause(source, 0, lambda: None, diagnostics=diagnostics) == (
+        True,
+        None,
+    )
+    assert diagnostics
+
+
+def test_special_xargs_input_mode_keeps_raw_destructive_findings():
+    source = 'xargs -a input sh -c "rm -rf /" <<< "$CODE"\n'
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+@pytest.mark.parametrize(
+    "redirection", ["&> output", "2>&1", "< <(printf '')", "<(printf '')", "> >(cat)", ">(cat)"]
+)
+def test_arg_file_later_here_string_cannot_hide_after_other_redirections(redirection):
+    source = f'xargs -a input sh -c "printf done" {redirection} <<< "$CODE"'
+    diagnostics = []
+    assert tm._command_string_from_clause(source, 0, lambda: None, diagnostics=diagnostics) == (
+        True,
+        None,
+    )
+    assert diagnostics[0].cause.value == "unsupported_syntax"
+
+
+@pytest.mark.parametrize(
+    "redirection", ["&> output", "2>&1", "< <(printf '')", "<(printf '')", "> >(cat)", ">(cat)"]
+)
+def test_arg_file_other_redirections_without_here_string_preserve_literal_c_body(redirection):
+    source = f'xargs -a input sh -c "printf done" {redirection}'
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, "printf done")
+
+
+@pytest.mark.parametrize("suffix", ["<(printf", ">(cat", "<(" + "a" * 9000 + ")"])
+def test_arg_file_lookahead_cannot_assume_a_truncated_process_substitution_is_closed(suffix):
+    diagnostics = []
+    assert tm._command_string_from_clause(
+        'xargs -a input sh -c "printf done" ' + suffix,
+        0,
+        lambda: None,
+        diagnostics=diagnostics,
+    ) == (True, None)
+    assert diagnostics
+
+
+@pytest.mark.parametrize("suffix", ["#suffix", "'suffix'", '"#suffix"', "<(printf x)#tail"])
+@pytest.mark.parametrize("opener", ["<(printf '')", ">(cat)"])
+def test_arg_file_process_word_keeps_adjacent_suffixes_before_later_here_string(opener, suffix):
+    source = f'xargs -a input sh -c bash {opener}{suffix} <<< "$CODE"'
+    diagnostics = []
+    assert tm._command_string_from_clause(source, 0, lambda: None, diagnostics=diagnostics) == (
+        True,
+        None,
+    )
+    assert diagnostics[0].cause.value == "unsupported_syntax"
+
+
+@pytest.mark.parametrize("suffix", ["#suffix", "'suffix'", '"#suffix"', "<(printf x)#tail"])
+def test_arg_file_adjacent_process_suffix_without_here_string_preserves_literal_c_body(suffix):
+    source = f'xargs -a input sh -c "printf done" <(printf x){suffix}'
+    assert tm._command_string_from_clause(source, 0, lambda: None) == (True, "printf done")
+
+
+def test_process_word_lookahead_opt_in_preserves_default_redirection_boundary():
+    source = "<(printf '')#suffix <<< '$CODE'"
+    assert tm._next_shell_invocation_word(source, 0, lambda: None) == (None, 0, False)
+    word, end, limited = tm._next_shell_invocation_word(
+        source, 0, lambda: None, leading_process_substitution=True
+    )
+    assert not limited
+    assert word is not None and word.endswith("#suffix")
+    assert source[end:].startswith(" <<<")
+
+
+@pytest.mark.parametrize("binding", ["xargs() { bash; }", "alias xargs=bash", 'eval "$SETUP"'])
+def test_printed_legacy_substitution_does_not_skip_enclosing_binding_effects(binding):
+    source = binding + '\necho "values (`xargs <<< "$VALUE"\n`)"\n'
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+def test_printed_legacy_substitution_keeps_raw_destructive_commands():
+    source = 'echo "values (`xargs <<< "$(rm -rf /)"`)"\n'
+    assert any(finding.rule_id == "TM1" for finding in tm.analyze(source, "example.sh", "shell"))

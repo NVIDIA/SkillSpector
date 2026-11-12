@@ -21,8 +21,14 @@ import fnmatch
 import re
 import sys
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from xml.parsers import expat
 
-from skillspector.artifacts import _is_emoji_base, prompt_injection_letter_spacing_view
+from skillspector.artifacts import (
+    SecurityTextView,
+    _is_emoji_base,
+    prompt_injection_letter_spacing_view,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -683,10 +689,129 @@ def _zero_width_match_is_safe_emoji_zwj(content: str, offset: int) -> bool:
     )
 
 
+_DRAWINGML_NAMESPACE = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_DRAWINGML_PARAGRAPH_PROPERTIES = frozenset(
+    f"{_DRAWINGML_NAMESPACE}}}{name}"
+    for name in ("pPr", "defPPr", *(f"lvl{level}pPr" for level in range(1, 10)))
+)
+_XML_START_TAG = re.compile(
+    rb"<[^<>\s/]+(?P<attributes>(?:\s+[^<>\s=/'\"]+\s*=\s*(?:\"[^\"]*\"|'[^']*'))*)\s*/?>"
+)
+_XML_ATTRIBUTE = re.compile(rb"\s+([^<>\s=/'\"]+)\s*=\s*([\"'])(.*?)\2", re.DOTALL)
+
+
+def _drawingml_bullet_offsets(content: str, check_runtime: Callable[[], None]) -> frozenset[int]:
+    """Prove literal U+200B bullet formatting without exempting XML text."""
+    if (
+        "\u200b" not in content
+        or len(content) > 1_000_000
+        or not content.removeprefix("\ufeff").lstrip().startswith("<")
+    ):
+        return frozenset()
+    check_runtime()
+    try:
+        raw = content.encode("utf-8")
+    except UnicodeError:
+        return frozenset()
+    if len(raw) > 1_000_000:
+        return frozenset()
+    parser = expat.ParserCreate(namespace_separator="}")
+    stack: list[str] = []
+    offsets: list[int] = []
+    nodes = 0
+
+    def reject(*_args: object) -> None:
+        raise ValueError("Unsupported XML declaration")
+
+    def start(name: str, attributes: dict[str, str]) -> None:
+        nonlocal nodes
+        check_runtime()
+        nodes += 1
+        if nodes > 10_000 or len(stack) >= 64 or len(attributes) > 128:
+            raise ValueError("XML applicability budget exceeded")
+        if stack and stack[-1] == f"{_DRAWINGML_NAMESPACE}}}buChar":
+            raise ValueError("Bullet marker cannot contain child elements")
+        if (
+            name == f"{_DRAWINGML_NAMESPACE}}}buChar"
+            and stack
+            and stack[-1] in _DRAWINGML_PARAGRAPH_PROPERTIES
+            and attributes == {"char": "\u200b"}
+        ):
+            position = parser.CurrentByteIndex
+            tag = _XML_START_TAG.match(raw, position, min(len(raw), position + 4096))
+            if tag is not None:
+                cursor = tag.start("attributes")
+                while attribute := _XML_ATTRIBUTE.match(raw, cursor, tag.end("attributes")):
+                    if attribute.group(1) == b"char" and attribute.group(3) == b"\xe2\x80\x8b":
+                        offsets.append(attribute.start(3))
+                    cursor = attribute.end()
+        stack.append(name)
+
+    def characters(text: str) -> None:
+        if stack and stack[-1] == f"{_DRAWINGML_NAMESPACE}}}buChar" and text:
+            raise ValueError("Bullet marker cannot contain text")
+
+    parser.StartElementHandler = start
+    parser.EndElementHandler = lambda _name: stack.pop()
+    parser.CharacterDataHandler = characters
+    parser.StartDoctypeDeclHandler = reject
+    parser.EntityDeclHandler = reject
+    parser.ExternalEntityRefHandler = reject
+    parser.ProcessingInstructionHandler = reject
+    try:
+        for start_byte in range(0, len(raw), 4096):
+            check_runtime()
+            parser.Parse(raw[start_byte : start_byte + 4096], False)
+        parser.Parse(b"", True)
+    except (expat.ExpatError, ValueError):
+        return frozenset()
+    # Convert ordered UTF-8 positions once, without quadratic prefix decoding.
+    result: set[int] = set()
+    byte_cursor = character_cursor = 0
+    for offset in offsets:
+        check_runtime()
+        character_cursor += len(raw[byte_cursor:offset].decode("utf-8"))
+        result.add(character_cursor)
+        byte_cursor = offset
+    return frozenset(result)
+
+
+@dataclass(frozen=True)
+class _PreparedAnalysis:
+    bullet_offsets: frozenset[int]
+    check_runtime: Callable[[], None]
+
+    def analyze(
+        self, content: str, file_path: str, file_type: str, source_view: SecurityTextView
+    ) -> list[AnalyzerFinding]:
+        return analyze(
+            content,
+            file_path,
+            file_type,
+            self.check_runtime,
+            _safe_zero_width=lambda offset: (
+                source_view.name == "raw"
+                and content[offset] == "\u200b"
+                and source_view.source_offset(offset) in self.bullet_offsets
+            ),
+        )
+
+
+def prepare_analysis(
+    content: str, file_type: str, check_runtime: Callable[[], None]
+) -> _PreparedAnalysis:
+    """Bind bullet ownership to complete canonical source before windowing."""
+    offsets = (
+        _drawingml_bullet_offsets(content, check_runtime) if file_type == "other" else frozenset()
+    )
+    return _PreparedAnalysis(offsets, check_runtime)
+
+
 def _p2_pattern_matches(
     content: str,
     pattern: str,
     check_runtime: Callable[[], None] | None = None,
+    safe_zero_width: Callable[[int], bool] | None = None,
 ) -> Iterator[re.Match[str]]:
     """Yield all structured matches or the first control signal on each line."""
     if check_runtime is not None:
@@ -696,7 +821,7 @@ def _p2_pattern_matches(
         return
     compiled = re.compile(pattern, re.IGNORECASE | re.DOTALL)
     if pattern not in _SINGLE_CHARACTER_P2_PATTERNS:
-        for match in compiled.finditer(content):
+        for match in static_runner.iter_pattern_matches(compiled, content):
             if check_runtime is not None:
                 check_runtime()
             yield match
@@ -713,6 +838,7 @@ def _p2_pattern_matches(
             # A leading U+FEFF is a byte-order mark, not hidden text.
             (candidate.start() == 0 and content[0] == "\ufeff")
             or _zero_width_match_is_safe_emoji_zwj(content, candidate.start())
+            or (safe_zero_width is not None and safe_zero_width(candidate.start()))
         ):
             cursor = candidate.end()
             continue
@@ -860,6 +986,8 @@ def analyze(
     file_path: str,
     file_type: str,
     check_runtime: Callable[[], None] | None = None,
+    *,
+    _safe_zero_width: Callable[[int], bool] | None = None,
 ) -> list[AnalyzerFinding]:
     """Analyze content for prompt injection patterns (P1–P4, P9)."""
     findings: list[AnalyzerFinding] = []
@@ -897,8 +1025,12 @@ def analyze(
                 )
             )
     if file_type in ("markdown", "perl", "powershell", "other"):
+        if _safe_zero_width is None and file_type == "other":
+            _safe_zero_width = _drawingml_bullet_offsets(content, runtime_check).__contains__
         for pattern_source, confidence in P2_PATTERNS:
-            for match in _p2_pattern_matches(content, pattern_source, check_runtime):
+            for match in _p2_pattern_matches(
+                content, pattern_source, check_runtime, _safe_zero_width
+            ):
                 runtime_check()
                 matched_text = match.group(0)
                 if _is_structurally_benign_p2_comment(content, match.start(), matched_text):
