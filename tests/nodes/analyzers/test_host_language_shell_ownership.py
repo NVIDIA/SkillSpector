@@ -213,6 +213,7 @@ def test_concatenated_fstrings_keep_runtime_operand_ambiguity() -> None:
     # parameter can leave a root path, while a replacement field supplies flags.
     # Concatenation must retain those possible operands even in report strings.
     assert _python(content) is True
+    assert _shell(content + '"$CMD" -rf /\n') is True
 
 
 _CONSTANT_CHECKOUT_SOURCE = """\

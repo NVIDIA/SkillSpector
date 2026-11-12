@@ -426,7 +426,9 @@ def _iter_e1_shell_matches(
     covered = 0
     for start, end in command_ranges:
         if end is None:
-            yield from compiled.finditer(content, max(start, covered))
+            yield from static_runner.iter_pattern_matches(
+                compiled, content, start=max(start, covered)
+            )
             return
         if start < covered:
             continue
@@ -1310,7 +1312,9 @@ def analyze(
                 pattern, content, re.IGNORECASE | re.MULTILINE
             )
         else:
-            e1_matches = re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE)
+            e1_matches = static_runner.iter_pattern_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            )
         for match in e1_matches:
             line_num = get_line_number(content, match.start())
             adj = (
@@ -1344,7 +1348,7 @@ def analyze(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in E2_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -1365,7 +1369,7 @@ def analyze(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in E3_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -1403,7 +1407,9 @@ def analyze(
     # E5: retain uploads and uncertain directions; lower only proven downloads.
     line_starts = logical_line_starts(content[: _CLOUD_DOWNLOAD_CONTEXT_CHARS + 1])
     for pattern, confidence in E5_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             if _is_literal_cloud_download(
                 content, match.start(), line_starts, file_path, file_type
             ):
