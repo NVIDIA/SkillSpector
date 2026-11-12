@@ -1661,6 +1661,20 @@ class TestTP4MarkdownFences:
 
         assert fences[0][4] == "" and fences[0][5] == ""
 
+    def test_fence_context_does_not_slice_remaining_lines(self):
+        class NoSliceList(list[str]):
+            def __getitem__(self, index):
+                if isinstance(index, slice):
+                    raise AssertionError("unexpected slice")
+                return super().__getitem__(index)
+
+        lines = NoSliceList(["```python\n", "print('x')\n", "```\n", "Run it.\n"])
+
+        before, after = mcp_tool_poisoning._tp4_fence_context(lines, 0, 0, 2)
+
+        assert before == ""
+        assert after == "Run it."
+
     def test_fence_context_walks_back_through_blanks_to_the_heading(self):
         content = "## Before: unsafe example\n\nDo not execute this.\n```bash\nrm -rf ./data\n```\n"
 
@@ -1970,6 +1984,35 @@ class TestTP4MarkdownFences:
         assert structured.calls == 1
         assert "value = normalize(payload)" in structured.prompts[0]
         assert long_prose not in structured.prompts[0]
+        size_limited = [
+            event
+            for event in result.ledger
+            if event.get("reason_code") is LedgerReason.SIZE_LIMIT
+            and event.get("path") == "guide.md"
+        ]
+        assert size_limited == []
+
+    def test_single_line_that_fits_without_context_is_not_size_limited(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Context must shrink before a single line that fits without it is dropped."""
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCH_INPUT_TOKENS", 600)
+        long_prose = "Background narrative sentence. " * 60
+        code_line = "value = '" + "y" * 1000 + "'\n"
+        content = f"{long_prose}\n```python\n{code_line}```\n"
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documents a helper."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert structured.calls == 1
+        assert code_line.strip() in structured.prompts[0]
         size_limited = [
             event
             for event in result.ledger

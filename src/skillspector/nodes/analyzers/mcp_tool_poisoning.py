@@ -1008,23 +1008,22 @@ _TP4_CONTEXT_OPEN = "Document context (verbatim, not part of the code):\n"
 _TP4_CONTEXT_CLOSE = "End of document context.\n"
 
 
-def _tp4_preceding_block(preceding: Sequence[str]) -> list[str]:
+def _tp4_preceding_block(lines: Sequence[str], start: int, stop: int) -> list[str]:
     """Collect the trailing prose block, walking back to a nearby heading.
 
     Returns at most ``TP4_PRE_CONTEXT_LINES`` stripped lines in document
-    order. A blank line ends the introducing block, unless the next
-    non-blank line above it is a Markdown heading, in which case that one
-    heading is included: headings routinely carry the safety framing (for
-    example marking the fence as an example that must not be run). The walk
-    never passes a non-blank, non-heading line, so prose from an earlier
-    section cannot leak in.
+    order from ``lines[start:stop]``. A blank line ends the introducing
+    block, unless the next non-blank line above it is a Markdown heading, in
+    which case that one heading is included: headings routinely carry the
+    safety framing (for example marking the fence as an example that must not
+    be run). The walk never passes a non-blank, non-heading line, so prose
+    from an earlier section cannot leak in.
     """
     collected: list[str] = []
-    lines = list(preceding)
-    index = len(lines) - 1
-    while index >= 0 and not lines[index].strip():
+    index = stop - 1
+    while index >= start and not lines[index].strip():
         index -= 1
-    while index >= 0 and len(collected) < TP4_PRE_CONTEXT_LINES:
+    while index >= start and len(collected) < TP4_PRE_CONTEXT_LINES:
         stripped = lines[index].strip()
         if not stripped:
             break
@@ -1037,9 +1036,9 @@ def _tp4_preceding_block(preceding: Sequence[str]) -> list[str]:
     # collected block.
     cursor = index
     if collected and not _TP4_HEADING_RE.match(collected[-1]):
-        while cursor >= 0 and not lines[cursor].strip():
+        while cursor >= start and not lines[cursor].strip():
             cursor -= 1
-        if cursor >= 0 and _TP4_HEADING_RE.match(lines[cursor].strip()):
+        if cursor >= start and _TP4_HEADING_RE.match(lines[cursor].strip()):
             if full:
                 collected.pop()
             collected.append(lines[cursor].strip())
@@ -1073,7 +1072,7 @@ def _truncate_preceding(text: str, max_chars: int = TP4_PRE_CONTEXT_CHARS) -> st
     return text[-max_chars:]
 
 
-def _tp4_trailing_block(following: Sequence[str]) -> list[str]:
+def _tp4_trailing_block(lines: Sequence[str], start: int) -> list[str]:
     """Collect the prose that follows a fence, stopping at structure.
 
     Returns at most ``TP4_POST_CONTEXT_LINES`` stripped lines in document
@@ -1084,8 +1083,8 @@ def _tp4_trailing_block(following: Sequence[str]) -> list[str]:
     candidate), or at the line cap.
     """
     collected: list[str] = []
-    for raw in following:
-        stripped = raw.strip()
+    for index in range(start, len(lines)):
+        stripped = lines[index].strip()
         if not stripped:
             continue
         if _TP4_HEADING_RE.match(stripped):
@@ -1099,7 +1098,9 @@ def _tp4_trailing_block(following: Sequence[str]) -> list[str]:
     return collected
 
 
-def _tp4_fence_context(preceding: Sequence[str], following: Sequence[str]) -> tuple[str, str]:
+def _tp4_fence_context(
+    lines: Sequence[str], resume: int, opened: int, closed: int
+) -> tuple[str, str]:
     """Return the bounded prose around a fence as ``(before, after)``.
 
     A fenced block is often introduced (or followed) by text that changes how
@@ -1111,8 +1112,10 @@ def _tp4_fence_context(preceding: Sequence[str], following: Sequence[str]) -> tu
     two sides stay separate so budget pressure can shrink each one with
     nearest-fence priority instead of cutting the trailing side off.
     """
-    before = _truncate_preceding("\n".join(_tp4_preceding_block(preceding)), TP4_PRE_CONTEXT_CHARS)
-    after_lines = _tp4_trailing_block(following)
+    before = _truncate_preceding(
+        "\n".join(_tp4_preceding_block(lines, resume, opened)), TP4_PRE_CONTEXT_CHARS
+    )
+    after_lines = _tp4_trailing_block(lines, closed + 1)
     after = "\n".join(after_lines)
     if len(after) > TP4_POST_CONTEXT_CHARS:
         after = after[:TP4_POST_CONTEXT_CHARS]
@@ -1176,7 +1179,7 @@ def _iter_tp4_markdown_fences(
                 continue
         body.append(line)
     for language, body_text, start, end, resume, opened, closed in fences:
-        before, after = _tp4_fence_context(lines[resume:opened], lines[closed + 1 :])
+        before, after = _tp4_fence_context(lines, resume, opened, closed)
         yield language, body_text, start, end, before, after
 
 
@@ -1231,6 +1234,19 @@ def _bounded_utf8_prefix(text: str, max_bytes: int) -> tuple[str, int, bool]:
     return candidate, len(encoded), len(candidate) < len(text)
 
 
+def _tp4_line_tokens(line: str) -> int:
+    """Return the token estimate for one line."""
+    return max(1, (len(line) + 3) // 4)
+
+
+def _tp4_max_line_tokens(content: str) -> int:
+    """Return the largest single-line token estimate in *content*."""
+    return max(
+        (_tp4_line_tokens(line) for line in content.splitlines(keepends=True)),
+        default=1,
+    )
+
+
 def _tp4_line_chunks(content: str, max_tokens: int) -> Iterator[_TP4CodeChunk]:
     """Yield bounded line-aligned chunks; oversized single lines fail closed."""
     lines = content.splitlines(keepends=True)
@@ -1238,7 +1254,7 @@ def _tp4_line_chunks(content: str, max_tokens: int) -> Iterator[_TP4CodeChunk]:
     current_tokens = 0
     start_line = 1
     for line_number, line in enumerate(lines, start=1):
-        line_tokens = max(1, (len(line) + 3) // 4)
+        line_tokens = _tp4_line_tokens(line)
         if line_tokens > max_tokens:
             if current:
                 yield _TP4CodeChunk("".join(current), start_line, line_number - 1)
@@ -1455,8 +1471,14 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
             # kept the preceding side whole and dropped the trailing
             # instruction first. Shrink the context first and drop it before
             # ever touching code.
+            header_tokens = estimate_tokens(header)
+            code_floor = TP4_MIN_CODE_TOKENS
+            if had_context:
+                max_line_tokens = _tp4_max_line_tokens(candidate.content)
+                if max_line_tokens <= code_token_budget - header_tokens:
+                    code_floor = max(code_floor, max_line_tokens)
             fixed = len(header) + len(_TP4_CONTEXT_OPEN) + 1 + len(_TP4_CONTEXT_CLOSE)
-            room = (code_token_budget - TP4_MIN_CODE_TOKENS) * 4 - fixed
+            room = (code_token_budget - code_floor) * 4 - fixed
             if had_context:
                 half = max(0, room // 2)
                 before_cap = half + max(0, half - len(after))
@@ -1482,11 +1504,11 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     )
                 )
             candidate_token_budget = code_token_budget - estimate_tokens(header + context_block)
-            if candidate_token_budget < TP4_MIN_CODE_TOKENS and context_block:
+            if candidate_token_budget < code_floor and context_block:
                 # Safety net if the token estimate ever diverges from the
                 # character allowance above: drop the context, never the code.
                 context_block = ""
-                candidate_token_budget = code_token_budget - estimate_tokens(header)
+                candidate_token_budget = code_token_budget - header_tokens
             if candidate_token_budget < TP4_MIN_CODE_TOKENS:
                 stop_planning(
                     LedgerReason.SIZE_LIMIT,
