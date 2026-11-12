@@ -1292,3 +1292,112 @@ def test_cancellation_inside_the_bounded_markdown_child_projection_propagates(mo
     monkeypatch.setattr(tm, "_markdown_shell_text", project)
     with pytest.raises(TimeoutError, match="Markdown example deadline"):
         project("````markdown\nReference `local-build`.\n````\n", expired, markdown_examples=True)
+
+
+def _quoted_key_reference_document(quote: str) -> str:
+    return (
+        "# Reference Δ\n\n"
+        "1. Enter a configuration keyword:\n"
+        "   ```\n"
+        "   CONFIG_{" + quote + "RUN_MODE" + quote + ":" + quote + "demo" + quote + "}\n"
+        "   ```\n\n"
+        "```bash\n"
+        'printf \'%s\\n\' "/stage/one" "/stage/two"\n'
+        "```\n\n"
+        'Read "Expected result".\n\n' + "Additional reference detail.\n" * 200
+    )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("quote", ["'", '"'])
+def test_prefixed_configuration_quotes_do_not_borrow_later_prose_or_hide_raw_high(
+    newline: str, quote: str
+) -> None:
+    source = (_quoted_key_reference_document(quote) + "\nRun `rm -rf /`.\n").replace("\n", newline)
+    assert len(source) > tm._SHELL_COMMAND_WORD_CHARS
+    assert len(source) < static_runner.SECURITY_VIEW_WINDOW_CHARS
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": source}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    expected = "rm -rf /"
+    start = source.index(expected)
+    assert any(
+        finding.rule_id == "TM1"
+        and finding.severity == "HIGH"
+        and finding.file == "guide.md"
+        and finding.start_line == source.count("\n", 0, start) + 1
+        and finding.matched_text == expected
+        and finding.match_fingerprint == compute_match_fingerprint("TM1", expected)
+        for finding in result["findings"]
+    )
+    assert any(
+        finding.rule_id == "TM1"
+        and finding.severity == "HIGH"
+        and finding.location.file == "guide.md"
+        and finding.matched_text == expected
+        and finding.match_fingerprint == compute_match_fingerprint("TM1", expected)
+        and finding.evidence[static_runner._VIEW_START_EVIDENCE] == start
+        for finding in tm.analyze(source, "guide.md", "markdown")
+    )
+
+
+@pytest.mark.parametrize("brace", ["{", "}"])
+@pytest.mark.parametrize("quote", ["'", '"'])
+def test_raw_shared_caller_keeps_brace_adjacent_quoted_destructive_command(
+    brace: str, quote: str
+) -> None:
+    expected = quote + "rm" + quote + " -rf /"
+    source = "prefix" + brace + expected + "\n"
+    start = source.index(quote)
+    assert (start, start + len(quote + "rm" + quote)) in list(tm._destructive_command_words(source))
+    assert any(
+        finding.rule_id == "TM1"
+        and finding.severity == "HIGH"
+        and finding.location.file == "guide.md"
+        and finding.location.start_line == 1
+        and finding.matched_text == expected
+        and finding.match_fingerprint == compute_match_fingerprint("TM1", expected)
+        and finding.evidence[static_runner._VIEW_START_EVIDENCE] == start
+        for finding in tm.analyze(source, "guide.md", "markdown")
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    ['sh -c "$PAYLOAD"', 'eval "$PAYLOAD"', "$(unfinished", '"$CMD'],
+)
+def test_prefixed_quote_ownership_does_not_clear_executing_or_unclosed_operands(body: str) -> None:
+    source = _quoted_key_reference_document('"') + "\nRun ``" + body + "``.\n"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.cause in {ParserCause.RUNTIME_DEPENDENT, ParserCause.BOUNDARY_UNRESOLVED}
+    assert source.index(body) <= diagnostic.start < diagnostic.end <= len(source)
+
+
+@pytest.mark.parametrize("quote", ["'", '"'])
+def test_brace_adjacent_unclosed_literal_keeps_its_command_word_boundary(quote: str) -> None:
+    source = "prefix{" + quote + "read " + "x" * (tm._SHELL_COMMAND_WORD_CHARS + 1)
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell")
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.BOUNDARY_UNRESOLVED
+    assert diagnostic.check is ParserCheck.COMMAND_WORD_BOUNDARY
+    assert diagnostic.start == source.index(quote)
+    assert diagnostic.end == len(source)
+
+
+def test_prefixed_quote_reference_walk_keeps_runtime_cancellation() -> None:
+    calls = 0
+
+    def expired() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 123:
+            raise TimeoutError("quoted reference deadline")
+
+    with pytest.raises(TimeoutError, match="quoted reference deadline"):
+        tm.bounded_parse_diagnostic(
+            _quoted_key_reference_document('"'), expired, file_type="markdown"
+        )
+    assert calls == 123
