@@ -107,6 +107,7 @@ async def test_stdio_mcp_preserves_compact_verdicts_and_ignores_shipped_baseline
                         "target",
                         "use_llm",
                         "output_format",
+                        "include_report",
                     }
 
                     async def scan(target: Path, output_format: str = "json") -> dict[str, Any]:
