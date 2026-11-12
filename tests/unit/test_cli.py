@@ -1749,6 +1749,113 @@ def test_cli_keyring_access_can_be_suppressed_by_baseline(tmp_path: Path) -> Non
     assert any(issue["id"] == "PE3" for issue in payload["suppressed"])
 
 
+@pytest.mark.parametrize("format", ["json", "sarif"])
+@pytest.mark.parametrize("shipped", [False, True])
+@pytest.mark.parametrize("alias", ["same-path", "relative-path", "symlink", "hard-link"])
+def test_cli_scan_preserves_consumed_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, format: str, shipped: bool, alias: str
+) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: protected\n---\n# Hello\n")
+    baseline = skill / ".skillspector-baseline.yaml"
+    original = b"version: 2\nrules:\n  - id: P1\n    reason: Reviewed\n"
+    baseline.write_bytes(original)
+    output = baseline
+    monkeypatch.chdir(tmp_path)
+    if alias == "relative-path":
+        output = baseline.relative_to(tmp_path)
+    elif alias in {"symlink", "hard-link"}:
+        output = tmp_path / "report.json"
+        try:
+            if alias == "symlink":
+                output.symlink_to(baseline)
+            else:
+                os.link(baseline, output)
+        except OSError:
+            pytest.skip(f"{alias} is not supported on this filesystem")
+    scan = MagicMock(return_value={"report_body": "{}", "risk_score": 0})
+    monkeypatch.setattr(cli, "_scan_skill", scan)
+    options = ["--use-shipped-baseline"] if shipped else ["--baseline", str(baseline)]
+
+    result = runner.invoke(
+        app,
+        ["scan", str(skill), "--no-llm", "--format", format, "-o", str(output), *options],
+    )
+
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert baseline.read_bytes() == original
+    assert output.read_bytes() == original
+    scan.assert_not_called()
+
+
+@pytest.mark.parametrize("format", ["json", "sarif"])
+@pytest.mark.parametrize("shipped", [False, True])
+@pytest.mark.parametrize(
+    "alias", ["missing-parent", "nested-missing-parent", "file-parent", "symlink-parent"]
+)
+def test_cli_scan_preserves_baseline_at_normalized_report_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, format: str, shipped: bool, alias: str
+) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: protected\n---\n# Hello\n")
+    baseline = skill / ".skillspector-baseline.yaml"
+    original = b"version: 2\nrules:\n  - id: P1\n    reason: Reviewed\n"
+    baseline.write_bytes(original)
+    output = skill / "missing" / ".." / baseline.name
+    if alias == "nested-missing-parent":
+        output = skill / "missing" / "nested" / ".." / ".." / baseline.name
+    elif alias == "file-parent":
+        (skill / "not-a-directory").write_text("Keep this file")
+        output = skill / "not-a-directory" / ".." / baseline.name
+    elif alias == "symlink-parent":
+        target = tmp_path / "elsewhere" / "child"
+        target.mkdir(parents=True)
+        try:
+            (skill / "linked").symlink_to(target, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+        output = skill / "linked" / ".." / baseline.name
+    scan = MagicMock(return_value={"report_body": "{}", "risk_score": 0})
+    monkeypatch.setattr(cli, "_scan_skill", scan)
+    options = ["--use-shipped-baseline"] if shipped else ["--baseline", str(baseline)]
+
+    result = runner.invoke(
+        app,
+        ["scan", str(skill), "--no-llm", "--format", format, "-o", str(output), *options],
+    )
+
+    assert result.exit_code == 2
+    expected_error = (
+        "Not a directory" if alias == "file-parent" else "--output points to the input file"
+    )
+    assert expected_error in result.output
+    assert baseline.read_bytes() == original
+    assert not (skill / "missing").exists()
+    scan.assert_not_called()
+
+
+def test_validate_report_destination_keeps_original_symlink_parent_check(tmp_path: Path) -> None:
+    """Lexical normalization must not replace the original same-file check."""
+    source = tmp_path / "original" / "SKILL.md"
+    source.parent.mkdir()
+    source.write_text("Keep this source")
+    (source.parent / "child").mkdir()
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    try:
+        (output_root / "linked").symlink_to(source.parent / "child", target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+    output = output_root / "linked" / ".." / source.name
+
+    with pytest.raises(ValueError, match="--output points to the input file"):
+        cli_module._validate_report_destination(source, output)
+    assert source.read_text() == "Keep this source"
+
+
 def test_cli_keyring_access_is_kept_in_json_and_sarif(tmp_path: Path) -> None:
     skill = tmp_path / "skill"
     skill.mkdir()
