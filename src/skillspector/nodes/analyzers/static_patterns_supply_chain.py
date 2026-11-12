@@ -2446,7 +2446,10 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.SUPPLY_CHAIN.value]
 
     is_dep_file = _is_dependency_manifest(file_path)
-    if is_dep_file:
+    # An npm lockfile pins every install to an exact version. The ranges it also
+    # records are the installed packages' own declared requirements, so they are
+    # not unpinned dependencies of the skill.
+    if is_dep_file and not _is_npm_lockfile(file_path):
         for pattern, confidence in SC1_PATTERNS:
             matches = (
                 static_runner.iter_paragraph_matches

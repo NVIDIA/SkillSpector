@@ -108,6 +108,53 @@ name = "broken"
     assert supply_chain._extract_packages_from_toml_lock(content) == []
 
 
+_NPM_LOCK_WITH_TRANSITIVE_RANGES = """{
+  "name": "demo",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "demo",
+      "version": "1.0.0",
+      "dependencies": {
+        "ajv": "8.17.1"
+      }
+    },
+    "node_modules/ajv": {
+      "version": "8.17.1",
+      "dependencies": {
+        "fast-deep-equal": "^3.1.3"
+      },
+      "peerDependencies": {
+        "react": "*"
+      }
+    },
+    "node_modules/fast-deep-equal": {
+      "version": "3.1.3"
+    }
+  }
+}
+"""
+
+
+@pytest.mark.parametrize("path", ["package-lock.json", "mcp/npm-shrinkwrap.json"])
+def test_npm_lockfile_requirement_ranges_are_not_unpinned_dependencies(path):
+    findings = supply_chain.analyze(_NPM_LOCK_WITH_TRANSITIVE_RANGES, path, "json")
+
+    assert not [finding for finding in findings if finding.rule_id == "SC1"]
+
+
+def test_package_json_ranges_are_still_unpinned_dependencies():
+    content = '{"dependencies": {"ajv": "^8.17.1", "react": "*"}}'
+
+    findings = supply_chain.analyze(content, "package.json", "json")
+
+    assert {finding.matched_text for finding in findings if finding.rule_id == "SC1"} == {
+        '"ajv": "^8.17.1"',
+        '"react": "*"',
+    }
+
+
 @pytest.mark.parametrize("path", ["package.json", "package-lock.json", "npm-shrinkwrap.json"])
 @pytest.mark.parametrize("is_cached", [True, False], ids=["present-empty", "missing"])
 def test_node_distinguishes_empty_dependency_file_from_missing_cache_entry(

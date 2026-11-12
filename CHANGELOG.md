@@ -1,5 +1,6 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
+* fix(sc1): stop reporting the requirement ranges recorded inside `package-lock.json` and `npm-shrinkwrap.json` as unpinned dependencies; the lockfile pins every install, and `package.json` ranges are still reported (#1104)
 * fix(pi): accept scans from symlinked workspace roots while preserving the CLI's checks on symlinks below the workspace. Custom YARA rules loaded with `--yara-rules-dir` cannot use `include`; place each rule directly in the selected directory.
 * fix(coverage): account for successfully inspected linked ZIP containers while retaining member failures and archive limits
 * fix(static): stop Markdown code fence lines from reading as an open quote that merges consecutive shell lines into one marker directive (#868)
