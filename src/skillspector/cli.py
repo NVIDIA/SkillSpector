@@ -3609,7 +3609,7 @@ def baseline(
         to_stdout = str(output) == "-"
         if not to_stdout:
             require_secure_file_output()
-            _validate_report_destination(Path(input_path.strip()), output)
+            _validate_report_destination(Path(input_path), output)
         if verbose:
             set_level("DEBUG")
             err_console.print("[dim]Scanning to build baseline...[/dim]")
