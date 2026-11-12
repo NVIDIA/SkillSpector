@@ -1310,10 +1310,16 @@ def _quoted_key_reference_document(quote: str) -> str:
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 @pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("reference", ["prefixed-key", "closing-brace-data"])
 def test_prefixed_configuration_quotes_do_not_borrow_later_prose_or_hide_raw_high(
-    newline: str, quote: str
+    newline: str, quote: str, reference: str
 ) -> None:
-    source = (_quoted_key_reference_document(quote) + "\nRun `rm -rf /`.\n").replace("\n", newline)
+    if reference == "prefixed-key":
+        source = _quoted_key_reference_document(quote)
+    else:
+        source = "CONFIG_" + quote + "value}" + quote + "\n"
+        source += "Additional reference detail.\n" * 200
+    source = (source + "\nRun `rm -rf /`.\n").replace("\n", newline)
     assert len(source) > tm._SHELL_COMMAND_WORD_CHARS
     assert len(source) < static_runner.SECURITY_VIEW_WINDOW_CHARS
     assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
@@ -1343,13 +1349,10 @@ def test_prefixed_configuration_quotes_do_not_borrow_later_prose_or_hide_raw_hig
     )
 
 
-@pytest.mark.parametrize("brace", ["{", "}"])
 @pytest.mark.parametrize("quote", ["'", '"'])
-def test_raw_shared_caller_keeps_brace_adjacent_quoted_destructive_command(
-    brace: str, quote: str
-) -> None:
+def test_raw_shared_caller_keeps_brace_adjacent_quoted_destructive_command(quote: str) -> None:
     expected = quote + "rm" + quote + " -rf /"
-    source = "prefix" + brace + expected + "\n"
+    source = "prefix{" + expected + "\n"
     start = source.index(quote)
     assert (start, start + len(quote + "rm" + quote)) in list(tm._destructive_command_words(source))
     assert any(

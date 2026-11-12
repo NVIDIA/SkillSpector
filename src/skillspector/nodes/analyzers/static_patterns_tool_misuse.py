@@ -870,13 +870,11 @@ def _is_shell_command_word_start(content: str, start: int) -> bool:
     if start == 0:
         return True
     previous = content[start - 1]
-    if (
-        previous.isspace()
-        or previous in ";|&()<>/"
-        or (previous in "{}" and content[start] in "'\"")
-    ):
-        # An eligible quoted word owns its closer before an interior letter can
-        # invert that quote and borrow delimiters from later host text.
+    if previous.isspace() or previous in ";|&()<>/":
+        return True
+    if previous == "{" and content[start] in "'\"":
+        # Visit an inline object key's opener before its first letter.
+        # A closing brace can instead precede a string's closing quote.
         return True
     if previous in "'\"`":
         before_quote = start - 2
