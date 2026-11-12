@@ -843,11 +843,12 @@ def test_recursive_output_rejects_child_primary_aliases(
     scan_skill.assert_not_called()
 
 
-def test_cli_baseline_preserves_local_input_with_remote_like_name(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("name", ["git@notes.md", " notes.md "])
+def test_cli_baseline_preserves_local_input_with_literal_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    source = Path("git@notes.md")
+    source = Path(name)
     original = "---\nname: protected\ndescription: Say hello.\n---\n# Hello\n"
     source.write_text(original)
     with patch("skillspector.cli.graph.invoke") as invoke:

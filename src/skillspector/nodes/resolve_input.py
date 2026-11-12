@@ -55,20 +55,20 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
     # exact object instead of restarting their own aggregate allowance.
     workflow_budget = ensure_workflow_resource_budget(state)
 
-    if input_path and isinstance(input_path, str) and input_path.strip():
+    if input_path and isinstance(input_path, str):
         handler = InputHandler(
             transitive_budget=workflow_budget,
             allow_git_credentials=state.get("allow_git_credentials", True),
         )
         try:
-            resolved, source_type = handler.resolve(input_path.strip())
+            resolved, source_type = handler.resolve(input_path)
             temp_dir = handler.temp_dir_for_cleanup()
             update: dict[str, object] = {
                 "skill_path": str(resolved),
                 "primary_file_path": handler.primary_file_path,
                 "primary_file_parent_path": handler.primary_file_parent_path,
                 "selected_source_identity": selected_source_identity_for_input(
-                    input_path.strip(),
+                    input_path,
                     source_type=source_type,
                     resolved_path=resolved,
                     temp_dir=temp_dir,
@@ -99,7 +99,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             handler.cleanup()
             raise
 
-    if skill_path and isinstance(skill_path, str) and skill_path.strip():
+    if skill_path and isinstance(skill_path, str):
         try:
             resolved = validate_local_input_path(Path(skill_path))
             return {
