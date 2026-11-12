@@ -15,23 +15,25 @@
 
 """Skillspector v2 LangGraph workflow package."""
 
-import warnings
 from importlib.metadata import version as _pkg_version
+from typing import Any
+
+from skillspector.graph_proxy import graph, restore_package_graph_export
 
 __version__ = _pkg_version("skillspector")
 
-# ponytail: langgraph deserializes with langchain's allowed_objects default,
-# which warns. langchain_core's import re-enables that warning via
-# surface_langchain_deprecation_warnings(), so import it first, then prepend our
-# ignore filter so it wins. Drop this once langgraph pins an explicit default.
-import langchain_core  # noqa: F401  (force its warning-filter setup before ours)
 
-warnings.filterwarnings(
-    "ignore",
-    message="The default value of `allowed_objects` will change",
-    category=Warning,
-)
+def create_graph() -> Any:
+    """Build and return a new SkillSpector workflow graph."""
+    from skillspector.graph import create_graph as build_graph
 
-from skillspector.graph import create_graph, graph  # noqa: E402 (after filter setup)
+    try:
+        return build_graph()
+    finally:
+        # Importing the submodule shadows the lazy proxy on the package;
+        # restore the documented export even when this factory is the first
+        # graph access.
+        restore_package_graph_export()
+
 
 __all__ = ["create_graph", "graph", "__version__"]

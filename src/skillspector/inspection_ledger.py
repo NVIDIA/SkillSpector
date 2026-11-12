@@ -15,11 +15,20 @@ from typing import Final, NotRequired, cast
 
 from typing_extensions import TypedDict
 
+from skillspector.resource_limits import bounded_capacity
+
 logger = logging.getLogger(__name__)
 
-MAX_INSPECTION_LEDGER_EVENTS: Final = 10_000
+# Every artifact produces separate work rows for multiple analyzers.
+MAX_INSPECTION_LEDGER_EVENTS: Final = bounded_capacity(
+    "SKILLSPECTOR_MAX_INSPECTION_LEDGER_EVENTS", 100_000, 1_000_000
+)
 MAX_FINDING_OUTPUT_RECORDS: Final = 10_000
 MAX_EFFECTIVE_FINDINGS: Final = MAX_FINDING_OUTPUT_RECORDS
+UNSUPPORTED_PROSE_COMMAND_PATTERN: Final = "unsupported_prose_command_pattern"
+UNSUPPORTED_PROSE_COMMAND_NOTICE: Final = (
+    "This command pattern is not allowed for inspection; put the command in a code block."
+)
 RESOURCE_MEASUREMENT_UNITS: Final = (
     "characters",
     "bytes",
@@ -62,9 +71,9 @@ RULE_SET_SCOPE: Final = "rule_set"
 
 
 class LedgerReason(StrEnum):
-    ARCHIVE_MEMBER_INCOMPLETE = "archive_member_incomplete"
     """Allowlisted reasons for omitted, skipped, or failed inspection work."""
 
+    USER_EXCLUSION = "user_exclusion"
     EXCLUDED_DIRECTORY = "excluded_directory"
     HIDDEN_FILE = "hidden_file"
     FILE_DISAPPEARED = "file_disappeared"
@@ -109,6 +118,7 @@ class LedgerReason(StrEnum):
     ARCHIVE_UNSUPPORTED_COMPRESSION = "archive_unsupported_compression"
     ARCHIVE_UNSUPPORTED_MEMBER = "archive_unsupported_member"
     ARCHIVE_TRUNCATED = "archive_truncated"
+    ARCHIVE_MEMBER_INCOMPLETE = "archive_member_incomplete"
     ARCHIVE_UNSAFE_MEMBER_PATH = "archive_unsafe_member_path"
     ARCHIVE_AMBIGUOUS_MEMBER_PATH = "archive_ambiguous_member_path"
     ARTIFACT_PATH_COLLISION = "artifact_path_collision"
@@ -126,17 +136,30 @@ class LedgerReason(StrEnum):
     REFERENCE_EXTRACTION_LIMIT = "reference_extraction_limit"
     REFERENCE_MISSING = "reference_missing"
     REFERENCE_UNRESOLVED = "reference_unresolved"
-    MANIFEST_PARSE_ERROR = "manifest_parse_error"
     DEPENDENCY_PARSE_ERROR = "dependency_parse_error"
+    MANIFEST_PARSE_ERROR = "manifest_parse_error"
+    DEPENDENCY_LOCKFILE_MISSING = "dependency_lockfile_missing"
+    DEPENDENCY_UNSUPPORTED_LOCKFILE = "dependency_unsupported_lockfile"
+    DEPENDENCY_LOCKFILE_MISMATCH = "dependency_lockfile_mismatch"
+    DEPENDENCY_UNSUPPORTED_SOURCE = "dependency_unsupported_source"
+    DEPENDENCY_UNSUPPORTED_CONTENT = "dependency_unsupported_content"
+    DEPENDENCY_INTEGRITY_MISSING = "dependency_integrity_missing"
+    DEPENDENCY_INTEGRITY_MISMATCH = "dependency_integrity_mismatch"
+    DEPENDENCY_IDENTITY_MISMATCH = "dependency_identity_mismatch"
+    DEPENDENCY_DOWNLOAD_FAILED = "dependency_download_failed"
+    DEPENDENCY_WORKER_FAILED = "dependency_worker_failed"
+    DEPENDENCY_SANDBOX_UNAVAILABLE = "dependency_sandbox_unavailable"
     MANIFEST_PARSE_LIMIT = "manifest_parse_limit"
     ARTIFACT_COUNT_LIMIT = "artifact_count_limit"
     TRAVERSAL_DEPTH_LIMIT = "traversal_depth_limit"
     TOTAL_BYTES_LIMIT = "total_bytes_limit"
     RUNTIME_LIMIT = "runtime_limit"
     EXCLUDED_EXECUTABLE_CONTENT = "excluded_executable_content"
+    HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY = "hidden_skill_executable_local_only"
     OUTPUT_LIMIT = "output_limit"
     TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
+    JSON_QUOTE_OWNERSHIP_LIMIT = "json_quote_ownership_limit"
     PYTHON_SOURCE_AMBIGUOUS = "python_source_ambiguous"
     PYTHON_SOURCE_DECODE_ERROR = "python_source_decode_error"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
@@ -379,6 +402,18 @@ def format_recovery_policy_accepted(completeness: Mapping[str, object]) -> bool:
 
 
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
+    LedgerReason.DEPENDENCY_LOCKFILE_MISSING: "Requested npm content inspection has no supported project lockfile.",
+    LedgerReason.DEPENDENCY_UNSUPPORTED_LOCKFILE: "Dependency content inspection requires npm lockfile version 2 or 3.",
+    LedgerReason.DEPENDENCY_LOCKFILE_MISMATCH: "Package manifest dependency declarations differ from the lockfile root.",
+    LedgerReason.DEPENDENCY_UNSUPPORTED_SOURCE: "Dependency source is outside supported public npm registry tarballs.",
+    LedgerReason.DEPENDENCY_UNSUPPORTED_CONTENT: "Dependency artifact contains a file outside supported static text analysis.",
+    LedgerReason.DEPENDENCY_INTEGRITY_MISSING: "Dependency has no supported, valid SHA-512 integrity hash.",
+    LedgerReason.DEPENDENCY_INTEGRITY_MISMATCH: "Downloaded dependency bytes do not match the lockfile integrity hash.",
+    LedgerReason.DEPENDENCY_IDENTITY_MISMATCH: "Package identity in the artifact differs from the locked name or version.",
+    LedgerReason.DEPENDENCY_DOWNLOAD_FAILED: "Locked dependency artifact could not be acquired under the network policy.",
+    LedgerReason.DEPENDENCY_WORKER_FAILED: "Dependency inspection worker failed or returned an invalid result.",
+    LedgerReason.DEPENDENCY_SANDBOX_UNAVAILABLE: "Required operating-system isolation for dependency inspection is unavailable.",
+    LedgerReason.USER_EXCLUSION: "File was not inspected because of an explicit caller exclusion.",
     LedgerReason.EXCLUDED_DIRECTORY: ("Directory tree is excluded from the configured scan scope."),
     LedgerReason.HIDDEN_FILE: "Hidden file is excluded from the configured scan scope.",
     LedgerReason.FILE_DISAPPEARED: ("Inventoried file disappeared before it could be inspected."),
@@ -445,7 +480,6 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.ARCHIVE_FORMAT_MISMATCH: (
         "Artifact bytes do not match the container format implied by its filename."
     ),
-    LedgerReason.ARCHIVE_MEMBER_INCOMPLETE: "Nested artifact inspection is incomplete.",
     LedgerReason.ARCHIVE_MALFORMED: "Archive or compressed content is malformed.",
     LedgerReason.ARCHIVE_ENCRYPTED: "Archive member is encrypted and could not be inspected.",
     LedgerReason.ARCHIVE_UNSUPPORTED_COMPRESSION: (
@@ -455,6 +489,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "Archive member uses a type or feature that is not supported for inspection."
     ),
     LedgerReason.ARCHIVE_TRUNCATED: "Archive member is truncated or unreadable.",
+    LedgerReason.ARCHIVE_MEMBER_INCOMPLETE: "Nested artifact inspection is incomplete.",
     LedgerReason.ARCHIVE_UNSAFE_MEMBER_PATH: (
         "Archive member uses an absolute, traversal, or otherwise unsafe path."
     ),
@@ -495,6 +530,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "A local path-like reference matched more than one bundled artifact"
         " and could not be resolved to a single target."
     ),
+    LedgerReason.DEPENDENCY_PARSE_ERROR: (
+        "Dependency metadata could not be parsed into supported registry coordinates."
+    ),
     LedgerReason.MANIFEST_PARSE_ERROR: (
         "Manifest frontmatter is malformed or uses an unsupported value shape."
     ),
@@ -511,6 +549,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.EXCLUDED_EXECUTABLE_CONTENT: (
         "Executable content was inventoried but excluded from content analysis."
     ),
+    LedgerReason.HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY: (
+        "Conventional hidden-skill helper script was kept local and not sent to an external LLM."
+    ),
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
     LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED: (
         "A transitive child scan failed before complete inspection."
@@ -523,6 +564,12 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     ),
     LedgerReason.PYTHON_SOURCE_DECODE_ERROR: (
         "Python source bytes could not be decoded under their declared encoding."
+    ),
+    LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT: (
+        "JSON quote ownership was not validated because a candidate source span exceeds "
+        "the character limit. JSON validity remains unverified; other instruction uncertainty "
+        "may remain. Split the document into smaller complete JSON values without dropping "
+        "required content, then rescan. Increasing the scan timeout does not raise this limit."
     ),
     LedgerReason.OBFUSCATED_INSTRUCTION_TEXT: (
         "Obfuscated instruction text could not be fully evaluated by the deterministic layer."
@@ -605,6 +652,7 @@ class ParserCheck(StrEnum):
     COMMAND_STRING_DEPTH = "command_string_depth"
     COMMAND_STRING_RUNTIME = "command_string_runtime"
     COMMAND_STRING_EFFECTS = "command_string_effects"
+    JSON_STRING_DECODING = "json_string_decoding"
     STARTUP_PROOF_CHARACTERS = "startup_proof_characters"
     BRACE_CHARACTERS = "brace_characters"
     BRACE_ALTERNATIVES = "brace_alternatives"
@@ -747,6 +795,8 @@ class InspectionLedgerEvent(ResourceMeasurements):
     message: NotRequired[str]
     error_class: NotRequired[str]
     stage: NotRequired[str]
+    source_start_offset: NotRequired[int]
+    source_end_offset: NotRequired[int]
     parser_diagnostic: NotRequired[ParserDiagnostic]
 
 
@@ -776,9 +826,11 @@ class InspectionLedgerException(ResourceMeasurements):
     error_class: NotRequired[str]
     analyzers: NotRequired[list[str]]
     fatal: NotRequired[bool]
+    source_start_offset: NotRequired[int]
+    source_end_offset: NotRequired[int]
     scope: NotRequired[str]
-    parser_diagnostic: NotRequired[ParserDiagnostic]
     source_identity: NotRequired[str]
+    parser_diagnostic: NotRequired[ParserDiagnostic]
 
 
 class AnalysisCompleteness(TypedDict):
@@ -795,6 +847,8 @@ class AnalysisCompleteness(TypedDict):
     entirely_uninspected_files: int
     ledger_exceptions: list[InspectionLedgerException]
     scope_exclusions: list[InspectionLedgerException]
+    exclude_patterns: NotRequired[list[str]]
+    excluded_file_count: NotRequired[int]
     analyzer_statuses: list[dict[str, object]]
     references: NotRequired[list[dict[str, object]]]
     limitations: NotRequired[list[str]]
@@ -803,6 +857,55 @@ class AnalysisCompleteness(TypedDict):
     dependency_inspection: NotRequired[dict[str, object]]
     policy_accepted: NotRequired[bool]
     warnings: NotRequired[list[dict[str, object]]]
+    notices: NotRequired[list[dict[str, object]]]
+
+
+def bounded_inspection_notices(rows: object) -> list[dict[str, object]]:
+    """Keep documentation notices separate from inspection gaps and findings."""
+    if not isinstance(rows, list) or MAX_FINDING_OUTPUT_RECORDS <= 0:
+        return []
+    notices: dict[tuple[str, int, int], dict[str, object]] = {}
+    for row in rows[:MAX_INSPECTION_LEDGER_EVENTS]:
+        if (
+            not isinstance(row, Mapping)
+            or row.get("reason_code") != UNSUPPORTED_PROSE_COMMAND_PATTERN
+        ):
+            continue
+        path = row.get("path")
+        if not isinstance(path, str):
+            continue
+        try:
+            path = _normalize_relative_path(path)
+        except ValueError:
+            continue
+        start, end = row.get("source_start_offset"), row.get("source_end_offset")
+        first, last = row.get("start_line"), row.get("end_line")
+        if not (
+            type(start) is int
+            and type(end) is int
+            and 0 <= start < end < (1 << 63)
+            and type(first) is int
+            and type(last) is int
+            and 1 <= first <= last < (1 << 63)
+        ):
+            continue
+        key = (path, start, end)
+        notices.setdefault(
+            key,
+            {
+                "reason_code": UNSUPPORTED_PROSE_COMMAND_PATTERN,
+                "message": UNSUPPORTED_PROSE_COMMAND_NOTICE,
+                "phase": "documentation",
+                "path": path,
+                "start_line": first,
+                "end_line": last,
+                "source_start_offset": start,
+                "source_end_offset": end,
+            },
+        )
+        if len(notices) >= MAX_FINDING_OUTPUT_RECORDS:
+            break
+    return list(notices.values())
 
 
 def _normalize_relative_path(path: str, *, scope_boundary: bool = False) -> str:
@@ -1131,12 +1234,37 @@ def _exception_from_event(
         scope=RULE_SET_SCOPE if _is_rule_set_record(event) else None,
     )
     exception.update(resource_measurements(event))
-    parser_diagnostic = sanitize_parser_diagnostic(event.get("parser_diagnostic"))
-    if parser_diagnostic is not None:
-        exception["parser_diagnostic"] = parser_diagnostic
     source_identity = event.get("source_identity")
     if isinstance(source_identity, str) and source_identity:
         exception["source_identity"] = source_identity
+    parser_diagnostic = sanitize_parser_diagnostic(event.get("parser_diagnostic"))
+    if parser_diagnostic is not None:
+        exception["parser_diagnostic"] = parser_diagnostic
+    if exception["reason_code"] is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT:
+        # Copy only consistent numeric evidence, never an arbitrary message or
+        # source payload from graph state. Keep distinct spans distinct when
+        # the public projection groups contributing analyzers below.
+        start = event.get("source_start_offset")
+        end = event.get("source_end_offset")
+        observed = event.get("observed_characters")
+        limit = event.get("limit_characters")
+        if (
+            type(start) is int
+            and type(end) is int
+            and type(observed) is int
+            and type(limit) is int
+            and 0 <= start < end <= (1 << 63) - 1
+            and observed == end - start
+            and observed > limit > 0
+        ):
+            exception["source_start_offset"] = start
+            exception["source_end_offset"] = end
+            exception["observed_characters"] = observed
+            exception["limit_characters"] = limit
+            exception["message"] += (
+                f" Observed source character span [{start}, {end}) "
+                f"({observed} characters; limit {limit})."
+            )
     return exception
 
 
@@ -1607,9 +1735,18 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_before_filtering": len(findings_by_id),
         "findings_after_filtering": len(validated_effective),
     }
+    notices = bounded_inspection_notices(state.get("inspection_notices"))
+    if notices:
+        completeness["notices"] = notices
+    patterns = state.get("exclude_patterns", [])
     dependency_inspection = state.get("dependency_inspection")
     if isinstance(dependency_inspection, dict):
         completeness["dependency_inspection"] = dict(dependency_inspection)
+    if patterns:
+        completeness["exclude_patterns"] = list(patterns)
+        completeness["excluded_file_count"] = sum(
+            item.get("reason") == LedgerReason.USER_EXCLUSION for item in inventory
+        )
     format_warnings = [
         {**row, "assessment_complete": False, "accepted_by_policy": True}
         for row in ledger_exceptions

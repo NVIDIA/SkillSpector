@@ -35,6 +35,7 @@ from skillspector.shell_sources import (
     ShellSourceContext,
     ShellSourceOrigin,
     ShellSourceValue,
+    readonly_file_arguments,
     readonly_sed_program,
 )
 
@@ -58,7 +59,6 @@ _READERS = frozenset(
         "diff",
         "readlink",
         "ls",
-        "file",
         "sleep",
         "id",
         "date",
@@ -371,7 +371,7 @@ class ShellArtifactAudit:
         }
         context = ShellSourceContext(path, {**self.context.sources, path: source})
         result = ShellProducer(trial, context, self.read_word, self.check_runtime, output).inspect(
-            (destination,), environment, (destination,)
+            (destination,), environment, (destination,), initial_cwd=command.cwd
         )
         if result is None or not self.store.adopt(trial):
             return None
@@ -803,6 +803,10 @@ class ShellArtifactAudit:
                 if not self._invalidate_path(path):
                     return None
                 writes.append(path)
+            status = None
+        elif name == "file":
+            if not readonly_file_arguments(args, self.check_runtime):
+                return None
             status = None
         elif name in _READERS or name == "wait":
             status = None

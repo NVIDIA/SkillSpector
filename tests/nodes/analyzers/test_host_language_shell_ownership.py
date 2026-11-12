@@ -752,7 +752,7 @@ def test_constant_checkout_full_bundle_checks_imported_initialization(
 
 
 @pytest.mark.parametrize("guard", ["flow", "import", "stdlib"])
-def test_refused_constant_proof_preserves_released_execution_bounds(
+def test_refused_constant_proof_preserves_existing_literal_value_bounds(
     guard: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     if guard == "flow":
@@ -771,12 +771,8 @@ def test_refused_constant_proof_preserves_released_execution_bounds(
     ownership = tm._PythonSourceOwnership(source, lambda: None, import_check, stdlib_check)
     value = ownership.string_value(start, start + len("$TOOL_ROOT"))
 
-    if guard == "stdlib":
-        assert value is not None
-        assert " -rf {" in value[0]
-    else:
-        # Unproven execution/import flow cannot claim a literal-only operand.
-        assert value is None
+    assert value is not None
+    assert " -rf {" in value[0]
     assert tm.has_bounded_parse_exhaustion(
         source,
         lambda: None,
@@ -784,8 +780,7 @@ def test_refused_constant_proof_preserves_released_execution_bounds(
         python_import_check=import_check,
         python_stdlib_check=stdlib_check,
     )
-    # Independently proven non-root operands still complete even when the
-    # additional constant-substitution proof is refused.
+    # Refusing the added proof cannot revoke an existing non-root literal bound.
     benign = _OPTION_TEXT + 'MESSAGE = "$TOOL -rf build"\n' + _TAIL
     assert not tm.has_bounded_parse_exhaustion(
         benign,
@@ -815,7 +810,8 @@ def test_interrupted_constant_import_proof_does_not_cache_success() -> None:
 
     value = ownership.string_value(start, start + len("$TOOL_ROOT"))
     assert calls == 2
-    assert value is None
+    assert value is not None
+    assert " -rf {" in value[0]
 
 
 def test_refused_constant_proof_keeps_typed_diagnostic_source_range() -> None:
@@ -826,13 +822,13 @@ def test_refused_constant_proof_keeps_typed_diagnostic_source_range() -> None:
         file_type="python",
         python_import_check=lambda check: False,
     )
+    final_literal = 'f"checked out to {active_branch}"'
 
     assert diagnostic is not None
-    assert diagnostic.cause is ParserCause.BOUNDARY_UNRESOLVED
-    assert diagnostic.start is not None and diagnostic.end is not None
-    assert 0 <= diagnostic.start < diagnostic.end <= len(source)
-    assert "$TOOL_ROOT" in source[diagnostic.start : diagnostic.end]
-    assert diagnostic.location_precision == "source_span"
+    assert diagnostic.cause is ParserCause.UNSUPPORTED_SYNTAX
+    assert diagnostic.start == source.index('f"$TOOL_ROOT')
+    assert diagnostic.end == source.index(final_literal) + len(final_literal)
+    assert diagnostic.location_precision == "enclosing_expression"
 
 
 @pytest.mark.parametrize("target,partial", [("/", True), ("build", False)])

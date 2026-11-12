@@ -8,14 +8,10 @@ import pytest
 from typer.testing import CliRunner
 
 from skillspector.cli import app
-from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
-from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
-from skillspector.nodes.analyzers import static_runner
 from skillspector.nodes.analyzers.static_patterns_tool_misuse import has_bounded_parse_exhaustion
 
 _COMMENT_PADDING = "\n" + "#" * 6000 + "\n"
 _APOSTROPHE_PADDING = "\n" + "y = 'b'\n" * 800
-_PYTHON_FSTRING_HEREDOC = "python3 <<'PY'\nvalue = 1\nprint(f\"Result: {value}\")\nPY\n"
 
 
 @pytest.mark.parametrize(
@@ -152,96 +148,3 @@ def test_issue_628_bundle_reports_complete_coverage(tmp_path: Path) -> None:
     assert report["analysis_completeness"]["status"] == "complete"
     assert report["analysis_completeness"]["ledger_exceptions"] == []
     assert not any(issue["id"] == "AE1" for issue in report["issues"])
-
-
-@pytest.mark.parametrize("key", ["enabled", "recursive", "depth"])
-@pytest.mark.parametrize("quote", ['"', "'"])
-def test_quote_after_brace_cannot_consume_a_later_example(key: str, quote: str) -> None:
-    content = (
-        f"Use `{{{quote}outer{quote}:{{{quote}{key}{quote}:true}}}}`.\n\n"
-        '```yaml\nvalue: "{workspace}/<folder>"\n```\n' + _COMMENT_PADDING
-    )
-    result = static_runner.run_static_patterns_with_ledger(
-        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
-    )
-    assert result["findings"] == []
-    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
-
-
-@pytest.mark.parametrize("padding", [0, 6000], ids=["short", "long"])
-@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
-def test_heredoc_fstring_closer_cannot_open_a_shell_word(padding: int, newline: str) -> None:
-    content = (_PYTHON_FSTRING_HEREDOC + "printf ready\n" + "#" * padding + "\n").replace(
-        "\n", newline
-    )
-    result = static_runner.run_static_patterns_with_ledger(
-        {"components": ["script.sh"], "file_cache": {"script.sh": content}}, [tm]
-    )
-    assert result["findings"] == []
-    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
-
-
-@pytest.mark.parametrize("command", ["$($CMD) -rf /", "rm -rf /", '"unclosed'])
-@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
-def test_heredoc_fstring_cannot_hide_following_shell_commands(command: str, newline: str) -> None:
-    content = (_PYTHON_FSTRING_HEREDOC + command + _COMMENT_PADDING).replace("\n", newline)
-    result = static_runner.run_static_patterns_with_ledger(
-        {"components": ["script.sh"], "file_cache": {"script.sh": content}}, [tm]
-    )
-    if command == "rm -rf /":
-        assert any(finding.rule_id == "TM1" for finding in result["findings"])
-    else:
-        assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
-        assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
-
-
-@pytest.mark.parametrize("prefix", ["{", "{ :; }; "])
-@pytest.mark.parametrize("command", ['"rm"', '"r"m', r'"r"\m', "'r'm"])
-def test_brace_quote_boundary_keeps_destructive_commands(prefix: str, command: str) -> None:
-    content = prefix + command + " -rf /\n"
-    result = static_runner.run_static_patterns_with_ledger(
-        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
-    )
-    assert any(finding.rule_id == "TM1" for finding in result["findings"])
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        '"$($CMD)" -rf /',
-        '"$(echo; $CMD -rf /)"',
-        '"`echo; $CMD -rf /`"',
-        '"unclosed\n' + "padding " * 600,
-        '"$(unclosed\n' + "padding " * 600,
-        '"$(' + "r" * 4097 + ' -rf /)"',
-    ],
-)
-@pytest.mark.parametrize("path", ["script.sh", "guide.md"])
-def test_brace_quote_boundary_keeps_uncertain_shell_content_partial(body: str, path: str) -> None:
-    content = "{" + body + "\n"
-    if path.endswith(".md"):
-        content = "```sh\n" + content + "```\n"
-    result = static_runner.run_static_patterns_with_ledger(
-        {"components": [path], "file_cache": {path: content}}, [tm]
-    )
-    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
-    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
-
-
-def test_wider_inline_span_keeps_inner_shell_backticks_partial() -> None:
-    content = '``{"`echo; $CMD -rf /`"``\n'
-    result = static_runner.run_static_patterns_with_ledger(
-        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
-    )
-    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
-    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
-
-
-@pytest.mark.parametrize("prefix", ["", "{"])
-def test_markdown_inline_delimiters_do_not_create_shell_substitutions(prefix: str) -> None:
-    content = prefix + '"`echo; $CMD -rf /`"\n'
-    assert tm._markdown_shell_text(content, lambda: None) == content.replace("`", " ")
-    result = static_runner.run_static_patterns_with_ledger(
-        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
-    )
-    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED

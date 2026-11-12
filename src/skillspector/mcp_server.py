@@ -34,9 +34,10 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from skillspector import __version__
-from skillspector.cleanup import cleanup_result
+from skillspector.cleanup import TempDirTracker, cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
+from skillspector.graph_proxy import restore_package_graph_export
 from skillspector.inspection_ledger import (
     format_recovery_policy_accepted,
     only_missing_reference_exceptions,
@@ -51,6 +52,12 @@ from skillspector.semantic_runtime import (
     semantic_runtime_accounting,
 )
 from skillspector.suppression import effective_findings
+
+# Importing `skillspector.graph` above assigns the submodule to the parent
+# package's `graph` attribute, shadowing the documented lazy proxy. Restore
+# the proxy so `skillspector.graph` stays invokable when MCP is imported
+# before any other graph access.
+restore_package_graph_export()
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -152,8 +159,9 @@ async def run_scan(
         "output_format": output_format,
         "use_llm": llm_enabled,
         "llm_requested": use_llm,
-        "llm_preflight_error": redact_llm_error(llm_preflight_error),
     }
+    if use_llm and not llm_preflight_available:
+        state["llm_preflight_error"] = redact_llm_error(llm_preflight_error)
     if yara_rules_dir:
         state["yara_rules_dir"] = yara_rules_dir
 
@@ -165,10 +173,14 @@ async def run_scan(
     )
 
     result: dict[str, Any] | None = None
+    # A cancelled or failed scan returns no result to clean up; the tracker still
+    # knows the temp directory resolve_input made.
+    temp_dir_tracker = TempDirTracker()
     try:
         result = await graph.ainvoke(
             state,
             config={
+                "callbacks": [temp_dir_tracker],
                 "run_name": "skillspector-mcp-scan",
                 "tags": ["skillspector", "mcp"],
                 "metadata": {
@@ -245,6 +257,8 @@ async def run_scan(
     finally:
         if result is not None:
             cleanup_result(result)
+        else:
+            temp_dir_tracker.remove()
 
 
 def build_server(name: str = "skillspector", *, allow_local_targets: bool = False) -> FastMCP:

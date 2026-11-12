@@ -105,25 +105,57 @@ class TestClaudeModelRules:
         assert rejects_sampling_controls(model)
 
     @pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-mythos-5-1"])
-    def test_fable_and_mythos_reject_forced_tool_calls_only(self, model: str) -> None:
+    def test_fable_and_mythos_reject_forced_tool_calls(self, model: str) -> None:
         assert rejects_forced_tool_call(model)
-        assert not rejects_sampling_controls(model)
 
     @pytest.mark.parametrize(
         "model",
         [
+            "claude-mythos-5-1",
+            "claude-mythos-5-1-20260901",
+            "us.anthropic.claude-mythos-5-1",
+            "azure/anthropic/claude-mythos-5-1",
+        ],
+    )
+    def test_mythos_rejects_sampling_controls(self, model: str) -> None:
+        assert rejects_sampling_controls(model)
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-fable-5",
+            "claude-fable-5-1",
             "claude-opus-5",
+            "claude-opus-5-20260901",
             "claude-sonnet-5",
+            "claude-haiku-5-5",
+            "claude-opus-4-7",
             "claude-opus-4-8",
-            "claude-sonnet-4-6",
             "azure/anthropic/claude-opus-5",
-            "claude-opus-5-50",
+            "anthropic.claude-haiku-5-5",
+            "vertex_ai/claude-opus-4-8@20260801",
+        ],
+    )
+    def test_models_documented_to_remove_sampling_parameters(self, model: str) -> None:
+        assert rejects_sampling_controls(model)
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "claude-opus-50",
             "gpt-6.1-sol",
         ],
     )
     def test_other_models_keep_both(self, model: str) -> None:
         assert not rejects_forced_tool_call(model)
         assert not rejects_sampling_controls(model)
+
+    @pytest.mark.parametrize("model", ["claude-opus-5", "claude-sonnet-5", "claude-opus-4-8"])
+    def test_opus_5_sonnet_5_opus_4_8_accept_forced_tool_calls(self, model: str) -> None:
+        assert not rejects_forced_tool_call(model)
 
     @pytest.mark.parametrize(
         ("model", "expected"),
@@ -237,11 +269,11 @@ class TestAnthropicClaude55:
 
         chain = bind_structured_output(llm, Verdict, "claude-opus-5-5", provider)
 
-        # Refusals remain terminal and never supply text to formatting recovery.
-        with pytest.raises(StructuredOutputParseError) as caught:
+        # A refusal remains incomplete and cannot trigger formatting or blind retries.
+        with pytest.raises(StructuredOutputParseError) as error:
             chain.invoke("analyse this")
-        assert caught.value.issue is ResponseIssue.REFUSED
-        assert caught.value.recovery_text is None
+        assert error.value.issue == ResponseIssue.REFUSED
+        assert not error.value.retryable
 
     @pytest.mark.parametrize(
         ("provider_cls", "temperature"),
@@ -317,14 +349,12 @@ class TestOpenAIStructuredOutput:
 
         assert chain.invoke("analyse this") == Verdict(ok=True)
         request = requests[0]
-        response_format = request["response_format"]
-        assert response_format["type"] == "json_schema"
-        definition = response_format["json_schema"]
-        assert definition["name"] == "Verdict" and definition["strict"] is True
-        schema = definition["schema"]
-        assert schema["required"] == ["ok"]
-        assert schema["properties"]["ok"]["type"] == "boolean"
-        assert schema["additionalProperties"] is False
+        assert request["response_format"]["type"] == "json_schema"
+        output_format = request["response_format"]["json_schema"]
+        assert output_format["name"] == "Verdict"
+        assert output_format["strict"] is True
+        assert output_format["schema"]["properties"] == Verdict.model_json_schema()["properties"]
+        assert output_format["schema"]["required"] == ["ok"]
         assert "tools" not in request and "tool_choice" not in request
         assert request["max_completion_tokens"] == 128_000
         assert "temperature" not in request and "reasoning_effort" not in request
@@ -556,7 +586,7 @@ class TestAzureOpenAIControls:
         assert chat_model_requested_controls(llm)["temperature"] == 0.2
 
 
-_DEFAULT_PROVIDER_ENV = pytest.mark.parametrize(
+_OPT_IN_MODEL_ENV = pytest.mark.parametrize(
     ("provider", "credential", "model"),
     [
         ("openai", "OPENAI_API_KEY", "gpt-6.1-sol"),
@@ -568,7 +598,7 @@ _DEFAULT_PROVIDER_ENV = pytest.mark.parametrize(
 class TestScanPreflightControls:
     """A rejected control stops the scan before analysis and names the setting."""
 
-    @_DEFAULT_PROVIDER_ENV
+    @_OPT_IN_MODEL_ENV
     def test_scan_exits_before_analysis_with_the_reason(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -580,6 +610,7 @@ class TestScanPreflightControls:
         (tmp_path / "SKILL.md").write_text("---\nname: demo\n---\nHello.\n", encoding="utf-8")
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", provider)
         monkeypatch.setenv(credential, "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", model)
         monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
 
         with patch("skillspector.cli.graph.invoke") as invoke:
@@ -589,12 +620,13 @@ class TestScanPreflightControls:
         assert f"SKILLSPECTOR_TEMPERATURE is not supported by {model}" in result.output
         invoke.assert_not_called()
 
-    @_DEFAULT_PROVIDER_ENV
+    @_OPT_IN_MODEL_ENV
     def test_preflight_reports_the_reason_as_llm_error(
         self, monkeypatch: pytest.MonkeyPatch, provider: str, credential: str, model: str
     ) -> None:
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", provider)
         monkeypatch.setenv(credential, "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", model)
         monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
 
         available, error = is_llm_available()
@@ -699,6 +731,7 @@ class TestScanPreflightControls:
         (tmp_path / "SKILL.md").write_text("---\nname: demo\n---\nHello.\n", encoding="utf-8")
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "gpt-6.1-sol")
         monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
 
         with patch("skillspector.cli.unsupported_control_error") as check:

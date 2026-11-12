@@ -57,6 +57,7 @@ from skillspector.nodes.analyzers.whitespace_padding import (
     padding_run_match_fingerprint,
 )
 from skillspector.providers import get_active_provider
+from skillspector.resource_limits import bounded_capacity
 from skillspector.state import (
     AnalyzerNodeResponse,
     LLMCallRecord,
@@ -74,10 +75,16 @@ logger = logging.getLogger(__name__)
 
 _FRAMEWORK_TAGS = ["ASI02", "AML.T0080"]
 TP3_MAX_PARAM_DESC_LENGTH = 500
-TP4_MAX_FILES = 128
-TP4_MAX_TOTAL_CODE_BYTES = 4 * 1024 * 1024
-TP4_MAX_TOTAL_INPUT_BYTES = 4 * 1024 * 1024
-TP4_MAX_FILE_CODE_BYTES = 1024 * 1024
+TP4_MAX_FILES = bounded_capacity("SKILLSPECTOR_TP4_MAX_FILES", 128, 10_000)
+TP4_MAX_TOTAL_CODE_BYTES = bounded_capacity(
+    "SKILLSPECTOR_TP4_MAX_TOTAL_CODE_BYTES", 4 * 1024 * 1024, 64 * 1024 * 1024
+)
+TP4_MAX_TOTAL_INPUT_BYTES = bounded_capacity(
+    "SKILLSPECTOR_TP4_MAX_TOTAL_INPUT_BYTES", 4 * 1024 * 1024, 64 * 1024 * 1024
+)
+TP4_MAX_FILE_CODE_BYTES = bounded_capacity(
+    "SKILLSPECTOR_TP4_MAX_FILE_CODE_BYTES", 1024 * 1024, 16 * 1024 * 1024
+)
 DEFAULT_TP4_MAX_BATCHES = 256
 TP4_MAX_BATCHES_CEILING = 4096
 TP4_MAX_BATCH_INPUT_TOKENS = 32_000
@@ -1152,16 +1159,21 @@ def _tp4_finding(
     actual = result.actual_behavior_summary[:1024]
     mismatched = [str(item)[:256] for item in result.mismatched_capabilities[:16]]
     mismatched_text = ", ".join(mismatched)[:2048] if mismatched else "unspecified"
+    message = (
+        f"Description-behavior mismatch: declared purpose is '{declared}' "
+        f"but code also performs: {mismatched_text}."
+    )[:4096]
+    from skillspector.nodes.analyzers.pattern_defaults import get_pattern_name
+
     return Finding(
         rule_id="TP4",
-        message=(
-            f"Description-behavior mismatch: declared purpose is '{declared}' "
-            f"but code also performs: {mismatched_text}."
-        )[:4096],
+        message=message,
         severity="HIGH" if result.confidence >= 0.7 else "MEDIUM",
         confidence=result.confidence,
         file="SKILL.md",
         category=_CATEGORY,
+        pattern=get_pattern_name("TP4"),
+        finding=message,
         tags=list(_FRAMEWORK_TAGS),
         explanation=(result.explanation[:4096] or f"Declared: {declared}. Actual: {actual}."),
         remediation=(
@@ -1631,10 +1643,14 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                 if batch_outcome.failures
                 else "UnexpectedStructuredResponse"
             )
+            refusal_only = not unexpected_response and all(
+                failure.reason is LedgerReason.LLM_RESPONSE_REFUSED
+                for failure in batch_outcome.failures
+            )
             result.record = llm_call_record(
                 ANALYZER_ID,
                 ok=False,
-                error=f"TP4 LLM batch failed: {error_class}",
+                error=None if refusal_only else f"TP4 LLM batch failed: {error_class}",
             )
         else:
             result.record = llm_call_record(ANALYZER_ID, ok=True)

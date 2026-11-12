@@ -1140,6 +1140,8 @@ class TestTP4DescriptionBehaviorMismatch:
         tp4 = [f for f in result["findings"] if f.rule_id == "TP4"]
         assert len(tp4) >= 1
         assert tp4[0].severity in {"HIGH", "MEDIUM"}
+        assert tp4[0].pattern == "Description-Behavior Mismatch"
+        assert tp4[0].finding == tp4[0].message
 
     def test_no_mismatch_clean(self, monkeypatch: pytest.MonkeyPatch):
         _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
@@ -1147,6 +1149,36 @@ class TestTP4DescriptionBehaviorMismatch:
         result = node(state)
         tp4 = [f for f in result["findings"] if f.rule_id == "TP4"]
         assert len(tp4) == 0
+
+
+class TestTP4Finding:
+    def test_finding_maps_result_metadata_for_unit_ci(self):
+        result = mcp_tool_poisoning._TP4AnalysisResult(
+            is_mismatch=True,
+            confidence=0.9,
+            declared_purpose_summary="Local text transformation",
+            actual_behavior_summary="Sends source data to a remote endpoint",
+            mismatched_capabilities=["network access"],
+            explanation="The declared purpose does not disclose network behavior.",
+        )
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(result, batch, "A local text utility")
+
+        assert finding is not None
+        assert finding.rule_id == "TP4"
+        assert finding.category == "MCP Tool Poisoning"
+        assert finding.pattern == "Description-Behavior Mismatch"
+        assert finding.finding == finding.message
+        assert "network access" in finding.message
+        assert finding.evidence["code_path"] == "scripts/tool.py"
+        assert finding.evidence["code_start_line"] == 12
+        assert finding.evidence["code_end_line"] == 12
 
 
 class TestTP4MarkdownFences:
@@ -1812,20 +1844,100 @@ class TestTP4Fallbacks:
             for event in result["inspection_ledger"]
         )
 
-    def test_missing_structured_result_stays_incomplete(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_tool_refusal_stays_incomplete(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A structured call that keeps returning None ends degraded, not fatal (#843)."""
         state = _make_state("mcp_mismatched_skill", use_llm=True)
         monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", AsyncMock())
-        structured_llm = _mock_tp4_structured_llm(monkeypatch, [None] * 4)
+        structured_llm = _mock_tp4_structured_llm(monkeypatch, [None, None, None, None])
 
         result = node(state)
 
         assert structured_llm.calls == 4
         assert result["analyzer_status_events"][0]["status"] == "degraded"
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        assert [
+            (event["outcome"], event["reason_code"], event["error_class"]) for event in semantic
+        ] == [
+            (
+                LedgerOutcome.SKIPPED,
+                LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+                "ValidationError",
+            )
+        ]
+        assert result["llm_call_log"][0]["ok"] is False
+        completeness, _ = finalize_ledger(
+            {
+                "components": state["components"],
+                "findings": result["findings"],
+                "inspection_ledger": result["inspection_ledger"],
+                "analyzer_status_events": result["analyzer_status_events"],
+            }
+        )
+        assert completeness["execution_successful"] is True
+        assert completeness["is_complete"] is False
+
+    def test_missing_structured_response_is_retried(self, monkeypatch: pytest.MonkeyPatch):
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        sleep = AsyncMock()
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", sleep)
+        structured_llm = _mock_tp4_structured_llm(monkeypatch, [None, {"is_mismatch": False}])
+
+        result = node(state)
+
+        assert structured_llm.calls == 2
+        sleep.assert_called_once_with(0.5)
+        assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
+        assert result["analyzer_status_events"][0]["status"] == "completed"
+
+    def test_bedrock_forced_tool_call_answered_in_prose_is_retried(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bedrock's tool parser returns None for a reply with no tool call (#843)."""
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        from langchain_aws import ChatBedrockConverse
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        from skillspector import llm_utils
+        from skillspector.providers.bedrock import (
+            BEDROCK_DEFAULT_MODEL,
+            BEDROCK_DEFAULT_REGION,
+            BedrockProvider,
+        )
+
+        assert BedrockProvider().forced_tool_choice_supported(BEDROCK_DEFAULT_MODEL)
+        calls = []
+
+        async def answer_in_prose(*_args, **_kwargs):
+            calls.append(1)
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="refused"))])
+
+        monkeypatch.setattr(ChatBedrockConverse, "_agenerate", answer_in_prose)
+        monkeypatch.setattr(llm_utils, "get_active_provider", BedrockProvider)
+        monkeypatch.setattr(
+            "skillspector.llm_analyzer_base.get_chat_model",
+            lambda **kwargs: ChatBedrockConverse(
+                model=kwargs["model"],
+                client=MagicMock(),
+                bedrock_client=MagicMock(),
+                region_name=BEDROCK_DEFAULT_REGION,
+            ),
+        )
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", AsyncMock())
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        state["model_config"] = {"default": BEDROCK_DEFAULT_MODEL}
+
+        result = node(state)
+
+        assert len(calls) == 4
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
         assert any(
             event.get("reason_code") is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+            and event.get("error_class") == "ValidationError"
             for event in result["inspection_ledger"]
+        )
+        assert not any(
+            event["outcome"] is LedgerOutcome.FAILED for event in result["inspection_ledger"]
         )
 
     def test_opus5_function_calling_refusal_stays_incomplete(
@@ -1951,6 +2063,48 @@ class TestTP4Concurrency:
 class TestTP4Telemetry:
     """TP4 records llm_call_log so the report's degradation detector counts it
     consistently with the semantic analyzers and the meta-analyzer."""
+
+    @pytest.mark.parametrize("kind", ["refused", "mixed", "runtime", "unexpected"])
+    def test_only_explicit_refusals_omit_transport_error(self, monkeypatch, kind) -> None:
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        state["components"].append("second.py")
+        state["file_cache"]["second.py"] = "print(2)"
+        state["component_metadata"].append(
+            {"path": "second.py", "type": "python", "executable": True}
+        )
+        _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+
+        async def outcomes(self, batches, **_kwargs):
+            assert len(batches) >= 2
+            if kind == "unexpected":
+                return BatchExecutionResult(successful=[(batch, []) for batch in batches])
+            failures = []
+            for index, batch in enumerate(batches):
+                reason = LedgerReason.LLM_RESPONSE_REFUSED
+                if kind == "runtime":
+                    reason = LedgerReason.RUNTIME_LIMIT
+                elif kind == "mixed" and index:
+                    reason = LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+                failures.append(
+                    BatchFailure(batch=batch, error_class="ValidationError", reason=reason)
+                )
+            return BatchExecutionResult(failures=failures)
+
+        monkeypatch.setattr(LLMAnalyzerBase, "arun_batches_detailed", outcomes)
+        result = node(state)
+        call = result["llm_call_log"][0]
+        assert call["ok"] is False
+        if kind == "refused":
+            assert call["error"] is None
+            semantic = [
+                event for event in result["inspection_ledger"] if event["phase"] == "semantic"
+            ]
+            assert semantic and all(
+                event["reason_code"] is LedgerReason.LLM_RESPONSE_REFUSED for event in semantic
+            )
+        else:
+            assert "TP4 LLM batch failed" in call["error"]
+        assert result["analyzer_status_events"][0]["status"] != "completed"
 
     def test_successful_call_records_ok_true(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)

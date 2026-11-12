@@ -38,7 +38,13 @@ class SarifRegion(BaseModel):
 class SarifArtifactLocation(BaseModel):
     """Reference to an artifact (file) in the run."""
 
+    model_config = {"populate_by_name": True}
+
     uri: str
+    # SARIF 2.1.0 section 3.4.4: base URI identifier resolved through the
+    # run's originalUriBaseIds. Recursive scans scope each child run's
+    # skill-relative URIs to its own skill directory with this.
+    uri_base_id: str | None = Field(default=None, alias="uriBaseId")
     index: int | None = None
     properties: dict[str, object] | None = None
 
@@ -98,6 +104,9 @@ class SarifReportingDescriptor(BaseModel):
     default_configuration: dict[str, object] | None = Field(
         default=None, alias="defaultConfiguration"
     )
+    # Rule-level metadata such as security-severity, emitted only when the
+    # rule has a single severity across every reported finding.
+    properties: dict[str, object] | None = None
 
 
 class SarifDriver(BaseModel):
@@ -158,6 +167,11 @@ class SarifRun(BaseModel):
     )
     artifacts: list[SarifArtifact] | None = None
     invocations: list[SarifInvocation] | None = None
+    # SARIF 2.1.0 section 3.14.14: resolves artifactLocation.uriBaseId
+    # values used by this run's results.
+    original_uri_base_ids: dict[str, SarifArtifactLocation] | None = Field(
+        default=None, alias="originalUriBaseIds"
+    )
 
 
 class SarifLog(BaseModel):

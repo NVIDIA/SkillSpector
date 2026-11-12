@@ -910,7 +910,8 @@ class _OutputInterpreter(_Interpreter):
             # variable-setting %n or escape-driven format cannot hide effects.
             if (
                 template.startswith("-")
-                or re.fullmatch(r"(?:[^%\\]|%[%s]|\\[nt\\])*", template) is None
+                or re.search(r"%(?!%|s)", template)
+                or re.search(r"\\(?!n|t|\\)", template)
             ):
                 raise _UnresolvedError
             if stdout:

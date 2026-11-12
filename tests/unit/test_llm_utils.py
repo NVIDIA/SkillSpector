@@ -59,7 +59,6 @@ from skillspector.providers import (
     use_provider,
 )
 from skillspector.providers.nv_build import NvBuildProvider
-from skillspector.providers.openai import OpenAIProvider
 from skillspector.structured_response import (
     MAX_RESPONSE_CHARS,
     MAX_RESPONSE_DEPTH,
@@ -76,7 +75,6 @@ _LLM_ENV_VARS = (
     "SKILLSPECTOR_REASONING_EFFORT",
     "SKILLSPECTOR_MODEL",
     "SKILLSPECTOR_PROVIDER",
-    "SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD",
 )
 
 
@@ -281,6 +279,16 @@ class TestChatCompletion:
 
 
 class TestIsLlmAvailable:
+    def test_unbound_gemini_uses_bounded_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "gemini")
+        resolve = MagicMock(return_value=("token", "https://example.invalid"))
+        monkeypatch.setattr(
+            "skillspector.providers.gemini.provider.GeminiProvider.resolve_credentials", resolve
+        )
+
+        assert is_llm_available(timeout=7) == (True, None)
+        resolve.assert_called_once_with(timeout=7)
+
     def test_returns_true_when_credentials_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "k")
         ok, msg = is_llm_available()
@@ -631,7 +639,7 @@ class TestGetChatModelCLIAdapter:
         provider = MagicMock()
         provider.complete.return_value = '{"verdict": "ok"}'
         model = AgentCLIChatModel(provider, "claude-sonnet-4-6", 1024, timeout=30.0)
-        runnable = model.with_structured_output(_Schema)
+        runnable = model.with_structured_output(_Schema, method=method)
 
         model.set_timeout(4.5)
         runnable.invoke("prompt")
@@ -772,7 +780,7 @@ class TestGetChatModel:
 
         llm = get_chat_model()
 
-        assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
+        assert _chat_model_name(llm) == "gpt-6.1-sol"
 
     def test_graph_model_config_matches_openai_fallback_client(
         self, monkeypatch: pytest.MonkeyPatch
@@ -782,8 +790,8 @@ class TestGetChatModel:
         model = build_model_config()["default"]
         llm = get_chat_model(model=model)
 
-        assert model == OpenAIProvider.DEFAULT_MODEL
-        assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
+        assert model == "gpt-6.1-sol"
+        assert _chat_model_name(llm) == "gpt-6.1-sol"
 
     def test_explicit_model_still_overrides_openai_fallback(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1071,6 +1079,8 @@ class TestStructuredOutputMethod:
     def test_chat_openai_with_tool_choice_disabled_asks_for_the_call(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        from skillspector.providers.openai_compatible import OpenAICompatibleProvider
+
         monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
         monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
         llm, requests = _stub_chat_openai(
@@ -1084,11 +1094,7 @@ class TestStructuredOutputMethod:
             ],
         )
         chain = bind_structured_output(
-            llm,
-            Verdict,
-            "spark-x2.5",
-            provider=_PlainProvider(),
-            preferred_method="function_calling",
+            llm, Verdict, "spark-x2.5", provider=OpenAICompatibleProvider()
         )
         with pytest.raises(StructuredOutputParseError, match="Verdict"):
             chain.invoke("analyse this")  # type: ignore[attr-defined]

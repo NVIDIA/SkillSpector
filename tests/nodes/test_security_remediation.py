@@ -737,32 +737,56 @@ def test_reference_resolver_rejects_external_and_parent_escape(tmp_path: Path) -
     assert all(record["target_path"] is None for record in records)
 
 
-def test_root_level_numeric_suffix_known_path_resolves(tmp_path: Path) -> None:
+def test_scoped_npm_package_spec_is_not_a_reference(tmp_path: Path) -> None:
+    source = (
+        "Run `npx --yes @xerg/cli@0.34.0 doctor --json` after approval.\n"
+        "Install @modelcontextprotocol/server-filesystem or npm i @types/node @babel/core@^7.0.0.\n"
+    )
     records = resolve_bundle_references(
         tmp_path,
         source_path="SKILL.md",
-        source_text='See "tool.1" for the manual page.',
-        known_paths=["SKILL.md", "tool.1"],
+        source_text=source,
+        known_paths=["SKILL.md"],
     )
-
-    assert any(
-        record["status"] == "resolved" and record["target_path"] == "tool.1" for record in records
-    )
+    assert all(record["target_path"] is None for record in records)
+    assert not any(record["status"] in {"resolved", "missing", "ambiguous"} for record in records)
 
 
-def test_numeric_suffix_path_with_directory_signal_still_resolves(tmp_path: Path) -> None:
+def test_explicit_known_at_paths_resolve(tmp_path: Path) -> None:
+    source = "See [@scope/tool.py](@scope/tool.py) and [helper](@pkg/helper.sh) for details.\n"
     records = resolve_bundle_references(
         tmp_path,
         source_path="SKILL.md",
-        source_text="See `docs/tool.1` for the manual page.",
-        known_paths=["SKILL.md", "docs/tool.1"],
+        source_text=source,
+        known_paths=["SKILL.md", "@scope/tool.py", "@pkg/helper.sh"],
     )
+    assert len(records) == 2
+    assert [record["target_path"] for record in records] == ["@scope/tool.py", "@pkg/helper.sh"]
+    assert all(record["status"] == "resolved" for record in records)
+    assert all(record["disposition"] == ArtifactDisposition.ANALYZED for record in records)
 
-    assert records
-    assert any(
-        record["status"] == "resolved" and record["target_path"] == "docs/tool.1"
-        for record in records
+
+def test_paths_followed_by_punctuation_still_resolve(tmp_path: Path) -> None:
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "run.sh").write_text("#!/bin/sh", encoding="utf-8")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "guide.md").write_text("guide", encoding="utf-8")
+    source = (
+        "run scripts/run.sh; then stop\n"
+        "open docs/guide.md?v=2 now\n"
+        "cat docs/guide.md> out.txt\n"
+        "<a href=docs/guide.md>\n"
     )
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=source,
+        known_paths=["SKILL.md", "scripts/run.sh", "docs/guide.md"],
+    )
+    resolved = [r for r in records if r["status"] == "resolved"]
+    resolved_targets = {r["target_path"] for r in resolved}
+    assert "scripts/run.sh" in resolved_targets
+    assert "docs/guide.md" in resolved_targets
 
 
 def test_rejected_candidates_do_not_consume_accepted_reference_budget(tmp_path: Path) -> None:
@@ -4171,7 +4195,8 @@ def test_real_binary_structure_is_not_instruction_noise(
         (tmp_path / path).write_bytes(payload)
     started = time.monotonic()
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
-    assert time.monotonic() - started < 10
+    # Smoke bound: instrumented CI runners run 2-4x slower; asserts below are the guard.
+    assert time.monotonic() - started < 30
     assert not {"AE4", "P2", "P9", "MP2", "TM1"} & {
         finding.rule_id for finding in result["findings"]
     }
