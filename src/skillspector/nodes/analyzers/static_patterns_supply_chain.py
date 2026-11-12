@@ -4217,22 +4217,24 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     dependency_packages_seen = 0
     dependency_findings_seen = 0
     osv_budget = OsvQueryBudget.create(dependency_remaining_seconds())
+    # Stop analysis at the first cutoff, but account for every omitted manifest.
+    dependency_cutoff: OsvQueryLimitation | None = None
     for path in components:
         is_dep_file = _is_dependency_manifest(path)
         if not is_dep_file:
             continue
+        if dependency_cutoff is not None:
+            record_limitation(path, dependency_cutoff, f"{ANALYZER_ID}_dependencies")
+            continue
         dependency_files_seen += 1
         if dependency_files_seen > max(0, MAX_DEPENDENCY_FILES_PER_SCAN):
-            record_limitation(
-                path,
-                OsvQueryLimitation(
-                    reason=LedgerReason.OUTPUT_LIMIT,
-                    observed_records=dependency_files_seen,
-                    limit_records=max(0, MAX_DEPENDENCY_FILES_PER_SCAN),
-                ),
-                f"{ANALYZER_ID}_dependencies",
+            dependency_cutoff = OsvQueryLimitation(
+                reason=LedgerReason.OUTPUT_LIMIT,
+                observed_records=dependency_files_seen,
+                limit_records=max(0, MAX_DEPENDENCY_FILES_PER_SCAN),
             )
-            break
+            record_limitation(path, dependency_cutoff, f"{ANALYZER_ID}_dependencies")
+            continue
         remaining_packages = max(
             0,
             MAX_DEPENDENCY_PACKAGES_PER_SCAN - dependency_packages_seen,
@@ -4245,36 +4247,30 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             ),
         )
         if remaining_packages <= 0 or remaining_dependency_findings <= 0:
-            record_limitation(
-                path,
-                OsvQueryLimitation(
-                    reason=LedgerReason.OUTPUT_LIMIT,
-                    observed_records=(
-                        dependency_packages_seen + 1
-                        if remaining_packages <= 0
-                        else dependency_findings_seen + 1
-                    ),
-                    limit_records=(
-                        MAX_DEPENDENCY_PACKAGES_PER_SCAN
-                        if remaining_packages <= 0
-                        else MAX_DEPENDENCY_FINDINGS_PER_SCAN
-                    ),
+            dependency_cutoff = OsvQueryLimitation(
+                reason=LedgerReason.OUTPUT_LIMIT,
+                observed_records=(
+                    dependency_packages_seen + 1
+                    if remaining_packages <= 0
+                    else dependency_findings_seen + 1
                 ),
-                f"{ANALYZER_ID}_dependencies",
+                limit_records=(
+                    MAX_DEPENDENCY_PACKAGES_PER_SCAN
+                    if remaining_packages <= 0
+                    else MAX_DEPENDENCY_FINDINGS_PER_SCAN
+                ),
             )
-            break
+            record_limitation(path, dependency_cutoff, f"{ANALYZER_ID}_dependencies")
+            continue
         shared_remaining = dependency_remaining_seconds()
         if shared_remaining <= 0:
-            record_limitation(
-                path,
-                OsvQueryLimitation(
-                    reason=LedgerReason.RUNTIME_LIMIT,
-                    observed_seconds=max(0.0, time.monotonic() - dependency_started_at),
-                    limit_seconds=dependency_runtime_limit,
-                ),
-                f"{ANALYZER_ID}_dependencies",
+            dependency_cutoff = OsvQueryLimitation(
+                reason=LedgerReason.RUNTIME_LIMIT,
+                observed_seconds=max(0.0, time.monotonic() - dependency_started_at),
+                limit_seconds=dependency_runtime_limit,
             )
-            break
+            record_limitation(path, dependency_cutoff, f"{ANALYZER_ID}_dependencies")
+            continue
         content = file_cache.get(path)
         if content is None:
             continue

@@ -17,11 +17,18 @@
 
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 from markdown_it import MarkdownIt
 
-from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.dependency_sources import DependencySourceScanResult
+from skillspector.inspection_ledger import (
+    LedgerOutcome,
+    LedgerReason,
+    LedgerRecordType,
+    finalize_ledger,
+)
 from skillspector.llm_analyzer_base import Batch
 from skillspector.models import Finding, Severity
 from skillspector.nodes.analyzers import static_patterns_supply_chain as sc
@@ -433,3 +440,219 @@ def test_failed_lookup_advice_does_not_assume_network_failure(monkeypatch, limit
     assert "if the lookup timed out or the network was unavailable" in finding.remediation.lower()
     assert "verify dependency versions" in finding.remediation.lower()
     assert "incomplete" in finding.explanation.lower()
+
+
+@pytest.mark.parametrize("cutoff", ["files", "packages", "findings", "runtime"])
+def test_dependency_cutoff_accounts_for_every_remaining_manifest(monkeypatch, cutoff):
+    manifests = [
+        "first/requirements.txt",
+        "second/requirements.txt",
+        "scripts/requirements.txt",
+    ]
+    components = [manifests[0], "helper.txt", *manifests[1:]]
+    cache = dict.fromkeys(manifests, "examplepkg==1.0.0\n")
+    cache["helper.txt"] = "Documentation mentions requirements.txt.\n"
+    monkeypatch.setattr(sc, "_collect_locked_versions_detailed", lambda *_a, **_k: ({}, []))
+    monkeypatch.setattr(sc, "_collect_npm_locked_versions", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        sc,
+        "analyze_dependency_sources_detailed",
+        lambda *_a, **_k: DependencySourceScanResult([], []),
+    )
+    monkeypatch.setattr(sc, "transitive_remaining_seconds", lambda _state: None)
+    monkeypatch.setattr(sc, "MAX_DEPENDENCY_FILES_PER_SCAN", 1 if cutoff == "files" else 64)
+    monkeypatch.setattr(sc, "MAX_DEPENDENCY_PACKAGES_PER_SCAN", 1 if cutoff == "packages" else 1024)
+    monkeypatch.setattr(sc, "MAX_DEPENDENCY_FINDINGS_PER_SCAN", 1 if cutoff == "findings" else 2048)
+    monkeypatch.setattr(sc, "MAX_DEPENDENCY_ANALYSIS_SECONDS", 0.0 if cutoff == "runtime" else 30.0)
+    raw = sc._sc4_from_fallback(
+        [("examplepkg", "1.0.0", 1)],
+        [("examplepkg", "2.0.0", "Synthetic advisory", 0.8)],
+        manifests[0],
+        ["supply-chain"],
+    )
+    calls = []
+
+    def analyze(_content, path, *_args, **_kwargs):
+        calls.append(path)
+        return raw, [], 1
+
+    monkeypatch.setattr(sc, "_analyze_dependencies_detailed", analyze)
+    state = {
+        "skill_path": "",
+        "components": components,
+        "file_cache": cache,
+        "local_file_cache": cache,
+        "manifest": {},
+        "component_metadata": [],
+        "use_llm": False,
+    }
+    response = sc.node(state)
+    assert calls == ([] if cutoff == "runtime" else manifests[:1])
+    omitted = manifests if cutoff == "runtime" else manifests[1:]
+    events = [
+        event
+        for event in response["inspection_ledger"]
+        if event["record_type"] is LedgerRecordType.SYSTEM
+        and event.get("analyzer_id", "").startswith(f"{sc.ANALYZER_ID}_dependencies_")
+    ]
+    assert [event["path"] for event in events] == omitted
+    expected_reason = (
+        LedgerReason.RUNTIME_LIMIT if cutoff == "runtime" else LedgerReason.OUTPUT_LIMIT
+    )
+    assert all(event["outcome"] is LedgerOutcome.PARTIAL for event in events)
+    assert all(event["reason_code"] is expected_reason for event in events)
+    metrics = [
+        tuple(
+            event.get(key)
+            for key in ("observed_records", "limit_records", "observed_seconds", "limit_seconds")
+        )
+        for event in events
+    ]
+    assert len(set(metrics)) == 1
+    if cutoff == "runtime":
+        assert events[0]["observed_seconds"] >= 0 and events[0]["limit_seconds"] == 0
+    else:
+        assert events[0]["observed_records"] == 2 and events[0]["limit_records"] == 1
+    retained = [finding for finding in response["findings"] if finding.rule_id == "SC4"]
+    if cutoff == "runtime":
+        assert retained == []
+    else:
+        assert len(retained) == 1
+        finding = retained[0]
+        assert finding.severity == "HIGH"
+        assert finding.file == manifests[0] and finding.start_line == 1
+        assert finding.matched_text == raw[0].matched_text
+        assert finding.evidence == raw[0].evidence and finding.tags == raw[0].tags
+        assert finding.confidence == raw[0].confidence
+        base_event = next(
+            event
+            for event in response["inspection_ledger"]
+            if event["path"] == manifests[0] and event["outcome"] is LedgerOutcome.COMPLETED
+        )
+        assert finding.finding_id in base_event["emitted_finding_ids"]
+    completeness, _ = finalize_ledger({**state, **response})
+    assert completeness["status"] == "partial" and completeness["execution_successful"] is True
+    assert completeness["fully_inspected_files"] == len(components) - len(omitted)
+    assert completeness["partially_inspected_files"] == len(omitted)
+    assert completeness["entirely_uninspected_files"] == 0
+    assert {row["path"] for row in completeness["ledger_exceptions"]} == set(omitted)
+    status = response["analyzer_status_events"][0]
+    assert status["status"] == "degraded"
+    assert len(status["planned_work"]) == len(components) + len(omitted)
+
+
+def test_unexhausted_dependency_work_keeps_complete_manifest_accounting(monkeypatch):
+    manifests = [
+        "first/requirements.txt",
+        "second/requirements.txt",
+        "scripts/requirements.txt",
+    ]
+    cache = dict.fromkeys(manifests, "examplepkg==1.0.0\n")
+    monkeypatch.setattr(sc, "_collect_locked_versions_detailed", lambda *_a, **_k: ({}, []))
+    monkeypatch.setattr(sc, "_collect_npm_locked_versions", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        sc,
+        "analyze_dependency_sources_detailed",
+        lambda *_a, **_k: DependencySourceScanResult([], []),
+    )
+    calls = []
+
+    def analyze(_content, path, *_args, **_kwargs):
+        calls.append(path)
+        return [], [], 1
+
+    monkeypatch.setattr(sc, "_analyze_dependencies_detailed", analyze)
+    state = {
+        "skill_path": "",
+        "components": manifests,
+        "file_cache": cache,
+        "local_file_cache": cache,
+        "manifest": {},
+        "component_metadata": [],
+        "use_llm": False,
+    }
+    response = sc.node(state)
+    assert calls == manifests and response["findings"] == []
+    completeness, _ = finalize_ledger({**state, **response})
+    assert completeness["status"] == "complete"
+    assert completeness["fully_inspected_files"] == len(manifests)
+    assert completeness["partially_inspected_files"] == 0
+    assert completeness["ledger_exceptions"] == []
+    assert len(response["analyzer_status_events"][0]["planned_work"]) == len(manifests)
+
+
+def test_dependency_runtime_after_first_manifest_preserves_prefix_and_suffix(monkeypatch):
+    manifests = [
+        "first/requirements.txt",
+        "second/requirements.txt",
+        "scripts/requirements.txt",
+    ]
+    components = [manifests[0], "helper.txt", *manifests[1:]]
+    cache = dict.fromkeys(manifests, "examplepkg==1.0.0\n")
+    cache["helper.txt"] = "Documentation mentions requirements.txt.\n"
+    clock = SimpleNamespace(now=0.0)
+    clock.monotonic = lambda: clock.now
+    monkeypatch.setattr(sc, "time", clock)
+    monkeypatch.setattr(sc, "transitive_remaining_seconds", lambda _state: None)
+    monkeypatch.setattr(sc, "MAX_DEPENDENCY_ANALYSIS_SECONDS", 30.0)
+    monkeypatch.setattr(sc, "_collect_locked_versions_detailed", lambda *_a, **_k: ({}, []))
+    monkeypatch.setattr(sc, "_collect_npm_locked_versions", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        sc,
+        "analyze_dependency_sources_detailed",
+        lambda *_a, **_k: DependencySourceScanResult([], []),
+    )
+    raw = sc._sc4_from_fallback(
+        [("examplepkg", "1.0.0", 1)],
+        [("examplepkg", "2.0.0", "Synthetic advisory", 0.8)],
+        manifests[0],
+        ["supply-chain"],
+    )
+    calls = []
+
+    def analyze(_content, path, *_args, **_kwargs):
+        calls.append(path)
+        clock.now = 31.0
+        return raw, [], 1
+
+    monkeypatch.setattr(sc, "_analyze_dependencies_detailed", analyze)
+    state = {
+        "skill_path": "",
+        "components": components,
+        "file_cache": cache,
+        "local_file_cache": cache,
+        "manifest": {},
+        "component_metadata": [],
+        "use_llm": False,
+    }
+    response = sc.node(state)
+    assert calls == manifests[:1]
+    events = [
+        event
+        for event in response["inspection_ledger"]
+        if event["record_type"] is LedgerRecordType.SYSTEM
+        and event.get("analyzer_id", "").startswith(f"{sc.ANALYZER_ID}_dependencies_")
+    ]
+    assert [event["path"] for event in events] == manifests[1:]
+    assert all(event["outcome"] is LedgerOutcome.PARTIAL for event in events)
+    assert all(event["reason_code"] is LedgerReason.RUNTIME_LIMIT for event in events)
+    assert all(event["observed_seconds"] == 31.0 for event in events)
+    assert all(event["limit_seconds"] == 30.0 for event in events)
+    [finding] = [finding for finding in response["findings"] if finding.rule_id == "SC4"]
+    assert finding.severity == "HIGH" and finding.file == manifests[0]
+    assert finding.start_line == 1 and finding.matched_text == raw[0].matched_text
+    assert finding.evidence == raw[0].evidence and finding.tags == raw[0].tags
+    assert finding.confidence == raw[0].confidence
+    prefix_event = next(
+        event
+        for event in response["inspection_ledger"]
+        if event["path"] == manifests[0] and event["outcome"] is LedgerOutcome.COMPLETED
+    )
+    assert finding.finding_id in prefix_event["emitted_finding_ids"]
+    completeness, _ = finalize_ledger({**state, **response})
+    assert completeness["status"] == "partial" and completeness["execution_successful"] is True
+    assert completeness["fully_inspected_files"] == 2
+    assert completeness["partially_inspected_files"] == 2
+    assert completeness["entirely_uninspected_files"] == 0
+    assert {row["path"] for row in completeness["ledger_exceptions"]} == set(manifests[1:])
+    assert len(response["analyzer_status_events"][0]["planned_work"]) == 6
