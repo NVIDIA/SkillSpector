@@ -1230,10 +1230,18 @@ _TP4_SUBJECT_FIRST_AFFIRMATIVE_PATTERN = re.compile(
 # stays detection-side, which is the safe direction (an emitted TP4 for a
 # pure absence) versus dropping a real affirmative finding. An optional
 # bounded prepositional tail ("in the workflow") is allowed; anything
-# longer or verb-bearing falls through to the verb check.
+# longer or verb-bearing falls through to the verb check. A relative
+# pronoun (that, which, who) in the subject disqualifies the shortcut:
+# three words do not establish a noun-only phrase, and "Uploads files that
+# are missing" opens with a finite verb plus object, so it falls through
+# to the verb check, where the verb before the marker keeps the finding.
+# A relative clause with no affirmative verb ("Files that are missing")
+# still stays suppressed, because the verb check finds no verb before the
+# marker.
 _TP4_NOUN_FIRST_ABSENCE_PATTERN = re.compile(
     r"^(?:the\s+)?"
-    r"[a-z][a-z\-]*(?:\s+[a-z][a-z\-]*){0,2}"
+    r"(?:(?!(?:that|which|who|whom|whose)\b)[a-z][a-z\-]*)"
+    r"(?:\s+(?!(?:that|which|who|whom|whose)\b)[a-z][a-z\-]*){0,2}"
     r"\s+(?:is|are|was|were)\s+"
     r"(?:missing|not\s+implement\w*)"
     r"(?:\s+(?:in|from|for|of|within)\s+(?:the\s+)?[a-z][a-z\-]*(?:\s+[a-z][a-z\-]*){0,2})?"
@@ -1307,7 +1315,10 @@ def _tp4_mismatched_item_is_absence(item: str) -> bool:
     clause, not a list item, so the leading phrase is dropped for it. A
     noun-first absence statement ("Search functionality is missing",
     "Network access is not implemented") is an absence too: its capability
-    word is the subject noun, not an affirmative verb.
+    word is the subject noun, not an affirmative verb. A relative pronoun
+    in that subject ("Uploads files that are missing") disqualifies the
+    shortcut, since the phrase may open with a finite verb and object, so
+    it falls through to the verb check instead.
     """
     normalized = " ".join(item.strip().casefold().split())
     if not normalized:

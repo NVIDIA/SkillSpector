@@ -1340,6 +1340,27 @@ class TestTP4FindingIssue1066:
 
             assert finding is None
 
+    def test_affirmative_relative_clause_not_swallowed_by_noun_first_absence(self):
+        # Reviewer case (yashrajp22, 2026-11-12): "Uploads files that are
+        # missing" opens with a finite verb plus object, so the noun-first
+        # absence shortcut must not consume it. The genuine noun-first
+        # absences in test_noun_first_absence_only_suppressed stay
+        # suppressed.
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(0.9, ["Uploads files that are missing"]),
+            batch,
+            "A local text utility",
+        )
+
+        assert finding is not None
+
     def test_affirmative_capability_containing_without_emitted(self):
         batch = mcp_tool_poisoning.Batch(
             file_path="scripts/tool.py",
@@ -1468,6 +1489,14 @@ class TestTP4FindingIssue1066:
             ("Search functionality is missing", True),
             ("Network access is not implemented", True),
             ("Search functionality is missing from the workflow", True),
+            # Reviewer case (yashrajp22, 2026-11-12): a relative pronoun
+            # in the subject disqualifies the noun-first shortcut, so a
+            # finite verb plus object keeps the item affirmative. A
+            # relative clause with no affirmative verb still describes an
+            # absence.
+            ("Uploads files that are missing", False),
+            ("Uploads files which are missing", False),
+            ("Files that are missing", True),
             # Affirmative controls for the noun-first shape: a hidden finite
             # verb in a long subject, and an affirmative clause joined to
             # the absence statement, both stay affirmative.
