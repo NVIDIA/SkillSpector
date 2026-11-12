@@ -23,6 +23,9 @@ in the active provider — see ``tests/unit/test_providers.py``.
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
+import textwrap
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -84,6 +87,69 @@ def _clean_llm_env(monkeypatch: pytest.MonkeyPatch):
     for var in _LLM_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     yield
+
+
+@pytest.mark.parametrize("kind", ["provider", "controls"])
+def test_model_metadata_cleanup_can_reenter_registration(kind: str) -> None:
+    """Collect an older model during registration without stranding pytest."""
+    script = textwrap.dedent(
+        """
+        import gc
+        import sys
+        import weakref
+
+        from skillspector import inference_usage, llm_utils
+
+        gc.disable()
+
+        class Model:
+            pass
+
+        class CollectingRegistry(dict):
+            armed = False
+
+            def __setitem__(self, key, value):
+                if self.armed:
+                    self.armed = False
+                    gc.collect()
+                super().__setitem__(key, value)
+
+        registry = CollectingRegistry()
+        if sys.argv[1] == "provider":
+            llm_utils._CHAT_MODEL_PROVIDERS = registry
+
+            def register(model):
+                llm_utils.register_chat_model_provider(model, "test-provider")
+        else:
+            inference_usage._CHAT_MODEL_CONTROLS = registry
+
+            def register(model):
+                inference_usage.register_chat_model_controls(
+                    model, {"temperature": 0.25},
+                    requested_controls={"temperature": 0.5},
+                )
+
+        old = Model()
+        old.cycle = old
+        old_id, old_ref = id(old), weakref.ref(old)
+        register(old)
+        del old
+        registry.armed = True
+        current = Model()
+        register(current)
+        assert old_ref() is None
+        assert old_id not in registry
+        if sys.argv[1] == "provider":
+            assert llm_utils.chat_model_provider_name(current) == "test-provider"
+        else:
+            assert inference_usage.chat_model_controls(current) == {"temperature": 0.25}
+            assert inference_usage.chat_model_requested_controls(current) == {"temperature": 0.5}
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, kind], capture_output=True, text=True, timeout=20
+    )
+    assert result.returncode == 0, result.stderr
 
 
 class TestCredentialResolution:

@@ -108,8 +108,9 @@ class TestPerSlotModelOverrides:
 
         config = _reload_constants().build_model_config()
 
-        assert config["default"] == "gpt-5.4"
-        assert config["meta_analyzer"] == "gpt-5.4"
+        provider = OpenAIProvider()
+        assert config["default"] == provider.resolve_model()
+        assert config["meta_analyzer"] == provider.resolve_model("meta_analyzer")
 
     def test_slot_override_wins_over_openai_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-only")
@@ -140,8 +141,8 @@ class TestPerSlotModelOverrides:
         meta_default = AnthropicProvider.SLOT_DEFAULTS["meta_analyzer"]
 
         config = constants.build_model_config()
-        assert config["default"] == "claude-opus-4-6"
-        assert config["meta_analyzer"] == "claude-sonnet-4-6"
+        assert config["default"] == AnthropicProvider.DEFAULT_MODEL
+        assert config["meta_analyzer"] == meta_default
 
         # SKILLSPECTOR_MODEL replaces the slot default as well...
         monkeypatch.setenv("SKILLSPECTOR_MODEL", "claude-opus-5-5")

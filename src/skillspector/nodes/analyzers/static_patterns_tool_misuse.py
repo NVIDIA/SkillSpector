@@ -6545,6 +6545,7 @@ class _PythonSourceOwnership:
         self._check_runtime = check_runtime
         self._spans: PythonLiteralSpans | None = None
         self._spans_computed = False
+        self._string_value_bounds_allowed: bool | None = None
         self._cached_word_start = -1
         self._cached_word_end = -1
 
@@ -6612,18 +6613,21 @@ class _PythonSourceOwnership:
             return None
         if source_range is not None:
             source_range[:] = owner
-        if self._constant_fields is None:
-            # Additional constant substitution requires the released execution
-            # and import guards. Refusing that proof preserves lexical handling
-            # and unknown-field uncertainty from the existing parser.
-            constant_fields: tuple[tuple[int, int, str], ...] = ()
-            if python_string_value_bounds_allowed(content, self._check_runtime) and (
+        # A literal may flow to a later shell call after concatenation or
+        # transformation. Its lexical boundary alone cannot prove that the
+        # original whole-source operand evidence is irrelevant.
+        if self._string_value_bounds_allowed is None:
+            self._string_value_bounds_allowed = python_string_value_bounds_allowed(
+                content, self._check_runtime
+            ) and (
                 self._python_import_check is None or self._python_import_check(self._check_runtime)
-            ):
-                constant_fields = python_constant_string_fields(
-                    content, self._check_runtime, stdlib_check=self._python_stdlib_check
-                )
-            self._constant_fields = constant_fields
+            )
+        if not self._string_value_bounds_allowed:
+            return None
+        if self._constant_fields is None:
+            self._constant_fields = python_constant_string_fields(
+                content, self._check_runtime, stdlib_check=self._python_stdlib_check
+            )
         body_start, body_end = _python_string_body(content, *owner)
         if start >= body_end:
             return "", 0, 0

@@ -70,7 +70,8 @@ _CHAT_MODEL_CONTROLS: dict[
         dict[str, float | int | str | None],
     ],
 ] = {}
-_CHAT_MODEL_CONTROLS_LOCK = threading.Lock()
+# Cyclic GC may synchronously reenter this registry through weakref cleanup.
+_CHAT_MODEL_CONTROLS_LOCK = threading.RLock()
 
 
 def _is_compact_credential(value: str) -> bool:

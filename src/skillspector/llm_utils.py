@@ -90,7 +90,8 @@ from skillspector.structured_response import (
 )
 
 _CHAT_MODEL_PROVIDERS: dict[int, tuple[weakref.ReferenceType[object], str]] = {}
-_CHAT_MODEL_PROVIDERS_LOCK = threading.Lock()
+# Cyclic GC may synchronously reenter this registry through weakref cleanup.
+_CHAT_MODEL_PROVIDERS_LOCK = threading.RLock()
 
 
 def register_chat_model_provider(chat_model: object, provider: object) -> None:
