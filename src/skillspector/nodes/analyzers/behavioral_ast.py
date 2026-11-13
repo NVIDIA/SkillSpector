@@ -372,9 +372,38 @@ def _is_true_constant(node: ast.expr) -> bool:
     return isinstance(node, ast.Constant) and node.value is True
 
 
-# ``subprocess.Popen`` takes ``shell`` as its ninth positional argument
-# (args, bufsize, executable, stdin, stdout, stderr, preexec_fn, close_fds, shell, ...).
+# ``Popen`` takes ``executable`` and ``shell`` as positional arguments. The
+# forwarding helpers (``run``/``call``/``check_call``/``check_output``) pass
+# their positional arguments through to ``Popen`` as well.
+_POPEN_EXECUTABLE_ARG_INDEX = 2
 _POPEN_SHELL_ARG_INDEX = 8
+_SUBPROCESS_POPEN_FORWARDERS = frozenset({"Popen", "run", "call", "check_call", "check_output"})
+
+
+@dataclass(frozen=True)
+class _ExecutableTarget:
+    """The effective executable name, and whether it could be resolved statically."""
+
+    name: str | None
+    known: bool
+
+
+def _positional_popen_argument(node: ast.Call, index: int) -> tuple[bool, ast.expr | None]:
+    """Return ``(known, value)`` for a positional ``Popen`` argument.
+
+    A starred argument at or before the requested slot can shift or populate it,
+    so the slot is no longer statically knowable.
+    """
+    position = 0
+    for argument in node.args:
+        if isinstance(argument, ast.Starred):
+            if position <= index:
+                return False, None
+            break
+        if position == index:
+            return True, argument
+        position += 1
+    return True, None
 
 
 def _subprocess_shell_mode(node: ast.Call, attr: str) -> bool | None:
@@ -389,14 +418,11 @@ def _subprocess_shell_mode(node: ast.Call, attr: str) -> bool | None:
         if isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, bool):
             return keyword.value.value
         return None
-    if attr == "Popen":
-        # Only ``Popen`` accepts ``shell`` positionally; the other helpers pass
-        # their arguments through as keywords. Starred unpacking makes the slot
-        # index unknowable, so treat that as caller-controlled input.
-        if any(isinstance(argument, ast.Starred) for argument in node.args):
+    if attr in _SUBPROCESS_POPEN_FORWARDERS:
+        known, positional = _positional_popen_argument(node, _POPEN_SHELL_ARG_INDEX)
+        if not known:
             return None
-        if len(node.args) > _POPEN_SHELL_ARG_INDEX:
-            positional = node.args[_POPEN_SHELL_ARG_INDEX]
+        if positional is not None:
             if isinstance(positional, ast.Constant) and isinstance(positional.value, bool):
                 return positional.value
             return None
@@ -408,11 +434,8 @@ _CMD_INTERPRETERS = frozenset({"cmd", "cmd.exe"})
 _POWERSHELL_INTERPRETERS = frozenset({"powershell", "powershell.exe", "pwsh", "pwsh.exe"})
 
 
-def _literal_shell_interpreter(node: ast.expr | None) -> bool:
-    """Return whether literal argv[0] names a known shell interpreter."""
-    if not isinstance(node, (ast.List, ast.Tuple)) or not node.elts:
-        return False
-    executable = _constant_string(node.elts[0])
+def _is_shell_interpreter_name(executable: str | None) -> bool:
+    """Return whether *executable* names a known shell interpreter."""
     if executable is None:
         return False
     basename = executable.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
@@ -423,11 +446,14 @@ def _literal_shell_interpreter(node: ast.expr | None) -> bool:
     )
 
 
-def _literal_inline_shell_command(node: ast.expr | None) -> tuple[bool, ast.expr | None]:
+def _literal_inline_shell_command(
+    node: ast.expr | None, executable: str | None = None
+) -> tuple[bool, ast.expr | None]:
     """Return the command argument when literal argv explicitly invokes a shell."""
     if not isinstance(node, (ast.List, ast.Tuple)) or len(node.elts) < 2:
         return False, None
-    executable = _constant_string(node.elts[0])
+    if executable is None:
+        executable = _constant_string(node.elts[0])
     if executable is None:
         return False, None
 
@@ -452,12 +478,37 @@ def _literal_inline_shell_command(node: ast.expr | None) -> tuple[bool, ast.expr
     return False, None
 
 
-def _has_dynamic_executable(node: ast.Call) -> bool:
-    """Return whether ``executable=`` is present but not a literal string."""
-    return any(
-        keyword.arg == "executable" and _constant_string(keyword.value) is None
-        for keyword in node.keywords
+def _effective_executable(node: ast.Call, attr: str, command: ast.expr | None) -> _ExecutableTarget:
+    """Resolve the executable that subprocess will actually launch.
+
+    ``executable=`` replaces argv[0] as the program, and ``Popen`` accepts the
+    same value as its third positional argument. The forwarding helpers pass
+    that positional argument through unchanged. An override that is dynamic or
+    hidden by ``*args`` makes the effective program unknown.
+    """
+    keyword_executable = next(
+        (keyword.value for keyword in reversed(node.keywords) if keyword.arg == "executable"),
+        None,
     )
+    if keyword_executable is not None and not (
+        isinstance(keyword_executable, ast.Constant) and keyword_executable.value is None
+    ):
+        literal = _constant_string(keyword_executable)
+        return _ExecutableTarget(name=literal, known=literal is not None)
+
+    if attr in _SUBPROCESS_POPEN_FORWARDERS:
+        known, positional = _positional_popen_argument(node, _POPEN_EXECUTABLE_ARG_INDEX)
+        if not known:
+            return _ExecutableTarget(name=None, known=False)
+        if positional is not None and not (
+            isinstance(positional, ast.Constant) and positional.value is None
+        ):
+            literal = _constant_string(positional)
+            return _ExecutableTarget(name=literal, known=literal is not None)
+
+    if isinstance(command, (ast.List, ast.Tuple)) and command.elts:
+        return _ExecutableTarget(name=_constant_string(command.elts[0]), known=True)
+    return _ExecutableTarget(name=None, known=True)
 
 
 def _subprocess_command_arg(node: ast.Call) -> ast.expr | None:
@@ -494,21 +545,24 @@ def _ast4_guidance(node: ast.Call, attr: str) -> tuple[str, str]:
     """Return contextual AST4 guidance without changing detection or scoring."""
     command = _subprocess_command_arg(node)
     shell_mode = _subprocess_shell_mode(node, attr)
-    inline_shell, inline_command = _literal_inline_shell_command(command)
 
     if shell_mode is True:
         if _is_constructed_shell_command(command):
             return _AST4_SHELL_BUILD_EXPLANATION, _AST4_SHELL_BUILD_REMEDIATION
         return _AST4_SHELL_STRING_EXPLANATION, _AST4_SHELL_STRING_REMEDIATION
+    if shell_mode is None:
+        return _AST4_UNKNOWN_SHELL_EXPLANATION, _AST4_UNKNOWN_SHELL_REMEDIATION
+
+    executable = _effective_executable(node, attr, command)
+    if not executable.known:
+        return _AST4_UNKNOWN_EXPLANATION, _AST4_UNKNOWN_REMEDIATION
+
+    inline_shell, inline_command = _literal_inline_shell_command(command, executable.name)
     if inline_shell:
         if _is_constructed_shell_command(inline_command):
             return _AST4_SHELL_BUILD_EXPLANATION, _AST4_SHELL_BUILD_REMEDIATION
         return _AST4_SHELL_STRING_EXPLANATION, _AST4_SHELL_STRING_REMEDIATION
-    if shell_mode is None:
-        return _AST4_UNKNOWN_SHELL_EXPLANATION, _AST4_UNKNOWN_SHELL_REMEDIATION
-    if _has_dynamic_executable(node):
-        return _AST4_UNKNOWN_EXPLANATION, _AST4_UNKNOWN_REMEDIATION
-    if _literal_shell_interpreter(command):
+    if _is_shell_interpreter_name(executable.name):
         return _AST4_SHELL_STRING_EXPLANATION, _AST4_SHELL_STRING_REMEDIATION
     if _is_fixed_argv(command):
         return _AST4_FIXED_ARGV_EXPLANATION, _AST4_FIXED_ARGV_REMEDIATION

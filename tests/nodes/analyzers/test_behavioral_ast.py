@@ -270,6 +270,66 @@ class TestSubprocessGuidance:
         assert "fixed argument vector" not in explanation.lower()
         assert "resolve the executable" in remediation
 
+    @pytest.mark.parametrize("attr", ["Popen", "run", "call", "check_call", "check_output"])
+    def test_literal_shell_executable_override_uses_shell_guidance(self, attr):
+        """`executable=` replaces argv[0], so a shell override really runs a shell."""
+        code = (
+            "import subprocess\n"
+            f"subprocess.{attr}(['placeholder', '-c', 'echo $HOME'], "
+            "executable='/bin/bash', shell=False)\n"
+        )
+        finding = next(f for f in _run(code) if f.rule_id == "AST4")
+
+        explanation = (finding.explanation or "").lower()
+        remediation = (finding.remediation or "").lower()
+
+        assert "shell command string" in explanation
+        assert "shell expansion enabled" in explanation
+        assert "fixed argument vector" not in explanation
+        assert "keep the explicit argument vector" not in remediation
+
+    def test_literal_shell_executable_override_keeps_constructed_inline_guidance(self):
+        code = (
+            "import subprocess\n"
+            "host = 'example.com'\n"
+            "subprocess.run(['placeholder', '-c', f'ping {host}'], "
+            "executable='/bin/bash', shell=False)\n"
+        )
+        finding = next(f for f in _run(code) if f.rule_id == "AST4")
+
+        explanation = (finding.explanation or "").lower()
+
+        assert "concatenated input" in explanation
+        assert "fixed argument vector" not in explanation
+
+    def test_literal_ordinary_executable_override_keeps_fixed_argv_guidance(self):
+        code = (
+            "import subprocess\n"
+            "subprocess.run(['bash', '-c', 'echo $HOME'], "
+            "executable='/usr/bin/python3', shell=False)\n"
+        )
+        finding = next(f for f in _run(code) if f.rule_id == "AST4")
+
+        explanation = (finding.explanation or "").lower()
+
+        assert "fixed argument vector" in explanation
+        assert "shell expansion is disabled" in explanation
+        assert "shell command string" not in explanation
+
+    def test_popen_positional_shell_executable_uses_shell_guidance(self):
+        """`Popen` accepts `executable` as its third positional argument."""
+        code = (
+            "import subprocess\n"
+            "subprocess.Popen(['placeholder', '-c', 'echo $HOME'], "
+            "-1, '/bin/bash', None, None, None, None, True, False)\n"
+        )
+        finding = next(f for f in _run(code) if f.rule_id == "AST4")
+
+        explanation = (finding.explanation or "").lower()
+
+        assert "shell command string" in explanation
+        assert "fixed argument vector" not in explanation
+
     def test_non_literal_shell_keyword_uses_unknown_shell_guidance(self):
         code = (
             "import subprocess\n"
@@ -380,24 +440,42 @@ class TestSubprocessGuidance:
         assert "unknown caller input" not in explanation.lower()
 
     @pytest.mark.parametrize(
-        ("command", "shell_argument", "expected"),
+        ("attr", "command", "shell_argument", "expected"),
         [
-            pytest.param("['echo', '$HOME']", "True", "shell expansion enabled", id="literal-true"),
-            pytest.param("['ls', '-la']", "False", "fixed argument vector", id="literal-false"),
             pytest.param(
+                attr,
+                "['echo', '$HOME']",
+                "True",
+                "shell expansion enabled",
+                id=f"{attr}-literal-true",
+            )
+            for attr in ["Popen", "run", "call", "check_call", "check_output"]
+        ]
+        + [
+            pytest.param(
+                attr, "['ls', '-la']", "False", "fixed argument vector", id=f"{attr}-literal-false"
+            )
+            for attr in ["Popen", "run", "call", "check_call", "check_output"]
+        ]
+        + [
+            pytest.param(
+                attr,
                 "['ls']",
                 "sys.argv[1]",
                 "effective shell mode is not statically known",
-                id="dynamic",
-            ),
+                id=f"{attr}-dynamic",
+            )
+            for attr in ["Popen", "run", "call", "check_call", "check_output"]
         ],
     )
-    def test_popen_positional_shell_argument(self, command, shell_argument, expected):
-        """`Popen` takes `shell` as its ninth positional argument, not only as a keyword."""
+    def test_forwarding_api_positional_shell_argument(
+        self, attr, command, shell_argument, expected
+    ):
+        """All forwarding helpers pass positional arguments to `Popen` unchanged."""
         code = (
             "import subprocess\n"
             "import sys\n"
-            "subprocess.Popen("
+            f"subprocess.{attr}("
             f"{command}, -1, None, None, None, None, None, True, {shell_argument})\n"
         )
         finding = next(f for f in _run(code) if f.rule_id == "AST4")
@@ -410,9 +488,10 @@ class TestSubprocessGuidance:
         else:
             assert "shell expansion is disabled" not in explanation
 
-    def test_popen_starred_arguments_are_treated_as_unknown(self):
-        """`Popen(*args)` hides which positional slot `shell` lands in."""
-        code = "import subprocess\nargs = build_args()\nsubprocess.Popen(*args)\n"
+    @pytest.mark.parametrize("attr", ["Popen", "run", "call", "check_call", "check_output"])
+    def test_forwarding_api_starred_arguments_are_treated_as_unknown(self, attr):
+        """`subprocess.<helper>(*args)` hides which positional slot `shell` lands in."""
+        code = f"import subprocess\nargs = build_args()\nsubprocess.{attr}(*args)\n"
         finding = next(f for f in _run(code) if f.rule_id == "AST4")
 
         explanation = (finding.explanation or "").lower()
