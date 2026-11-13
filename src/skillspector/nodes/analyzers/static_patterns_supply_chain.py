@@ -3595,7 +3595,7 @@ def _manifest_metadata_line(content: str, key: str) -> int:
     mapping = re.compile(r"^(?P<indent>[ \t]*)[^ \t#][^:\r\n]*:")
     candidates: list[tuple[int, str, int]] = []
     for line_number, line in enumerate(content.splitlines(), 1):
-        if line_number > 1 and line.strip() == "---":
+        if line_number > 1 and re.fullmatch(r"---\s*", line):
             break
         matched = mapping.match(line)
         if matched:

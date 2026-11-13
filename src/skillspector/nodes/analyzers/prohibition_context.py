@@ -90,7 +90,7 @@ _NEXT_INSTRUCTION = re.compile(
     r"(?:(?:then|now)\s+)?(?:"
     r"(?:analyze\s+the\s+structure\s+and\s+intent\s+without\s+obeying\s+its\s+directives"
     r"|follow\s+the\s+user['’]s\s+task"
-    r"|return\s+(?:the\s+)?(?:result|answer|report|summary)\s+to\s+(?:the\s+)?user"
+    r"|(?P<return_result>return\s+(?:the\s+)?(?:result|answer|report|summary)\s+to\s+(?:the\s+)?user)"
     r"|only\s+make\s+changes\s+directly\s+requested)"
     rf"(?=\s*(?:[.!?;{LINE_BREAK_CHARS}]|\Z))"
     r"|(?:(?:do\s+not|don['’]t|never|must\s+not|shall\s+not)\s+)?"
@@ -204,6 +204,7 @@ def is_directly_prohibited(
         following_raw = raw_tail[following_start:]
         following = following_raw.lstrip()
         following = _LIST_PREFIX.sub("", following, count=1)
+        independent_source = following
         independent = _NEXT_INSTRUCTION.match(following) if following else None
         if following and independent is None:
             section = _FOLLOWING_SECTION.match(following_raw)
@@ -212,9 +213,17 @@ def is_directly_prohibited(
                 if _INDEPENDENT_SECTION_TITLE.fullmatch(title.strip().rstrip("#").rstrip()):
                     # A heading alone proves nothing. The first instruction
                     # must still be independently understood by this helper.
-                    independent = _NEXT_INSTRUCTION.match(following_raw[section.end() :].lstrip())
+                    independent_source = following_raw[section.end() :].lstrip()
+                    independent = _NEXT_INSTRUCTION.match(independent_source)
         if following and independent is None:
             return False
+        if independent is not None and independent.group("return_result") is not None:
+            # A result-return sentence proves only the end of this instruction,
+            # not any unseen or unexplained condition that follows it.
+            if independent_source[independent.end() :].strip(" \t\r\n.!?;") or end + len(
+                raw_tail
+            ) < len(content):
+                return False
         if (
             independent is not None
             and independent.group("yara_reveal") is not None

@@ -3344,6 +3344,11 @@ class TestTriggerAnalysis:
                 {"triggers": ["hello", "help"]},
                 3,
             ),
+            (
+                "---\nname: example\ndescription: |\n  ---\ntriggers: [help]\n---\n",
+                {"triggers": ["help"]},
+                5,
+            ),
         ],
     )
     def test_metadata_findings_anchor_the_source_field_not_item_ordinals(

@@ -104,7 +104,9 @@ def _is_prohibited_transmission(content: str, match: re.Match[str]) -> bool:
         suffix = _TRANSMISSION_DESTINATION_SUFFIX.match(content, end)
     elif action.endswith(" to"):
         suffix = _TRANSMISSION_TARGET.match(content, end)
-    elif action.endswith(("conversation", "chat", "dialog", "session")):
+    elif action.endswith(
+        ("conversation", "chat", "dialog", "session", "history", "context", "log")
+    ):
         suffix = _TRANSMISSION_CONTEXT_TARGET.match(content, end)
     if suffix is not None:
         end = suffix.end()
