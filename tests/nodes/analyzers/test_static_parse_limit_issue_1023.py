@@ -87,6 +87,12 @@ def test_type6_html_block_after_open_inline_span_stays_literal() -> None:
     assert projected == content
 
 
+def test_html_block_in_new_list_item_after_open_inline_span_stays_literal() -> None:
+    content = "Intro `open\n- <custom>\n  `rm -rf /`\n"
+    projected = tm._markdown_shell_text(content, lambda: None)
+    assert projected == content
+
+
 def test_wrapped_span_scan_is_complete_and_safe(tmp_path: Path) -> None:
     (tmp_path / "SKILL.md").write_text(_SKILL, encoding="utf-8")
     references = tmp_path / "references"

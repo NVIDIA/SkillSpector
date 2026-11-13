@@ -9069,11 +9069,14 @@ def _markdown_shell_text(
             html_open
             and paragraph_open
             and runs
+            and not has_list_marker
             and not _markdown_html_block_interrupts_paragraph(leading)
         ):
             # A pending inline-code run proves the paragraph continues across
             # the soft break. Inline HTML cannot start a block inside that
-            # body; raw-text and block-level starts still interrupt.
+            # body; raw-text and block-level starts still interrupt. A new
+            # list item ends the paragraph first, so its content starts a
+            # fresh block where inline HTML may open an HTML block.
             html_open = None
         lazy_list_paragraph = (
             paragraph_open
