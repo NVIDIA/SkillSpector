@@ -33,7 +33,15 @@ Do not rely on the numeric score alone. A low score can miss semantic risk, and 
 
 1. Resolve the target.
 
-   Accept a local skill directory, downloaded archive, or repository URL. If the user provides a URL, clone or download it into a temporary directory before review. Do not run installer scripts from the target.
+   Accept a local skill directory, downloaded archive, or repository URL. Review the exact artefact that will be installed, not the default branch of the whole repository: a verdict is only valid for the artefact it examined.
+
+   Name the install channel (git tag or commit, publish branch, package registry tarball, or release binary) and fetch from that channel at the exact version the install pins, for example `git clone --branch <tag> <url>` or `npm pack <pkg>@<version>`, never a default-branch clone. If the user gives only a repository URL with no pinned version, ask which tag, commit, or release will be installed before reviewing. Record the resolved version or commit in the report's Source line, and make every line reference in the report point at that artefact.
+
+   When the target writes skill or instruction files at run time, locate the generator and review the rendered text, above all its trigger `description`: a file-based scan never sees text that only exists after the first run.
+
+   When installed hooks or scripts execute code outside the installed path (a globally installed CLI, a self-updater), list that code and either review it or state plainly that the verdict does not cover it.
+
+   Do not run installer scripts from the target.
 
 2. Run the static scan.
 
@@ -42,6 +50,8 @@ Do not rely on the numeric score alone. A low score can miss semantic risk, and 
    ```
 
    If the command exits non-zero, inspect any partial report and continue manually. Record that the static line was incomplete.
+
+   When only a subset of the resolved artefact will be installed, scan that subset as its own target (`$TARGET` is the subset directory) and grep its bodies for directives to run project-local files (`./*.sh`, "NEVER SKIP", "always run"): a whole-repo pass can miss an instruction that only the installed subset carries.
 
 3. Read the SkillSpector report.
 
@@ -128,7 +138,7 @@ Recommended report shape:
 ```text
 ## 🛡️ Skill Inspector: `{skill-name}`
 
-**Source:** {path-or-url}
+**Source:** {path-or-url} · {resolved version or commit}
 **Verdict:** {APPROVE | CAUTION | REJECT} {short meaning}
 **Risk:** {score}/100 · {severity} · {SkillSpector recommendation}
 **Install posture:** {one sentence about suitable and unsuitable use}
