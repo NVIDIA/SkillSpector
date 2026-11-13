@@ -44,6 +44,7 @@ from .common import (
     resolve_dotted_name,
 )
 from .pattern_defaults import PatternCategory
+from .prohibition_context import is_directly_prohibited
 from .static_patterns_supply_chain import (
     _sc2_has_unproved_compound_context,
     _sc2_logical_command,
@@ -77,6 +78,41 @@ E1_PROSE_PATTERNS = [
     ),
 ]
 E1_PATTERNS = E1_CODE_PATTERNS + E1_PROSE_PATTERNS
+_TRANSMISSION_DESTINATION_SUFFIX = re.compile(
+    r"[ \t]+(?:services?|servers?|systems?|endpoints?|destinations?)\b", re.IGNORECASE
+)
+_TRANSMISSION_URL_SUFFIX = re.compile(r"[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]{1,512}")
+_TRANSMISSION_TARGET = re.compile(
+    r"[ \t]+(?:https?://[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]{1,512}"
+    r"|(?:external|remote)(?:[ \t]+(?:services?|servers?|systems?|endpoints?|destinations?))?)",
+    re.IGNORECASE,
+)
+_TRANSMISSION_CONTEXT_TARGET = re.compile(
+    r"[ \t]+(?:data[ \t]+)?to" + _TRANSMISSION_TARGET.pattern, re.IGNORECASE
+)
+
+
+def _is_prohibited_transmission(content: str, match: re.Match[str]) -> bool:
+    """Check the complete prohibited action without changing finding evidence."""
+    action = match.group().rstrip()
+    end = match.start() + len(action)
+    action = action.lower()
+    suffix = None
+    if action.endswith(("http://", "https://")):
+        suffix = _TRANSMISSION_URL_SUFFIX.match(content, end)
+    elif action.endswith(("external", "remote")):
+        suffix = _TRANSMISSION_DESTINATION_SUFFIX.match(content, end)
+    elif action.endswith(" to"):
+        suffix = _TRANSMISSION_TARGET.match(content, end)
+    elif action.endswith(("conversation", "chat", "dialog", "session")):
+        suffix = _TRANSMISSION_CONTEXT_TARGET.match(content, end)
+    if suffix is not None:
+        end = suffix.end()
+        while end > match.end() and content[end - 1] in ".,;!?)]}":
+            end -= 1
+    return is_directly_prohibited(content, match.start(), end)
+
+
 _E1_FETCH_COMMAND = re.compile(r"(?:curl|wget)(?=\s)", re.IGNORECASE)
 _E1_UNPROVED_SHELL_SPACE = re.compile(r"(?!\r\n)[^\S \t\n]")
 _E1_UNPROVED_SHELL_SYNTAX = re.compile(r"(?<!\S)--%(?=\s|$)|[{}]|<#")
@@ -1336,6 +1372,10 @@ def analyze(
                 pattern, content, re.IGNORECASE | re.MULTILINE
             )
         for match in e1_matches:
+            if (pattern, confidence) in E1_PROSE_PATTERNS and _is_prohibited_transmission(
+                content, match
+            ):
+                continue
             line_num = get_line_number(content, match.start())
             adj = (
                 min(1.0, confidence + 0.1)
@@ -1410,6 +1450,8 @@ def analyze(
         for match in static_runner.iter_paragraph_matches(
             pattern, content, re.IGNORECASE | re.MULTILINE
         ):
+            if _is_prohibited_transmission(content, match):
+                continue
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
