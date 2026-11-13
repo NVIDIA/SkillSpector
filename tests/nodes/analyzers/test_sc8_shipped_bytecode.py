@@ -45,10 +45,24 @@ def test_sc8_flags_pycache_and_pyc(tmp_path: Path) -> None:
     rule_ids = {f.rule_id for f in findings}
     assert rule_ids == {"SC8"}
     paths = {f.file for f in findings}
-    assert "scripts/__pycache__/" in paths
+    assert "scripts/__pycache__/" not in paths
     assert "scripts/__pycache__/evil.cpython-312.pyc" in paths
     assert "orphan.pyc" in paths
     assert all(f.severity == "HIGH" for f in findings)
+    assert all((tmp_path / f.file).is_file() for f in findings)
+    cached = next(f for f in findings if f.file.startswith("scripts/__pycache__/"))
+    assert cached.evidence["bytecode_directory"] == "scripts/__pycache__"
+
+
+@pytest.mark.parametrize("contents", [None, b"This directory contains no bytecode.\n"])
+def test_sc8_cache_directory_without_bytecode_is_not_executable_evidence(
+    tmp_path: Path, contents: bytes | None
+) -> None:
+    cache = tmp_path / "scripts" / "__pycache__"
+    cache.mkdir(parents=True)
+    if contents is not None:
+        (cache / "README.txt").write_bytes(contents)
+    assert supply_chain._analyze_shipped_bytecode(str(tmp_path)) == []
 
 
 def test_sc8_flags_bytecode_inside_a_shipped_virtual_environment(tmp_path: Path) -> None:

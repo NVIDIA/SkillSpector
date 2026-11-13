@@ -52,6 +52,7 @@ from urllib.parse import urlparse
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import InvalidVersion, Version
 
+from skillspector.artifacts import decode_text
 from skillspector.dependency_sources import (
     DependencySourceLimitation,
     analyze_dependency_sources_detailed,
@@ -3547,10 +3548,23 @@ def _analyze_dependencies_detailed(
 # ---------------------------------------------------------------------------
 
 
+def _manifest_metadata_line(content: str, key: str) -> int:
+    """Anchor parsed metadata to its source field, including folded YAML values."""
+    field = re.compile(rf"^[ \t]*(?P<quote>['\"]?){re.escape(key)}(?P=quote)[ \t]*:")
+    for line_number, line in enumerate(content.splitlines(), 1):
+        if line_number > 1 and line.strip() == "---":
+            break
+        if field.match(line):
+            return line_number
+    return 1
+
+
 def _analyze_triggers(
     manifest: dict[str, object],
     skill_path: str,
     *,
+    manifest_path: str = "SKILL.md",
+    manifest_source: str = "",
     on_description_truncated: Callable[[int, int], None] | None = None,
 ) -> list[Finding]:
     """Analyze trigger-like manifest content for abuse patterns.
@@ -3591,9 +3605,11 @@ def _analyze_triggers(
 
     findings: list[Finding] = []
     tag = [PatternCategory.TRIGGER_ABUSE.value]
-    file_ref = "SKILL.md"
+    file_ref = manifest_path
+    trigger_line = _manifest_metadata_line(manifest_source, "triggers")
+    description_line = _manifest_metadata_line(manifest_source, "description")
 
-    for i, trigger in enumerate(triggers, 1):
+    for trigger in triggers:
         trigger_lower = trigger.lower().strip()
         words = trigger_lower.split()
 
@@ -3606,7 +3622,7 @@ def _analyze_triggers(
                     severity="LOW",
                     confidence=0.75,
                     file=file_ref,
-                    start_line=i,
+                    start_line=trigger_line,
                     tags=tag,
                     matched_text=trigger,
                     category=PatternCategory.TRIGGER_ABUSE.value,
@@ -3621,7 +3637,7 @@ def _analyze_triggers(
                     severity="LOW",
                     confidence=0.7,
                     file=file_ref,
-                    start_line=i,
+                    start_line=trigger_line,
                     tags=tag,
                     matched_text=trigger,
                     category=PatternCategory.TRIGGER_ABUSE.value,
@@ -3640,7 +3656,7 @@ def _analyze_triggers(
                     severity="MEDIUM",
                     confidence=0.7,
                     file=file_ref,
-                    start_line=i,
+                    start_line=trigger_line,
                     tags=tag,
                     matched_text=trigger,
                     category=PatternCategory.TRIGGER_ABUSE.value,
@@ -3663,7 +3679,7 @@ def _analyze_triggers(
                         severity="MEDIUM",
                         confidence=0.8,
                         file=file_ref,
-                        start_line=i,
+                        start_line=trigger_line,
                         tags=tag,
                         matched_text=trigger,
                         category=PatternCategory.TRIGGER_ABUSE.value,
@@ -3672,7 +3688,7 @@ def _analyze_triggers(
                 )
                 break
 
-    for i, clause in enumerate(description_clauses, 1):
+    for clause in description_clauses:
         clause_lower = clause.lower().strip()
 
         # TR1 (description-calibrated): extract the trigger phrase the skill
@@ -3701,7 +3717,7 @@ def _analyze_triggers(
                         severity="LOW",
                         confidence=0.75,
                         file=file_ref,
-                        start_line=i,
+                        start_line=description_line,
                         tags=tag,
                         matched_text=clause,
                         category=PatternCategory.TRIGGER_ABUSE.value,
@@ -3720,7 +3736,7 @@ def _analyze_triggers(
                         severity="LOW",
                         confidence=0.7,
                         file=file_ref,
-                        start_line=i,
+                        start_line=description_line,
                         tags=tag,
                         matched_text=clause,
                         category=PatternCategory.TRIGGER_ABUSE.value,
@@ -3749,7 +3765,7 @@ def _analyze_triggers(
                     severity="MEDIUM",
                     confidence=0.7,
                     file=file_ref,
-                    start_line=i,
+                    start_line=description_line,
                     tags=tag,
                     matched_text=clause,
                     category=PatternCategory.TRIGGER_ABUSE.value,
@@ -3780,7 +3796,7 @@ def _analyze_triggers(
                     severity="MEDIUM",
                     confidence=0.8,
                     file=file_ref,
-                    start_line=i,
+                    start_line=description_line,
                     tags=tag,
                     matched_text=clause,
                     category=PatternCategory.TRIGGER_ABUSE.value,
@@ -3901,7 +3917,7 @@ def _scan_shipped_bytecode(
         )
         return True
 
-    def add_finding(relative_path: str, *, directory: bool) -> bool:
+    def add_finding(relative_path: str) -> bool:
         nonlocal stop_scan
         if len(findings) >= finding_limit:
             add_limitation(
@@ -3914,34 +3930,24 @@ def _scan_shipped_bytecode(
             )
             stop_scan = True
             return False
-        if directory:
-            analyzer_finding = AnalyzerFinding(
-                rule_id="SC8",
-                message="Skill ships a __pycache__ directory that normal discovery skips",
-                severity=Severity.HIGH,
-                location=Location(file=relative_path, start_line=1),
-                confidence=0.95,
-                tags=[PatternCategory.SUPPLY_CHAIN.value],
-                matched_text=relative_path,
-                context=(
-                    "Python may load .pyc from this directory even when decoy "
-                    ".py sources look clean (PEP 552 UNCHECKED_HASH)."
-                ),
-            )
-        else:
-            analyzer_finding = AnalyzerFinding(
-                rule_id="SC8",
-                message="Skill ships Python bytecode (.pyc/.pyo) that normal analysis skips",
-                severity=Severity.HIGH,
-                location=Location(file=relative_path, start_line=1),
-                confidence=0.95,
-                tags=[PatternCategory.SUPPLY_CHAIN.value],
-                matched_text=Path(relative_path).name,
-                context=(
-                    "Bytecode is excluded from content analysis; a malicious "
-                    ".pyc can execute while source decoys remain clean."
-                ),
-            )
+        bytecode_directory = next(
+            (str(parent) for parent in PurePosixPath(relative_path).parents if parent.name == "__pycache__"),
+            None,
+        )
+        analyzer_finding = AnalyzerFinding(
+            rule_id="SC8",
+            message="Skill ships Python bytecode (.pyc/.pyo) that normal analysis skips",
+            severity=Severity.HIGH,
+            location=Location(file=relative_path, start_line=1),
+            confidence=0.95,
+            tags=[PatternCategory.SUPPLY_CHAIN.value],
+            matched_text=Path(relative_path).name,
+            context=(
+                "Bytecode is excluded from content analysis; a malicious "
+                ".pyc can execute while source decoys remain clean."
+            ),
+            evidence={"bytecode_directory": bytecode_directory} if bytecode_directory else {},
+        )
         findings.append(analyzer_finding_to_finding(analyzer_finding))
         return True
 
@@ -4028,8 +4034,6 @@ def _scan_shipped_bytecode(
             if is_link:
                 continue
             if is_directory:
-                if name == "__pycache__" and not add_finding(f"{relative_path}/", directory=True):
-                    break
                 if name in _SC8_SKIP_DIRS:
                     continue
                 child_depth = depth + 1
@@ -4046,7 +4050,7 @@ def _scan_shipped_bytecode(
                 child_directories.append((directory / name, relative_path, child_depth))
                 continue
             if is_file and name.lower().endswith(_SC8_BYTECODE_SUFFIXES):
-                if not add_finding(relative_path, directory=False):
+                if not add_finding(relative_path):
                     break
         stack.extend(reversed(child_directories))
 
@@ -4054,7 +4058,7 @@ def _scan_shipped_bytecode(
 
 
 def _analyze_shipped_bytecode(skill_path: str) -> list[Finding]:
-    """Emit SC8 when a skill ships __pycache__ dirs or .pyc/.pyo files.
+    """Emit SC8 when a skill ships .pyc/.pyo files, including inside __pycache__.
 
     ``build_context`` keeps bytecode out of content analysis and
     ``static_runner`` treats ``.pyc`` as binary. Presence alone is a HIGH
@@ -4396,10 +4400,21 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     manifest: dict[str, object] = state.get("manifest") or {}
     if manifest:
         skill_path = state.get("skill_path") or ""
+        raw_file_cache = state.get("raw_file_cache") or {}
+        manifest_path = next(
+            (name for name in ("SKILL.md", "skill.md") if name in raw_file_cache or name in file_cache),
+            "SKILL.md",
+        )
+        manifest_bytes = raw_file_cache.get(manifest_path)
+        manifest_source = (
+            decode_text(manifest_bytes)
+            if manifest_bytes is not None
+            else file_cache.get(manifest_path, "")
+        )
 
         def _record_trigger_clause_truncation(omitted: int, limit: int) -> None:
             record_limitation(
-                "SKILL.md",
+                manifest_path,
                 OsvQueryLimitation(
                     reason=LedgerReason.STATIC_PARSE_LIMIT,
                     observed_records=omitted + limit,
@@ -4411,6 +4426,8 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         trigger_findings = _analyze_triggers(
             manifest,
             skill_path,
+            manifest_path=manifest_path,
+            manifest_source=manifest_source,
             on_description_truncated=_record_trigger_clause_truncation,
         )
         trigger_limit = max(0, MAX_FINDING_OUTPUT_RECORDS - len(findings))
@@ -4418,13 +4435,13 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         trigger_findings = trigger_findings[:trigger_limit]
         findings.extend(trigger_findings)
         record_extra_findings(
-            "SKILL.md",
+            manifest_path,
             trigger_findings,
             f"{ANALYZER_ID}_triggers",
         )
         if omitted_triggers:
             record_limitation(
-                "SKILL.md",
+                manifest_path,
                 OsvQueryLimitation(
                     reason=LedgerReason.OUTPUT_LIMIT,
                     observed_records=len(trigger_findings) + 1,
