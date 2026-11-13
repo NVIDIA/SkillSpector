@@ -44,7 +44,10 @@ from skillspector.inference_usage import (
     retained_chat_model_controls,
 )
 from skillspector.providers import registry
-from skillspector.providers.chat_models import resolve_reasoning_effort, resolve_sampling_parameters
+from skillspector.providers.chat_models import (
+    resolve_reasoning_effort,
+    resolve_sampling_parameters,
+)
 from skillspector.providers.structured_output import rejects_forced_tool_call
 
 # Default endpoint; overridden by ``ANTHROPIC_BASE_URL`` when set.
@@ -96,10 +99,11 @@ class AnthropicProvider:
             return None
 
         api_key, base_url = creds
+        endpoint = base_url or ANTHROPIC_BASE_URL
         kwargs = {
             "model_name": model,
             "api_key": SecretStr(api_key),
-            "base_url": base_url or ANTHROPIC_BASE_URL,
+            "base_url": endpoint,
             "max_tokens_to_sample": max_tokens,
             "timeout": timeout,
             "stop": None,
@@ -107,7 +111,11 @@ class AnthropicProvider:
         effort = resolve_reasoning_effort()
         if effort is not None:
             kwargs["effort"] = effort
-        sampling_parameters = resolve_sampling_parameters()
+        # The native Messages API accepts 1.0 for backwards compatibility;
+        # endpoint overrides may have different sampling rules.
+        sampling_parameters = resolve_sampling_parameters(
+            model, native_anthropic=endpoint.rstrip("/") == ANTHROPIC_BASE_URL
+        )
         kwargs.update(sampling_parameters)
         chat_model_cls = _ChatAnthropicBearer if _use_bearer_auth() else ChatAnthropic
         chat_model = chat_model_cls(**kwargs)
@@ -136,7 +144,7 @@ class AnthropicProvider:
         return user_input or self.SLOT_DEFAULTS.get(slot, "") or self.DEFAULT_MODEL
 
     def structured_output_method(self, model: str) -> str | None:
-        """``with_structured_output`` method for *model*: registry entry, then family prefix, else ``None``."""
+        """``with_structured_output`` method for *model*: registry entry, then Claude name, else ``None``."""
         declared = registry.lookup_structured_output_method(REGISTRY_PATH, model)
         if declared:
             return declared

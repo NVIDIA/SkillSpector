@@ -78,6 +78,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from uuid import uuid4
 
+from skillspector.file_output import require_secure_file_output, write_text_no_follow
 from skillspector.logging_config import set_level
 
 from .api_pool import create_api_key_pool_from_env
@@ -116,6 +117,7 @@ def _scan_skill(
     require_llm: bool,
     api_pool=None,
     verbose: bool = False,
+    timeout: float = 90,
 ) -> tuple[dict[str, object], str | None, str]:
     """Scan a single skill through the full pipeline.
 
@@ -139,6 +141,7 @@ def _scan_skill(
         detected_language=lang,
         apply_gap_fill=True,
         api_pool=api_pool,
+        timeout=timeout,
     )
 
     return entry, error_msg, rel_name
@@ -155,8 +158,10 @@ def _kill_worker_group(pid: int) -> None:
         try:
             subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=5, check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
             pass
@@ -201,10 +206,16 @@ def _scan_skill_process(
 
 
 def _scan_skill_bounded(
-    skill_dir: Path, root: Path, *, api_pool=None, timeout: float = 90,
-    startup_timeout: float = 90, **options
+    skill_dir: Path,
+    root: Path,
+    *,
+    api_pool=None,
+    timeout: float = 90,
+    startup_timeout: float = 90,
+    **options,
 ) -> tuple[dict[str, object], str | None, str]:
     """Enforce the wall-clock limit on actual work, including local analysis."""
+    options["timeout"] = timeout
     owner = uuid4().hex
     if api_pool is not None:
         options["api_pool"] = SimpleNamespace(
@@ -281,24 +292,6 @@ def _main_impl() -> None:
     except ImportError:
         Console = None  # type: ignore[assignment]  # noqa: N806
 
-    c = Console(emoji=False) if Console is not None else None
-
-    def display(value: object) -> str:
-        text = _terminal_text(value)
-        return escape(text) if c else text
-
-    def _print(*args: object, **kwargs: object) -> None:
-        """Print through Rich when available, falling back to plain text."""
-        if c:
-            c.print(*args, **{k: v for k, v in kwargs.items() if k != "file"})
-        else:
-            msg = " ".join(str(a) for a in args)
-            file = kwargs.get("file")
-            if file:
-                print(msg, file=file)  # type: ignore[arg-type]
-            else:
-                print(msg)
-
     # -- CLI arguments -------------------------------------------------------
     parser = argparse.ArgumentParser(
         description="Batch-scan a directory of AI agent skills with SkillSpector.",
@@ -365,6 +358,30 @@ def _main_impl() -> None:
     )
     args = parser.parse_args()
 
+    # Structured reports must not share stdout with progress or diagnostics.
+    progress_file = sys.stdout if args.format == "terminal" else sys.stderr
+    c = Console(file=progress_file, emoji=False) if Console is not None else None
+
+    def display(value: object) -> str:
+        text = _terminal_text(value)
+        return escape(text) if c else text
+
+    def _print(*args: object, **kwargs: object) -> None:
+        """Print to the requested stream, with Rich or plain text."""
+        file = kwargs.pop("file", progress_file)
+        if c:
+            console = c if file is progress_file else Console(file=file, emoji=False)
+            console.print(*args, **kwargs)
+        else:
+            print(" ".join(str(a) for a in args), file=file)  # type: ignore[arg-type]
+
+    if args.output:
+        try:
+            require_secure_file_output()
+        except ValueError as exc:
+            _print(f"Error: {exc}", markup=False, file=sys.stderr)
+            sys.exit(2)
+
     if args.verbose:
         set_level("DEBUG")
 
@@ -389,8 +406,7 @@ def _main_impl() -> None:
 
     # -- Header --------------------------------------------------------------
     pool_note = (
-        f", [green]{api_pool.keys_configured} keys "
-        f"({api_pool.total_capacity} slots)[/green]"
+        f", [green]{api_pool.keys_configured} keys ({api_pool.total_capacity} slots)[/green]"
         if api_pool
         else ""
     )
@@ -501,13 +517,10 @@ def _main_impl() -> None:
             f"{snap['total_requests_served']} requests served",
         ]
         if snap.get("peak_active_requests", 0) > 0:
-            _parts.append(
-                f"peak {snap['peak_active_requests']}/{snap['total_capacity']} slots"
-            )
+            _parts.append(f"peak {snap['peak_active_requests']}/{snap['total_capacity']} slots")
         if snap.get("rate_limits_hit", 0) > 0:
             _parts.append(
-                f"{snap['rate_limits_hit']} rate-limit(s), "
-                f"{snap['retry_successes']} retried"
+                f"{snap['rate_limits_hit']} rate-limit(s), {snap['retry_successes']} retried"
             )
         _parts.append(f"{snap['keys_configured']} keys")
         _print(f"\n[dim]API Pool: {', '.join(_parts)}[/dim]")
@@ -522,7 +535,11 @@ def _main_impl() -> None:
         report_body = format_markdown(results)
 
     if args.output:
-        args.output.write_text(report_body, encoding="utf-8")
+        try:
+            write_text_no_follow(args.output, report_body)
+        except (OSError, ValueError) as exc:
+            _print(f"Error: {exc}", markup=False, file=sys.stderr)
+            sys.exit(2)
         _print(f"\n[green]Batch report saved to:[/green] {display(args.output)}")
     else:
         if fmt == "terminal":

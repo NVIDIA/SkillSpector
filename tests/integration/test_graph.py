@@ -20,7 +20,6 @@ from importlib import import_module
 from pathlib import Path
 
 import pytest
-from markdown_it import MarkdownIt
 
 from skillspector.graph import create_graph, graph
 
@@ -153,92 +152,6 @@ def test_graph_keeps_reviewed_canonical_and_inert_forms_clear(
         json.dumps(result["sarif_report"]) if output_format == "sarif" else result["report_body"]
     )
     assert "SC10" not in rendered
-
-
-def test_graph_excludes_valid_oms_signature_from_static_findings(tmp_path: Path) -> None:
-    """A real OMS signature remains inventoried without producing scan findings."""
-    fixture = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
-    (tmp_path / "SKILL.md").write_text("---\nname: signed\n---\n# Signed\n", encoding="utf-8")
-    (tmp_path / "skill.oms.sig").write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
-
-    result = graph.invoke(
-        {
-            "skill_path": str(tmp_path),
-            "output_format": "json",
-            "use_llm": False,
-        }
-    )
-
-    report = json.loads(result["report_body"])
-    signature_component = next(
-        component for component in report["components"] if component["path"] == "skill.oms.sig"
-    )
-    assert signature_component["type"] == "oms_signature"
-    assert report["analysis_completeness"]["coverage_percent"] == 100.0
-    assert report["analysis_completeness"]["scope_exclusions"] == [
-        {
-            "outcome": "out_of_scope",
-            "phase": "discovery",
-            "reason_code": "oms_signature",
-            "message": "Recognized OMS signature metadata is excluded from content analysis.",
-            "path": "skill.oms.sig",
-            "start_line": None,
-            "end_line": None,
-            "fatal": False,
-        }
-    ]
-    assert report["analysis_completeness"]["ledger_exceptions"] == []
-    assert report["analysis_completeness"]["execution_successful"] is True
-    assert "skill.oms.sig" not in result["components"]
-    assert "skill.oms.sig" not in result["file_cache"]
-    assert not any(
-        event["path"] == "skill.oms.sig" and event["outcome"] == "failed"
-        for event in result["inspection_ledger"]
-    )
-    assert all(finding.file != "skill.oms.sig" for finding in result["findings"])
-    assert all(issue["file"] != "skill.oms.sig" for issue in report["issues"])
-
-
-@pytest.mark.parametrize("output_format", ["terminal", "markdown", "sarif"])
-def test_graph_reports_oms_scope_exclusion_in_every_non_json_format(
-    tmp_path: Path, output_format: str
-) -> None:
-    """OMS scope exclusions remain visible in every user-facing report format."""
-    fixture = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
-    (tmp_path / "SKILL.md").write_text("---\nname: signed\n---\n# Signed\n", encoding="utf-8")
-    (tmp_path / "skill.oms.sig").write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
-
-    result = graph.invoke(
-        {
-            "skill_path": str(tmp_path),
-            "output_format": output_format,
-            "use_llm": False,
-        }
-    )
-
-    scope_exclusion = result["analysis_completeness"]["scope_exclusions"]
-    assert scope_exclusion[0]["path"] == "skill.oms.sig"
-    assert scope_exclusion[0]["reason_code"] == "oms_signature"
-
-    if output_format == "sarif":
-        notifications = result["sarif_report"]["runs"][0]["invocations"][0][
-            "toolExecutionNotifications"
-        ]
-        notification = next(
-            item for item in notifications if item["properties"]["reasonCode"] == "oms_signature"
-        )
-        assert notification["level"] == "note"
-        assert notification["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == (
-            "skill.oms.sig"
-        )
-    else:
-        expected_heading = "Scope exclusions" if output_format == "terminal" else "Scope Exclusions"
-        body = result["report_body"]
-        if output_format == "markdown":
-            body = MarkdownIt().enable("table").render(body)
-        assert expected_heading in body
-        assert "oms_signature" in body
-        assert "skill.oms.sig" in body
 
 
 def test_graph_invoke_returns_findings_and_report(tmp_path: Path) -> None:

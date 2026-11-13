@@ -747,10 +747,10 @@ def selected_source_identity_for_input(
         # InputHandler preserves a unique outer directory from an archive.
         return resolved_path.name or None
     if source_type == "zip" and resolved_path == extraction_root:
-        return Path(input_path.strip()).stem or None
+        return Path(input_path).stem or None
 
     if source_type == "file":
-        original = Path(input_path.strip())
+        original = Path(input_path)
         if original.name not in {"SKILL.md", "skill.md"}:
             return None
         return Path(os.path.abspath(original)).parent.name or None
@@ -775,6 +775,7 @@ class InputHandler:
         self._temp_dir: Path | None = None
         self._transitive_budget = transitive_budget
         self.primary_file_path: str | None = None
+        self.primary_file_parent_path: str | None = None
 
     def resolve(self, input_path: str) -> tuple[Path, str]:
         """
@@ -793,10 +794,13 @@ class InputHandler:
                 ``INGEST_MAX_ZIP_MEMBERS`` (``IngestLimitExceededError``).
             FileNotFoundError: If local path doesn't exist.
         """
-        input_path = input_path.strip()
+        # Whitespace can be part of a local filename. Only normalize the URL
+        # candidate; trimming local input can silently select a different file.
+        url_candidate = input_path.strip()
         self.primary_file_path = None
+        self.primary_file_parent_path = None
 
-        git_target = self._github_tree_target(input_path)
+        git_target = self._github_tree_target(url_candidate)
         if git_target is not None:
             repository_url, branch, subdirectory = git_target
             clone_dir = self._clone_git(repository_url, branch=branch)
@@ -812,17 +816,18 @@ class InputHandler:
                 # cannot clean an owned clone on our behalf.
                 self.cleanup()
                 raise
-        if self._is_git_url(input_path):
-            return self._clone_git(input_path), "git"
-        if self._is_file_url(input_path):
-            return self._download_file(input_path), "url"
+        if self._is_git_url(url_candidate):
+            return self._clone_git(url_candidate), "git"
+        if self._is_file_url(url_candidate):
+            return self._download_file(url_candidate), "url"
         normalized_local_path = validate_local_input_path(Path(input_path))
+        # An existing directory remains a directory regardless of its suffix.
+        if normalized_local_path.is_dir():
+            return normalized_local_path, "directory"
         if input_path.lower().endswith(".zip"):
             return self._extract_zip(normalized_local_path), "zip"
         if input_path.endswith(".md"):
             return self._wrap_single_file(normalized_local_path), "file"
-        if normalized_local_path.is_dir():
-            return normalized_local_path, "directory"
         if normalized_local_path.is_file():
             return self._wrap_single_file(normalized_local_path), "file"
         raise ValueError(
@@ -1710,4 +1715,5 @@ class InputHandler:
                 dest.unlink(missing_ok=True)
                 raise
         self.primary_file_path = file_path.name
+        self.primary_file_parent_path = str(file_path.parent)
         return temp_dir

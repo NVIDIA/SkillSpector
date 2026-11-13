@@ -41,7 +41,7 @@ import json
 import os
 import threading
 import weakref
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Mapping
 from typing import Any, NoReturn
 
 from google.auth.exceptions import RefreshError
@@ -49,13 +49,18 @@ from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_openai.chat_models.base import BaseChatOpenAI
+from openai import ContentFilterFinishReasonError, LengthFinishReasonError, pydantic_function_tool
+from pydantic import BaseModel
 
+from skillspector.constants import build_model_config
 from skillspector.inference_usage import (
     InferenceUsageCollector,
     chat_model_controls,
     chat_model_requested_controls,
     provider_name,
 )
+from skillspector.llm_provenance import LLM_ANALYZER_SLOTS
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
 from skillspector.providers import (
     UnknownProviderError,
@@ -69,8 +74,20 @@ from skillspector.providers import (
     resolve_chat_model_credentials,
     resolve_provider_credentials,
 )
+from skillspector.providers.chat_models import UnsupportedControlError, resolve_reasoning_effort
 from skillspector.providers.gemini import GeminiProvider
 from skillspector.providers.openai import OpenAIProvider
+from skillspector.structured_response import (
+    MAX_RESPONSE_CHARS,
+    ResponseIssue,
+    parse_response_object,
+    validate_message,
+    validate_payload,
+    validate_response_text,
+)
+from skillspector.structured_response import (
+    StructuredOutputParseError as StructuredOutputParseError,
+)
 
 _CHAT_MODEL_PROVIDERS: dict[int, tuple[weakref.ReferenceType[object], str]] = {}
 _CHAT_MODEL_PROVIDERS_LOCK = threading.Lock()
@@ -142,7 +159,9 @@ def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
     ``opencode_cli``) are checked through their ``is_available()`` method
     first. Other providers probe the same native chat-model path used by
     :func:`get_chat_model`; unbound HTTP providers keep the
-    credential-resolution and OpenAI fallback path.
+    credential-resolution and OpenAI fallback path.  A configured model that
+    rejects a requested control makes the LLM unavailable, with the reason
+    from :func:`unsupported_control_error`.
     """
     try:
         provider = get_active_provider()
@@ -151,28 +170,58 @@ def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
     if has_cli_capability(provider):
         return provider.is_available()  # type: ignore[attr-defined]
 
-    if has_provider_binding():
-        try:
-            model = provider.resolve_model()
+    try:
+        if has_provider_binding():
+            model = next(iter(_llm_slot_models()))
             create_chat_model(
                 model=model,
                 max_tokens=get_max_output_tokens(model),
                 timeout=timeout,
             )
-        except (ValueError, RefreshError, TimeoutError) as exc:
-            return False, str(exc)
-        return True, None
-    if isinstance(provider, GeminiProvider):
-        try:
+        elif isinstance(provider, GeminiProvider):
             provider.resolve_credentials(timeout=timeout)
-        except (ValueError, RefreshError, TimeoutError) as exc:
-            return False, str(exc)
-        return True, None
-    try:
-        _resolve_llm_credentials()
-    except ValueError as exc:
+        else:
+            _resolve_llm_credentials()
+    except (ValueError, RefreshError, TimeoutError) as exc:
         return False, str(exc)
-    return True, None
+    control_error = unsupported_control_error(timeout)
+    return control_error is None, control_error
+
+
+def _llm_slot_models() -> dict[str, None]:
+    """Return distinct models for slots whose analyzers can make LLM calls."""
+    model_config = build_model_config()
+    return dict.fromkeys(model_config[slot] for slot in LLM_ANALYZER_SLOTS)
+
+
+def unsupported_control_error(timeout: float | None = 120) -> str | None:
+    """Return why a configured slot model rejects a requested control, else ``None``.
+
+    Only ``SKILLSPECTOR_TEMPERATURE`` and ``SKILLSPECTOR_REASONING_EFFORT`` can
+    be rejected, so nothing runs when both are unset.  Otherwise each distinct
+    LLM slot model is built the way the analyzers build it, so the provider's own
+    guard (model name or registry entry) reports an
+    :class:`~skillspector.providers.chat_models.UnsupportedControlError`
+    before any analysis.  Other failures, such as missing credentials, are
+    left to the regular availability path.
+    """
+    if not any(
+        os.environ.get(name, "").strip()
+        for name in ("SKILLSPECTOR_TEMPERATURE", "SKILLSPECTOR_REASONING_EFFORT")
+    ):
+        return None
+    try:
+        if has_cli_capability(get_active_provider()):
+            return None
+        models = _llm_slot_models()
+        for model in models:
+            get_chat_model(model, timeout=timeout)
+    except UnsupportedControlError as exc:
+        return str(exc)
+    except Exception:
+        # Not a control rejection; availability checks report it.
+        return None
+    return None
 
 
 def fetch_model_token_limits(model_label: str) -> tuple[int, int]:
@@ -194,14 +243,12 @@ def fetch_model_token_limits(model_label: str) -> tuple[int, int]:
 
 
 class _AgentCLIMessage:
-    """Minimal stand-in for a LangChain message: exposes ``.content``."""
+    """A response returned after the CLI provider's completion call succeeds."""
 
     def __init__(self, content: str) -> None:
         self.content = content
-
-
-class StructuredOutputParseError(ValueError):
-    """Raised when a structured-output response does not contain a JSON object."""
+        # CLI text transports expose process completion, not a model stop reason.
+        self.response_metadata = {"status": "completed", "completion_source": "cli_process"}
 
 
 def _extract_json_object(raw: str) -> dict:
@@ -210,6 +257,8 @@ def _extract_json_object(raw: str) -> dict:
     Tolerates markdown code fences and surrounding prose. Raises ``ValueError``
     (fail-closed) when no JSON object can be parsed.
     """
+    if len(raw) > MAX_RESPONSE_CHARS:
+        raise StructuredOutputParseError("response exceeds size limit", issue=ResponseIssue.LIMIT)
     text = raw.strip()
     if text.startswith("```"):
         # Drop the opening fence line (``` or ```json) and any closing fence.
@@ -219,22 +268,18 @@ def _extract_json_object(raw: str) -> dict:
             text = text[:fence]
         text = text.strip()
     try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except json.JSONDecodeError:
-        pass
+        return parse_response_object(text)
+    except StructuredOutputParseError as exc:
+        if exc.issue != ResponseIssue.INVALID_JSON:
+            raise
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end > start:
         try:
-            obj = json.loads(text[start : end + 1])
-            if isinstance(obj, dict):
-                return obj
-        except json.JSONDecodeError:
-            pass
-    raise StructuredOutputParseError(
-        f"could not extract a JSON object from CLI response: {raw[:200]!r}"
-    )
+            return parse_response_object(text[start : end + 1])
+        except StructuredOutputParseError as exc:
+            if exc.issue != ResponseIssue.INVALID_JSON:
+                raise
+    raise StructuredOutputParseError("could not extract a JSON object from CLI response")
 
 
 def _complete_agent_cli(
@@ -267,6 +312,20 @@ def _complete_agent_cli(
     )
 
 
+def structured_output_instructions(schema: type) -> str:
+    """Text a CLI provider's structured call appends after the analyzer prompt.
+
+    Exposed so prompt budgeting can measure the exact bytes the transport adds.
+    """
+    schema_json = json.dumps(schema.model_json_schema(), indent=2)
+    return (
+        "\n\n"
+        "Respond with ONLY a single JSON object conforming to the JSON Schema "
+        "below. Do not wrap it in markdown code fences and do not add any prose "
+        f"before or after the JSON.\n\nJSON Schema:\n{schema_json}"
+    )
+
+
 class _StructuredAgentCLIModel:
     """Mimics ``ChatOpenAI.with_structured_output(schema)`` for a CLI provider.
 
@@ -274,20 +333,14 @@ class _StructuredAgentCLIModel:
     ``complete()``, then parses and validates the response into *schema*.
     """
 
-    def __init__(self, owner: AgentCLIChatModel, schema: type) -> None:
+    def __init__(self, owner: AgentCLIChatModel, schema: type[BaseModel]) -> None:
         # Read transport settings through the owner so a structured wrapper does not pin the
         # deadline it happened to be created with.
         self._owner = owner
         self._schema = schema
 
     def _augment(self, prompt: str) -> str:
-        schema_json = json.dumps(self._schema.model_json_schema(), indent=2)
-        return (
-            f"{prompt}\n\n"
-            "Respond with ONLY a single JSON object conforming to the JSON Schema "
-            "below. Do not wrap it in markdown code fences and do not add any prose "
-            f"before or after the JSON.\n\nJSON Schema:\n{schema_json}"
-        )
+        return f"{prompt}{structured_output_instructions(self._schema)}"
 
     def _complete(self, prompt: str) -> str:
         """Return provider output before structured parsing begins."""
@@ -301,7 +354,29 @@ class _StructuredAgentCLIModel:
 
     def invoke(self, prompt: str) -> object:
         raw = self._complete(prompt)
-        return self._schema.model_validate(_extract_json_object(raw))
+        return self._parse(raw)
+
+    def _parse(self, raw: str) -> object:
+        try:
+            payload = _extract_json_object(raw)
+        except StructuredOutputParseError as exc:
+            if exc.issue in {
+                ResponseIssue.INVALID_JSON,
+                ResponseIssue.INVALID_SCHEMA,
+                ResponseIssue.EMPTY,
+            }:
+                try:
+                    validate_response_text(raw, self._schema, completed=True)
+                except StructuredOutputParseError as parse_error:
+                    if parse_error.issue == ResponseIssue.LIMIT:
+                        raise
+                    exc.recovery_text = parse_error.recovery_text
+            raise
+        try:
+            return validate_payload(payload, self._schema)
+        except StructuredOutputParseError as exc:
+            exc.recovery_text = raw.strip()
+            raise
 
     async def ainvoke(self, prompt: str) -> object:
         return await asyncio.to_thread(self.invoke, prompt)
@@ -314,7 +389,7 @@ class _StructuredAgentCLIModel:
         """Mark this invocation after transport success and before parsing."""
         raw = self._complete(prompt)
         collector.mark_response_received()
-        return self._schema.model_validate(_extract_json_object(raw))
+        return self._parse(raw)
 
     async def ainvoke_with_usage(
         self,
@@ -383,6 +458,33 @@ class AgentCLIChatModel:
 STRUCTURED_OUTPUT_METHODS = ("function_calling", "json_schema")
 
 
+def _gateway_output_preference(llm: object, model: str) -> str | None:
+    """Use the verified gateway method without overriding reasoning or explicit choices.
+
+    The exact OpenAI-route Opus 5 model wraps JSON-schema results in argument
+    envelopes across analyzers. This shares TP4's existing workaround; aliases
+    and other providers retain their own method choices.
+    """
+    if not (
+        isinstance(llm, BaseChatOpenAI)
+        and chat_model_provider_name(llm) == "openai"
+        and model == "azure/anthropic/claude-opus-5"
+    ):
+        return None
+    if resolve_reasoning_effort() is not None:
+        return None
+    if chat_model_controls(llm).get("reasoning_effort") is not None:
+        return None
+    if any(getattr(llm, name, None) is not None for name in ("reasoning_effort", "reasoning")):
+        return None
+    for controls in (llm.model_kwargs, llm.extra_body):
+        if isinstance(controls, Mapping) and any(
+            controls.get(name) is not None for name in ("reasoning_effort", "reasoning", "thinking")
+        ):
+            return None
+    return "function_calling"
+
+
 def structured_output_kwargs(
     model: str,
     provider: object | None = None,
@@ -428,6 +530,7 @@ def bind_structured_output(
     provider: object | None = None,
     *,
     preferred_method: str | None = None,
+    preserve_text: str | None = None,
 ) -> object:
     """``llm.with_structured_output(schema)`` with the method *model* needs.
 
@@ -437,17 +540,84 @@ def bind_structured_output(
     the prompt, and a prose answer raises :class:`StructuredOutputParseError`,
     which the analyzers retry like any other malformed structured response.
     """
+    if preferred_method is None:
+        preferred_method = _gateway_output_preference(llm, model)
     kwargs = structured_output_kwargs(model, provider, preferred_method=preferred_method)
+    if preserve_text is not None and not isinstance(llm, BaseChatModel):
+        raise StructuredOutputParseError(
+            "provider cannot verify lossless formatting", issue=ResponseIssue.FORMAT_CHANGED
+        )
     unforced = _binds_unforced_tool_call(llm, kwargs.get("method"))
-    include_raw = isinstance(llm, BaseChatModel) and (
-        unforced or kwargs.get("method") == "function_calling"
-    )
+    include_raw = isinstance(llm, BaseChatModel)
     binding_kwargs: dict[str, Any] = dict(kwargs)
     if include_raw:
-        # Native parsers may silently keep only the first tool call. Retain the
-        # raw message so validation can reject extra or invalid calls instead.
+        # Preserve completion evidence before a parser discards it or fills defaults.
         binding_kwargs["include_raw"] = True
-    structured = llm.with_structured_output(schema, **binding_kwargs)  # type: ignore[attr-defined]
+    wire_schema: type | dict[str, Any] = schema
+    if isinstance(llm, BaseChatOpenAI) and kwargs.get("method") in (None, "json_schema"):
+        # A Pydantic response format makes the SDK parse before we can inspect stop/refusal
+        # evidence. The equivalent strict JSON schema leaves parsing at our shared boundary.
+        assert issubclass(schema, BaseModel)
+        wire_schema = {
+            "name": schema.__name__,
+            "strict": True,
+            "parameters": pydantic_function_tool(schema)["function"]["parameters"],
+        }
+        binding_kwargs["strict"] = True
+    structured = llm.with_structured_output(wire_schema, **binding_kwargs)  # type: ignore[attr-defined]
+    if include_raw:
+        tool = convert_to_openai_tool(schema)["function"]["name"]
+        allow_wrapper = (
+            chat_model_provider_name(llm) == "openai" and model == "azure/anthropic/claude-opus-5"
+        )
+
+        def check(result: object) -> object:
+            if not isinstance(result, dict) or result.get("raw") is None:
+                raise StructuredOutputParseError(
+                    "model returned no response", issue=ResponseIssue.EMPTY
+                )
+            return validate_message(
+                result["raw"],
+                schema,
+                tool=tool,
+                require_tool=unforced or kwargs.get("method") == "function_calling",
+                allow_json_wrapper=allow_wrapper,
+                preserve_text=preserve_text,
+            )
+
+        def invoke(prompt: Any, config: RunnableConfig) -> object:
+            try:
+                return check(structured.invoke(prompt, config=config))
+            except LengthFinishReasonError as exc:
+                raise StructuredOutputParseError(
+                    "model answer was cut short", issue=ResponseIssue.TRUNCATED
+                ) from exc
+            except ContentFilterFinishReasonError as exc:
+                raise StructuredOutputParseError(
+                    "model declined the assessment", issue=ResponseIssue.REFUSED
+                ) from exc
+
+        async def ainvoke(prompt: Any, config: RunnableConfig) -> object:
+            try:
+                return check(await structured.ainvoke(prompt, config=config))
+            except LengthFinishReasonError as exc:
+                raise StructuredOutputParseError(
+                    "model answer was cut short", issue=ResponseIssue.TRUNCATED
+                ) from exc
+            except ContentFilterFinishReasonError as exc:
+                raise StructuredOutputParseError(
+                    "model declined the assessment", issue=ResponseIssue.REFUSED
+                ) from exc
+
+        checked = RunnableLambda(invoke, ainvoke)
+        if unforced:
+            return (
+                RunnableLambda(
+                    lambda prompt: f"{prompt}\n\n{_TOOL_CALL_INSTRUCTION.format(tool=tool)}"
+                )
+                | checked
+            )
+        return checked
     if unforced:
         return _require_tool_call(structured, schema, include_raw=include_raw)
     if kwargs.get("method") == "function_calling" and not isinstance(
@@ -579,6 +749,12 @@ def get_chat_model(
     """
     provider = get_active_provider()
     if has_cli_capability(provider):
+        # Every CLI call is a full agent session on the user's plan. Warn here,
+        # before the analyzers fan out; the scan path only probes availability
+        # from the report node, after the calls have run.
+        warn_session_cost = getattr(provider, "warn_session_cost", None)
+        if callable(warn_session_cost):
+            warn_session_cost()
         resolved_model = model or provider.resolve_model()
         chat_model = AgentCLIChatModel(
             provider,
