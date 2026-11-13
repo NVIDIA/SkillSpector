@@ -3377,6 +3377,13 @@ class TestTriggerAnalysis:
         ]
         assert events and all(event["path"] == "skill.md" for event in events)
 
+    def test_metadata_location_uses_the_same_bounded_prefix_as_manifest_parsing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sc_mod, "MAX_MANIFEST_FRONTMATTER_BYTES", 64)
+        source = "---\n#" + "é" * 64 + "\ntriggers: [help]\n---\n"
+        assert sc_mod._manifest_metadata_line(source, "triggers") == 1
+
     def test_tr1_overly_broad_word(self) -> None:
         findings = sc_mod._analyze_triggers({"triggers": ["the", "code review"]}, "myskill")
         tr1 = [f for f in findings if f.rule_id == "TR1"]

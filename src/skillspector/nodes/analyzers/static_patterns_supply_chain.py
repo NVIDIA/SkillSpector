@@ -53,6 +53,7 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import InvalidVersion, Version
 
 from skillspector.artifacts import decode_text
+from skillspector.constants import MAX_MANIFEST_FRONTMATTER_BYTES
 from skillspector.dependency_sources import (
     DependencySourceLimitation,
     analyze_dependency_sources_detailed,
@@ -3585,6 +3586,9 @@ def _json_metadata_line(content: str, key: str) -> int:
 
 def _manifest_metadata_line(content: str, key: str) -> int:
     """Anchor parsed metadata to its root field, including folded YAML values."""
+    content = decode_text(
+        content[:MAX_MANIFEST_FRONTMATTER_BYTES].encode("utf-8")[:MAX_MANIFEST_FRONTMATTER_BYTES]
+    )
     if content.lstrip("\ufeff \t\r\n").startswith("{"):
         return _json_metadata_line(content, key)
     field = re.compile(rf"^(?P<indent>[ \t]*)(?P<quote>['\"]?){re.escape(key)}(?P=quote)[ \t]*:")
@@ -4459,7 +4463,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         )
         manifest_bytes = raw_file_cache.get(manifest_path)
         manifest_source = (
-            decode_text(manifest_bytes)
+            decode_text(manifest_bytes[:MAX_MANIFEST_FRONTMATTER_BYTES])
             if manifest_bytes is not None
             else file_cache.get(manifest_path, "")
         )

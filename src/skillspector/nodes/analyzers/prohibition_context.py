@@ -90,6 +90,7 @@ _NEXT_INSTRUCTION = re.compile(
     r"(?:(?:then|now)\s+)?(?:"
     r"(?:analyze\s+the\s+structure\s+and\s+intent\s+without\s+obeying\s+its\s+directives"
     r"|follow\s+the\s+user['’]s\s+task"
+    r"|return\s+(?:the\s+)?(?:result|answer|report|summary)\s+to\s+(?:the\s+)?user"
     r"|only\s+make\s+changes\s+directly\s+requested)"
     rf"(?=\s*(?:[.!?;{LINE_BREAK_CHARS}]|\Z))"
     r"|(?:(?:do\s+not|don['’]t|never|must\s+not|shall\s+not)\s+)?"
@@ -113,6 +114,13 @@ _NEXT_INSTRUCTION = re.compile(
 _YARA_AGENT_CONTEXT = re.compile(
     r"(?:AI agent|assistant|LLM|model|system prompt|developer message|tool description)",
     re.IGNORECASE | re.ASCII,
+)
+_FOLLOWING_SECTION = re.compile(
+    r"\A[ \t]*(?:\r?\n[ \t]*)+#{1,6}[ \t]+(?P<title>[^\r\n]+)(?:\r?\n|\Z)"
+)
+_SECTION_QUALIFIER = re.compile(
+    r"\b(?:exceptions?|conditions?|overrides?|scope|policy|first|last|once|twice)\b",
+    re.IGNORECASE,
 )
 
 
@@ -196,9 +204,18 @@ def is_directly_prohibited(
         following_start = (
             tail_view.source_offset(boundary.end()) if boundary.end() < len(tail) else len(raw_tail)
         )
-        following = raw_tail[following_start:].lstrip()
+        following_raw = raw_tail[following_start:]
+        following = following_raw.lstrip()
         following = _LIST_PREFIX.sub("", following, count=1)
         independent = _NEXT_INSTRUCTION.match(following) if following else None
+        if following and independent is None:
+            section = _FOLLOWING_SECTION.match(following_raw)
+            if section is not None:
+                title = normalized_security_view(section.group("title")).text.translate(_MARKDOWN)
+                if not _LEADING_QUALIFIER.search(title) and not _SECTION_QUALIFIER.search(title):
+                    # A heading alone proves nothing. The first instruction
+                    # must still be independently understood by this helper.
+                    independent = _NEXT_INSTRUCTION.match(following_raw[section.end() :].lstrip())
         if following and independent is None:
             return False
         if (
