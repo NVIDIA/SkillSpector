@@ -216,6 +216,17 @@ See the [contrib guide](contrib/batch_scan/docs/) for details.
 
 ### Comparing MCP Registry snapshots
 
+A named scan fetches only that server's published versions from the official
+registry, then selects entries marked as latest. If none are marked as latest,
+all matching versions are assessed. The server name remains the report source:
+
+```bash
+skillspector scan 'ac.inference.sh/mcp' --mcp-registry --format json --output current.json
+```
+
+Use `https://registry.modelcontextprotocol.io/v0/servers` as the input to scan
+the full catalog. Local registry captures are also supported.
+
 Start with raw registry payload captures (`registry-before.json` and
 `registry-after.json`). Save a scan report as `previous.json`, then compare a
 later scan against that generated local report:
@@ -502,12 +513,20 @@ initialize hang reported in issue #199 still applies there.
 
 The server exposes a single tool:
 
-- **`scan_skill(target, use_llm=true, output_format="json")`** — scans a Git
+- **`scan_skill(target, use_llm=true, output_format="json", include_report=true)`** — scans a Git
   URL, file URL, `.zip`, `.md` file, or directory and returns a structured
   verdict: `risk_score` (0-100), `severity`, `recommendation`,
   `safe_to_install`, and `findings`. It also reports `llm_used` / `scan_mode`
   so a low score from a static-only scan is never mistaken for a clean full
   scan.
+
+Set `include_report=false` when you only need the structured verdict. This
+omits the rendered `report` string and retains every other response field,
+including all findings and their occurrences, analysis completeness, and LLM
+accounting. The default still includes the full report. Report-only details,
+such as components, skill metadata, and suppressed findings, are unavailable
+in the compact response. Scanning and report generation still run normally;
+`output_format` must remain one of `json`, `markdown`, `sarif`, or `terminal`.
 
 Register it with Claude Code via:
 
@@ -557,7 +576,7 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | AR2 | Disclaimer Suppression | HIGH | Instructions to omit warnings, disclaimers, or ethical commentary (e.g. "no disclaimers", "do not moralize") |
 | AR3 | Safety Policy Nullification | HIGH | Jailbreak framing that nullifies guardrails (e.g. "you have no restrictions", "ignore your guidelines", "do anything now") |
 
-### Data Exfiltration (4 patterns)
+### Data Exfiltration (5 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -565,6 +584,19 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | E2 | Env Variable Harvesting | HIGH | Enumerating, copying, or searching environment data to collect secrets. A copy traced only to a child process's `env=` is reported LOW |
 | E3 | File System Enumeration | MEDIUM | Scanning directories for sensitive files |
 | E4 | Context Leakage | HIGH | Transmitting conversation context externally |
+| E5 | Cloud Storage Exfiltration | MEDIUM | Uploading data through cloud storage SDKs or CLIs |
+
+Within bounded, fully observed context, E5 distinguishes literal AWS/GCS downloads
+from uploads. Simple remote-to-local `cp`, AWS `sync`, and `gsutil rsync` commands do not produce E5
+findings. Moves, deletion options, unknown flags, dynamic operands, streams and
+compound shell commands retain conservative findings. This direction check does
+not change SDK upload detection or the CLI's exit-code policy. Direction proofs
+require the complete preceding context to fit within 4,096 characters. Only
+blank/comment lines, literal `set` flags (`-e`, `-u`, `-f`, and `-o pipefail`),
+and simple directory changes may precede a proved download. Other setup,
+including sourcing, autoloading, variable assignments, and earlier transfers,
+retains the original finding. Relative destinations after directory changes
+remain unproved; literal absolute file destinations are still eligible.
 
 ### Privilege Escalation (3 patterns)
 

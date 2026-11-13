@@ -1,8 +1,11 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
 * fix(e1): report outbound uploads made with Ruby (`Net::HTTP.post`, `Net::HTTP::Post.new`, HTTParty/RestClient/Faraday `post`/`put`) and Go (`http.Post`, `http.PostForm`, `client.Post("https://...")`, `http.NewRequest` with POST/PUT/PATCH) HTTP clients as External Transmission; read-only `get` requests are not reported
+* fix(deps): bump the locked `langgraph` from 1.2.6 to 1.2.20 (and `langgraph-checkpoint` 4.1.1 to 4.3.1, which it requires) past GHSA-3fx2-cqw9-xr3c; the locked `langgraph-sdk` 0.4.10 was already patched (#1078)
 * fix(pi): accept scans from symlinked workspace roots while preserving the CLI's checks on symlinks below the workspace. Custom YARA rules loaded with `--yara-rules-dir` cannot use `include`; place each rule directly in the selected directory.
 * fix(coverage): account for successfully inspected linked ZIP containers while retaining member failures and archive limits
+* fix(supply-chain): resolve npm manifest dependencies within their owning lockfile and workspace installation paths
+* fix(supply-chain): stop npm workspace `link: true` and versionless lockfile slots from borrowing an ancestor install's pinned version
 * fix(static): stop Markdown code fence lines from reading as an open quote that merges consecutive shell lines into one marker directive (#868)
 * fix(ra1): treat a prohibition on recommending a self-update ("Do not recommend self-update") as the prohibition it is, not as an RA1 self-modification instruction (#928)
 * fix(analyzer): stop PowerShell comments, `<# #>` blocks, backtick line continuations and display-only `Write-Host`/`Write-Verbose`-style messages from reporting a false `static_parse_limit`; payloads for `bash -c`, `Invoke-Expression`, script blocks and call operators, subexpressions inside messages, and any source whose token ownership cannot be proven keep their existing bounded checks and partial status (#711)

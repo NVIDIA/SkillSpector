@@ -775,6 +775,22 @@ def test_unsupported_or_unresolved_source_discards_all_ownership(source: str) ->
     assert tm._shell_quoted_candidate_limits(source, lambda: None) == {}
 
 
+@pytest.mark.parametrize("body", ['"unowned\n', '"$($CMD -rf /)"\n'])
+def test_complete_heredoc_preserves_outer_quotes_and_executable_substitutions(
+    body: str,
+) -> None:
+    source = 'echo "prefix $(date) suffix"\ncat <<E\n' + body + "E\n"
+    limits = tm._shell_quoted_candidate_limits(source, lambda: None)
+    assert limits[source.index("$(")] == source.index('"\n')
+    assert all(end < source.index("cat <<E") for end in limits.values())
+    # Outer quote ownership does not bound the raw scanner's unmatched quote
+    # inside heredoc data. That case remains conservatively partial; the
+    # balanced-quote executable substitution must retain its runtime limit too.
+    assert tm.has_bounded_parse_exhaustion(
+        source + "# " + "." * 6000 + "\n", lambda: None, file_type="shell"
+    )
+
+
 def test_ownership_walk_obeys_runtime_budget() -> None:
     def cancel() -> None:
         raise TimeoutError("fixture budget")

@@ -106,6 +106,56 @@ def test_resolve_single_md_file(tmp_path: Path) -> None:
         handler.cleanup()
 
 
+@pytest.mark.parametrize("name", ["skill.md", "skill.MD", "skill.zip", "skill.ZIP"])
+@pytest.mark.parametrize("trailing_slash", [False, True])
+def test_directory_type_takes_precedence_over_suffix(
+    tmp_path: Path, name: str, trailing_slash: bool
+) -> None:
+    selected = tmp_path / name
+    selected.mkdir()
+    (selected / "SKILL.md").write_text("# Directory skill")
+    handler = InputHandler()
+    try:
+        resolved, source_type = handler.resolve(str(selected) + ("/" if trailing_slash else ""))
+        assert source_type == "directory"
+        assert resolved == selected.resolve()
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows normalizes trailing spaces in filenames")
+def test_file_name_with_spaces_does_not_select_trimmed_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    Path(" doc.md ").write_text("# Selected file")
+    Path("doc.md").write_text("# Wrong file")
+    handler = InputHandler()
+    try:
+        resolved, source_type = handler.resolve(" doc.md ")
+        assert source_type == "file"
+        assert (resolved / " doc.md ").read_text() == "# Selected file"
+    finally:
+        handler.cleanup()
+
+
+@pytest.mark.parametrize(
+    "url", ["https://github.com/acme/skill.git", "https://example.com/skill.zip"]
+)
+def test_url_surrounding_whitespace_is_still_normalized(tmp_path: Path, url: str) -> None:
+    handler = InputHandler()
+    with patch.object(handler, "_clone_git", return_value=tmp_path) as clone:
+        with patch.object(handler, "_download_file", return_value=tmp_path) as download:
+            resolved, source_type = handler.resolve(" \t" + url + "\n")
+    assert resolved == tmp_path
+    if source_type == "git":
+        clone.assert_called_once_with(url)
+    else:
+        assert source_type == "url"
+        download.assert_called_once_with(url)
+
+
 def test_resolve_single_symlinked_file_raises(tmp_path: Path) -> None:
     """Standalone file inputs must not dereference symlinks before scanning."""
     secret = tmp_path / "external_secret.md"

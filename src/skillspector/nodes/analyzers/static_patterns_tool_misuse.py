@@ -44,6 +44,7 @@ from skillspector.artifacts import (
 from skillspector.baseline_tokens import baseline_rule_scalar_roles
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
+    LedgerReason,
     ParserCause,
     ParserCheck,
     ParserUncheckedScope,
@@ -55,7 +56,14 @@ from skillspector.javascript_tokens import javascript_template_spans as _javascr
 from skillspector.json_tokens import JSONSourceOwnership, prepare_json_source
 from skillspector.logging_config import get_logger
 from skillspector.markdown_tokens import quoted_list_spans
-from skillspector.models import AnalyzerFinding, Finding, Location, Severity, map_analyzer_findings
+from skillspector.models import (
+    AnalyzerFinding,
+    Finding,
+    Location,
+    Severity,
+    map_analyzer_findings,
+    observe_analyzer_findings,
+)
 from skillspector.powershell_tokens import PowerShellSource, PowerShellString, powershell_source
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_string_constants import python_constant_string_fields
@@ -68,6 +76,16 @@ from skillspector.python_tokens import python_literal_spans as _python_literal_s
 from skillspector.python_tokens import python_string_body as _python_string_body
 from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.semgrep_tokens import semgrep_rule_scalar_roles
+from skillspector.shell_helper_argv import reconstruct_helper_commands
+from skillspector.shell_sources import (
+    SAFE_PATH_MARKER,
+    ShellSourceContext,
+    ShellSourceOrigin,
+    ShellSourceResolver,
+    ShellSourceValue,
+    decode_env_unset_command,
+    generated_file_is_unmodified,
+)
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 from skillspector.yaml_tokens import YamlScalar, YamlSourceSpans, yaml_source_spans
 
@@ -321,6 +339,89 @@ _VARIABLE_SHELL_FLAG_PATTERN = (
     r"(?:subprocess\.\w+|Popen)\s*\([^)]*\bshell\s*=\s*\1\b"
 )
 _VARIABLE_SHELL_FLAG_RE = re.compile(_VARIABLE_SHELL_FLAG_PATTERN, re.IGNORECASE | re.MULTILINE)
+_VARIABLE_SHELL_HEADER_RE = re.compile(
+    r"(?m)^[^\S\n]*[A-Za-z_]\w*\s*=\s*True(?=\s*$)", re.IGNORECASE
+)
+_VARIABLE_SHELL_PREFIX_RE = re.compile(
+    _VARIABLE_SHELL_FLAG_PATTERN.split(r"[^)]*", 1)[0], re.IGNORECASE | re.MULTILINE
+)
+# Greedy line selection also accounts for later eligible calls in the same
+# assignment window. The final native match retains the original lazy order.
+_VARIABLE_SHELL_LAST_PREFIX_RE = re.compile(
+    _VARIABLE_SHELL_PREFIX_RE.pattern.replace("{0,4}?", "{0,4}"),
+    re.IGNORECASE | re.MULTILINE,
+)
+_VARIABLE_SHELL_ARGUMENT_CHARS = 4096
+
+
+def _iter_variable_shell_assignments(content: str) -> Iterator[re.Match[str]]:
+    """Find assignment starts without retrying leading whitespace at every line."""
+    for header in _VARIABLE_SHELL_HEADER_RE.finditer(content):
+        whitespace_start = header.start()
+        while whitespace_start > 0 and content[whitespace_start - 1].isspace():
+            whitespace_start -= 1
+        newline = content.find("\n", whitespace_start, header.start())
+        start = 0 if whitespace_start == 0 else newline + 1 if newline >= 0 else header.start()
+        assignment = _VARIABLE_SHELL_ASSIGNMENT_RE.match(content, start)
+        if assignment is not None:
+            yield assignment
+
+
+def _iter_variable_shell_flag_matches(
+    content: str,
+    *,
+    allowance: static_runner._PatternAllowance | None = None,
+    on_limit: Callable[[static_runner._StaticResourceLimitError], None] | None = None,
+) -> Iterator[re.Match[str]]:
+    """Keep Python's case-folded backreferences within bounded native searches."""
+    headers = _iter_variable_shell_assignments(content)
+    allowance = allowance or static_runner._PatternAllowance()
+    budget = static_runner._ACTIVE_FINDING_BUDGET.get()
+    consumed = 0
+    while True:
+        if budget is not None:
+            budget.check_runtime()
+        allowance.check()
+        started_at = time.thread_time()
+        match = None
+        truncated = False
+        try:
+            header = next(headers, None)
+            if header is None:
+                return
+            if header.start() < consumed:
+                continue
+            start = max(consumed, header.start())
+            prefix = _VARIABLE_SHELL_LAST_PREFIX_RE.match(content, start)
+            if prefix is None:
+                continue
+            end = min(len(content), prefix.end() + _VARIABLE_SHELL_ARGUMENT_CHARS)
+            match = _VARIABLE_SHELL_FLAG_RE.match(content, start, end)
+            # An artificial end must not make a partial identifier look like
+            # the backreference's trailing word boundary.
+            if match is not None and match.end() == end and end < len(content):
+                if content[end].isalnum() or content[end] == "_":
+                    match = None
+            truncated = end < len(content) and content.find(")", prefix.end(), end) < 0
+        finally:
+            allowance.seconds += max(0.0, time.thread_time() - started_at)
+        if match is not None:
+            consumed = match.end()
+            yield match
+        if truncated:
+            error = static_runner._StaticResourceLimitError(
+                LedgerReason.STATIC_PARSE_LIMIT,
+                {
+                    "observed_characters": _VARIABLE_SHELL_ARGUMENT_CHARS + 1,
+                    "limit_characters": _VARIABLE_SHELL_ARGUMENT_CHARS,
+                },
+            )
+            if on_limit is None:
+                raise error
+            on_limit(error)
+        allowance.check()
+
+
 _VARIABLE_SHELL_ASSIGNMENT_RE = re.compile(
     _VARIABLE_SHELL_ASSIGNMENT_PATTERN, re.IGNORECASE | re.MULTILINE
 )
@@ -404,7 +505,7 @@ TM1_CODE_PATTERNS = [
     # privilege-escalation rule: `--?` made the match exponential on a line of
     # unmatched `-- ` tokens, and `[\w=-]*` already absorbs a long option's
     # second dash.
-    (r"chmod\s+(?:-[\w=-]*[ \t]+)*[\"']?[+=]?0*[0-7]{2,3}[2367](?![0-9\w])[\"']?", 0.8),
+    (r"chmod\s+(?>(?:-[\w=-]*[ \t]+)*)[\"']?[+=]?0*[0-7]{2,3}[2367](?![0-9\w])[\"']?", 0.8),
     *[
         (prefix + r"[\s\S]*" + option, confidence)
         for prefix, option, confidence in _OPTION_COMMAND_RULES
@@ -709,6 +810,7 @@ class _ShellCommandString:
     exact_source: bool
     diagnostic: StaticParserDiagnostic | None
     xargs_contexts: tuple[tuple[str, list[bool | None]], ...] = ()
+    inspected_source: bool = False
 
 
 def _note_parser_diagnostic(
@@ -3501,6 +3603,7 @@ def _has_shell_command_word_exhaustion(
     quote_limits: dict[int, int] | None = None,
     file_type: str = "shell",
     _command_string_depth: int = 0,
+    source_commands: Mapping[tuple[int, int], str | tuple[str, ...]] | None = None,
     _quoted_printf_allowed: bool = True,
     _startup_exposure: list[bool] | None = None,
     _startup_diagnostics: list[StaticParserDiagnostic] | None = None,
@@ -4054,6 +4157,7 @@ def _has_shell_command_word_exhaustion(
         check_runtime,
         perl_eval_blocks=perl_eval_blocks,
         python_source=python_source,
+        source_commands=source_commands,
         powershell=powershell,
         shell_substitutions=file_type == "shell",
         startup_exposure=_startup_exposure,
@@ -4086,12 +4190,17 @@ def _has_shell_command_word_exhaustion(
             )
         command_effects: list[StaticParserDiagnostic] = []
         if _has_destructive_command_string(command_string, diagnostics=command_effects):
-            diagnostic = command_effects[0]
-            return (
-                diagnostic.shifted(command.start)
-                if command.exact_source
-                else diagnostic.enclosed(command.start, command.end)
+            diagnostic = (
+                _has_bounded_parse_exhaustion(command_string, check_runtime, file_type="shell")
+                if command.inspected_source
+                else command_effects[0]
             )
+            if diagnostic is not None:
+                return (
+                    diagnostic.shifted(command.start)
+                    if command.exact_source
+                    else diagnostic.enclosed(command.start, command.end)
+                )
         command_closers: set[int] = set()
         command_limits = _shell_quoted_candidate_limits(
             command_string, check_runtime, quote_closers=command_closers
@@ -4207,6 +4316,7 @@ def _shell_command_strings(
     *,
     perl_eval_blocks: bool = False,
     python_source: _PythonSourceOwnership | None = None,
+    source_commands: Mapping[tuple[int, int], str | tuple[str, ...]] | None = None,
     powershell: PowerShellSource | None = None,
     shell_substitutions: bool = True,
     startup_exposure: list[bool] | None = None,
@@ -4216,6 +4326,11 @@ def _shell_command_strings(
     json_value_starts: frozenset[int] = frozenset(),
 ) -> Iterator[_ShellCommandString]:
     """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
+    single_sources = (
+        {span: value for span, value in source_commands.items() if isinstance(value, str)}
+        if source_commands is not None
+        else None
+    )
     nested_substitutions = startup_exposure is not None and ("$(" in content or "`" in content)
     if startup_exposure is None:
         startup_exposure = [False]
@@ -4327,6 +4442,7 @@ def _shell_command_strings(
         diagnostics: list[StaticParserDiagnostic] = []
         source_span = [clause_start - body_start, clause_start - body_start]
         literal_spans: list[tuple[int, int]] = []
+        spans: list[tuple[int, int]] = []
         recognized, command_string = _command_string_from_clause(
             body,
             clause_start - body_start,
@@ -4335,6 +4451,9 @@ def _shell_command_strings(
             shell_traps=shell_substitutions,
             startup_exposure=startup_context,
             startup_diagnostics=context_diagnostics,
+            source_commands=single_sources,
+            command_word_spans=spans if source_commands is not None else None,
+            source_offset=body_start,
             starts_shell=starts_shell,
             diagnostics=diagnostics,
             source_span=source_span,
@@ -4380,7 +4499,7 @@ def _shell_command_strings(
         diagnostic = diagnostics[0] if diagnostics else None
         if diagnostic is not None and not any(diagnostic is item for item in context_diagnostics):
             diagnostic = diagnostic.shifted(body_start)
-        yield _ShellCommandString(
+        command = _ShellCommandString(
             command_string,
             [False] if starts_shell[0] else startup_context,
             [] if starts_shell[0] else context_diagnostics,
@@ -4390,6 +4509,33 @@ def _shell_command_strings(
             diagnostic,
             xargs_contexts + ((content, xargs_override_cache),),
         )
+        variants = (
+            source_commands.get(spans[0])
+            if source_commands is not None and len(spans) == 1
+            else None
+        )
+        if command_string is None and isinstance(variants, tuple):
+            for variant in variants:
+                yield replace(
+                    command,
+                    content=variant,
+                    start=spans[0][0],
+                    end=spans[0][1],
+                    exact_source=False,
+                    diagnostic=None,
+                    inspected_source=True,
+                )
+        elif isinstance(variants, str) and command_string == variants:
+            yield replace(
+                command,
+                start=spans[0][0],
+                end=spans[0][1],
+                exact_source=False,
+                diagnostic=None,
+                inspected_source=True,
+            )
+        else:
+            yield command
 
 
 def _shell_clause_sets_startup(
@@ -5061,6 +5207,9 @@ def _command_string_from_clause(
     check_runtime: Callable[[], None],
     *,
     perl_eval_blocks: bool = False,
+    source_commands: Mapping[tuple[int, int], str] | None = None,
+    command_word_spans: list[tuple[int, int]] | None = None,
+    source_offset: int = 0,
     shell_traps: bool = False,
     literal_command_spans: list[tuple[int, int]] | None = None,
     startup_exposure: list[bool] | None = None,
@@ -5402,6 +5551,14 @@ def _command_string_from_clause(
                         if command_operand_spans is not None and cursor > last_word_start:
                             command_operand_spans.append((last_word_start, cursor))
                         resolved = resolved_command_string(command_string, limited)
+                        if command_word_spans is not None:
+                            command_word_spans.append(
+                                (last_word_start + source_offset, cursor + source_offset)
+                            )
+                        if resolved is None and not limited and source_commands is not None:
+                            resolved = source_commands.get(
+                                (last_word_start + source_offset, cursor + source_offset)
+                            )
                         if (
                             literal_command_spans is not None
                             and resolved is not None
@@ -8310,38 +8467,84 @@ def _is_true_prefixed_name(name: str) -> bool:
     return name.casefold().startswith("true")
 
 
-def _variable_shell_matches(content: str) -> list[re.Match[str]]:
-    """Return bounded variable-shell windows, one per call for true-prefixed names.
+def _variable_shell_matches(
+    content: str,
+    *,
+    on_limit: Callable[[static_runner._StaticResourceLimitError], None] | None = None,
+) -> list[re.Match[str]]:
+    """Return variable-shell windows under one allowance per content window.
 
-    The non-overlapping scan pairs an assignment with one call and skips an
-    assignment inside an earlier window. The ``\\b``-bounded direct pattern
-    does not report ``shell=true_value`` and folds identical same-line
-    ``shell=true`` calls into one candidate, so every assignment of a
-    true-prefixed name is also paired with each call its bounded window
-    reaches. The nearest assignment owns each call.
+    Whole-artifact reconciliation receives the same allowance for each raw
+    window it covers. A caller can defer local exhaustion until other rules
+    have run, retaining the matches already found.
     """
     windows: dict[int, re.Match[str]] = {}
+    window_count = max(
+        1,
+        (len(content) + static_runner.SECURITY_VIEW_WINDOW_CHARS - 1)
+        // static_runner.SECURITY_VIEW_WINDOW_CHARS,
+    )
+    allowance = static_runner._PatternAllowance(
+        limit=static_runner._STATIC_PATTERN_SECONDS * window_count
+    )
+    budget = static_runner._ACTIVE_FINDING_BUDGET.get()
 
     def keep(window: re.Match[str]) -> None:
         previous = windows.get(window.end())
         if previous is None or window.start() > previous.start():
             windows[window.end()] = window
 
-    for match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
-        keep(match)
-    for assignment in _VARIABLE_SHELL_ASSIGNMENT_RE.finditer(content):
-        if not _is_true_prefixed_name(assignment.group(1)):
-            continue
-        search_end = assignment.end() - 1
-        for _ in range(5):
-            search_end = content.find("\n", search_end + 1)
-            if search_end == -1:
-                search_end = len(content)
-                break
-        for argument in _SHELL_NAME_ARGUMENT_RE.finditer(content, assignment.end(), search_end):
-            window = _VARIABLE_SHELL_FLAG_RE.fullmatch(content, assignment.start(), argument.end())
-            if window is not None:
-                keep(window)
+    started_at = time.thread_time()
+
+    def check_runtime() -> None:
+        if budget is not None:
+            budget.check_runtime()
+        allowance.seconds = max(0.0, time.thread_time() - started_at)
+        allowance.check()
+
+    try:
+        for match in _iter_variable_shell_flag_matches(
+            content, allowance=allowance, on_limit=on_limit
+        ):
+            keep(match)
+        for assignment in _iter_variable_shell_assignments(content):
+            check_runtime()
+            if not _is_true_prefixed_name(assignment.group(1)):
+                continue
+            search_end = assignment.end() - 1
+            for _ in range(5):
+                search_end = content.find("\n", search_end + 1)
+                if search_end == -1:
+                    search_end = len(content)
+                    break
+            prefix = _VARIABLE_SHELL_LAST_PREFIX_RE.match(content, assignment.start())
+            if prefix is None:
+                continue
+            for argument in _SHELL_NAME_ARGUMENT_RE.finditer(content, assignment.end(), search_end):
+                check_runtime()
+                if argument.end() - prefix.end() > _VARIABLE_SHELL_ARGUMENT_CHARS:
+                    error = static_runner._StaticResourceLimitError(
+                        LedgerReason.STATIC_PARSE_LIMIT,
+                        {
+                            "observed_characters": argument.end() - prefix.end(),
+                            "limit_characters": _VARIABLE_SHELL_ARGUMENT_CHARS,
+                        },
+                    )
+                    if on_limit is None:
+                        raise error
+                    on_limit(error)
+                    continue
+                window = _VARIABLE_SHELL_FLAG_RE.fullmatch(
+                    content, assignment.start(), argument.end()
+                )
+                check_runtime()
+                if window is not None:
+                    keep(window)
+        check_runtime()
+    except static_runner._StaticResourceLimitError as error:
+        if on_limit is None:
+            raise
+        on_limit(error)
     return sorted(windows.values(), key=lambda window: (window.start(), window.end()))
 
 
@@ -8784,6 +8987,7 @@ def _tm1_candidates(
     *,
     direct_shell_only: bool = False,
     shell_content: str | None = None,
+    variable_matches: list[re.Match[str]] | None = None,
     check_runtime: Callable[[], None] | None,
     file_type: str = "",
 ) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
@@ -8794,7 +8998,9 @@ def _tm1_candidates(
         pattern: str,
         confidence: float,
     ) -> Iterator[tuple[int, int, re.Match[str], float]]:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             yield match.start(), pattern_index, match, confidence
 
     def direct_candidates() -> Iterator[
@@ -8897,13 +9103,15 @@ def _tm1_candidates(
             return
         pattern = _OPTION_COMMAND_HOST_PATTERNS.get(pattern, pattern)
         if pattern == _VARIABLE_SHELL_FLAG_PATTERN:
-            for match in _variable_shell_matches(content):
+            for match in (
+                _variable_shell_matches(content) if variable_matches is None else variable_matches
+            ):
                 yield match.start(), pattern_index, match, confidence
             return
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in TM1_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             yield match.start(), pattern_index, match, confidence
@@ -9845,6 +10053,617 @@ def _fenced_powershell_source(
         tuple(sorted(clause_starts)),
         tuple(continuations),
         tuple(invocations),
+    )
+
+
+def _source_path_arguments_safe(value: ShellSourceValue, check_runtime: Callable[[], None]) -> bool:
+    """Keep generated-path data out of command, option and parser positions."""
+    if not value.safe_spans:
+        return True
+    source = value.text
+    cursor = 0
+    command_seen = False
+    seen = 0
+    while cursor < len(source):
+        check_runtime()
+        if source[cursor].isspace():
+            if source[cursor] in "\r\n":
+                command_seen = False
+            cursor += 1
+            continue
+        if source[cursor] in ";|&(){}":
+            command_seen = False
+            cursor += 1
+            continue
+        if source[cursor] == "#":
+            newline = source.find("\n", cursor)
+            cursor = len(source) if newline < 0 else newline + 1
+            command_seen = False
+            continue
+        if source[cursor] in "<>":
+            if source.startswith(("<(", ">("), cursor):
+                stop = _skip_command_substitution(source, cursor, len(source), check_runtime)
+                if stop is None or SAFE_PATH_MARKER in source[cursor:stop]:
+                    return False
+                cursor = stop
+                continue
+            if source.startswith("<<", cursor) and not source.startswith("<<<", cursor):
+                # This positional refinement does not own heredoc bodies.
+                return False
+            operator = re.match(r"(?:<<<|>>|>&|<&|>\||<>|>|<)", source[cursor : cursor + 3])
+            if operator is None:
+                return False
+            cursor += len(operator[0])
+            while cursor < len(source) and source[cursor] in " \t":
+                cursor += 1
+            start = cursor
+            target, cursor, limited = _next_shell_invocation_word(source, cursor, check_runtime)
+            if (
+                target is None
+                or limited
+                or cursor <= start
+                or SAFE_PATH_MARKER in source[start:cursor]
+            ):
+                return False
+            continue
+        start = cursor
+        word, cursor, limited = _next_shell_invocation_word(source, cursor, check_runtime)
+        if limited or word is None or cursor <= start:
+            return False
+        raw = source[start:cursor]
+        if SAFE_PATH_MARKER in raw:
+            if (
+                not command_seen
+                or re.fullmatch(r"'[-A-Za-z0-9_./]+'", raw) is None
+                or not raw.startswith("'/tmp/")
+            ):
+                return False
+            seen += raw.count(SAFE_PATH_MARKER)
+        if word in {"if", "then", "elif", "else", "while", "until", "do", "!"}:
+            command_seen = False
+        elif (
+            not command_seen and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", raw, re.DOTALL) is None
+        ):
+            command_seen = not any(
+                marker in word
+                for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+            )
+    return seen == len(value.safe_spans)
+
+
+@dataclass
+class _PreparedSourceCommands:
+    content: str
+    path: str
+    resolver: ShellSourceResolver
+    values: dict[tuple[int, int], ShellSourceValue | tuple[ShellSourceValue, ...]]
+    check_runtime: Callable[[], None]
+    analyzed: bool = False
+    mapped_findings: list[Finding] = field(default_factory=list)
+    emitted_findings: int = 0
+    parser_diagnostic: StaticParserDiagnostic | None = None
+
+    def retained_source_findings(self) -> list[Finding]:
+        """Return only bounded evidence already addressed to the parent consumer."""
+        return self.mapped_findings[self.emitted_findings :]
+
+    def variants(self) -> Iterator[tuple[tuple[int, int], ShellSourceValue]]:
+        for span, value in self.values.items():
+            for variant in value if isinstance(value, tuple) else (value,):
+                yield span, variant
+
+    def _retain_parser_diagnostic(self, metrics: object, start: int, end: int) -> None:
+        if not isinstance(metrics, static_runner._StaticScanMetrics):
+            return
+        diagnostic = getattr(metrics, "parser_diagnostic", None)
+        if isinstance(diagnostic, StaticParserDiagnostic):
+            diagnostic = diagnostic.enclosed(start, end)
+            if self.parser_diagnostic is None:
+                self.parser_diagnostic = diagnostic
+            metrics.parser_diagnostic = self.parser_diagnostic
+
+    def analyze_source_commands(
+        self,
+        *,
+        content: str,
+        file_path: str,
+        file_type: str,
+        source_view: SecurityTextView,
+        finding_budget: static_runner._FindingBudget | None = None,
+    ) -> Iterator[AnalyzerFinding]:
+        if (
+            content != self.content
+            or file_path != self.path
+            or file_type != "shell"
+            or source_view.text != content
+        ):
+            self.resolver.valid = False
+            return
+        if finding_budget is None:
+            started_at = time.monotonic()
+
+            def clock() -> float:
+                self.check_runtime()
+                return time.monotonic()
+
+            finding_budget = static_runner._FindingBudget(
+                static_runner.MAX_FINDINGS_PER_ARTIFACT,
+                started_at,
+                started_at + static_runner.MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT,
+                clock,
+            )
+        locations = SourceLocationIndex(content, file_path)
+        parent_lines = content.splitlines()
+        ambiguous_lines = any(ch in content for ch in static_runner._EXOTIC_LINE_BREAKS)
+        for (start, end), value in self.variants():
+            finding_budget.check_runtime()
+            try:
+                children, reason, metrics = static_runner._scan_all_views_detailed(
+                    file_path,
+                    value.text,
+                    [sys.modules[__name__]],
+                    None,
+                    python_source=False,
+                    # This text is already reconstructed. No child source cache is
+                    # available, and all views charge the original artifact budget.
+                    _parent_budget=finding_budget,
+                )
+            except static_runner._StaticResourceLimitError as exc:
+                self._retain_parser_diagnostic(exc.metrics, start, end)
+                raise
+            self._retain_parser_diagnostic(metrics, start, end)
+            if reason is not None:
+                self.resolver.valid = False
+            if reason == static_runner.LedgerReason.RUNTIME_LIMIT:
+                finalized = cleanup_path_findings(children)
+            else:
+                finalized = postprocess_path_findings(
+                    value.text,
+                    children,
+                    started_at=finding_budget.started_at,
+                    timeout_seconds=finding_budget.deadline - finding_budget.started_at,
+                )
+            line, column = locations.line_and_column(start)
+            parent_line = (
+                parent_lines[line - 1]
+                if not ambiguous_lines and 0 < line <= len(parent_lines)
+                else None
+            )
+            parent_surface = static_runner.infer_surface(file_path, parent_line)
+            self.mapped_findings = finalized
+            self.emitted_findings = 0
+            for child in finalized:
+                child_line, child_column = child.start_line, child.start_column
+                child.file = file_path
+                child.surface = parent_surface
+                child.start_line = child.end_line = line
+                child.start_column = column
+                child.end_column = column + max(1, min(end - start, 128))
+                child.evidence = {
+                    key: item for key, item in child.evidence.items() if not key.startswith("_")
+                }
+                child.evidence["reconstructed_shell_source"] = {
+                    "consumer_start": start,
+                    "consumer_end": end,
+                    "command_sha256": sha256(value.text.encode()).hexdigest(),
+                    "command_line": child_line,
+                    "command_column": child_column,
+                    "origins": [
+                        {
+                            "path": origin.path,
+                            "start": origin.start,
+                            "end": origin.end,
+                            "sha256": origin.sha256,
+                        }
+                        for origin in value.origins
+                    ],
+                }
+                if value.argv is not None:
+                    detail = child.evidence["reconstructed_shell_source"]
+                    detail["normalized_command_sha256"] = detail.pop("command_sha256")
+                    detail["normalized_forwarded_argv"] = list(value.argv)
+                identity = f"{file_path}:{start}:{end}:{child_line}:{child_column}:{child.match_fingerprint}:{value.text}"
+                child.match_fingerprint = sha256(identity.encode()).hexdigest()
+            if reason in {
+                static_runner.LedgerReason.RUNTIME_LIMIT,
+                static_runner.LedgerReason.OUTPUT_LIMIT,
+            }:
+                raise static_runner._StaticResourceLimitError(reason, metrics)
+            for child in finalized:
+                # Child construction was already charged. Converting its
+                # mapped representation must not charge it again or discard a
+                # proven prefix when the parent deadline expires at emission.
+                with observe_analyzer_findings(lambda _: None):
+                    mapped = AnalyzerFinding(
+                        rule_id=child.rule_id,
+                        message=child.message,
+                        severity=Severity(child.severity),
+                        location=Location(
+                            file_path,
+                            line,
+                            end_line=line,
+                            start_column=column,
+                            end_column=child.end_column,
+                        ),
+                        confidence=child.confidence,
+                        remediation=child.remediation,
+                        tags=list(child.tags),
+                        explanation=child.explanation,
+                        context=child.context,
+                        matched_text=child.matched_text,
+                        evidence=child.evidence,
+                        match_fingerprint=child.match_fingerprint,
+                    )
+                yield mapped
+                self.emitted_findings += 1
+        self.analyzed = True
+
+    def has_bounded_parse_exhaustion(self) -> bool:
+        return self.bounded_parse_diagnostic() is not None
+
+    def bounded_parse_diagnostic(self) -> StaticParserDiagnostic | None:
+        if self.parser_diagnostic is not None:
+            return self.parser_diagnostic
+        commands = (
+            {
+                span: tuple(item.text for item in value) if isinstance(value, tuple) else value.text
+                for span, value in self.values.items()
+            }
+            if self.analyzed and self.resolver.valid and self.resolver.work_budget[0] >= 0
+            else None
+        )
+        return _has_bounded_parse_exhaustion(
+            self.content, self.check_runtime, file_type="shell", source_commands=commands
+        )
+
+
+def _generated_helper_variants(
+    resolver: ShellSourceResolver,
+    values: Mapping[tuple[int, int], ShellSourceValue],
+    check_runtime: Callable[[], None],
+) -> dict[tuple[int, int], ShellSourceValue | tuple[ShellSourceValue, ...]]:
+    """Bind finite helper argv to exact generated bytes and every PATH caller."""
+    output: dict[tuple[int, int], ShellSourceValue | tuple[ShellSourceValue, ...]] = {}
+    source = resolver.content
+    source_hash = sha256(source.encode()).hexdigest()
+    total = 0
+    for generated in resolver.generated_files():
+        check_runtime()
+        if not any(
+            command.content is None
+            for command in _shell_command_strings(generated.value.text, check_runtime)
+        ):
+            continue
+        directory, _, helper_name = generated.path.text.rpartition("/")
+        callers = []
+        programs: dict[tuple[int, int], ShellSourceValue] = {}
+        uncertain = False
+        for command in resolver.commands:
+            if command.start <= generated.declaration_end:
+                continue
+            paths = []
+            for _, left, right in command.words:
+                assignment = re.match(r"([A-Za-z_][A-Za-z0-9_]*)=", source[left:right])
+                if assignment is None:
+                    break
+                if assignment[1] == "PATH":
+                    paths.append(resolver.path_prefix(left, right))
+            if not any(path is not None and path.text == directory for path in paths):
+                continue
+            if len(paths) != 1:
+                uncertain = True
+                break
+            spans: list[tuple[int, int]] = []
+            recognized, literal = _command_string_from_clause(
+                source, command.start, check_runtime, command_word_spans=spans
+            )
+            if not recognized or len(spans) != 1:
+                uncertain = True
+                break
+            span = spans[0]
+            program = values.get(span)
+            if program is None and literal is not None:
+                program = ShellSourceValue(literal, "code")
+            if program is None or program.safe_spans:
+                uncertain = True
+                break
+            caller_origin = ShellSourceOrigin(resolver.context.path, span[0], span[1], source_hash)
+            programs[span] = ShellSourceValue(
+                program.text, "code", (*program.origins, caller_origin)
+            )
+            callers.append(command)
+        if (
+            uncertain
+            or not callers
+            or not generated_file_is_unmodified(resolver, generated, tuple(callers))
+        ):
+            continue
+        variants = reconstruct_helper_commands(
+            generated.value.text,
+            tuple(program.text for program in programs.values()),
+            helper_name,
+            _next_shell_invocation_word,
+            check_runtime,
+        )
+        if variants is None:
+            continue
+        origins = tuple(
+            dict.fromkeys(
+                (
+                    *generated.value.origins,
+                    *(origin for program in programs.values() for origin in program.origins),
+                )
+            )
+        )
+        for (left, right), commands in variants.items():
+            if not 0 <= left < right <= len(generated.value.text) or not commands:
+                resolver.valid = False
+                return output
+            span = (generated.body_start + left, generated.body_start + right)
+            if span in output or span in values:
+                resolver.valid = False
+                return output
+            entries = tuple(
+                ShellSourceValue(command, "code", origins, argv=argv) for command, argv in commands
+            )
+            total += sum(len(entry.text) for entry in entries)
+            if len(output) >= 128 or total > 1_000_000:
+                resolver.valid = False
+                return output
+            output[span] = entries
+        # The literal caller is a separate shell consumer. Analyze its exact
+        # bytes too before its destructive operands can count as inspected.
+        for span, program in programs.items():
+            if span in values:
+                continue
+            total += len(program.text)
+            if span in output or len(output) >= 128 or total > 1_000_000:
+                resolver.valid = False
+                return output
+            output[span] = program
+    return output
+
+
+def prepare_source_analysis(
+    *,
+    content: str,
+    file_path: str,
+    file_type: str,
+    source_context: ShellSourceContext,
+    check_runtime: Callable[[], None],
+) -> _PreparedSourceCommands | None:
+    """Inspect commands from complete cached bundle bytes before resolving them."""
+    if (
+        file_type != "shell"
+        or source_context.path != file_path
+        or source_context.sources.get(file_path) != content
+    ):
+        return None
+    from skillspector.shell_artifact_effects import ShellArtifactAudit
+    from skillspector.shell_source_effects import source_effects_collect, source_effects_preserve
+
+    def make_resolver(
+        *,
+        text: str | None = None,
+        inherited: Mapping[str, ShellSourceValue] | None = None,
+        depth: int = 0,
+        budget: list[int] | None = None,
+    ) -> ShellSourceResolver:
+        resolver = ShellSourceResolver(
+            source_context,
+            _next_shell_invocation_word,
+            lambda text, start, end: _skip_command_substitution(text, start, end, check_runtime),
+            _static_heredoc_header,
+            _skip_static_heredoc_bodies,
+            check_runtime,
+            content=text,
+            inherited_values=inherited,
+            source_identity=text is None,
+            work_budget=budget,
+        )
+
+        # The optional effect pass proves bytes at this exact consumer prefix.
+        # Cache both success and refusal; repeated sed/cat consumers must not
+        # repeatedly walk a large workflow or reuse facts from a later state.
+        effect_cache: dict[int, ShellArtifactAudit | None] = {}
+        preservation_cache: dict[tuple[str, int], ShellSourceValue | None] = {}
+        active_effects: set[int] = set()
+
+        def effect_source(target: ShellSourceValue, before_offset: int) -> ShellSourceValue | None:
+            if target.kind not in {"bundle_path", "safe_path"} or not 0 <= before_offset <= len(
+                resolver.content
+            ):
+                return None
+            if target.kind == "bundle_path" and target.text in source_context.sources:
+                key = (target.text, before_offset)
+                if key not in preservation_cache:
+                    if len(preservation_cache) >= 16 or before_offset in active_effects:
+                        return None
+                    resolver.work_budget[0] -= max(1, before_offset)
+                    if resolver.work_budget[0] < 0:
+                        resolver.valid = False
+                        return None
+                    active_effects.add(before_offset)
+                    try:
+                        audit = ShellArtifactAudit(
+                            source_context, _next_shell_invocation_word, check_runtime
+                        )
+                        preserved = source_effects_preserve(
+                            resolver,
+                            target.text,
+                            before_offset,
+                            read_source=audit.read_source,
+                            preserve_effect=audit.preserve,
+                            preserve_state=audit.preservation_state,
+                        )
+                        original = source_context.sources[target.text]
+                        origin = ShellSourceOrigin(
+                            target.text, 0, len(original), sha256(original.encode()).hexdigest()
+                        )
+                        artifact = audit.store.read(target.text) if preserved else None
+                        preservation_cache[key] = (
+                            ShellSourceValue(original, "code", (origin,))
+                            if artifact is not None
+                            and artifact.value is not None
+                            and artifact.value.text == original
+                            and artifact.value.origins == (origin,)
+                            else None
+                        )
+                    finally:
+                        active_effects.discard(before_offset)
+                if preservation_cache[key] is not None:
+                    return preservation_cache[key]
+            # Generated targets still require exact ordered artifact facts.
+            if before_offset not in effect_cache:
+                if len(effect_cache) >= 16 or before_offset in active_effects:
+                    return None
+                resolver.work_budget[0] -= max(1, before_offset)
+                if resolver.work_budget[0] < 0:
+                    resolver.valid = False
+                    return None
+                active_effects.add(before_offset)
+                try:
+                    audit = ShellArtifactAudit(
+                        source_context, _next_shell_invocation_word, check_runtime
+                    )
+                    complete = source_effects_collect(
+                        resolver, before_offset, read_source=audit.read_source, native_effect=audit
+                    )
+                    effect_cache[before_offset] = audit if complete else None
+                finally:
+                    active_effects.discard(before_offset)
+            audit = effect_cache[before_offset]
+            if audit is None:
+                return None
+            artifact = audit.store.read(target.text)
+            if artifact is None or artifact.value is None or not artifact.value.origins:
+                return None
+            return ShellSourceValue(artifact.value.text, "code", artifact.value.origins)
+
+        resolver.effect_source = effect_source
+
+        def literal_children(before_offset: int) -> Iterator[tuple[ShellSourceResolver, int]]:
+            if depth >= 8:
+                resolver.valid = False
+                return
+            for command in (*resolver.commands, *resolver.child_commands):
+                if command.start >= before_offset:
+                    continue
+                check_runtime()
+                spans: list[tuple[int, int]] = []
+                recognized, child = _command_string_from_clause(
+                    resolver.content, command.start, check_runtime, command_word_spans=spans
+                )
+                if not recognized:
+                    continue
+                if child is None and len(spans) == 1:
+                    value = resolver.word(*spans[0])
+                    if value is not None and value.kind == "code":
+                        child = value.text
+                if child is None:
+                    continue
+                environment: dict[str, ShellSourceValue] = {}
+                executable_index = 0
+                for _, start, end in command.words:
+                    binding = re.match(r"([A-Za-z_][A-Za-z0-9_]*)=", resolver.content[start:end])
+                    if binding is None:
+                        break
+                    value = resolver.word(start + binding.end(), end, assignment_value=True)
+                    if value is not None:
+                        environment[binding[1]] = value
+                    executable_index += 1
+                if (
+                    executable_index < len(command.words)
+                    and command.words[executable_index][0].rpartition("/")[2] == "env"
+                ):
+                    invocation = decode_env_unset_command(resolver, command.words, executable_index)
+                    if invocation is None:
+                        continue
+                    _, removed, assigned = invocation
+                    for name in removed:
+                        environment.pop(name, None)
+                    environment.update(assigned)
+                yield (
+                    make_resolver(
+                        text=child,
+                        inherited=environment,
+                        depth=depth + 1,
+                        budget=resolver.work_budget,
+                    ),
+                    command.start,
+                )
+
+        def executable_children(before_offset: int) -> Iterator[tuple[ShellSourceResolver, int]]:
+            for left, right, stop, child_scope in resolver.executable_spans:
+                if stop > before_offset:
+                    continue
+                if depth >= 8 or not resolver.audit_spend(right - left):
+                    resolver.executable_children_complete = False
+                    return
+                child = resolver.content[left:right]
+                inherited_values: dict[str, ShellSourceValue] = {}
+                # Only names actually read by this child need parent values.
+                # Local reassignments and setters still invalidate inheritance
+                # in the independently collected child resolver.
+                for match in (
+                    ()
+                    if child_scope
+                    else re.finditer(
+                        r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})", child
+                    )
+                ):
+                    name = match[1] or match[2]
+                    if name not in inherited_values:
+                        value = resolver._name(name, 0, left - 2)
+                        if value is not None:
+                            inherited_values[name] = value
+                yield (
+                    make_resolver(
+                        text=child,
+                        inherited=inherited_values,
+                        depth=depth + 1,
+                        budget=resolver.work_budget,
+                    ),
+                    left - 2,
+                )
+
+        resolver.child_contexts = literal_children
+        resolver.substitution_contexts = executable_children
+        return resolver
+
+    resolver = make_resolver()
+    if not resolver.valid:
+        return None
+    values: dict[tuple[int, int], ShellSourceValue] = {}
+    total_chars = 0
+    for command in resolver.commands:
+        check_runtime()
+        spans: list[tuple[int, int]] = []
+        recognized, literal = _command_string_from_clause(
+            content, command.start, check_runtime, command_word_spans=spans
+        )
+        if not recognized or literal is not None or len(spans) != 1:
+            continue
+        start, end = spans[0]
+        value = resolver.word(start, end)
+        if (
+            value is None
+            or value.kind != "code"
+            or not _source_path_arguments_safe(value, check_runtime)
+        ):
+            continue
+        total_chars += len(value.text)
+        if len(values) >= 128 or total_chars > 1_000_000:
+            resolver.valid = False
+            break
+        values[(start, end)] = value
+    combined: dict[tuple[int, int], ShellSourceValue | tuple[ShellSourceValue, ...]] = dict(values)
+    if resolver.valid:
+        combined.update(_generated_helper_variants(resolver, values, check_runtime))
+    return (
+        _PreparedSourceCommands(content, file_path, resolver, combined, check_runtime)
+        if combined
+        else None
     )
 
 
@@ -11262,6 +12081,7 @@ def _has_bounded_parse_exhaustion(
     file_type: str,
     complete_context: bool = True,
     word_apostrophes: bool = False,
+    source_commands: Mapping[tuple[int, int], str | tuple[str, ...]] | None = None,
     prepared_analysis: object | None = None,
     source_view: SecurityTextView | None = None,
     python_import_check: Callable[[Callable[[], None]], bool] | None = None,
@@ -11525,6 +12345,7 @@ def _has_bounded_parse_exhaustion(
         perl_eval_blocks=file_type == "perl",
         quote_limits=quote_limits,
         file_type=file_type,
+        source_commands=source_commands if file_type == "shell" and complete_context else None,
         complete_context=complete_context,
         **(
             {
@@ -11895,12 +12716,13 @@ def analyze(
     tm1_findings_by_key: dict[tuple[int, str], AnalyzerFinding] = {}
     direct_safety_by_line: dict[int, tuple[bool, bool]] = {}
 
+    variable_limits: list[static_runner._StaticResourceLimitError] = []
     variable_matches = (
         {}
         if _direct_shell_only
         else {
             (match.start(), match.end()): (match.group(1), match)
-            for match in _variable_shell_matches(content)
+            for match in _variable_shell_matches(content, on_limit=variable_limits.append)
         }
     )
     invisible_variable_matches: set[tuple[int, int]] = set()
@@ -11939,6 +12761,7 @@ def analyze(
         content,
         direct_shell_only=_direct_shell_only,
         shell_content=shell_content,
+        variable_matches=[match for _, match in variable_matches.values()],
         check_runtime=check_runtime,
         file_type=file_type,
     ):
@@ -12088,7 +12911,7 @@ def analyze(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in TM2_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             runtime_check()
@@ -12119,7 +12942,7 @@ def analyze(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in TM3_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         skip_assigned = (pattern, confidence) == _TM3_UMASK_CALL
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
@@ -12147,7 +12970,9 @@ def analyze(
     reference_material = is_reference_material(file_path, file_type)
     tm4_tags = [*tag, "contextual-triage", "likely-benign-context"] if reference_material else tag
     for pattern, confidence in TM4_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             runtime_check()
             line_num = line_number(match.start())
             findings.append(
@@ -12163,6 +12988,9 @@ def analyze(
                     complete_match=match.group(0),
                 )
             )
+    if variable_limits:
+        runtime_check()
+        static_runner.defer_pattern_limit(variable_limits[0])
     return findings
 
 
@@ -13434,7 +14262,7 @@ def _reconcile_variable_shell_findings(
     if ast_index is None:
         return findings
     resolved: dict[tuple[int, str], list[_VariableShellCandidate]] = {}
-    for match in _variable_shell_matches(content):
+    for match in _variable_shell_matches(content, on_limit=static_runner.defer_pattern_limit):
         assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
         candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)
         if candidate is not None:
