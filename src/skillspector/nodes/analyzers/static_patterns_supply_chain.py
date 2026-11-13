@@ -2254,29 +2254,27 @@ def _collect_npm_locked_versions(
                 if str(root / relative) in manifest_dirs:
                     projects.add(relative)
                 owner, separator, name = location.rpartition("node_modules/")
+                if not separator or (owner and not owner.endswith("/")):
+                    continue
                 version = entry.get("version")
                 registry_name = entry.get("name")
-                if (
-                    isinstance(registry_name, str)
-                    and registry_name.strip()
-                    and registry_name != name
-                ):
-                    # Keep the occupied slot in the nearest layer so ChainMap cannot
-                    # borrow an unrelated ancestor's registry pin for this alias name.
-                    if separator and (not owner or owner.endswith("/")):
-                        installs.setdefault(PurePosixPath(owner), {})[
-                            _normalize_npm_package_name(name)
-                        ] = None
-                    continue
-                if (
-                    separator
-                    and (not owner or owner.endswith("/"))
-                    and isinstance(version, str)
+                pinned = (
+                    isinstance(version, str)
                     and version.strip()
-                ):
-                    installs.setdefault(PurePosixPath(owner), {})[
-                        _normalize_npm_package_name(name)
-                    ] = version.strip()
+                    and not entry.get("link")
+                    and not (
+                        isinstance(registry_name, str)
+                        and registry_name.strip()
+                        and registry_name != name
+                    )
+                )
+                # Every occupied install slot shadows its ancestors, as Node's module
+                # lookup does. An alias, a local `link: true` install or a slot without
+                # a version stays unresolved (None), so ChainMap cannot borrow an unrelated
+                # ancestor's registry pin for it; any other slot records its own version.
+                installs.setdefault(PurePosixPath(owner), {})[_normalize_npm_package_name(name)] = (
+                    version.strip() if pinned else None
+                )
         elif isinstance(data.get("dependencies"), dict):
             trees = {PurePosixPath("."): data["dependencies"]}
             for entry in data["dependencies"].values():
