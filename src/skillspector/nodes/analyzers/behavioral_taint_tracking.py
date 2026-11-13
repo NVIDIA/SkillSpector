@@ -53,6 +53,7 @@ from skillspector.state import (
     transitive_remaining_seconds,
 )
 
+from .canonical_sink import resolve_to_canonical_sink
 from .common import (
     apply_import_aliases,
     build_type_map,
@@ -60,7 +61,6 @@ from .common import (
     get_context_from_lines,
     resolve_call_name_typed,
     resolve_dotted_name,
-    resolve_dynamic_import_call,
 )
 from .static_runner import (
     MAX_FILE_CHARS,
@@ -299,12 +299,13 @@ def _resolve_sink_name(
     type_map: dict[str, str] | None = None,
     aliases: dict[str, str] | None = None,
 ) -> str | None:
-    """Resolve a call to its canonical sink name, including dynamic-import chains.
+    """Resolve a call to its canonical sink name through the canonicalization chokepoint.
 
-    Wraps :func:`resolve_call_name_typed` (type-/alias-aware resolution) and falls back
-    to :func:`resolve_dynamic_import_call` so that
-    ``importlib.import_module('subprocess').run(...)`` resolves to ``'subprocess.run'``
-    and re-enters ``_EXEC_SINKS`` like the statically-imported form would.
+    Delegates to :func:`resolve_to_canonical_sink`, which reduces every spelling —
+    type-/alias-aware names, ``importlib.import_module('subprocess').run(...)``,
+    reflective ``getattr(os, "system")(...)`` and subscript ``__builtins__["exec"](...)``
+    / ``vars(builtins)["exec"](...)`` — to the bare/dotted id so it re-enters
+    ``_EXEC_SINKS`` like the statically-imported form would.
     """
     if (
         isinstance(node.func, ast.Attribute)
@@ -313,11 +314,10 @@ def _resolve_sink_name(
         and resolve_call_name_typed(node.func.value, type_map, aliases)
         == "urllib.request.build_opener"
     ):
+        # ``build_opener(...).open(url)`` has no dotted name of its own; keep this
+        # special case ahead of the chokepoint so it still maps to its network sink.
         return "urllib.request.build_opener.open"
-    name = resolve_call_name_typed(node, type_map, aliases)
-    if name is None:
-        name = resolve_dynamic_import_call(node, aliases)
-    return name
+    return resolve_to_canonical_sink(node, aliases, type_map)
 
 
 def _classify(name: str, categories: list[tuple[frozenset[str], str]], default: str) -> str:
