@@ -18,7 +18,7 @@ models:
   # The model card advertises 1M context, but the hosted endpoint's combined
   # input/output limit has not been verified. These are not its capacity claims.
   # https://build.nvidia.com/z-ai/glm-5-3/modelcard
-  "z-ai/glm-5.3":
+  "z-ai/glm-5.3-flash":
     context_length: 128000
     max_output_tokens: 32000
 
