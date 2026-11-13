@@ -2025,9 +2025,10 @@ class TestTP4MarkdownFences:
         self, monkeypatch: pytest.MonkeyPatch
     ):
         """An oversized line must not reserve budget away from a line that fits."""
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCH_INPUT_TOKENS", 16_000)
         long_prose = "Background narrative sentence. " * 60
-        oversized_line = "x" * 128_000 + "\n"
-        fitting_line = "y" * 126_000 + "\n"
+        oversized_line = "x" * 64_000 + "\n"
+        fitting_line = "y" * 60_000 + "\n"
         content = f"{long_prose}\n```python\n{oversized_line}{fitting_line}```\n"
         structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
 
