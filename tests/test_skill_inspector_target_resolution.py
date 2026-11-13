@@ -14,9 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-SKILL_PATH = (
-    Path(__file__).resolve().parents[1] / "skills" / "skill-inspector" / "SKILL.md"
-)
+SKILL_PATH = Path(__file__).resolve().parents[1] / "skills" / "skill-inspector" / "SKILL.md"
 
 
 def _skill_text() -> str:
