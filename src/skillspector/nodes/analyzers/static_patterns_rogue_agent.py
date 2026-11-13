@@ -44,6 +44,38 @@ ANALYZER_ID = "static_patterns_rogue_agent"
 _SECURITY_VIEW_START_EVIDENCE = "_security_view_start"
 
 # RA1: Self-Modification — skill modifies its own code, config, or behavior
+#
+# Two narrow context exemptions (issue #1120) keep the rule from firing on
+# prose that names an update without instructing one:
+#
+# * A Markdown heading only names a section ("## Config + self-update"), so
+#   no RA1 match on a heading line is an instruction. The lines below the
+#   heading are still scanned, so genuine instructions keep their findings.
+# * A bare "self-update" noun on a line that also says the update is offered
+#   to, or run by, the user first ("checked + offered before it's applied",
+#   "offers the update", "the user runs ... to apply it") describes a
+#   consent gate, the opposite of the skill changing itself unasked. The
+#   gate is a closed list of consent wordings on the same logical line; an
+#   imperative ("Apply the self-update now") carries none of them and keeps
+#   its finding. Only the bare self-* noun qualifies: imperative prose
+#   patterns ("update this skill") are not covered by this gate.
+_RA1_SELF_NOUN_PATTERN = re.compile(
+    r"self[_-]?(?:update|modify|rewrite|patch|evolve)",
+    re.IGNORECASE,
+)
+_MARKDOWN_HEADING_PATTERN = re.compile(r"^\s{0,3}#{1,6}(?:\s|$)")
+_RA1_CONSENT_GATE_PATTERN = re.compile(
+    r"\bchecked\s*\+\s*offered\b"
+    r"|\boffer(?:ed|s|ing)?\b[^\n.;!?]{0,60}\bbefore\b"
+    r"|\boffers?\s+(?:the\s+)?update\b"
+    r"|\bask(?:s|ed|ing)?\b[^\n.;!?]{0,60}\bbefore\b"
+    r"|\bonly\s+after\s+(?:asking|user\s+(?:approval|consent|confirmation)"
+    r"|approval|consent|confirmation)\b"
+    r"|\brequires?\s+(?:user\s+)?(?:approval|consent|confirmation)\b"
+    r"|\buser\s+(?:runs|applies|chooses|confirms|approves)\b"
+    r"|\bwith\s+(?:the\s+)?user(?:'s)?\s+(?:approval|consent|confirmation|permission)\b",
+    re.IGNORECASE,
+)
 RA1_CODE_PATTERNS = [
     # Python: writing to own file
     (r"open\s*\(\s*__file__\s*,\s*['\"]w", 0.95),
@@ -279,6 +311,10 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             line_num = bisect_right(line_starts, match.start())
             context = ctx(match.start())
             if _is_negated_safety_constraint(content, match, line_starts, line_ends):
+                continue
+            if _is_markdown_heading_match(content, match, file_type, line_starts, line_ends):
+                continue
+            if _is_consent_gated_self_update(content, match, line_starts, line_ends):
                 continue
             companion_update = _is_signed_companion_cli_update(
                 content,
@@ -573,6 +609,44 @@ def _logical_line_bounds(
         line_starts, line_ends = _logical_line_metadata(content)
     line_index = bisect_right(line_starts, start) - 1
     return line_starts[line_index], line_ends[line_index]
+
+
+def _is_markdown_heading_match(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> bool:
+    """Return True when an RA1 match lies on a Markdown heading line.
+
+    Headings name sections; they instruct nothing. Only Markdown and plain
+    text carry headings, so a ``#`` comment in source keeps its finding.
+    """
+    if file_type not in {"markdown", "text"}:
+        return False
+    line_start, line_end = _logical_line_bounds(content, match.start(), line_starts, line_ends)
+    return _MARKDOWN_HEADING_PATTERN.match(content[line_start:line_end]) is not None
+
+
+def _is_consent_gated_self_update(
+    content: str,
+    match: re.Match[str],
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> bool:
+    """Return True when a bare self-update noun shares its line with a consent gate.
+
+    The gate wording must be on the same logical line as the match, so a
+    consent row in one table row cannot exempt an instruction in another.
+    The gap inside the offered/asked-before branches may not cross a
+    sentence terminator, so consent in an earlier sentence cannot exempt a
+    later imperative on the same long line.
+    """
+    if _RA1_SELF_NOUN_PATTERN.fullmatch(match.group(0).strip()) is None:
+        return False
+    line_start, line_end = _logical_line_bounds(content, match.start(), line_starts, line_ends)
+    return _RA1_CONSENT_GATE_PATTERN.search(content[line_start:line_end]) is not None
 
 
 def _is_negated_safety_constraint(
