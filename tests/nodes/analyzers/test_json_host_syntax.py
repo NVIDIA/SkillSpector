@@ -306,8 +306,12 @@ def test_existing_over_budget_nested_shell_command_remains_partial() -> None:
 
 def test_json_looking_shell_and_markdown_keep_their_existing_contract() -> None:
     source = _dense(20_000)
-    assert tm.bounded_parse_diagnostic(source, _check, file_type="shell") is None
+    diagnostic = tm.bounded_parse_diagnostic(source, _check, file_type="shell")
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.RESOURCE_LIMIT
+    assert diagnostic.check is ParserCheck.COMMAND_WORD_CHARACTERS
     assert tm.bounded_parse_diagnostic(source, _check, file_type="markdown") is not None
+    assert tm.bounded_parse_diagnostic(source, _check, file_type="json") is None
 
 
 @pytest.mark.parametrize(

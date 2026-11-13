@@ -276,10 +276,12 @@ def test_unrelated_oversized_fence_does_not_relabel_instruction_uncertainty(
 
 
 def test_separate_static_parser_limit_takes_precedence_over_capacity() -> None:
-    source = json.dumps({"request": _PLACEHOLDER, "padding": "x" * _LIMIT})
+    container, start, end = _source(_LIMIT + 1, "fence")
+    # Keep capacity refusal separate from a genuine unquoted shell-word limit.
+    source = container + "\n" + "r" * 4097 + " -rf /\n"
     assert reconstruction.json_quote_capacity_limit(
         source, None, containing_offset=source.index("omit")
-    ) == (0, len(source))
+    ) == (start, end)
     event = _scan(source)["inspection_ledger"][0]
     assert event["outcome"] is LedgerOutcome.PARTIAL
     assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT

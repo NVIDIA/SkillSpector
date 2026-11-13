@@ -838,7 +838,12 @@ def test_recursive_output_rejects_child_primary_aliases(
             ],
         )
     assert result.exit_code == 2
-    assert "--output points to the input file" in result.output
+    expected_error = (
+        "Cannot verify --output is separate from skill inputs"
+        if alias in {"symlink", "symlink-parent"}
+        else "--output points to the input file"
+    )
+    assert expected_error in result.output
     assert source.read_text() == "# Child skill\n"
     scan_skill.assert_not_called()
 
