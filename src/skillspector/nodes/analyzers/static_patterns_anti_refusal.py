@@ -44,9 +44,7 @@ from .common import (
     CHINESE_GAP,
     SourceLocationIndex,
     chinese_spaced,
-    get_context,
     get_context_from_lines,
-    get_line_number,
     is_code_example,
 )
 from .pattern_defaults import PatternCategory
