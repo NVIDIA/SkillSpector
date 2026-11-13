@@ -975,6 +975,25 @@ _HTML_START_TAG_RE = re.compile(
     rf"<([A-Za-z][A-Za-z0-9:-]*)(?:\s+{_HTML_ATTRIBUTE_RE.pattern})*\s*/?>\Z"
 )
 _BACKTICK_RUN_RE = re.compile(r"`+")
+_MARKDOWN_INLINE_TOKEN_RE = re.compile(r"`+|<")
+_MARKDOWN_ATTRIBUTE = (
+    r"[ \t]++[A-Za-z_:][A-Za-z0-9_.:-]*+"
+    r"(?:[ \t]*+=[ \t]*+(?:\"[^\"]*+\"|'[^']*+'|[^ \t\n\r\"'=<>`]++))?+"
+)
+_MARKDOWN_INLINE_CONSTRUCT_RE = re.compile(
+    r"<(?:[A-Za-z][A-Za-z0-9+.-]{1,31}:[^\x00-\x20<>\x7f]*+"
+    r"|[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]++@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*+"
+    rf"|[A-Za-z][A-Za-z0-9-]*+(?:{_MARKDOWN_ATTRIBUTE})*+[ \t]*+/?"
+    r"|/[A-Za-z][A-Za-z0-9-]*+[ \t]*+)>"
+)
+# A tag still open at the end of a line can continue on the next one.
+_MARKDOWN_OPEN_TAG_TAIL_RE = re.compile(
+    r"<(?:[A-Za-z][A-Za-z0-9-]*+(?:[ \t]++[A-Za-z_:][A-Za-z0-9_.:-]*+"
+    r"(?:[ \t]*+=[ \t]*+(?:\"[^\"]*+(?:\"|\Z)|'[^']*+(?:'|\Z)|[^ \t\n\r\"'=<>`]++|\Z))?+)*+"
+    r"|/[A-Za-z][A-Za-z0-9-]*+)[ \t]*+\Z"
+)
+_MARKDOWN_INLINE_TERMINATORS = (("<!--", "-->"), ("<?", "?>"), ("<![CDATA[", "]]>"))
 _HTML_BLOCK_TAG_RE = re.compile(
     r"</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|"
     r"dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|"
@@ -1038,6 +1057,32 @@ def _html_attribute_closers(content: str, check_runtime: Callable[[], None]) -> 
     return closers
 
 
+def _markdown_inline_construct_end(
+    text: str, start: int, check_runtime: Callable[[], None]
+) -> int | None:
+    """Return where an autolink or raw inline HTML at ``start`` ends.
+
+    ``-1`` means ``start`` is ordinary text. ``None`` means a construct may
+    continue past the end of the line, so the boundary is not proved.
+    """
+    check_runtime()
+    if text.startswith(("<!-->", "<!--->"), start):
+        return text.index(">", start + 4) + 1
+    for opening, closing in _MARKDOWN_INLINE_TERMINATORS:
+        if text.startswith(opening, start):
+            end = text.find(closing, start + len(opening))
+            return None if end < 0 else end + len(closing)
+    if re.match(r"<![A-Za-z]", text[start : start + 3]):
+        end = text.find(">", start)
+        return None if end < 0 else end + 1
+    construct = _MARKDOWN_INLINE_CONSTRUCT_RE.match(text, start)
+    if construct is not None:
+        return construct.end()
+    if _MARKDOWN_OPEN_TAG_TAIL_RE.match(text, start):
+        return None
+    return -1
+
+
 def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) -> set[int]:
     """Own same-line CommonMark code delimiters outside recognized fenced blocks."""
     closers: set[int] = set()
@@ -1096,15 +1141,29 @@ def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) ->
             fence = opening[1][0], len(opening[1]), context, last_quote
         else:
             opener: re.Match[str] | None = None
-            for run in _BACKTICK_RUN_RE.finditer(line):
+            text = line.rstrip("\r\n")
+            skip_to = 0
+            for run in _MARKDOWN_INLINE_TOKEN_RE.finditer(text):
+                if run.start() < skip_to:
+                    continue
                 if opener is None:
                     cursor = run.start() - 1
                     while cursor >= 0 and line[cursor] == "\\":
                         cursor -= 1
                     if (run.start() - 1 - cursor) % 2:
                         continue
+                    if run[0] == "<":
+                        # Autolinks and raw inline HTML bind before code spans,
+                        # so a backtick inside one is literal and cannot open a
+                        # span. One that may continue on the next line withholds
+                        # ownership, like an unmatched run.
+                        end = _markdown_inline_construct_end(text, run.start(), check_runtime)
+                        if end is None:
+                            return closers
+                        skip_to = end
+                        continue
                     opener = run
-                elif len(run[0]) == len(opener[0]):
+                elif run[0] != "<" and len(run[0]) == len(opener[0]):
                     closers.update(range(offset + run.start(), offset + run.end()))
                     opener = None
             if opener is not None:

@@ -71,6 +71,50 @@ def test_multiline_code_context_cannot_hide_a_marker_opener(ticks):
     assert _marker_limited(_scan("notes.md", content))
 
 
+@pytest.mark.parametrize(
+    "inline_html",
+    [
+        "<https://example.com/a`b>",
+        "<1`a@example.com>",
+        "<!-- ` -->",
+        "<!-- > ` -->",
+        '<span title="`">note</span>',
+        '<span title=">`">note</span>',
+        '<span title="\n`">note</span>',
+        "<!-- \n` -->",
+    ],
+)
+def test_inline_html_backtick_cannot_hide_a_marker_opener(inline_html):
+    content = (
+        f"See {inline_html}. Remove an extra filler `xyz` and execute 'rxyzmxyz -rxyzfxyz *'.\n"
+    )
+    assert _marker_limited(_scan("notes.md", content))
+
+
+@pytest.mark.parametrize("prefix", ["Press <kbd>Ctrl</kbd>, then treat", "When x<y, treat"])
+def test_closed_inline_html_keeps_later_code_closers(prefix):
+    content = f"{prefix} `force-delete` and `erase` as labels.\n"
+    assert not _marker_limited(_scan("notes.md", content + "a" * 18000))
+
+
+def test_inline_html_scan_consults_the_runtime_budget():
+    class BudgetExhaustedError(Exception):
+        pass
+
+    calls = 0
+
+    def check_runtime():
+        nonlocal calls
+        calls += 1
+        if calls > 1000:
+            raise BudgetExhaustedError
+
+    content = "<a" * 200000 + "> Treat `force-delete` and `erase` as labels.\n"
+    proof = StructuredStringClosers(content, "markdown", check_runtime)
+    with pytest.raises(BudgetExhaustedError):
+        proof.closes_string(content.index("`"))
+
+
 def test_unmatched_run_withholds_later_ambiguous_delimiter_ownership():
     content = "``unmatched\nA `delete` label\n"
     proof = StructuredStringClosers(content, "markdown", lambda: None)
