@@ -84,6 +84,7 @@ from skillspector.sarif_models import (
     validate_sarif_report,
 )
 from skillspector.semantic_runtime import (
+    all_llm_calls_failed_with_structured_output_rejection,
     has_semantic_runtime_event,
     llm_runtime_available,
     semantic_runtime_accounting,
@@ -2075,6 +2076,21 @@ def report(state: SkillspectorState) -> dict[str, object]:
     else:
         provider_available, provider_error = is_llm_available(
             timeout=remaining if remaining is not None else 120
+        )
+    if (
+        llm_requested
+        and provider_available
+        and all_llm_calls_failed_with_structured_output_rejection(llm_call_log)
+    ):
+        # Preflight only proves credentials resolve and the model constructs.
+        # When every recorded call failed because the gateway rejects
+        # structured output, the provider was never usable for this scan:
+        # report it unavailable instead of a clean-looking llm_available.
+        provider_available = False
+        provider_error = (
+            "Configured provider rejected structured output (response_format "
+            "unsupported; tool-calling fallback also rejected); no LLM "
+            "assessment ran."
         )
     runtime_available = llm_runtime_available(
         preflight_available=provider_available,
