@@ -581,8 +581,6 @@ _POPULAR_PYPI: frozenset[str] = frozenset(
         "discord.py",
         "python-dotenv",
         "pycryptodome",
-        "perseus-ctx",
-        "mimir-mcp",
     }
 )
 
