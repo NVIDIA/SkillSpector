@@ -177,6 +177,9 @@ def typescript_template_spans(
     last_kind: str | None = None
     last_value = ""
     last_closed_control = False
+    # An identifier written after ``.`` or ``#`` is a property, even when it
+    # spells a keyword; ``obj.return / 2`` divides, it does not open a regex.
+    last_member = False
     paren_stack: list[bool] = []
     square_stack: list[int] = []
     # Paired openers and closers, so the closer that ends a scope is known
@@ -216,6 +219,8 @@ def typescript_template_spans(
         if last_kind is None:
             return True
         if last_kind == "identifier":
+            if last_member:
+                return False
             return last_value.casefold() in _EXPRESSION_PREFIX_WORDS
         if last_kind in {"number", "string", "template", "regex", "postfix"}:
             return False
@@ -348,7 +353,7 @@ def typescript_template_spans(
         return None
 
     def scan_code(cursor: int, depth: int, *, interpolation: bool = False) -> int | None:
-        nonlocal last_kind, last_value, last_closed_control, callee
+        nonlocal last_kind, last_value, last_closed_control, last_member, callee
         if depth >= _MAX_NESTING:
             return None
         outer_callee = callee
@@ -576,9 +581,11 @@ def typescript_template_spans(
                     word.casefold() in _CONTROL_WORDS and content.startswith("(", identifier.end())
                 ):
                     return None
+                member = last_kind == "punct" and last_value in {".", "#"}
                 callee = None
                 cursor = identifier.end()
                 last_kind, last_value, last_closed_control = "identifier", word, False
+                last_member = member
                 continue
             if character.isdigit():
                 cursor += 1
