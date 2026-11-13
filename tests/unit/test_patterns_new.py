@@ -3299,10 +3299,51 @@ class TestTriggerAnalysis:
     @pytest.mark.parametrize(
         "source,manifest,expected_line",
         [
-            ('{"triggers": ["hello", "help", "all inputs"]}', {"triggers": ["hello", "help", "all inputs"]}, 1),
-            ("---\nname: example\ntriggers:\n  - hello\n  - help\n---\n", {"triggers": ["hello", "help"]}, 3),
-            ("---\nname: example\ndescription: >-\n  Invoked with /help.\n  Invoked with /run.\n---\n", {"description": "Invoked with /help. Invoked with /run."}, 3),
-            ("---\n'description': Invoked with /help.\n---\n", {"description": "Invoked with /help."}, 2),
+            (
+                '{"triggers": ["hello", "help", "all inputs"]}',
+                {"triggers": ["hello", "help", "all inputs"]},
+                1,
+            ),
+            (
+                "---\nname: example\ntriggers:\n  - hello\n  - help\n---\n",
+                {"triggers": ["hello", "help"]},
+                3,
+            ),
+            (
+                "---\nname: example\ndescription: >-\n  Invoked with /help.\n  Invoked with /run.\n---\n",
+                {"description": "Invoked with /help. Invoked with /run."},
+                3,
+            ),
+            (
+                "---\n'description': Invoked with /help.\n---\n",
+                {"description": "Invoked with /help."},
+                2,
+            ),
+            (
+                "---\nname: example\nmetadata:\n  triggers: [safe]\ntriggers: [hello, help]\n---\n",
+                {"triggers": ["hello", "help"]},
+                5,
+            ),
+            (
+                '{\n  "metadata": {"triggers": ["safe"]},\n        "triggers": ["hello", "help"]\n}',
+                {"triggers": ["hello", "help"]},
+                3,
+            ),
+            (
+                '{\n "metadata": {"triggers": ["safe"]},\n "trigge\\u0072s": ["hello", "help"]\n}',
+                {"triggers": ["hello", "help"]},
+                3,
+            ),
+            (
+                '{\n "triggers": ["safe"],\n "triggers": ["hello", "help"]\n}',
+                {"triggers": ["hello", "help"]},
+                3,
+            ),
+            (
+                "---\ntriggers: [safe]\ntriggers: [hello, help]\n---\n",
+                {"triggers": ["hello", "help"]},
+                3,
+            ),
         ],
     )
     def test_metadata_findings_anchor_the_source_field_not_item_ordinals(
@@ -3329,7 +3370,11 @@ class TestTriggerAnalysis:
         assert triggers
         assert all(f.file == "skill.md" and f.start_line == 3 for f in triggers)
         ids = {f.finding_id for f in triggers}
-        events = [event for event in result["inspection_ledger"] if ids.intersection(event.get("emitted_finding_ids", []))]
+        events = [
+            event
+            for event in result["inspection_ledger"]
+            if ids.intersection(event.get("emitted_finding_ids", []))
+        ]
         assert events and all(event["path"] == "skill.md" for event in events)
 
     def test_tr1_overly_broad_word(self) -> None:

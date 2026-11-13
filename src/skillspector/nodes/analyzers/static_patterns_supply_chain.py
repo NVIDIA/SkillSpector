@@ -3548,13 +3548,57 @@ def _analyze_dependencies_detailed(
 # ---------------------------------------------------------------------------
 
 
+def _json_metadata_line(content: str, key: str) -> int:
+    """Locate one root JSON field without mistaking nested keys for metadata."""
+    depth = 0
+    field_offset = 0
+    string_start: int | None = None
+    escaped = False
+    for offset, char in enumerate(content):
+        if string_start is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                if depth == 1 and offset - string_start <= len(key) * 6 + 1:
+                    following = offset + 1
+                    while following < len(content) and content[following] in " \t\r\n":
+                        following += 1
+                    if following < len(content) and content[following] == ":":
+                        try:
+                            if json.loads(content[string_start : offset + 1]) == key:
+                                field_offset = string_start
+                        except json.JSONDecodeError:
+                            return 1
+                string_start = None
+        elif char == '"':
+            string_start = offset
+        elif char in "{[":
+            depth += 1
+        elif char in "}]":
+            depth -= 1
+            if depth == 0:
+                break
+    return get_line_number(content, field_offset)
+
+
 def _manifest_metadata_line(content: str, key: str) -> int:
-    """Anchor parsed metadata to its source field, including folded YAML values."""
-    field = re.compile(rf"^[ \t]*(?P<quote>['\"]?){re.escape(key)}(?P=quote)[ \t]*:")
+    """Anchor parsed metadata to its root field, including folded YAML values."""
+    if content.lstrip("\ufeff \t\r\n").startswith("{"):
+        return _json_metadata_line(content, key)
+    field = re.compile(rf"^(?P<indent>[ \t]*)(?P<quote>['\"]?){re.escape(key)}(?P=quote)[ \t]*:")
+    mapping = re.compile(r"^(?P<indent>[ \t]*)[^ \t#][^:\r\n]*:")
+    candidates: list[tuple[int, str, int]] = []
     for line_number, line in enumerate(content.splitlines(), 1):
         if line_number > 1 and line.strip() == "---":
             break
-        if field.match(line):
+        matched = mapping.match(line)
+        if matched:
+            candidates.append((line_number, line, len(matched.group("indent"))))
+    root_indent = min((indent for _, _, indent in candidates), default=0)
+    for line_number, line, indent in reversed(candidates):
+        if indent == root_indent and field.match(line):
             return line_number
     return 1
 
@@ -3931,7 +3975,11 @@ def _scan_shipped_bytecode(
             stop_scan = True
             return False
         bytecode_directory = next(
-            (str(parent) for parent in PurePosixPath(relative_path).parents if parent.name == "__pycache__"),
+            (
+                str(parent)
+                for parent in PurePosixPath(relative_path).parents
+                if parent.name == "__pycache__"
+            ),
             None,
         )
         analyzer_finding = AnalyzerFinding(
@@ -4402,7 +4450,11 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         skill_path = state.get("skill_path") or ""
         raw_file_cache = state.get("raw_file_cache") or {}
         manifest_path = next(
-            (name for name in ("SKILL.md", "skill.md") if name in raw_file_cache or name in file_cache),
+            (
+                name
+                for name in ("SKILL.md", "skill.md")
+                if name in raw_file_cache or name in file_cache
+            ),
             "SKILL.md",
         )
         manifest_bytes = raw_file_cache.get(manifest_path)
