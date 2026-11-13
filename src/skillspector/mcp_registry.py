@@ -15,6 +15,7 @@ from itertools import chain
 from pathlib import Path
 from stat import S_ISREG
 from typing import Any, TypedDict
+from urllib.parse import quote
 
 import httpx
 
@@ -414,7 +415,19 @@ def _load_payload(input_path: str) -> dict[str, Any]:
                     f"MCP Registry source failed: {input_path}: only the official registry URL is supported"
                 )
             return _load_paginated_registry(input_path)
-        payload = _load_paginated_registry(REGISTRY_URL)
+        # Keep the entire name in one path component, including its namespace.
+        # quote() leaves dots intact, so reject names that normalize as path segments.
+        if input_path in {"", ".", ".."}:
+            raise ValueError(f"MCP Registry server identifier was not found: {source}")
+        named_url = f"{REGISTRY_URL}/{quote(input_path, safe='')}/versions"
+        try:
+            payload = _load_paginated_registry(named_url)
+        except httpx.HTTPStatusError as exc:
+            # Only an initial 404 means the name is absent; a later page failure
+            # must not discard records already acquired or hide a source error.
+            if exc.response.status_code == 404 and exc.request.url == httpx.URL(named_url):
+                raise ValueError(f"MCP Registry server identifier was not found: {source}") from exc
+            raise
         matches = [
             entry
             for entry in payload.get("servers", [])

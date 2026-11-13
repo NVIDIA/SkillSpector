@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import re
 import time
 import unicodedata
@@ -33,6 +34,7 @@ from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
+    LedgerRecordType,
     analyzer_status_event,
     analyzer_status_for_events,
     ledger_event,
@@ -55,6 +57,8 @@ from skillspector.nodes.analyzers.whitespace_padding import (
     padding_run_match_fingerprint,
 )
 from skillspector.providers import get_active_provider
+from skillspector.resource_limits import bounded_capacity
+from skillspector.semantic_runtime import STRUCTURED_OUTPUT_UNAVAILABLE_ERROR
 from skillspector.state import (
     AnalyzerNodeResponse,
     LLMCallRecord,
@@ -72,15 +76,43 @@ logger = logging.getLogger(__name__)
 
 _FRAMEWORK_TAGS = ["ASI02", "AML.T0080"]
 TP3_MAX_PARAM_DESC_LENGTH = 500
-TP4_MAX_FILES = 128
-TP4_MAX_TOTAL_CODE_BYTES = 4 * 1024 * 1024
-TP4_MAX_TOTAL_INPUT_BYTES = 4 * 1024 * 1024
-TP4_MAX_FILE_CODE_BYTES = 1024 * 1024
-TP4_MAX_BATCHES = 64
+TP4_MAX_FILES = bounded_capacity("SKILLSPECTOR_TP4_MAX_FILES", 128, 10_000)
+TP4_MAX_TOTAL_CODE_BYTES = bounded_capacity(
+    "SKILLSPECTOR_TP4_MAX_TOTAL_CODE_BYTES", 4 * 1024 * 1024, 64 * 1024 * 1024
+)
+TP4_MAX_TOTAL_INPUT_BYTES = bounded_capacity(
+    "SKILLSPECTOR_TP4_MAX_TOTAL_INPUT_BYTES", 4 * 1024 * 1024, 64 * 1024 * 1024
+)
+TP4_MAX_FILE_CODE_BYTES = bounded_capacity(
+    "SKILLSPECTOR_TP4_MAX_FILE_CODE_BYTES", 1024 * 1024, 16 * 1024 * 1024
+)
+DEFAULT_TP4_MAX_BATCHES = 256
+TP4_MAX_BATCHES_CEILING = 4096
 TP4_MAX_BATCH_INPUT_TOKENS = 32_000
 TP4_MIN_CODE_TOKENS = 64
 TP4_MAX_DECLARATION_CHARS = 16_384
 TP4_MAX_FINDINGS = 64
+
+
+def _tp4_max_batches_from_environment(value: str | None) -> int:
+    """Resolve bounded TP4 capacity without exposing untrusted environment text."""
+    if value is None or not value.strip():
+        return DEFAULT_TP4_MAX_BATCHES
+    # Normalize leading zeroes before bounding conversion of arbitrarily long input.
+    digits = value.strip().lstrip("0")
+    if re.fullmatch(r"[0-9]{1,4}", digits):
+        capacity = int(digits)
+        if 1 <= capacity <= TP4_MAX_BATCHES_CEILING:
+            return capacity
+    logger.warning(
+        "SKILLSPECTOR_TP4_MAX_BATCHES must be a decimal integer from 1 to %d; using default %d",
+        TP4_MAX_BATCHES_CEILING,
+        DEFAULT_TP4_MAX_BATCHES,
+    )
+    return DEFAULT_TP4_MAX_BATCHES
+
+
+TP4_MAX_BATCHES = _tp4_max_batches_from_environment(os.environ.get("SKILLSPECTOR_TP4_MAX_BATCHES"))
 
 _CATEGORY = "MCP Tool Poisoning"
 
@@ -902,6 +934,7 @@ class _TP4Analyzer(LLMAnalyzerBase):
     """Run TP4 through the shared structured-output analyzer lifecycle."""
 
     response_schema = _TP4AnalysisResult
+    recovery_required_fields = ("confidence",)
 
     def __init__(
         self,
@@ -1159,6 +1192,7 @@ def _tp4_finding(
 
 def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
     """Run TP4 with per-file, aggregate, token, batch, and shared-time bounds."""
+    logger.info("%s: TP4 selected batch capacity=%d", ANALYZER_ID, TP4_MAX_BATCHES)
     result = _TP4CheckOutcome()
     analyzer: _TP4Analyzer | None = None
     attempted = False
@@ -1488,11 +1522,17 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
         batch_outcome = run_async(analyzer.arun_batches_detailed(batches))
         result.inference_usage = cast(list[InferenceUsageRecord], analyzer.inference_usage)
         seen_finding_ids: set[str] = set()
+        recovered_batches = {id(batch) for batch, _ in batch_outcome.recovered}
+        emitted_by_batch: dict[int, list[str]] = {}
+        capped_batches: set[int] = set()
         unexpected_response = False
-        for batch, assessments in batch_outcome.successful:
+        for batch, assessments in [*batch_outcome.successful, *batch_outcome.recovered]:
             batch_findings: list[Finding] = []
+            recovered = id(batch) in recovered_batches
             assessment = assessments[0] if assessments else None
             if not isinstance(assessment, _TP4AnalysisResult):
+                if recovered:
+                    continue
                 unexpected_response = True
                 result.ledger.append(
                     ledger_event(
@@ -1525,6 +1565,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                         limit_findings=TP4_MAX_FINDINGS,
                     )
                 )
+                capped_batches.add(id(batch))
                 continue
             finding = _tp4_finding(assessment, batch, description)
             if (
@@ -1532,9 +1573,15 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                 and finding.finding_id not in seen_finding_ids
                 and len(result.findings) < TP4_MAX_FINDINGS
             ):
+                if recovered:
+                    finding.tags.append("llm-format-recovery")
+                    finding.evidence["assessment_complete"] = False
                 result.findings.append(finding)
                 batch_findings.append(finding)
                 seen_finding_ids.add(finding.finding_id)
+            emitted_by_batch[id(batch)] = [item.finding_id for item in batch_findings]
+            if recovered:
+                continue
             result.ledger.append(
                 ledger_event(
                     analyzer_id=ANALYZER_ID,
@@ -1543,25 +1590,47 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     path=batch.file_path,
                     start_line=batch.start_line,
                     end_line=batch.end_line,
-                    emitted_finding_ids=[item.finding_id for item in batch_findings],
+                    emitted_finding_ids=emitted_by_batch[id(batch)],
                 )
             )
 
-        for failure in batch_outcome.failures:
+        for failure in [*batch_outcome.warnings, *batch_outcome.failures]:
+            batch_id = id(failure.batch)
+            retained_ids = emitted_by_batch.get(batch_id, [])
+            is_warning = failure.reason is LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+            terminal_outcome = (
+                LedgerOutcome.PARTIAL
+                if failure.reason is LedgerReason.RUNTIME_LIMIT or is_warning
+                else outcome_for_llm_batch_failure(failure.reason)
+            )
+            if (batch_id in capped_batches and not is_warning) or (
+                retained_ids and terminal_outcome is LedgerOutcome.FAILED
+            ):
+                result.ledger.append(
+                    ledger_event(
+                        record_type=LedgerRecordType.SYSTEM,
+                        outcome=terminal_outcome,
+                        phase=f"{ANALYZER_ID}:recovery",
+                        path=failure.batch.file_path,
+                        start_line=failure.batch.start_line,
+                        end_line=failure.batch.end_line,
+                        reason=failure.reason,
+                        error_class=failure.error_class,
+                    )
+                )
+            if batch_id in capped_batches:
+                continue
             result.ledger.append(
                 ledger_event(
                     analyzer_id=ANALYZER_ID,
-                    outcome=(
-                        LedgerOutcome.PARTIAL
-                        if failure.reason is LedgerReason.RUNTIME_LIMIT
-                        else outcome_for_llm_batch_failure(failure.reason)
-                    ),
+                    outcome=(LedgerOutcome.PARTIAL if retained_ids else terminal_outcome),
                     phase="semantic",
                     path=failure.batch.file_path,
                     start_line=failure.batch.start_line,
                     end_line=failure.batch.end_line,
                     reason=failure.reason,
                     error_class=failure.error_class,
+                    emitted_finding_ids=retained_ids,
                     observed_seconds=(
                         0.0 if failure.reason is LedgerReason.RUNTIME_LIMIT else None
                     ),
@@ -1575,10 +1644,30 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                 if batch_outcome.failures
                 else "UnexpectedStructuredResponse"
             )
+            refusal_only = not unexpected_response and all(
+                failure.reason is LedgerReason.LLM_RESPONSE_REFUSED
+                for failure in batch_outcome.failures
+            )
+            structured_output_only = (
+                not unexpected_response
+                and bool(batch_outcome.failures)
+                and not batch_outcome.successful
+                and not batch_outcome.recovered
+                and all(
+                    failure.reason is LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
+                    for failure in batch_outcome.failures
+                )
+            )
             result.record = llm_call_record(
                 ANALYZER_ID,
                 ok=False,
-                error=f"TP4 LLM batch failed: {error_class}",
+                error=(
+                    STRUCTURED_OUTPUT_UNAVAILABLE_ERROR
+                    if structured_output_only
+                    else None
+                    if refusal_only
+                    else f"TP4 LLM batch failed: {error_class}"
+                ),
             )
         else:
             result.record = llm_call_record(ANALYZER_ID, ok=True)

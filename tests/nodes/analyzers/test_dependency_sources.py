@@ -8,12 +8,12 @@ from __future__ import annotations
 import json
 
 import pytest
+from markdown_it import MarkdownIt
 
 from skillspector.dependency_sources import analyze_dependency_sources
 from skillspector.llm_analyzer_base import Batch
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import (
-    PER_FILE_ANALYSIS_PROMPT,
     LLMMetaAnalyzer,
     _fallback_filtered,
     _passthrough_with_defaults,
@@ -1204,6 +1204,8 @@ def test_url_credentials_are_redacted_from_findings_and_all_reports(output_forma
         "output_format": output_format,
     }
     rendered = report(state)["report_body"]
+    if output_format == "markdown":
+        rendered = MarkdownIt().enable("table").render(rendered)
     for secret in (username, password, query_token):
         assert secret not in rendered
 
@@ -1231,14 +1233,13 @@ def test_cargo_url_credentials_are_redacted_for_supported_schemes(destination: s
     assert "packages.example.invalid" in serialized
 
 
-def test_sc10_credentials_are_redacted_before_provider_prompt_construction() -> None:
+def test_sc10_credentials_are_redacted_before_provider_prompt_construction(mock_llm) -> None:
     username = "provider-user-sentinel"
     password = "provider-password-sentinel"
     token = "provider-token-sentinel"
     content = f"registry=ssh://{username}:{password}@packages.example.invalid/index?token={token}\n"
     finding = _analyze({".npmrc": content})[0]
-    analyzer = LLMMetaAnalyzer.__new__(LLMMetaAnalyzer)
-    analyzer.base_prompt = PER_FILE_ANALYSIS_PROMPT
+    analyzer = LLMMetaAnalyzer(model="fixture")
     analyzer._input_budget = 100_000
 
     batch = analyzer.get_batches([".npmrc"], {".npmrc": content}, [finding])[0]
@@ -1248,6 +1249,8 @@ def test_sc10_credentials_are_redacted_before_provider_prompt_construction() -> 
         assert secret not in batch.content
         assert secret not in prompt
     assert "packages.example.invalid" in prompt
+    mock_llm.invoke.assert_not_called()
+    mock_llm.ainvoke.assert_not_called()
 
 
 def test_hidden_source_finding_is_marked_local_only() -> None:

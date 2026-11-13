@@ -89,6 +89,8 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
       - run: make install-dev
       - run: uv run skillspector --version
+      - name: Check isolated dependency inspection before the full suite
+        run: uv run pytest -q tests/unit/test_dependency_inspection.py
       - run: uv run make test-ci
 
   test-opencode:

@@ -18,8 +18,12 @@
 from __future__ import annotations
 
 import ast
+import itertools
+import posixpath
 import re
 import sys
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
@@ -28,19 +32,33 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
 from .common import (
+    LOGICAL_LINE_BREAK,
+    MARKDOWN_FENCE_CLOSE,
+    MARKDOWN_FENCE_OPEN,
     apply_import_aliases,
     get_context,
     get_context_from_lines,
     get_line_number,
+    logical_line_starts,
     resolve_call_name,
     resolve_dotted_name,
 )
 from .pattern_defaults import PatternCategory
+from .static_patterns_supply_chain import (
+    _sc2_has_unproved_compound_context,
+    _sc2_logical_command,
+    _shell_tokens,
+)
+from .static_patterns_tool_misuse import _bounded_shell_tokens
 
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_data_exfiltration"
 USES_PYTHON_AST = True
+
+_E1_CURL_UPLOAD_PATTERN = (r"curl\s+[^|]*(?:-d|--data|--data-raw|--data-binary)\s+", 0.6)
+_E1_WGET_UPLOAD_PATTERN = (r"wget\s+[^|]*--post-(?:data|file)", 0.6)
+_E1_SHELL_PATTERNS = frozenset({_E1_CURL_UPLOAD_PATTERN, _E1_WGET_UPLOAD_PATTERN})
 
 E1_CODE_PATTERNS = [
     (r"requests\s*\.\s*(?:post|put)\s*\(\s*['\"]https?://", 0.6),
@@ -48,8 +66,8 @@ E1_CODE_PATTERNS = [
     (r"httpx\s*\.\s*(?:post|put)\s*\(\s*['\"]https?://", 0.6),
     (r"urllib\s*\.\s*request\s*\.\s*urlopen\s*\([^)]*data\s*=", 0.6),
     (r"fetch\s*\(\s*['\"]https?://[^'\"]+['\"][^)]*method\s*:\s*['\"]POST['\"]", 0.6),
-    (r"curl\s+[^|]*(?:-d|--data|--data-raw|--data-binary)\s+", 0.6),
-    (r"wget\s+[^|]*--post-(?:data|file)", 0.6),
+    _E1_CURL_UPLOAD_PATTERN,
+    _E1_WGET_UPLOAD_PATTERN,
     (r"https?://(?:api\.|data\.|collect\.|telemetry\.|analytics\.)[\w.-]+/", 0.5),
 ]
 E1_PROSE_PATTERNS = [
@@ -59,6 +77,9 @@ E1_PROSE_PATTERNS = [
     ),
 ]
 E1_PATTERNS = E1_CODE_PATTERNS + E1_PROSE_PATTERNS
+_E1_FETCH_COMMAND = re.compile(r"(?:curl|wget)(?=\s)", re.IGNORECASE)
+_E1_UNPROVED_SHELL_SPACE = re.compile(r"(?!\r\n)[^\S \t\n]")
+_E1_UNPROVED_SHELL_SYNTAX = re.compile(r"(?<!\S)--%(?=\s|$)|[{}]|<#")
 E2_PYTHON_FALLBACK_PATTERNS = [
     # Python: for k, v in os.environ.items() — whitespace-tolerant
     (r"for\s+\w+\s*,\s*\w+\s+in\s+os\s*\.\s*environ\s*\.\s*items\s*\(\s*\)", 0.7),
@@ -70,11 +91,185 @@ E2_PYTHON_FALLBACK_PATTERNS = [
     # Require braces so bare ``2 ** os.environ`` (exponentiation) is not flagged.
     (r"\{\s*\*\*\s*os\s*\.\s*environ\s*\}", 0.6),
 ]
+# The prefix the argument scan may cross before the name it looks for, and that name. Both are
+# reused by the guards below, which have to decide whether an option's operand is itself the
+# search pattern. A quoted argument is scanned up to the next quote character. An unquoted one
+# ends at whitespace, a quote, a # or a shell operator, so a bare pipe stops it and a redacting
+# stage further down the pipeline stays a command of its own, while a redirect keeps the name of
+# the file out of it, as in `grep PATH<secret.txt`, but an escaped pipe is grep's own
+# alternation and is crossed: it is the `aws_\|secret` in `grep -E aws_\|secret`. An escaped
+# space or tab is crossed too, since it keeps the word going, as in `grep PATH\ SECRET`. The
+# three unquoted alternatives cannot match the same character, so a long argument has nothing
+# to reparse.
+_GREP_ARGUMENT_PREFIX = (
+    r"(?:['\"`][^'\"`\n]{0,40}?"
+    r"|(?:\\[|\t ]|[^'\"`\s;<>&#|\\]|\\(?![|\t ])){0,40}?)"
+)
+# A secret name, optionally plural or numbered and optionally joined to a qualifier that names
+# the kind of secret, as in APIKEY or secretkey. The name cannot follow a letter, a digit, a $
+# or a ${, so MONKEY_PATCH and `grep "^$key="` are not secret lookups.
+_SECRET_NAME = (
+    r"(?:api|access|auth|client|private|secret)?(?:key|secret|token|password)s?\d*(?![a-z])"
+)
+_NAME_START = r"(?<![a-z0-9$])(?<!\$\{)"
+# An inverting option, in either the short bundle or the long spelling. In a short bundle the
+# v has to come before any e, since everything after -e is the search pattern: -ePRIVATE_KEY
+# searches for PRIVATE_KEY. The bundle is case sensitive, since -E is not -e and -V is not -v,
+# so `grep -Ev 'KEY|SECRET'` inverts. The letters before the v cannot themselves be a v, so
+# there is one way to split the word and a long run of v characters cannot backtrack.
+_GREP_INVERTING_OPTION = r"-(?:(?-i:[^\Wev]*v)\w*+|-inv[\w-]*+)(?![\w-])"
+# The shell removes quotes before grep runs, so in `grep -E 'KEY|TOKEN' '-v'` grep receives -v
+# and inverts the match. An inverting option quoted whole, in single or double quotes, counts
+# only as the word right after the search pattern. Further on it could be the operand of an
+# option that is quoted too, as in `grep SECRET '--label' '-v'`, which the walk does not read.
+_GREP_QUOTED_INVERTING_OPTION = rf"(?:'{_GREP_INVERTING_OPTION}'|\"{_GREP_INVERTING_OPTION}\")"
+# One piece of a shell word: a quoted string, an escaped character, or a character the shell
+# does not end the word at. A quoted | or > stays inside the word, as in --label='<stdin>', while
+# an unquoted one ends it, which keeps the option walks inside one command so a line of
+# repeated pipelines is not rescanned from every env on it. Inside double quotes a backslash
+# keeps the next character from closing the string, so the -v in `-e "\" -v"` is still quoted.
+# The alternatives start with different characters, so a word has one way to split.
+_SHELL_WORD_PART = r"(?:'[^'\n]*'|\"(?:[^\"\\\n]|\\.)*+\"|\\.|[^\s;&|<>'\"\\])"
+# grep options that take a separate operand, so the operand is not mistaken for the search
+# pattern: `grep -m 1 SECRET` would otherwise stop at the 1. -e and --regexp are left out on
+# purpose, since their operand is the search pattern and is handled separately below; their
+# abbreviations, such as --reg, are not recognized. The short forms are case sensitive because
+# -A and -a mean different things, and the alternatives are atomic so a run of them cannot be
+# reparsed and blow up.
+# `--` ends grep's options, so no later word is one, and an inversion walk stops at one it
+# meets. The trailing walk starts at the search pattern, so a `--` in front of the pattern is
+# not carried into it and `grep -- SECRET -v` reads as redaction: grep takes that -v as a file
+# name and searches the file, not the pipe.
+_GREP_END_OF_OPTIONS = r"--(?![^\s;&|<>])"
+# grep expands an unambiguous prefix of a long option, so --lab is --label and the -v in
+# `grep SECRET --lab -v` is the label. Each name is paired with the length of its shortest
+# prefix that BSD or GNU grep expands to it. No shorter prefix expands to it in either grep;
+# --binary, for one, is an option of its own.
+_GREP_LONG_OPTIONS_TAKING_OPERAND = {
+    "after-context": 1,
+    "before-context": 2,
+    "context": 3,
+    "binary-files": 7,
+    "devices": 3,
+    "directories": 2,
+    "file": 4,
+    "max-count": 1,
+    "label": 2,
+    "exclude": 7,
+    "exclude-dir": 8,
+    "exclude-from": 9,
+    "include": 3,
+    "include-dir": 8,
+    "group-separator": 1,
+}
+
+
+def _long_option_prefixes(name: str, shortest: int) -> str:
+    """Match ``name`` or any prefix of it at least ``shortest`` characters long."""
+    rest = name[shortest:]
+    return name[:shortest] + "".join(f"(?:{char}" for char in rest) + ")?" * len(rest)
+
+
+_GREP_OPTION_TAKING_OPERAND = (
+    r"(?:(?-i:-[a-zA-Z]*[ABCDdfm])|--(?:"
+    + "|".join(
+        _long_option_prefixes(name, shortest)
+        for name, shortest in _GREP_LONG_OPTIONS_TAKING_OPERAND.items()
+    )
+    + "))"
+)
+_GREP_OPTION_WITH_OPERAND = (
+    rf"{_GREP_OPTION_TAKING_OPERAND}(?:={_SHELL_WORD_PART}*+|[^\S\n]++{_SHELL_WORD_PART}++)"
+)
+# A short bundle whose operand-taking letter is not its last letter carries the operand in the
+# same word, as in `-dread`, so the word after it is not that operand. The trailing walk
+# checks this before it lets an option take the next word.
+_GREP_SHORT_OPTION_OPERAND_ATTACHED = r"(?-i:-[a-zA-Z]*[ABCDdfme][a-zA-Z])"
+# The trailing walk does not let an option take a `#` word or a bare `--` as its operand
+# either, so it still ends there: BSD grep accepts --context without a number, and in
+# `grep SECRET --context # -v` the -v is inside a comment.
+_GREP_OPTION_BEFORE_END_OF_WALK = (
+    rf"{_GREP_OPTION_TAKING_OPERAND}[^\S\n]++(?:\#|{_GREP_END_OF_OPTIONS})"
+)
+# -e and --regexp carry the search pattern, attached or separate. The flag run stops in front
+# of one that names a secret, so the scan lands on the name: `grep --regexp=SECRET > out` would
+# otherwise have the run consume the option whole and start scanning at the redirect. Operands
+# naming something else are consumed, so the second pattern in `grep -e PATH -e SECRET` is
+# still reached.
+# A quoted operand is one word even when it holds a space, as in -e 'PATH HOME', and so is an
+# unquoted one whose space is escaped, as in -e PATH\ HOME.
+# The -e of a short bundle, and only a real one: a letter that takes an operand would have
+# swallowed the rest of the word, so `-drecurse` is -d with the operand recurse, not an -e.
+# Each letter before the e is checked one at a time, so the word has one way to split.
+_GREP_SHORT_PATTERN_FLAG = r"(?-i:-(?:[a-zA-Z](?<![ABCDdfme]))*e)"
+_GREP_ATTACHED_PATTERN_OPTION = rf"(?:--regexp=|{_GREP_SHORT_PATTERN_FLAG})"
+_GREP_ATTACHED_SECRET = (
+    rf"(?!{_GREP_ATTACHED_PATTERN_OPTION}"
+    rf"(?:{_GREP_ARGUMENT_PREFIX}{_NAME_START})?{_SECRET_NAME})"
+)
+_GREP_PATTERN_OPERAND = rf"{_SHELL_WORD_PART}++"
+_GREP_ORDINARY_PATTERN_OPERAND = (
+    rf"(?:{_GREP_SHORT_PATTERN_FLAG}[^\S\n]++|--regexp(?:=|[^\S\n]++))"
+    rf"(?!{_GREP_ARGUMENT_PREFIX}{_NAME_START}{_SECRET_NAME})"
+    rf"{_GREP_PATTERN_OPERAND}"
+)
+# The leading walk skips every separate pattern operand, whatever it names, so the -v in
+# `grep -e PATH -v -e SECRET` is still found and an operand spelled -v is not taken for one.
+# An attached one is part of its option word, quotes included, as in --regexp='PATH|HOME'.
+_GREP_ANY_PATTERN_OPERAND = (
+    rf"(?:{_GREP_SHORT_PATTERN_FLAG}[^\S\n]++|--regexp[^\S\n]++){_GREP_PATTERN_OPERAND}"
+)
+
 E2_OTHER_CODE_PATTERNS = [
     (r"(?:API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)\s+in\s+(?:key|name|var)", 0.8),
     (r"process\.env\s*\[\s*['\"][^'\"]*(?:KEY|SECRET|TOKEN|PASSWORD)[^'\"]*['\"]\s*\]", 0.7),
     (r"Object\.keys\s*\(\s*process\.env\s*\)", 0.6),
-    (r"env\s*\|\s*grep\s+(?:-i\s+)?(?:key|secret|token|password)", 0.8),
+    # Shell: env/printenv piped to grep for secrets. Inversion is checked on both sides of the
+    # search pattern, because grep accepts -v after it as readily as before, and excluding
+    # secrets from the output is the redaction idiom rather than harvesting. Neither check
+    # reads the whole line: each walks the words of this command only, the leading one from
+    # grep to the search pattern and the trailing one from the search pattern on, and a word
+    # ends at a pipe, a redirect or a separator, quoted strings and escaped characters
+    # included, so the pipe in `grep -E 'SECRET|TOKEN' -v` does not end the walk early.
+    # A word that cannot be an option is not read as one: an -e or --regexp operand is stepped
+    # over, as in `grep -e SECRET -e -v`, and a bare -- ends the walk, since it ends grep's
+    # options, as in `grep -E -- -v\|SECRET` where the -v is grep's pattern. That scoping is
+    # what keeps a trailing "# -v" comment or a later command from suppressing a real harvest,
+    # and it leaves a redacting stage further down the pipeline visible to the grep that owns
+    # it. Both walks and the flag run carry an option's operand along with it, so
+    # `grep -m 1 SECRET` reaches SECRET, `grep -m 1 -v SECRET` still reads as redaction and the
+    # -v in `grep SECRET --label -v` is the label rather than an inversion, and
+    # the run stops in front of an -e or --regexp operand that names a secret so an attached or
+    # later search pattern is not skipped over. The flag run and the whitespace around its
+    # words are possessive, so a long run of flags or spaces is not rescanned for every way to
+    # split it. The pipe may be followed by a line break, and either side of it by an escaped
+    # one, as bash allows. A name cannot follow a letter or digit but may be plural, numbered or
+    # joined to a qualifier, so KEY2 and APIKEY count but MONKEY_PATCH and KEYBOARD do not; an
+    # attached operand is the other place a name may follow a letter, since the letter is
+    # grep's flag.
+    # Where a redirect leads is not followed, so `env | grep SECRET < in.txt` is reported
+    # although grep reads the file there: `< /dev/stdin` and `<&0` leave grep on the pipe, and
+    # a target such as `$f` does not say what it names.
+    (
+        r"\b(?:printenv|env)(?:[^\S\n]|\\\n)*+\|(?:\s|\\\n)*+[ef]?grep"
+        rf"(?!(?:[^\S\n]++(?>{_GREP_OPTION_WITH_OPERAND}|{_GREP_ANY_PATTERN_OPERAND}"
+        rf"|(?!{_GREP_END_OF_OPTIONS})-{_SHELL_WORD_PART}*+))*"
+        rf"[^\S\n]++{_GREP_INVERTING_OPTION})"
+        rf"[^\S\n]++(?:{_GREP_ATTACHED_SECRET}"
+        rf"(?>{_GREP_ORDINARY_PATTERN_OPERAND}|{_GREP_OPTION_WITH_OPERAND}"
+        rf"|--?[\w-]+(?:={_SHELL_WORD_PART}*+)?)[^\S\n]++)*+"
+        rf"(?!{_GREP_PATTERN_OPERAND}"
+        rf"(?:[^\S\n]++{_GREP_QUOTED_INVERTING_OPTION}"
+        rf"|(?:[^\S\n]++(?>{_GREP_ANY_PATTERN_OPERAND}"
+        rf"|(?!{_GREP_SHORT_OPTION_OPERAND_ATTACHED})(?!{_GREP_OPTION_BEFORE_END_OF_WALK})"
+        rf"{_GREP_OPTION_WITH_OPERAND}"
+        rf"|(?!{_GREP_END_OF_OPTIONS})(?!\#){_SHELL_WORD_PART}++))*?"
+        rf"[^\S\n]++{_GREP_INVERTING_OPTION}))"
+        rf"(?:{_GREP_ATTACHED_PATTERN_OPTION}"
+        rf"|{_GREP_ATTACHED_PATTERN_OPTION}?{_GREP_ARGUMENT_PREFIX}{_NAME_START})"
+        rf"{_SECRET_NAME}",
+        0.8,
+    ),
     (r"printenv\s+(?:\w*(?:KEY|SECRET|TOKEN|PASSWORD)\w*)", 0.7),
 ]
 E2_PROSE_PATTERNS = [
@@ -92,6 +287,25 @@ _ENVIRONMENT_MAPPING_METHOD_CONFIDENCE = {
 }
 _ENVIRONMENT_COLLECTION_CALLS = frozenset({"dict", "list", "tuple", "set", "frozenset"})
 _ENVIRONMENT_COPY_CALLS = frozenset({"copy.copy", "copy.deepcopy"})
+# Calls that hand an environment mapping to a child process. Materializing
+# ``os.environ`` for one of these is process launching, not harvesting: the child
+# receives the environment the skill already runs in, and no value leaves the host.
+_CHILD_PROCESS_ENV_CALLS = frozenset(
+    {
+        "subprocess.run",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.Popen",
+        "asyncio.create_subprocess_exec",
+        "asyncio.create_subprocess_shell",
+    }
+)
+_LAUNCHER_MODULES = frozenset(name.partition(".")[0] for name in _CHILD_PROCESS_ENV_CALLS)
+# A copy the flow pass traces only to a child process stays an E2 finding, but as a
+# low-confidence LOW. The proof covers ordinary Python, not every introspection
+# trick, so a read it misses lowers the finding instead of removing it.
+_CHILD_PROCESS_PASSTHROUGH_CONFIDENCE = 0.2
 E3_CODE_PATTERNS = [
     (r"glob\s*\.\s*glob\s*\([^)]*(?:\.env|\.ssh|\.aws|\.config|credentials)", 0.8),
     (r"os\s*\.\s*walk\s*\([^)]*(?:home|~|/Users|/home)", 0.6),
@@ -151,6 +365,272 @@ E5_PATTERNS = [
     (r"\.upload_blob\s*\(", 0.55),  # Azure SDK
 ]
 
+_CLOUD_DOWNLOAD_AWS_FLAGS = frozenset(
+    {"--quiet", "--only-show-errors", "--no-progress", "--no-sign-request", "--dryrun"}
+)
+_CLOUD_DOWNLOAD_AWS_VALUE_OPTIONS = frozenset({"--region", "--profile", "--include", "--exclude"})
+_CLOUD_DOWNLOAD_SHELL_META = re.compile(r"[;&|<>(){}\[\]*?$\x60%!#~\x00-\x1f\x7f]")
+_CLOUD_DOWNLOAD_BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]*")
+_CLOUD_DOWNLOAD_CONTEXT_CHARS = 4_096
+_CLOUD_DOWNLOAD_SAFE_SET = re.compile(
+    r"set[ \t]+(?:-[efu]+[ \t]+)*(?:-[efu]+|-[efu]*o[ \t]+pipefail)"
+)
+_CLOUD_DOWNLOAD_SAFE_SHEBANG = re.compile(
+    r"#![ \t]*(?:/usr(?:/local)?)?/bin/(?:env[ \t]+)?(?:ba|da|k|z)?sh(?:[ \t]+-[eu]+)?"
+)
+
+
+def _is_literal_cloud_download(
+    content: str,
+    offset: int,
+    line_starts: tuple[int, ...],
+    file_path: str,
+    file_type: str,
+) -> bool:
+    """Prove only a bounded, standalone, non-destructive cloud download.
+
+    The existing shell helpers retain unknown context and cap logical commands
+    at 4096 characters. No line or enclosing match is rewritten: callers decide
+    separately for every E5 occurrence, including nested or later uploads.
+    """
+    if file_type not in {"shell", "markdown", "text"} or file_path.lower().endswith(
+        (".ps1", ".psm1", ".psd1", ".bat", ".cmd")
+    ):
+        return False
+    if offset > _CLOUD_DOWNLOAD_CONTEXT_CHARS or _sc2_has_unproved_compound_context(
+        content, offset, ()
+    ):
+        return False
+    preamble = content[:offset]
+    if any(
+        separator.group(0) not in {"\n", "\r\n"}
+        for separator in LOGICAL_LINE_BREAK.finditer(preamble)
+    ):
+        # Shells end a line, and so a comment, only at a newline. Splitting at a
+        # form feed, lone CR or Unicode separator would hide the rest of that
+        # shell line (such as a function rebinding the cloud command) as a comment.
+        return False
+    if preamble.startswith("#!") and (
+        _CLOUD_DOWNLOAD_SAFE_SHEBANG.fullmatch(preamble.split("\n", 1)[0].rstrip(" \t\r")) is None
+    ):
+        # A shebang is not a comment when the file is executed: env -S assignments,
+        # interpreter options or a relative interpreter can change PATH or load
+        # setup code before the transfer runs. Only plain shell interpreters qualify.
+        return False
+    directory_changed = False
+    for line in preamble.split("\n"):
+        setup = line.strip(" \t\r")
+        if not setup or setup.startswith("#"):
+            continue
+        if _CLOUD_DOWNLOAD_SAFE_SET.fullmatch(setup):
+            continue
+        if "\\" in setup or _CLOUD_DOWNLOAD_SHELL_META.search(setup):
+            return False
+        setup_tokens = _shell_tokens(setup)
+        if setup_tokens == ["popd"] or (
+            setup_tokens
+            and len(setup_tokens) == 2
+            and setup_tokens[0] in {"cd", "chdir", "pushd"}
+            and setup_tokens[1]
+            and not setup_tokens[1].startswith("-")
+        ):
+            directory_changed = True
+            continue
+        # Unknown setup can load or replace the cloud command. Even an earlier
+        # download can overwrite an executable, so only the preambles above
+        # preserve this proof; do not enumerate unsafe command-loading forms.
+        return False
+    command = _sc2_logical_command(content, offset, line_starts)
+    if command is None or "\\" in command or _CLOUD_DOWNLOAD_SHELL_META.search(command) is not None:
+        return False
+    tokens = _shell_tokens(command)
+    if not tokens:
+        return False
+    if tokens[:3] in (["aws", "s3", "cp"], ["aws", "s3", "sync"]):
+        scheme = "s3://"
+        arguments = iter(tokens[3:])
+        flags = _CLOUD_DOWNLOAD_AWS_FLAGS
+        if tokens[2] == "cp":
+            flags = flags | {"--recursive"}
+        value_options = _CLOUD_DOWNLOAD_AWS_VALUE_OPTIONS
+    elif tokens[:2] in (["gsutil", "cp"], ["gsutil", "rsync"]):
+        scheme = "gs://"
+        arguments = iter(tokens[2:])
+        flags = frozenset({"-r"})
+        value_options = frozenset()
+    else:
+        # In particular, mv and sync deletion flags do more than copy data.
+        return False
+
+    operands: list[str] = []
+    for argument in arguments:
+        if argument in flags:
+            continue
+        if argument in value_options:
+            value = next(arguments, "")
+            if not value or value.startswith("-"):
+                return False
+        elif argument.startswith("-"):
+            return False
+        else:
+            operands.append(argument)
+    if len(operands) != 2:
+        return False
+    source, destination = operands
+    if not source.startswith(scheme):
+        return False
+    bucket = source[len(scheme) :].split("/", 1)[0]
+    if _CLOUD_DOWNLOAD_BUCKET.fullmatch(bucket) is None:
+        return False
+    if directory_changed and not destination.startswith("/"):
+        # A relative file may resolve to a stream after cd /dev (or a directory
+        # stack change). Absolute destinations do not depend on this setup.
+        return False
+    normalized_destination = posixpath.normpath(destination)
+    # A static local destination cannot be a cloud URI, stream or shell expansion.
+    # Colons remain conservative for other URL schemes and host-language paths.
+    return (
+        bool(destination)
+        and destination != "-"
+        and ":" not in destination
+        and not destination.startswith("//")
+        and normalized_destination not in {"/dev", "/proc", "/sys"}
+        and not normalized_destination.startswith(("/dev/", "/proc/", "/sys/"))
+    )
+
+
+def _e1_shell_regions(content: str, file_type: str) -> tuple[tuple[int, int], ...]:
+    """Identify source regions whose physical separators have shell semantics.
+
+    Host-language strings, YAML folded scalars and Markdown soft wraps can join
+    physical lines. Their existing conservative matcher must remain in charge.
+    Explicit shell fences with the shared 0-3 space marker grammar can provide
+    Markdown proof. Unknown languages and uncertain host contexts cannot.
+    """
+    if file_type == "shell":
+        return ((0, len(content)),)
+    if file_type != "markdown":
+        return ()
+    # CommonMark HTML blocks can contain shell-looking fences as literal text.
+    # Without parsing HTML block ownership, conservatively retain legacy
+    # matching throughout documents with a possible opener or closer, including
+    # markers nested in list/quote containers or following other inline text.
+    if re.search(r"<(?:[/!?]|[A-Za-z])", content) is not None:
+        return ()
+    shell_languages = {"sh", "bash", "shell", "dash", "zsh", "ksh", "console"}
+    regions: list[tuple[int, int]] = []
+    active: tuple[str, int, int, bool] | None = None
+    frontmatter = content.lstrip("\ufeff").startswith(("---\n", "---\r"))
+    offset = 0
+    for physical in re.finditer(r"[^\r\n]*(?:\r\n|\r|\n|$)", content):
+        line = physical[0]
+        physical_line = line.rstrip("\r\n")
+        if frontmatter:
+            if offset and physical_line in {"---", "..."}:
+                frontmatter = False
+        elif active is None:
+            opening = MARKDOWN_FENCE_OPEN.fullmatch(physical_line)
+            if opening is not None:
+                marker = opening[1]
+                info = physical_line[opening.end(1) :].strip().split()
+                active = (
+                    marker[0],
+                    len(marker),
+                    offset + len(line),
+                    bool(info) and info[0].lower() in shell_languages,
+                )
+        else:
+            closing = MARKDOWN_FENCE_CLOSE.fullmatch(physical_line)
+            if closing is not None and closing[1][0] == active[0] and len(closing[1]) >= active[1]:
+                if active[3]:
+                    regions.append((active[2], offset))
+                active = None
+        offset += len(line)
+    if active is not None and active[3]:
+        regions.append((active[2], len(content)))
+    return tuple(regions)
+
+
+def _e1_shell_command_ranges(content: str, file_type: str) -> tuple[tuple[int, int | None], ...]:
+    """Locate proved command boundaries without changing source evidence.
+
+    Upload flags belong to the curl/wget invocation, not a later command or
+    Markdown example. Reuse the bounded shell tokenizer so quoted newlines and
+    backslash continuations remain part of the same invocation. Uncertain syntax
+    retains the existing conservative matcher instead of suppressing evidence.
+    """
+    ranges: list[tuple[int, int | None]] = []
+    previous_end = 0
+    regions = _e1_shell_regions(content, file_type)
+    region_index = 0
+    for fetch in _E1_FETCH_COMMAND.finditer(content):
+        if fetch.start() < previous_end:
+            # An embedded fetch may be an argument or a real nested invocation.
+            # Keep legacy evidence instead of reparsing overlapping suffixes
+            # quadratically when a command contains many curl/wget words.
+            ranges.append((fetch.start(), None))
+            break
+        while region_index < len(regions) and regions[region_index][1] <= fetch.start():
+            region_index += 1
+        if region_index == len(regions) or fetch.start() < regions[region_index][0]:
+            ranges.append((fetch.start(), None))
+            break
+        try:
+            _, end, limited = _bounded_shell_tokens(content, fetch.start(), fetch.end())
+        except (TypeError, ValueError):
+            # The shared security-view decoder can reject unusual ANSI-C
+            # escapes. Keep E1/E2 evidence rather than failing the analyzer.
+            # Deadline and budget exceptions deliberately propagate.
+            ranges.append((fetch.start(), None))
+            break
+        if (
+            limited
+            or end > regions[region_index][1]
+            # A ')' in a nested heredoc body can fool the substitution skipper.
+            # No separator after that point is a proved shell command end.
+            or "<<" in content[fetch.start() : end]
+            # Wrappers and PowerShell expressions can assemble more arguments;
+            # semicolons and hashes can be literal arguments in CMD commands.
+            or content[end : end + 1] in {"'", '"', "`", "(", ")", ";", "#"}
+            # The shared parser's security view treats Unicode/control spaces
+            # as separators. Native shells can keep them inside an argument,
+            # including before a '#' that would otherwise look like a comment.
+            or _E1_UNPROVED_SHELL_SPACE.search(content, fetch.start(), end + 1) is not None
+            # PowerShell stop-parsing, script blocks, hashtables and block
+            # comments can contain separators that do not end the invocation.
+            or _E1_UNPROVED_SHELL_SYNTAX.search(content, fetch.start(), end + 1) is not None
+            # CMD caret continuation is outside the Bourne parser's proof.
+            or re.search(r"\^[ \t]*\r?$", content[fetch.start() : end]) is not None
+        ):
+            # Keep legacy nonoverlapping matching on unproved syntax instead of
+            # repeatedly parsing overlapping suffixes after a parser limit.
+            ranges.append((fetch.start(), None))
+            break
+        ranges.append((fetch.start(), end))
+        previous_end = end
+    return tuple(ranges)
+
+
+def _iter_e1_shell_matches(
+    pattern: str,
+    content: str,
+    command_ranges: tuple[tuple[int, int | None], ...],
+) -> Iterator[re.Match[str]]:
+    compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    covered = 0
+    for start, end in command_ranges:
+        if end is None:
+            yield from static_runner.iter_pattern_matches(
+                compiled, content, start=max(start, covered)
+            )
+            return
+        if start < covered:
+            continue
+        match = compiled.match(content, start, end)
+        if match is not None:
+            yield match
+            covered = match.end()
+
 
 def _resolve_expression_name(node: ast.expr, aliases: dict[str, str]) -> str | None:
     """Resolve a Python expression to its import-normalized dotted name."""
@@ -188,6 +668,700 @@ def _is_dynamic_copy_call(call: ast.Call, aliases: dict[str, str]) -> bool:
     )
 
 
+# In-place edits of a mapping that keep the values on the host. ``update`` and
+# ``clear`` return ``None``. The extraction methods hand a value back, so they
+# only count as edits when that value is thrown away. A value kept from the copy,
+# even by one literal key, is invisible to taint tracking, so it keeps the finding.
+_ENVIRONMENT_MUTATION_METHODS = frozenset({"update", "clear"})
+_ENVIRONMENT_EXTRACTION_METHODS = frozenset({"pop", "popitem", "setdefault"})
+
+# Statement lists a raise, ``break`` or ``continue`` can leave before a later
+# rebinding runs, while code that still sees the older binding goes on to run:
+# a handler, a ``finally``, a context manager that swallows the error, or the
+# code after the loop. Loop bodies are handled in ``_visit_loop``.
+_PROTECTED_BODIES = frozenset(
+    {
+        (ast.Try, "body"),
+        (ast.Try, "orelse"),
+        (ast.TryStar, "body"),
+        (ast.TryStar, "orelse"),
+        (ast.ExceptHandler, "body"),
+        (ast.With, "body"),
+        (ast.AsyncWith, "body"),
+    }
+)
+
+# Builtins, attributes and modules that read variables by a name only known at
+# run time.
+_DYNAMIC_NAMESPACE_NAMES = frozenset({"globals", "locals", "vars", "eval", "exec", "sys.modules"})
+_DYNAMIC_NAMESPACE_ATTRIBUTES = frozenset({"f_locals", "f_globals", "__globals__"})
+
+# Calls that can replace an attribute of the object passed first, and the
+# ``sys.modules`` methods that can replace a module before it is imported.
+_ATTRIBUTE_WRITE_CALLS = frozenset({"setattr", "delattr", "vars"})
+_MODULE_TABLE_WRITE_METHODS = frozenset(
+    {"update", "setdefault", "pop", "popitem", "clear", "__setitem__", "__delitem__"}
+)
+
+# Bindings of one name that may all still be live, past which the name is
+# reported rather than followed. Keeps crafted files linear.
+_MAX_OPEN_BINDINGS = 32
+
+
+def _method_receiver(node: ast.AST, methods: frozenset[str]) -> ast.Name | None:
+    """Return the bare name a ``name.method(...)`` call is made on, for *methods*."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in methods
+        and isinstance(node.func.value, ast.Name)
+    ):
+        return node.func.value
+    return None
+
+
+def _edit_receiver(node: ast.AST) -> ast.Name | None:
+    """Return the name a call edits in place without taking values off the mapping."""
+    receiver = _method_receiver(node, _ENVIRONMENT_MUTATION_METHODS)
+    if receiver is None and isinstance(node, ast.Expr):
+        receiver = _method_receiver(node.value, _ENVIRONMENT_EXTRACTION_METHODS)
+    return receiver
+
+
+def _is_main_guard(test: ast.expr) -> bool:
+    """Return whether ``test`` is ``__name__ == "__main__"``, either way round."""
+    if not (
+        isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq)
+    ):
+        return False
+    sides = (test.left, test.comparators[0])
+    return any(isinstance(side, ast.Name) and side.id == "__name__" for side in sides) and any(
+        isinstance(side, ast.Constant) and side.value == "__main__" for side in sides
+    )
+
+
+def _reads_names_dynamically(node: ast.AST, aliases: dict[str, str]) -> bool:
+    """Return whether ``node`` can read a variable by a name only known at run time.
+
+    Any reference counts, not only a call, so ``namespace = locals`` is caught too.
+    """
+    if isinstance(node, ast.Attribute):
+        if node.attr in _DYNAMIC_NAMESPACE_ATTRIBUTES:
+            return True
+        # Two parts at most (``sys.modules``, ``builtins.locals``) keeps this linear.
+        if not isinstance(node.value, ast.Name):
+            return False
+        name = apply_import_aliases(f"{node.value.id}.{node.attr}", aliases)
+    elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+        name = apply_import_aliases(node.id, aliases)
+    else:
+        return False
+    return name in _DYNAMIC_NAMESPACE_NAMES
+
+
+class _FileBindings:
+    """How one file binds its names: by import or otherwise, and what it patches.
+
+    The flow pass sees one file, and call names are matched by spelling, so a
+    launcher or a ``__main__`` guard is only trusted when nothing in the file can
+    have replaced it.
+    """
+
+    def __init__(self, tree: ast.AST, aliases: dict[str, str]) -> None:
+        # Local name to the absolute import paths bound to it. ``""`` marks a
+        # relative import, which may load a file the skill ships.
+        self._imports: dict[str, set[str]] = {}
+        # Names bound other than by an import, anywhere in the file.
+        self._rebound: set[str] = set()
+        # Top-level modules with an attribute written from this file.
+        self._patched: set[str] = set()
+        # A star import or a write to ``sys.modules`` can replace any import.
+        self._imports_replaceable = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    # ``import a.b`` binds ``a``; ``import a.b as c`` binds ``c`` to ``a.b``.
+                    root = alias.name.partition(".")[0]
+                    local, path = (alias.asname, alias.name) if alias.asname else (root, root)
+                    self._imports.setdefault(local, set()).add(path)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "*":
+                        self._imports_replaceable = True
+                        continue
+                    path = f"{node.module}.{alias.name}" if node.module and not node.level else ""
+                    self._imports.setdefault(alias.asname or alias.name, set()).add(path)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                self._rebound.add(node.name)
+            elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+                self._rebound.add(node.id)
+            elif isinstance(node, ast.arg):
+                self._rebound.add(node.arg)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                self._rebound.update(node.names)
+            elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+                self._rebound.add(node.name)
+            elif isinstance(node, ast.MatchMapping) and node.rest:
+                self._rebound.add(node.rest)
+            else:
+                self._record_patch(node, aliases)
+
+    def _record_patch(self, node: ast.AST, aliases: dict[str, str]) -> None:
+        """Note a module whose attributes ``node`` may replace."""
+        written: ast.expr | None = None
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and not isinstance(node.ctx, ast.Load):
+            written = node.value if isinstance(node, ast.Subscript) else node
+        elif (
+            isinstance(node, ast.Attribute)
+            and node.attr == "__dict__"
+            and isinstance(node.value, ast.Name)
+        ):
+            written = node.value
+        elif isinstance(node, ast.Call) and node.args:
+            call_name = resolve_call_name(node, aliases)
+            if call_name in _ATTRIBUTE_WRITE_CALLS:
+                written = node.args[0]
+            elif call_name is not None and call_name.startswith("sys.modules."):
+                if call_name.rpartition(".")[2] in _MODULE_TABLE_WRITE_METHODS:
+                    written = node.func
+        if written is None:
+            return
+        name = _resolve_expression_name(written, aliases)
+        if name is None:
+            return
+        if name == "sys.modules" or name.startswith("sys.modules."):
+            self._imports_replaceable = True
+        self._patched.add(name.partition(".")[0])
+
+    def launchers(self) -> set[str]:
+        """Local names a child-process launcher can be called through.
+
+        Each one is bound only by absolute imports of one path in a launcher
+        module, and nothing in the file writes to that module.
+        """
+        if self._imports_replaceable:
+            return set()
+        trusted: set[str] = set()
+        for name, paths in self._imports.items():
+            if name in self._rebound or len(paths) != 1:
+                continue
+            module = next(iter(paths)).partition(".")[0]
+            if module in _LAUNCHER_MODULES and module not in self._patched:
+                trusted.add(name)
+        return trusted
+
+    def main_guard_holds(self) -> bool:
+        """Whether ``__name__`` keeps its import-time value in this file."""
+        return (
+            not self._imports_replaceable
+            and "__name__" not in self._rebound
+            and "__name__" not in self._imports
+        )
+
+
+@dataclass
+class _EnvironmentBinding:
+    """One name bound to a candidate expression, tracked until a rebinding that surely runs."""
+
+    value_id: int
+    # The statement block the binding was made in, as a path of block numbers.
+    block: tuple[int, ...]
+    reached_child_process: bool = False
+    escaped: bool = False
+
+
+@dataclass
+class _Loop:
+    """Names read and bindings made in one loop, whose body may run again."""
+
+    reads: set[tuple[_Scope, str]] = field(default_factory=set)
+    bindings: list[tuple[_Scope, str, _EnvironmentBinding]] = field(default_factory=list)
+
+
+# Compared by identity, so a scope can key the per-loop read set.
+@dataclass(eq=False)
+class _Scope:
+    """Open bindings of one lexical scope: module, function, lambda, class or comprehension."""
+
+    # ``None`` for the module, which owns every name no inner scope binds.
+    local_names: set[str] | None
+    declared_global: set[str] = field(default_factory=set)
+    # The body runs when it is called or iterated, not where it is defined.
+    deferred: bool = False
+    is_class: bool = False
+    is_comprehension: bool = False
+    # Several bindings of one name stay open when a rebinding may not have run.
+    open: dict[str, list[_EnvironmentBinding]] = field(default_factory=dict)
+    read_later: set[str] = field(default_factory=set)
+
+    def owns(self, name: str) -> bool:
+        return self.local_names is None or name in self.local_names
+
+
+def _scope_declarations(body: Sequence[ast.AST]) -> tuple[set[str], set[str]]:
+    """Return the names a scope binds itself and the names it declares ``global``.
+
+    Nested functions, lambdas and classes are scopes of their own, so only their
+    names count here. Comprehension targets stay inside the comprehension, but a
+    walrus inside one binds in this scope. ``nonlocal`` names belong to an
+    enclosing function.
+    """
+    bound: set[str] = set()
+    declared_global: set[str] = set()
+    declared_nonlocal: set[str] = set()
+    pending: list[ast.AST] = list(body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.comprehension):
+            pending.append(node.iter)
+            pending.extend(node.ifs)
+            continue
+        if isinstance(node, ast.Global):
+            declared_global.update(node.names)
+        elif isinstance(node, ast.Nonlocal):
+            declared_nonlocal.update(node.names)
+        elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            bound.add(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            bound.update(
+                (alias.asname or alias.name).split(".")[0]
+                for alias in node.names
+                if alias.name != "*"
+            )
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
+        pending.extend(ast.iter_child_nodes(node))
+    return bound - declared_global - declared_nonlocal, declared_global
+
+
+def _argument_names(arguments: ast.arguments) -> set[str]:
+    return {
+        argument.arg
+        for argument in (
+            *arguments.posonlyargs,
+            *arguments.args,
+            *arguments.kwonlyargs,
+            arguments.vararg,
+            arguments.kwarg,
+        )
+        if argument is not None
+    }
+
+
+def _annotation_expressions(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.expr | None]:
+    arguments = node.args
+    return [
+        *(
+            argument.annotation
+            for argument in (
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+                arguments.vararg,
+                arguments.kwarg,
+            )
+            if argument is not None
+        ),
+        node.returns,
+    ]
+
+
+def _type_param_expressions(type_params: Sequence[ast.type_param]) -> list[ast.expr | None]:
+    # Type parameter defaults arrived in Python 3.13.
+    return [
+        expression
+        for type_param in type_params
+        for expression in (
+            getattr(type_param, "bound", None),
+            getattr(type_param, "default_value", None),
+        )
+    ]
+
+
+class _EnvironmentFlowVisitor(ast.NodeVisitor):
+    """Decide which environment mappings only ever reach a child-process ``env=``.
+
+    Names are followed per lexical scope, in evaluation order (assignment values
+    before their targets), until a rebinding that surely runs. A later ``env = {}``
+    handed to a launcher therefore cannot vouch for an earlier
+    ``env = os.environ.copy()``, and a nested scope's own ``env`` cannot close the
+    outer one. A binding passes through only if every use is a child-process
+    ``env=`` argument or an in-place edit of the mapping; any other use keeps the
+    finding HIGH.
+
+    The pass sees one file, so a binding only passes through by name where no
+    other file can reach it: a function local, or a module global bound in a
+    top-level ``if __name__ == "__main__":`` body, which importers never run. A
+    launcher only counts when its root name is bound solely by an absolute import
+    from ``subprocess`` or ``asyncio`` and nothing in the file writes to that
+    module, so a local ``def run`` or ``class subprocess`` is never trusted.
+
+    Control flow errs toward keeping the finding HIGH. A rebinding closes only the
+    bindings made in its own block or in blocks nested inside it, so one inside an
+    ``if``, ``try``, ``with``, ``match`` or loop body leaves the outer binding open
+    next to the new one, and later uses count against both. A rebinding never
+    closes anything where a raise, ``break`` or ``continue`` can skip it (``try``,
+    ``except``, ``with`` and loop bodies), or as a walrus, which can sit in a
+    short-circuit. A loop body may run again, so a read anywhere in a loop counts
+    against every binding made in that loop. A walrus result, a class attribute
+    and any name in a file that can read names dynamically (``globals``,
+    ``eval``, frame locals, ``__globals__``, ``sys.modules``) keep the finding,
+    as does a name with too many live bindings.
+
+    A function or lambda body runs at some later time, so its reads of an
+    enclosing name count against every binding of that name that is open when the
+    body is defined or made after it. Its writes to an enclosing name through
+    ``global`` or ``nonlocal`` cannot be ordered against the enclosing uses and
+    leave those bindings as they are.
+    """
+
+    def __init__(self, tree: ast.AST, aliases: dict[str, str]) -> None:
+        self._env_arguments: set[int] = set()
+        self._mutated_names: set[int] = set()
+        self._dynamic_reads = False
+        bindings = _FileBindings(tree, aliases)
+        launchers = bindings.launchers()
+        # Importers never run a top-level ``if __name__ == "__main__":`` body.
+        self._main_guards: set[int] = set()
+        if isinstance(tree, ast.Module) and bindings.main_guard_holds():
+            self._main_guards = {
+                id(statement)
+                for statement in tree.body
+                if isinstance(statement, ast.If) and _is_main_guard(statement.test)
+            }
+        self._in_main_guard = False
+        self._lazy = 0
+        for node in ast.walk(tree):
+            if _reads_names_dynamically(node, aliases):
+                self._dynamic_reads = True
+            receiver = _edit_receiver(node)
+            if receiver is not None:
+                self._mutated_names.add(id(receiver))
+            elif isinstance(node, ast.Call):
+                call_name = resolve_call_name(node, aliases)
+                spelling = resolve_dotted_name(node.func)
+                if (
+                    call_name in _CHILD_PROCESS_ENV_CALLS
+                    and spelling is not None
+                    and spelling.partition(".")[0] in launchers
+                ):
+                    self._env_arguments.update(
+                        id(keyword.value) for keyword in node.keywords if keyword.arg == "env"
+                    )
+            elif (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and isinstance(node.value, ast.Name)
+            ):
+                self._mutated_names.add(id(node.value))
+            elif (
+                isinstance(node, ast.AugAssign)
+                and isinstance(node.op, ast.BitOr)
+                and isinstance(node.target, ast.Name)
+            ):
+                # Only ``dict.__ior__`` exists. Any other operator hands the whole
+                # mapping to the right operand's reflected method.
+                self._mutated_names.add(id(node.target))
+        self._scopes: list[_Scope] = [_Scope(local_names=None)]
+        self._passed_through: set[int] = set()
+        self._escaped: set[int] = set()
+        self._block_numbers = itertools.count()
+        self._block: tuple[int, ...] = ()
+        # How many protected bodies of the current scope enclose this point.
+        self._protected = 0
+        self._loops: list[_Loop] = []
+
+    def passthrough_ids(self) -> set[int]:
+        """Ids of expressions whose only destination is a child-process ``env=``."""
+        self._close_scope(self._scopes[0])
+        if self._dynamic_reads:
+            # Any name may be read back by a string, so only inline arguments are safe.
+            return set(self._env_arguments)
+        return (self._passed_through - self._escaped) | self._env_arguments
+
+    def _close(self, scope: _Scope, name: str, block: tuple[int, ...] | None = None) -> None:
+        """Close the bindings of ``name`` made in ``block`` or in blocks nested inside it.
+
+        Those are the bindings a rebinding in ``block`` surely replaces; ``None``
+        closes them all.
+        """
+        still_open: list[_EnvironmentBinding] = []
+        for binding in scope.open.pop(name, []):
+            if block is not None and binding.block[: len(block)] != block:
+                still_open.append(binding)
+            elif binding.escaped:
+                self._escaped.add(binding.value_id)
+            elif binding.reached_child_process:
+                self._passed_through.add(binding.value_id)
+        if still_open:
+            scope.open[name] = still_open
+
+    def _close_scope(self, scope: _Scope) -> None:
+        for name in list(scope.open):
+            self._close(scope, name)
+
+    def _resolve(self, name: str, *, walrus: bool = False) -> tuple[_Scope, bool]:
+        """Return the scope that owns ``name`` here, and whether this access runs later."""
+        deferred = self._lazy > 0
+        innermost = True
+        for scope in reversed(self._scopes):
+            if walrus and scope.is_comprehension:
+                deferred = deferred or scope.deferred
+                continue
+            # A class body does not enclose the scopes nested inside it.
+            if innermost or not scope.is_class:
+                if scope.owns(name):
+                    return scope, deferred
+                if name in scope.declared_global:
+                    return self._scopes[0], deferred or scope.deferred
+            deferred = deferred or scope.deferred
+            innermost = False
+        return self._scopes[0], deferred
+
+    def _store(self, name: str, value_id: int | None, *, walrus: bool = False) -> None:
+        scope, deferred = self._resolve(name, walrus=walrus)
+        if deferred:
+            return
+        if not walrus and not self._protected:
+            self._close(scope, name, self._block)
+        if value_id is None:
+            return
+        # A walrus also hands the value to the enclosing expression, a class
+        # attribute outlives the class body, and another file can import a module
+        # global this pass never sees.
+        escaped = (
+            walrus
+            or scope.is_class
+            or name in scope.read_later
+            or (scope is self._scopes[0] and not self._in_main_guard)
+        )
+        binding = _EnvironmentBinding(value_id, self._block, escaped=escaped)
+        bindings = scope.open.setdefault(name, [])
+        bindings.append(binding)
+        for loop in self._loops:
+            loop.bindings.append((scope, name, binding))
+        if len(bindings) > _MAX_OPEN_BINDINGS:
+            self._escaped.update(open_binding.value_id for open_binding in bindings)
+            del scope.open[name]
+
+    def _bind(self, target: ast.expr, value_id: int, *, walrus: bool = False) -> None:
+        if isinstance(target, ast.Name):
+            self._store(target.id, value_id, walrus=walrus)
+        else:
+            self.visit(target)
+
+    def _visit_block(self, nodes: Sequence[ast.AST], *, protected: bool = False) -> None:
+        """Visit statements that may run zero, one or several times as one block."""
+        outer = self._block
+        self._block = (*outer, next(self._block_numbers))
+        self._protected += protected
+        for node in nodes:
+            self.visit(node)
+        self._protected -= protected
+        self._block = outer
+
+    def _visit_loop(self, header: Sequence[ast.AST], body: list[ast.stmt]) -> None:
+        """Visit a loop's repeated part, then count its reads against its bindings."""
+        loop = _Loop()
+        self._loops.append(loop)
+        # ``break`` and ``continue`` can skip any rebinding in the body.
+        self._visit_block([*header, *body], protected=True)
+        self._loops.pop()
+        # The next pass reads what this pass bound, whatever the source order.
+        for scope, name, binding in loop.bindings:
+            if (scope, name) in loop.reads:
+                self._escaped.add(binding.value_id)
+
+    def generic_visit(self, node: ast.AST) -> None:
+        """Visit children in order, giving every nested statement list its own block."""
+        for field_name, value in ast.iter_fields(node):
+            if isinstance(value, list) and value and isinstance(value[0], ast.stmt):
+                protected = (type(node), field_name) in _PROTECTED_BODIES
+                self._visit_block(value, protected=protected)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, ast.AST):
+                        self.visit(item)
+            elif isinstance(value, ast.AST):
+                self.visit(value)
+
+    def _visit_scope(self, scope: _Scope, body: list[ast.stmt] | list[ast.expr]) -> None:
+        # A ``try`` around a definition cannot see the locals of its body.
+        outer_protected, self._protected = self._protected, 0
+        self._scopes.append(scope)
+        self._visit_block(body)
+        self._close_scope(self._scopes.pop())
+        self._protected = outer_protected
+
+    def _visit_lazy(self, expressions: Sequence[ast.expr | None]) -> None:
+        """Visit expressions that run where they are defined, or only when read.
+
+        Annotations run eagerly before Python 3.14 and lazily from it on, and type
+        parameters and ``type`` alias values always run lazily, so a read here
+        counts against the bindings open now and every later one.
+        """
+        self._lazy += 1
+        for expression in expressions:
+            if expression is not None:
+                self.visit(expression)
+        self._lazy -= 1
+
+    def _visit_defaults(self, arguments: ast.arguments) -> None:
+        for default in (*arguments.defaults, *arguments.kw_defaults):
+            if default is not None:
+                self.visit(default)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self._visit_defaults(node.args)
+        self._visit_lazy(
+            [*_type_param_expressions(node.type_params), *_annotation_expressions(node)]
+        )
+        bound, declared_global = _scope_declarations(node.body)
+        scope = _Scope(bound | _argument_names(node.args), declared_global, deferred=True)
+        self._visit_scope(scope, node.body)
+        self._store(node.name, None)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._visit_defaults(node.args)
+        bound, _ = _scope_declarations([node.body])
+        scope = _Scope(bound | _argument_names(node.args), deferred=True)
+        self._visit_scope(scope, [node.body])
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._visit_lazy(_type_param_expressions(node.type_params))
+        for expression in (*node.decorator_list, *node.bases):
+            self.visit(expression)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+        bound, declared_global = _scope_declarations(node.body)
+        self._visit_scope(_Scope(bound, declared_global, is_class=True), node.body)
+        self._store(node.name, None)
+
+    def _visit_comprehension(
+        self,
+        node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp,
+        results: list[ast.expr],
+    ) -> None:
+        # The first iterable is evaluated in the enclosing scope.
+        self.visit(node.generators[0].iter)
+        targets = {
+            name.id
+            for generator in node.generators
+            for name in ast.walk(generator.target)
+            if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)
+        }
+        deferred = isinstance(node, ast.GeneratorExp)
+        self._scopes.append(_Scope(targets, deferred=deferred, is_comprehension=True))
+        repeated: list[ast.AST] = []
+        for index, generator in enumerate(node.generators):
+            if index:
+                repeated.append(generator.iter)
+            repeated.append(generator.target)
+            repeated.extend(generator.ifs)
+        self._visit_loop([*repeated, *results], [])
+        self._close_scope(self._scopes.pop())
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node, [node.key, node.value])
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for target in node.targets:
+            self._bind(target, id(node.value))
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is not None:
+            self.visit(node.value)
+            self._bind(node.target, id(node.value))
+        elif not isinstance(node.target, ast.Name):
+            # Without a value, an attribute or subscript target still evaluates its base.
+            self.visit(node.target)
+        # A function never evaluates its local annotations; counting them anyway is safe.
+        self._visit_lazy([node.annotation])
+
+    def visit_TypeAlias(self, node: ast.TypeAlias) -> None:
+        self.visit(node.name)
+        self._visit_lazy([*_type_param_expressions(node.type_params), node.value])
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+        self._bind(node.target, id(node.value), walrus=True)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self.visit(node.value)
+        target = node.target
+        if isinstance(target, ast.Name) and id(target) not in self._mutated_names:
+            # The operator reads the old value before the name is rebound.
+            self.visit(ast.copy_location(ast.Name(target.id, ast.Load()), target))
+        self.visit(target)
+
+    def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
+        self.visit(node.iter)
+        # The target is rebound on every pass, and not at all for an empty iterable.
+        self._visit_loop([node.target], node.body)
+        self._visit_block(node.orelse)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self.visit_For(node)
+
+    def visit_If(self, node: ast.If) -> None:
+        if id(node) not in self._main_guards:
+            self.generic_visit(node)
+            return
+        self.visit(node.test)
+        self._in_main_guard = True
+        self._visit_block(node.body)
+        self._in_main_guard = False
+        self._visit_block(node.orelse)
+
+    def visit_While(self, node: ast.While) -> None:
+        # The test runs again before every pass.
+        self._visit_loop([node.test], node.body)
+        self._visit_block(node.orelse)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        node_id = id(node)
+        if not isinstance(node.ctx, ast.Load) and node_id not in self._mutated_names:
+            self._store(node.id, None)
+            return
+        scope, deferred = self._resolve(node.id)
+        bindings = scope.open.get(node.id, [])
+        if node_id in self._env_arguments:
+            for binding in bindings:
+                binding.reached_child_process = True
+        elif node_id not in self._mutated_names:
+            if deferred:
+                scope.read_later.add(node.id)
+            if scope.is_class:
+                # Before the class body binds the name, the read falls through to globals.
+                bindings = [*bindings, *self._scopes[0].open.get(node.id, [])]
+            for binding in bindings:
+                binding.escaped = True
+            for loop in self._loops:
+                loop.reads.add((scope, node.id))
+
+
 def _analyze_python_environment_reads(
     content: str,
     file_path: str,
@@ -196,7 +1370,8 @@ def _analyze_python_environment_reads(
     """Detect materializing or enumerating the complete ``os.environ`` mapping.
 
     A full mapping copy or enumeration is an environment-harvesting signal, unlike a
-    targeted single-key lookup or passing ``os.environ`` through to a child process.
+    targeted single-key lookup. A copy that the flow pass traces only to a child
+    process is still reported, but as a low-confidence LOW pass-through.
     Credential flows to network and execution sinks remain covered by the behavioral
     taint analyzer. AST parsing makes this check insensitive to formatting and lets it
     resolve ``os`` / ``environ`` import aliases.
@@ -213,6 +1388,14 @@ def _analyze_python_environment_reads(
 
     aliases = python_ast.import_aliases
     lines = python_ast.lines
+    try:
+        flow = _EnvironmentFlowVisitor(tree, aliases)
+        flow.visit(tree)
+        child_process_passthroughs = flow.passthrough_ids()
+    except RecursionError:
+        # Too deep for the recursive flow pass: report every full read as HIGH
+        # instead of losing the whole file.
+        child_process_passthroughs = set()
     findings: list[AnalyzerFinding] = []
     emitted: set[int] = set()
     tag = [PatternCategory.DATA_EXFILTRATION.value]
@@ -222,16 +1405,32 @@ def _analyze_python_environment_reads(
         if node_id in emitted:
             return
         emitted.add(node_id)
+        passthrough = node_id in child_process_passthroughs
         lineno = getattr(node, "lineno", 1)
         end_lineno = getattr(node, "end_lineno", None)
         matched_text = ast.get_source_segment(content, node) or "os.environ"
         findings.append(
             AnalyzerFinding(
                 rule_id="E2",
-                message="Env Variable Harvesting",
-                severity=Severity.HIGH,
+                message=(
+                    "Environment Pass-Through to Child Process"
+                    if passthrough
+                    else "Env Variable Harvesting"
+                ),
+                severity=Severity.LOW if passthrough else Severity.HIGH,
                 location=Location(file=file_path, start_line=lineno, end_line=end_lineno),
-                confidence=confidence,
+                confidence=(
+                    min(confidence, _CHILD_PROCESS_PASSTHROUGH_CONFIDENCE)
+                    if passthrough
+                    else confidence
+                ),
+                explanation=(
+                    "The copy of os.environ is only handed to a child process launched "
+                    "through subprocess or asyncio, so the child receives the environment "
+                    "the skill already runs in. No other read of the copy was found."
+                    if passthrough
+                    else None
+                ),
                 tags=tag,
                 context=get_context_from_lines(lines, lineno),
                 matched_text=matched_text[:200],
@@ -298,13 +1497,19 @@ def analyze(
 
     tag = [PatternCategory.DATA_EXFILTRATION.value]
 
+    shell_command_ranges = _e1_shell_command_ranges(content, file_type)
     for pattern, confidence in E1_PATTERNS:
-        matches = (
-            static_runner.iter_paragraph_matches
-            if (pattern, confidence) in E1_PROSE_PATTERNS
-            else re.finditer
-        )
-        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+        if (pattern, confidence) in _E1_SHELL_PATTERNS:
+            e1_matches = _iter_e1_shell_matches(pattern, content, shell_command_ranges)
+        elif (pattern, confidence) in E1_PROSE_PATTERNS:
+            e1_matches = static_runner.iter_paragraph_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            )
+        else:
+            e1_matches = static_runner.iter_pattern_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            )
+        for match in e1_matches:
             line_num = get_line_number(content, match.start())
             adj = (
                 min(1.0, confidence + 0.1)
@@ -337,7 +1542,7 @@ def analyze(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in E2_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -358,7 +1563,7 @@ def analyze(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in E3_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -393,9 +1598,16 @@ def analyze(
                     complete_match=match.group(0),
                 )
             )
-    # E5: cloud-storage exfiltration. Example filtering is delegated to the runner.
+    # E5: retain uploads and uncertain directions; lower only proven downloads.
+    line_starts = logical_line_starts(content[: _CLOUD_DOWNLOAD_CONTEXT_CHARS + 1])
     for pattern, confidence in E5_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
+            if _is_literal_cloud_download(
+                content, match.start(), line_starts, file_path, file_type
+            ):
+                continue
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(

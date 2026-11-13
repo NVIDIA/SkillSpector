@@ -34,7 +34,9 @@ from skillspector.llm_analyzer_base import (
     LLMAnalyzerBase,
     LLMRuntimeLimitError,
     ledger_events_for_batches,
+    llm_call_record_for_outcome,
 )
+from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
 from skillspector.state import (
     AnalyzerNodeResponse,
@@ -213,11 +215,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             model=model,
             node=ANALYZER_ID,
             timeout=timeout,
+            recovery_rule_ids=("SSD-1", "SSD-2", "SSD-3", "SSD-4"),
         )
         batches = analyzer.get_batches(available_components, file_cache)
-        results = analyzer.run_batches(batches)
+        results = run_async(analyzer.arun_batches(batches))
         outcome = getattr(analyzer, "_last_batch_outcome", BatchExecutionResult(successful=results))
-        findings = analyzer.collect_findings(outcome.successful)
+        findings = analyzer.collect_findings([*outcome.successful, *outcome.recovered])
         events, status = ledger_events_for_batches(ANALYZER_ID, outcome)
         all_events = [*missing_cache_events, *events]
         if missing_cache_events:
@@ -240,11 +243,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             "inspection_ledger": all_events,
             "analyzer_status_events": [status],
             "llm_call_log": [
-                # A record is ok only when every submitted batch succeeded. A
-                # partial batch failure (e.g. one file's batch 429'd while
-                # another's succeeded) is still lost coverage, so it must not
-                # read as ok=True just because some batches came back.
-                llm_call_record(ANALYZER_ID, ok=not outcome.failures)
+                # Formatting warnings describe an unknown assessment; provider
+                # failures still make execution unsuccessful. Coverage is in the ledger.
+                llm_call_record_for_outcome(ANALYZER_ID, outcome)
             ],
             "inference_usage": analyzer.inference_usage,
         }

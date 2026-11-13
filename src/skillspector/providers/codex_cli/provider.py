@@ -13,18 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Codex CLI provider — Stage-2 LLM analysis via the local ``codex`` binary.
+"""Codex CLI provider — registered but disabled for untrusted skill analysis.
 
-Activated by ``SKILLSPECTOR_PROVIDER=codex_cli``. Authentication is handled by
-the ``codex`` CLI's own session (``codex login``); no API key is read or
-required.
-
-All behaviour is inherited from
-:class:`skillspector.providers._agent_cli_base.AgentCLIProviderBase`; the
-"codex"-specific argv (``codex exec --json --sandbox read-only --ephemeral
---ignore-user-config --ignore-rules``; never ``--dangerously-bypass-*``),
-output parsing, and auth probe live in the
-:mod:`skillspector.providers._agent_cli` registry.
+A read-only sandbox permits host file reads. Inference remains disabled until
+SkillSpector can verify a complete no-tools policy; the shared registry reports
+this provider unavailable and rejects direct completion calls before spawning.
 """
 
 from __future__ import annotations
@@ -35,11 +28,6 @@ BINARY_NAME = "codex"
 
 
 class CodexCLIProvider(AgentCLIProviderBase):
-    """Codex CLI provider (no API key; uses the local ``codex`` login).
-
-    No model is pinned: ``codex`` runs with the account's own default model
-    (some models, e.g. ``o4-mini``, aren't valid for ChatGPT-account codex, so
-    pinning is fragile). Set ``SKILLSPECTOR_MODEL`` to override.
-    """
+    """Registered provider that fails closed until tool denial is verified."""
 
     BINARY_NAME = "codex"

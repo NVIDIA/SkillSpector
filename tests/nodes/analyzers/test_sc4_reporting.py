@@ -19,6 +19,7 @@ import json
 from dataclasses import replace
 
 import pytest
+from markdown_it import MarkdownIt
 
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.llm_analyzer_base import Batch
@@ -55,7 +56,7 @@ def failed_lookup(monkeypatch):
         return QueryBatchResults([[] for _ in packages], limitations=(limitation,))
 
     monkeypatch.setattr(sc, "query_batch", query)
-    monkeypatch.setattr(sc, "was_osv_reachable", lambda: False)
+    monkeypatch.setattr(sc, "was_osv_reachable", lambda budget=None: False)
     return limitation
 
 
@@ -85,6 +86,8 @@ def _assert_report_guidance(finding, output_format):
         assert properties["explanation"] == finding.explanation
         assert properties["remediation"] == finding.remediation
     else:
+        if output_format == "markdown":
+            body = MarkdownIt().render(body)
         assert finding.remediation in body
 
 
@@ -187,7 +190,7 @@ def test_failed_osv_lookup_retains_positive_fallback_evidence(monkeypatch, faile
 @pytest.mark.parametrize("content", ["examplepkg==1.0.0\n", "examplepkg>=1.0.0\n"])
 def test_successful_empty_lookup_does_not_add_a_vulnerability(monkeypatch, content):
     monkeypatch.setattr(sc, "query_batch", lambda *_args, **_kwargs: [[]])
-    monkeypatch.setattr(sc, "was_osv_reachable", lambda: True)
+    monkeypatch.setattr(sc, "was_osv_reachable", lambda budget=None: True)
     raw, limitations, count = sc._analyze_dependencies_detailed(content, "requirements.txt")
     assert _sc4(raw) == []
     assert limitations == []
@@ -420,7 +423,7 @@ def test_failed_lookup_advice_does_not_assume_network_failure(monkeypatch, limit
             [[] for _ in packages], limitations=(limitation,)
         ),
     )
-    monkeypatch.setattr(sc, "was_osv_reachable", lambda: False)
+    monkeypatch.setattr(sc, "was_osv_reachable", lambda budget=None: False)
     raw, limitations, _ = sc._analyze_dependencies_detailed(
         "examplepkg==1.0.0\n", "requirements.txt"
     )

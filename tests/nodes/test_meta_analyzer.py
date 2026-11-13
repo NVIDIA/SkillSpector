@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import Batch, BatchExecutionResult, BatchFailure
 from skillspector.models import Finding
@@ -31,6 +33,7 @@ from skillspector.nodes.analyzers import static_patterns_anti_refusal
 from skillspector.nodes.analyzers.static_runner import analyzer_finding_to_finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
+    MetaAnalyzerResult,
     _meta_ledger_response,
     meta_analyzer,
 )
@@ -846,6 +849,28 @@ class TestMetaAnalyzerPartialBatchFailure:
         assert arun_batches.await_args.args[0] == [finding_batch]
         assert result["effective_finding_ids"] == [finding.finding_id]
 
+    def test_node_sizes_batches_with_the_metadata_it_sends(self) -> None:
+        """get_batches must see the same metadata_text the prompts are built with."""
+        finding = Finding(rule_id="R1", message="m", file="a.py", start_line=1)
+        batch = Batch(file_path="a.py", content="code a", findings=[finding])
+        state = self._state([finding])
+        state["manifest"] = {"name": "demo", "description": "d" * 500}
+
+        with (
+            patch.object(LLMMetaAnalyzer, "get_batches", return_value=[batch]) as get_batches,
+            patch.object(
+                LLMMetaAnalyzer,
+                "arun_batches",
+                new_callable=AsyncMock,
+                return_value=[(batch, [_confirm("R1", "a.py", 1)])],
+            ) as arun_batches,
+        ):
+            meta_analyzer(state)
+
+        sized_with = get_batches.call_args.kwargs["metadata_text"]
+        assert sized_with
+        assert sized_with == arun_batches.await_args.kwargs["metadata_text"]
+
     def test_no_failures_still_preserve_deterministic_findings(self) -> None:
         """Even complete LLM coverage cannot suppress deterministic findings."""
         f_confirmed = Finding(rule_id="R1", message="m", file="a.py", start_line=1)
@@ -1118,7 +1143,145 @@ def test_use_llm_false_records_nothing() -> None:
     assert "filtered_findings" not in result
 
 
+@pytest.mark.parametrize("value", ["invalid JSON", "", "{not json", "null", "42", '"wrong type"'])
+def test_invalid_stringified_meta_findings_fail_validation(value) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        MetaAnalyzerResult.model_validate({"findings": value})
+
+
+def test_valid_stringified_meta_fields_are_supported() -> None:
+    result = MetaAnalyzerResult.model_validate(
+        {
+            "findings": "[]",
+            "overall_assessment": '{"risk_level": "LOW", "summary": "No issues found"}',
+        }
+    )
+    assert result.findings == []
+    assert result.overall_assessment.summary == "No issues found"
+
+
 def test_no_findings_records_nothing() -> None:
     result = meta_analyzer(_degr_state(findings=[]))
     assert "llm_call_log" not in result
     assert "filtered_findings" not in result
+
+
+@pytest.mark.parametrize("assessment", ["HIGH risk: exfiltrates credentials", "LOW", ""])
+def test_optional_prose_assessment_keeps_finding_verdict(assessment):
+    verdict = {
+        "pattern_id": "P1",
+        "is_vulnerability": True,
+        "confidence": 0.9,
+        "intent": "malicious",
+        "impact": "high",
+        "explanation": "Unsafe instruction",
+        "remediation": "Remove instruction",
+    }
+    result = MetaAnalyzerResult.model_validate(
+        {"findings": [verdict], "overall_assessment": assessment}
+    )
+    assert len(result.findings) == 1
+    assert result.findings[0].pattern_id == "P1"
+    assert result.findings[0].is_vulnerability is True
+    assert result.overall_assessment is None
+
+
+def test_meta_recovery_copies_exact_finding_identities():
+    original = _finding("E2", 12, 14)
+    batch = Batch(file_path=original.file, content="source", findings=[original])
+
+    identities = _analyzer()._recovery_known_items(batch)
+
+    assert identities == [
+        {
+            "finding_id": original.finding_id,
+            "pattern_id": "E2",
+            "start_line": 12,
+            "end_line": 14,
+        }
+    ]
+    identities[0]["pattern_id"] = "different"
+    assert original.rule_id == "E2"
+    assert _analyzer()._recovery_known_items(batch)[0]["pattern_id"] == "E2"
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+@pytest.mark.parametrize("assessment", ["missing", "valid", "unknown_id", "wrong_rule"])
+@pytest.mark.parametrize(
+    "reason,expected_outcome,call_ok",
+    [
+        (LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED, LedgerOutcome.PARTIAL, True),
+        (LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED, LedgerOutcome.FAILED, False),
+        (LedgerReason.RUNTIME_LIMIT, LedgerOutcome.PARTIAL, False),
+    ],
+)
+def test_meta_partial_recovery_preserves_originals_and_terminal_cause(
+    assessment, reason, expected_outcome, call_ok
+):
+    first = Finding(
+        rule_id="E2", message="original high", severity="HIGH", file="a.py", start_line=1
+    )
+    second = Finding(
+        rule_id="P1", message="original low", severity="LOW", file="a.py", start_line=2
+    )
+    batch = Batch(file_path="a.py", content="first\nsecond", findings=[first, second])
+    state = {
+        "findings": [first, second],
+        "use_llm": True,
+        "file_cache": {"a.py": batch.content},
+        "manifest": {},
+        "model_config": {},
+    }
+
+    async def recover(self, batches, **_kwargs):
+        returned_batch = Batch(file_path="a.py", content=batch.content, findings=[first, second])
+        response = MetaAnalyzerResult.model_validate(
+            {
+                "findings": [
+                    {
+                        "finding_id": "unknown" if assessment == "unknown_id" else first.finding_id,
+                        "pattern_id": "different" if assessment == "wrong_rule" else first.rule_id,
+                        "start_line": first.start_line,
+                        "end_line": first.end_line,
+                        "is_vulnerability": True,
+                        "confidence": 0.95,
+                        "intent": "malicious",
+                        "impact": "high",
+                        "explanation": "Recovered confirmed issue",
+                    }
+                ]
+                if assessment != "missing"
+                else [],
+            }
+        )
+        terminal = BatchFailure(batch, "RecoveryStopped", reason)
+        self._last_batch_outcome = BatchExecutionResult(
+            recovered=[(returned_batch, self.parse_response(response, returned_batch))],
+            warnings=[terminal] if call_ok else [],
+            failures=[] if call_ok else [terminal],
+        )
+        return []
+
+    with (
+        patch.object(LLMMetaAnalyzer, "get_batches", return_value=[batch]),
+        patch.object(LLMMetaAnalyzer, "arun_batches", recover),
+    ):
+        result = meta_analyzer(state)
+
+    assert [item.finding_id for item in result["findings"]] == [first.finding_id, second.finding_id]
+    assert [item.severity for item in result["findings"]] == ["HIGH", "LOW"]
+    if assessment == "valid":
+        assert result["findings"][0].explanation == "Recovered confirmed issue"
+        assert result["findings"][0].evidence["llm_review_outcome"] == "confirmed"
+    else:
+        assert result["findings"][0].evidence["llm_review_outcome"] == "failed"
+    assert result["findings"][1].evidence["llm_review_outcome"] == "failed"
+    assert all("llm-unconfirmed" not in item.tags for item in result["findings"])
+    (event,) = result["inspection_ledger"]
+    assert event["outcome"] is expected_outcome
+    assert event["reason_code"] is reason
+    assert event["input_finding_ids"] == [first.finding_id, second.finding_id]
+    assert event["emitted_finding_ids"] == [first.finding_id, second.finding_id]
+    assert result["llm_call_log"][0]["ok"] is call_ok

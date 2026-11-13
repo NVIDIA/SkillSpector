@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 
 from skillspector.inspection_ledger import (
+    FORMAT_RECOVERY_SEMANTIC_ANALYZERS,
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
@@ -15,13 +16,7 @@ from skillspector.inspection_ledger import (
     ledger_event,
 )
 
-CANONICAL_SEMANTIC_ANALYZER_IDS = frozenset(
-    {
-        "semantic_developer_intent",
-        "semantic_quality_policy",
-        "semantic_security_discovery",
-    }
-)
+CANONICAL_SEMANTIC_ANALYZER_IDS = FORMAT_RECOVERY_SEMANTIC_ANALYZERS
 
 SEMANTIC_PREFLIGHT_UNAVAILABLE_MESSAGE = (
     "Requested semantic analysis was unavailable before execution."
@@ -29,6 +24,38 @@ SEMANTIC_PREFLIGHT_UNAVAILABLE_MESSAGE = (
 SEMANTIC_RUNTIME_INCOMPLETE_MESSAGE = (
     "Requested semantic analysis did not produce complete per-source runtime telemetry."
 )
+
+# Call-log error carried when every batch of an analyzer run failed because
+# the gateway rejects structured output in both shapes (json_schema response
+# format and tool calling). The exact string is the contract between the
+# analyzer nodes that record it and the availability accounting below; keep
+# it stable and free of provider-specific detail.
+STRUCTURED_OUTPUT_UNAVAILABLE_ERROR = (
+    "structured output rejected by provider (response_format unsupported; "
+    "tool-calling fallback also rejected)"
+)
+
+
+def all_llm_calls_failed_with_structured_output_rejection(
+    call_log: object,
+) -> bool:
+    """Return whether every recorded LLM call failed with a structured-output rejection.
+
+    True only when the log is non-empty, no call succeeded, and every failed
+    record carries the structured-output rejection error. A partial failure
+    is a coverage gap, not an unavailable LLM, and stays out of this rule.
+    """
+    if not isinstance(call_log, list) or not call_log:
+        return False
+    for record in call_log:
+        if not isinstance(record, Mapping):
+            return False
+        if record.get("ok") is True:
+            return False
+        if record.get("error") != STRUCTURED_OUTPUT_UNAVAILABLE_ERROR:
+            return False
+    return True
+
 
 _ROOT_SOURCE_SCOPE = "<root>"
 
@@ -102,10 +129,18 @@ def llm_runtime_available(
     preflight_available: bool,
     result: Mapping[str, object],
 ) -> bool:
-    """Return provider availability after applying meta-analysis runtime evidence."""
+    """Return provider availability after applying meta-analysis runtime evidence.
+
+    A run where every recorded LLM call failed because the gateway rejects
+    structured output is not an available LLM: preflight only proves the
+    credentials resolve and the model constructs, while the call log proves
+    the provider cannot serve a single assessment.
+    """
     if not preflight_available:
         return False
     call_log = result.get("llm_call_log")
+    if all_llm_calls_failed_with_structured_output_rejection(call_log):
+        return False
     if not isinstance(call_log, list):
         return True
     meta_analyzer_records = [
@@ -209,6 +244,297 @@ def semantic_runtime_accounting(
     return used, True
 
 
+def is_format_recovery_event(event: Mapping[str, object]) -> bool:
+    """Identify a completed recovery procedure whose assessment remains unknown."""
+    analyzer = event.get("analyzer_id")
+    return (
+        event.get("record_type") == LedgerRecordType.WORK_ITEM
+        and event.get("outcome") == LedgerOutcome.PARTIAL
+        and event.get("reason_code") == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+        and isinstance(analyzer, str)
+        and bool(analyzer)
+        and event.get("phase") == ("meta" if analyzer == "meta_analyzer" else "semantic")
+    )
+
+
+def format_recovery_runtime_accepted(
+    result: Mapping[str, object],
+    discovered_modules: Mapping[str, object],
+) -> bool:
+    """Prove format-only policy acceptance separately from semantic completeness.
+
+    Every warning must bind to one submitted work item and successful recovery
+    telemetry in the same source. Projecting those statuses here never changes
+    the original ledger, call log, or reported inspection completeness.
+    """
+    requested, enabled = semantic_runtime_intent(result)
+    events = result.get("inspection_ledger")
+    statuses = result.get("analyzer_status_events")
+    calls = result.get("llm_call_log")
+    if (
+        not requested
+        or not enabled
+        or not all(isinstance(value, list) for value in (events, statuses, calls))
+    ):
+        return False
+    assert isinstance(events, list) and isinstance(statuses, list) and isinstance(calls, list)
+    allowed_analyzers = required_semantic_analyzer_ids(discovered_modules) | {
+        "meta_analyzer",
+        "mcp_tool_poisoning",
+    }
+    by_work: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+    warning_work: set[tuple[str, str]] = set()
+    warning_scopes: set[tuple[str, str]] = set()
+    for event in events:
+        if not isinstance(event, Mapping):
+            return False
+        scope, work_id = _source_scope(event), event.get("work_id")
+        if scope is None or not isinstance(work_id, str) or not work_id:
+            return False
+        key = (scope, work_id)
+        by_work.setdefault(key, []).append(event)
+        if event.get("reason_code") == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED:
+            analyzer = event.get("analyzer_id")
+            if not is_format_recovery_event(event) or analyzer not in allowed_analyzers:
+                return False
+            assert isinstance(analyzer, str)
+            warning_work.add(key)
+            warning_scopes.add((scope, analyzer))
+    if not warning_work:
+        return False
+    projected_statuses: list[Mapping[str, object]] = []
+    accounted_work: set[tuple[str, str]] = set()
+    accounted_scopes: set[tuple[str, str]] = set()
+    for status in statuses:
+        if not isinstance(status, Mapping):
+            return False
+        scope, analyzer = _source_scope(status), status.get("analyzer_id")
+        if scope is None or not isinstance(analyzer, str):
+            return False
+        key = (scope, analyzer)
+        if key not in warning_scopes:
+            projected_statuses.append(status)
+            continue
+        targets = status.get("planned_work")
+        if (
+            key in accounted_scopes
+            or status.get("status") != "degraded"
+            or not isinstance(targets, list)
+            or not targets
+        ):
+            return False
+        for target in targets:
+            if not isinstance(target, Mapping) or not isinstance(target.get("work_id"), str):
+                return False
+            work_key = (scope, str(target["work_id"]))
+            matches = by_work.get(work_key, [])
+            if len(matches) != 1:
+                return False
+            event = matches[0]
+            # TP4 shares its status with the same node's completed static phase.
+            own_static_work = (
+                analyzer == "mcp_tool_poisoning"
+                and event.get("analyzer_id") == "mcp_tool_poisoning_static"
+                and event.get("record_type") == LedgerRecordType.WORK_ITEM
+                and event.get("phase") == "static"
+                and event.get("path")
+                == ("SKILL.md" if scope == _ROOT_SOURCE_SCOPE else scope + "/SKILL.md")
+            )
+            if (event.get("analyzer_id") != analyzer and not own_static_work) or any(
+                event.get(field) != target.get(field)
+                for field in ("path", "start_line", "end_line")
+            ):
+                return False
+            if is_format_recovery_event(event):
+                if work_key in accounted_work:
+                    return False
+                accounted_work.add(work_key)
+            elif (
+                event.get("outcome") != LedgerOutcome.COMPLETED
+                or event.get("reason_code") is not None
+            ):
+                return False
+        if (
+            sum(
+                1
+                for call in calls
+                if isinstance(call, Mapping)
+                and _source_scope(call) == scope
+                and call.get("node") == analyzer
+                and successful_llm_record(call)
+            )
+            != 1
+        ):
+            return False
+        accounted_scopes.add(key)
+        projected_statuses.append({**status, "status": "completed"})
+    if accounted_work != warning_work or accounted_scopes != warning_scopes:
+        return False
+    _used, complete = semantic_runtime_accounting(
+        enabled=True,
+        result={**result, "analyzer_status_events": projected_statuses},
+        discovered_modules=discovered_modules,
+    )
+    return complete
+
+
+def _refused_runtime_is_accounted(
+    result: Mapping[str, object],
+    discovered_modules: Mapping[str, object],
+) -> bool:
+    """Distinguish reported refusals from missing execution evidence."""
+    events = result.get("inspection_ledger")
+    statuses = result.get("analyzer_status_events")
+    calls = result.get("llm_call_log")
+    if not all(isinstance(value, list) for value in (events, statuses, calls)):
+        return False
+    assert isinstance(events, list) and isinstance(statuses, list) and isinstance(calls, list)
+    by_work: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+    refusals: set[tuple[str, str]] = set()
+    refused_nodes: set[tuple[str, str]] = set()
+    required_analyzers = required_semantic_analyzer_ids(discovered_modules) | {
+        "mcp_tool_poisoning",
+        "meta_analyzer",
+    }
+    for event in events:
+        if not isinstance(event, Mapping):
+            return False
+        scope, work_id = _source_scope(event), event.get("work_id")
+        if scope is None or not isinstance(work_id, str) or not work_id:
+            return False
+        key = (scope, work_id)
+        by_work.setdefault(key, []).append(event)
+        if not isinstance(event.get("phase"), str):
+            return False
+        if (
+            event.get("phase") in {"semantic", "meta"}
+            and event.get("outcome") != LedgerOutcome.COMPLETED
+        ):
+            analyzer = event.get("analyzer_id")
+            if (
+                event.get("record_type") != LedgerRecordType.WORK_ITEM
+                or not isinstance(analyzer, str)
+                or analyzer not in required_analyzers
+                or event.get("phase") != ("meta" if analyzer == "meta_analyzer" else "semantic")
+                or event.get("outcome") != LedgerOutcome.SKIPPED
+                or event.get("reason_code") != LedgerReason.LLM_RESPONSE_REFUSED
+            ):
+                return False
+            refusals.add(key)
+            refused_nodes.add((scope, analyzer))
+    if not refusals:
+        return False
+
+    projected_statuses: list[Mapping[str, object]] = []
+    accounted_work: set[tuple[str, str]] = set()
+    accounted_refusals: set[tuple[str, str]] = set()
+    accounted_statuses: set[tuple[str, str]] = set()
+    for status in statuses:
+        if not isinstance(status, Mapping):
+            return False
+        scope, analyzer = _source_scope(status), status.get("analyzer_id")
+        if scope is None or not isinstance(analyzer, str) or not analyzer:
+            return False
+        if (scope, analyzer) not in refused_nodes:
+            projected_statuses.append(status)
+            continue
+        if (scope, analyzer) in accounted_statuses:
+            return False
+        targets = status.get("planned_work")
+        if status.get("status") != "degraded" or not isinstance(targets, list) or not targets:
+            return False
+        node_refusals: set[tuple[str, str]] = set()
+        for target in targets:
+            if not isinstance(target, Mapping):
+                return False
+            work_id, path = target.get("work_id"), target.get("path")
+            if not isinstance(work_id, str) or not work_id or not isinstance(path, str) or not path:
+                return False
+            start, end = target.get("start_line"), target.get("end_line")
+            if (start is not None and (type(start) is not int or start < 1)) or (
+                end is not None and (type(end) is not int or start is None or end < start)
+            ):
+                return False
+            key = (scope, work_id)
+            matches = by_work.get(key, [])
+            if key in accounted_work or len(matches) != 1:
+                return False
+            event = matches[0]
+            own_static_work = (
+                analyzer == "mcp_tool_poisoning"
+                and event.get("analyzer_id") == "mcp_tool_poisoning_static"
+                and event.get("phase") == "static"
+                and event.get("path")
+                == ("SKILL.md" if scope == _ROOT_SOURCE_SCOPE else scope + "/SKILL.md")
+            )
+            if (
+                event.get("record_type") != LedgerRecordType.WORK_ITEM
+                or (event.get("analyzer_id") != analyzer and not own_static_work)
+                or (
+                    event.get("phase") != ("meta" if analyzer == "meta_analyzer" else "semantic")
+                    and not own_static_work
+                )
+                or any(
+                    event.get(field) != target.get(field)
+                    for field in ("path", "start_line", "end_line")
+                )
+                or not (
+                    key in refusals
+                    or (
+                        event.get("outcome") == LedgerOutcome.COMPLETED
+                        and event.get("reason_code") is None
+                    )
+                )
+            ):
+                return False
+            accounted_work.add(key)
+            if key in refusals:
+                node_refusals.add(key)
+        if not node_refusals:
+            return False
+        accounted_statuses.add((scope, analyzer))
+        accounted_refusals.update(node_refusals)
+        projected_statuses.append({**status, "status": "completed"})
+    if accounted_refusals != refusals or accounted_statuses != refused_nodes:
+        return False
+
+    projected_calls: list[object] = []
+    accounted_nodes: set[tuple[str, str]] = set()
+    for call in calls:
+        if not isinstance(call, Mapping):
+            return False
+        scope, node = _source_scope(call), call.get("node")
+        if scope is None or not isinstance(node, str) or not node:
+            return False
+        key = (scope, node)
+        if key in refused_nodes:
+            # Refusal batch outcomes have no transport error. Other failures
+            # must retain their missing-runtime warning.
+            if (
+                key in accounted_nodes
+                or call.get("ok") is not False
+                or "error" not in call
+                or call["error"] is not None
+            ):
+                return False
+            accounted_nodes.add(key)
+            projected_calls.append({**call, "ok": True})
+        else:
+            projected_calls.append(call)
+    if accounted_nodes != refused_nodes:
+        return False
+    _used, complete = semantic_runtime_accounting(
+        enabled=True,
+        result={
+            **result,
+            "analyzer_status_events": projected_statuses,
+            "llm_call_log": projected_calls,
+        },
+        discovered_modules=discovered_modules,
+    )
+    return complete
+
+
 def semantic_runtime_limitation(
     *,
     requested: bool,
@@ -249,6 +575,8 @@ def semantic_runtime_ledger_event(
         discovered_modules=discovered_modules,
     )
     if limitation is None:
+        return None
+    if enabled and _refused_runtime_is_accounted(result, discovered_modules):
         return None
     event = ledger_event(
         outcome=LedgerOutcome.PARTIAL,

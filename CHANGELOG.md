@@ -1,5 +1,17 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
+* fix(deps): bump the locked `langgraph` from 1.2.6 to 1.2.20 (and `langgraph-checkpoint` 4.1.1 to 4.3.1, which it requires) past GHSA-3fx2-cqw9-xr3c; the locked `langgraph-sdk` 0.4.10 was already patched (#1078)
+* fix(pi): accept scans from symlinked workspace roots while preserving the CLI's checks on symlinks below the workspace. Custom YARA rules loaded with `--yara-rules-dir` cannot use `include`; place each rule directly in the selected directory.
+* fix(coverage): account for successfully inspected linked ZIP containers while retaining member failures and archive limits
+* fix(supply-chain): resolve npm manifest dependencies within their owning lockfile and workspace installation paths
+* fix(supply-chain): stop npm workspace `link: true` and versionless lockfile slots from borrowing an ancestor install's pinned version
+* fix(static): stop Markdown code fence lines from reading as an open quote that merges consecutive shell lines into one marker directive (#868)
+* fix(ra1): treat a prohibition on recommending a self-update ("Do not recommend self-update") as the prohibition it is, not as an RA1 self-modification instruction (#928)
+* fix(analyzer): stop PowerShell comments, `<# #>` blocks, backtick line continuations and display-only `Write-Host`/`Write-Verbose`-style messages from reporting a false `static_parse_limit`; payloads for `bash -c`, `Invoke-Expression`, script blocks and call operators, subexpressions inside messages, and any source whose token ownership cannot be proven keep their existing bounded checks and partial status (#711)
+* fix(sc8): count only the bytecode walk's own CPU time against its 5 s budget, so time spent waiting behind concurrent analyzers no longer reports a static `runtime_limit` for skills that ship no bytecode (#828)
+* fix(providers): cut per-call cost of CLI-provider scans and default their LLM fan-out to 2 (#808)
+* fix(taint): key TT1-TT6 taint by lexical scope and follow direct calls to functions and methods defined in the same file, so a tainted variable no longer taints same-named variables in other functions (#799). Message-glob baseline rules keep matching TT findings whose rule and message are unchanged; exact baseline fingerprints are bound to the scanner version and suppress nothing after an upgrade (see docs/SUPPRESSION.md), so they must be regenerated in any case. A TT message changes where the earlier message came from a same-named variable in another scope (it now names the variable, source and line that reach the sink); where a more severe source raises the rule (TT2 to TT3 or TT4, TT4 to TT3, TT2 to TT5 or TT6), and at such a sink, where a weaker finding is subsumed or now cites another variable; and where an identifier longer than 120 characters is now shortened. Re-accept those findings or regenerate the baseline. `match_fingerprint` changes only when the rule does.
+* fix(static): stop code comparisons after removal verbs from reading as unterminated tag-marker directives (#777)
 * fix(baseline): fingerprint every occurrence of a deduplicated finding so the next scan suppresses all of them (#633)
 * fix(security): retain incomplete coverage for runtime-selected commands and remeasure active Git clones strictly (#514)
 * fix(scan): preserve required-input failures and multiline prompt uncertainty (#563)

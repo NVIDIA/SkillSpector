@@ -6,9 +6,14 @@
 import os
 import shutil
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
+from langchain_core.callbacks import BaseCallbackHandler
+
+from skillspector.artifacts import _token_gap_span_cache_clear
 from skillspector.python_ast import clear_python_ast_cache
 
 
@@ -43,10 +48,73 @@ def remove_temp_tree(path: str | Path) -> None:
     shutil.rmtree(path, onexc=_retry_writable)
 
 
+SCAN_TEMP_DIR_PREFIX = "skillspector_"
+
+
+def _is_scan_temp_dir(value: object) -> bool:
+    """Return whether ``value`` names an existing, non-symlink scan temp directory."""
+    if not isinstance(value, str) or not value:
+        return False
+    path = Path(value)
+    if not path.name.startswith(SCAN_TEMP_DIR_PREFIX):
+        return False
+    try:
+        return path.is_dir() and not path.is_symlink() and not os.path.isjunction(path)
+    except OSError:
+        return False
+
+
+class TempDirTracker(BaseCallbackHandler):
+    """Remember the temp directory a graph run materializes, as soon as it exists.
+
+    ``resolve_input`` reports the directory in its output as ``temp_dir_for_cleanup``,
+    but a run that raises or is interrupted returns no result for
+    :func:`cleanup_result`. Pass the tracker in the run's ``callbacks`` and use
+    :meth:`removing_on_error` around the run.
+    """
+
+    run_inline = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.temp_dir: str | None = None
+
+    def on_chain_end(self, outputs: Any, **kwargs: Any) -> None:
+        """Record ``temp_dir_for_cleanup`` from a node or graph output.
+
+        The recorded path is later removed recursively, so only a value that
+        looks like a scan temp dir is accepted: an existing directory, not a
+        symlink, whose name carries the ``skillspector_`` prefix that
+        ``InputHandler`` gives ``mkdtemp``. Anything else is ignored and never
+        replaces a path already recorded.
+        """
+        if isinstance(outputs, Mapping):
+            temp_dir = outputs.get("temp_dir_for_cleanup")
+            if _is_scan_temp_dir(temp_dir):
+                self.temp_dir = temp_dir
+
+    def remove(self) -> None:
+        """Remove the recorded temp directory, if any."""
+        if self.temp_dir:
+            remove_temp_tree(self.temp_dir)
+
+    @contextmanager
+    def removing_on_error(self) -> Iterator[None]:
+        """Remove the recorded temp directory if the wrapped run raises or is interrupted."""
+        try:
+            yield
+        except BaseException:
+            self.remove()
+            raise
+
+
 def cleanup_result(result: dict[str, object]) -> None:
     """Release scan-local resources and remove a temp dir if set."""
     python_ast_cache_key = result.get("python_ast_cache_key")
     clear_python_ast_cache(python_ast_cache_key if isinstance(python_ast_cache_key, str) else None)
+    # The token-gap span cache is process-global and keyed by full input
+    # text; a finished scan must not leave whole artifacts retained in it.
+    _token_gap_span_cache_clear()
     temp_dir = result.get("temp_dir_for_cleanup")
     if temp_dir and isinstance(temp_dir, str):
         remove_temp_tree(temp_dir)

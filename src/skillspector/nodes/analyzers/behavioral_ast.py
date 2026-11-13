@@ -32,14 +32,25 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
-from skillspector.python_ast import ParsedPythonFile, get_python_ast
+from skillspector.python_ast import (
+    ParsedPythonFile,
+    PythonSourceClassification,
+    get_python_ast,
+    resolve_python_source_classification,
+)
 from skillspector.state import (
     AnalyzerNodeResponse,
     SkillspectorState,
     transitive_remaining_seconds,
 )
 
+from .canonical_sink import (
+    canonical_sibling_method,
+    canonical_sibling_sink,
+    resolve_to_canonical_sink,
+)
 from .common import (
+    build_type_map,
     get_complete_source_segment,
     get_context_from_lines,
     resolve_call_name,
@@ -652,6 +663,41 @@ def _reflective_module_dict_base(node: ast.Subscript, aliases: dict[str, str]) -
     return _reflective_module_dict_container(node.value, aliases)
 
 
+def _covered_by_ast9(node: ast.Call, aliases: dict[str, str]) -> bool:
+    """True when the callee of *node* is a reflective read that AST9 already reports.
+
+    AST9 fires on the reflective *read* of an allowlisted name
+    (:data:`_DANGEROUS_GETATTR_NAMES`) in three spellings: ``getattr(obj, "<name>")``
+    (including constant-joined names), ``<module>.__dict__["<name>"]`` /
+    ``vars(<module>)["<name>"]``, and the ``.get`` / ``.setdefault`` / ``.pop`` reads of
+    the same namespaces. When *node* invokes one of those reads, the canonical-sink
+    fallback must stay silent so one expression yields one sink finding; it then owns
+    only the spellings AST9 does not report (``__builtins__["exec"]``, an un-imported
+    ``vars(builtins)``, and getattr targets outside the allowlist such as
+    ``getattr(subprocess, "Popen")``).
+    """
+    callee = node.func
+    if isinstance(callee, ast.Subscript):
+        if _reflective_module_dict_base(callee, aliases) is None:
+            return False
+        key = callee.slice
+        return isinstance(key, ast.Constant) and key.value in _DANGEROUS_GETATTR_NAMES
+    if not (isinstance(callee, ast.Call) and len(callee.args) >= 1):
+        return False
+    if isinstance(callee.func, ast.Name) and callee.func.id == "getattr":
+        return len(callee.args) >= 2 and (
+            _constant_string(callee.args[1]) in _DANGEROUS_GETATTR_NAMES
+        )
+    if (
+        isinstance(callee.func, ast.Attribute)
+        and callee.func.attr in _REFLECTIVE_DICT_READ_METHODS
+        and _reflective_module_dict_container(callee.func.value, aliases) is not None
+    ):
+        key = callee.args[0]
+        return isinstance(key, ast.Constant) and key.value in _DANGEROUS_GETATTR_NAMES
+    return False
+
+
 def _analyze_python(
     python_ast: ParsedPythonFile,
     file_path: str,
@@ -662,6 +708,7 @@ def _analyze_python(
         return []
 
     aliases = python_ast.import_aliases
+    type_map = build_type_map(tree, aliases)
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
     contexts: dict[tuple[int, int], str] = {}
@@ -782,10 +829,32 @@ def _analyze_python(
                 continue
 
         call_name = resolve_call_name(ast_node, aliases)
+        if call_name is not None:
+            # Dynamic-import / code-exec sibling machinery (importlib.__import__,
+            # importlib.util.find_spec, runpy.run_module, code.interact, and the
+            # instance-method tails spec.loader.exec_module / runsource) resolves by name
+            # but matches no ladder; remap it to the primitive it equals so it re-enters
+            # the __import__/exec arms below.
+            call_name = (
+                canonical_sibling_sink(call_name)
+                or canonical_sibling_method(ast_node, type_map, aliases)
+                or call_name
+            )
         if call_name is None:
             # Dynamic-import chain: importlib.import_module('os').system(...) →
             # 'os.system', so it re-enters the os./subprocess. sink ladders below.
             call_name = resolve_dynamic_import_call(ast_node, aliases)
+        reflective = False
+        if call_name is None and not _covered_by_ast9(ast_node, aliases):
+            # Reflective invocation whose callee does not resolve by name:
+            # getattr(subprocess, "Popen")(cmd) (outside AST9's allowlist),
+            # __builtins__["exec"](src), vars(builtins)["exec"](src). Canonicalize to
+            # the bare/dotted sink id so it re-enters the ladders below with the correct
+            # rule + severity. A reflective read AST9 already reports (allowlisted getattr
+            # or module-namespace read) is left to AST9 (see _covered_by_ast9) so the
+            # two rules stay complementary, not duplicate.
+            call_name = resolve_to_canonical_sink(ast_node, aliases)
+            reflective = call_name is not None
         if call_name is None:
             continue
 
@@ -824,14 +893,21 @@ def _analyze_python(
         elif call_name.startswith("subprocess."):
             attr = call_name.split(".", 1)[1]
             if attr in _SUBPROCESS_CALLS:
-                explanation, remediation = _ast4_guidance(ast_node, attr)
-                _emit(
-                    node_index,
-                    "AST4",
-                    ast_node,
-                    explanation=explanation,
-                    remediation=remediation,
-                )
+                # A *reflective* subprocess invocation (getattr/subscript) signals the
+                # same evasion intent as reflective os.system, so it grades AST9-HIGH to
+                # stay consistent with that case; a direct subprocess.* call keeps its
+                # baseline AST4-MEDIUM.
+                if reflective:
+                    _emit(node_index, "AST9", ast_node)
+                else:
+                    explanation, remediation = _ast4_guidance(ast_node, attr)
+                    _emit(
+                        node_index,
+                        "AST4",
+                        ast_node,
+                        explanation=explanation,
+                        remediation=remediation,
+                    )
 
         elif call_name.startswith("os."):
             attr = call_name.split(".", 1)[1]
@@ -898,6 +974,14 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Parse Python files via AST and detect dangerous execution patterns."""
     components: list[str] = state.get("components") or []
     file_cache: dict[str, str] = state.get("local_file_cache") or state.get("file_cache") or {}
+    raw_file_cache = state.get("raw_file_cache")
+    source_classifications = (
+        state.get("python_source_classifications")
+        if "python_source_classifications" in state
+        else None
+    )
+    source_classification_limitations = state.get("python_source_classification_limitations") or {}
+    source_decode_failures = state.get("python_source_decode_failures") or {}
     python_ast_cache_key = state.get("python_ast_cache_key")
     all_findings: list[Finding] = []
     ledger_events: list[InspectionLedgerEvent] = []
@@ -905,7 +989,27 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     terminal_limit: _BehavioralResourceLimitError | None = None
 
     for path in components:
-        if not path.endswith(".py"):
+        content = file_cache.get(path)
+        source_classification: PythonSourceClassification | None = None
+        if source_classifications is not None and path in source_classifications:
+            source_classification = resolve_python_source_classification(
+                path,
+                content,
+                source_classifications=source_classifications,
+                raw_file_cache=raw_file_cache,
+            )
+            if source_classification is PythonSourceClassification.NON_PYTHON:
+                continue
+        if path in source_classification_limitations:
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="behavioral",
+                    analyzer_id=ANALYZER_ID,
+                    path=path,
+                    reason=LedgerReason.RUNTIME_LIMIT,
+                )
+            )
             continue
         if terminal_limit is None and budget.analyzer_exhausted():
             terminal_limit = _BehavioralResourceLimitError(
@@ -915,11 +1019,41 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                     "limit_findings": MAX_FINDINGS_PER_ANALYZER,
                 },
             )
+        if terminal_limit is None:
+            try:
+                budget.check_runtime()
+            except _BehavioralResourceLimitError as exc:
+                terminal_limit = exc
         if terminal_limit is not None:
             event = _partial_limit_event(path, terminal_limit)
             ledger_events.append(event)
             continue
-        content = file_cache.get(path)
+        if path in source_decode_failures:
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="behavioral",
+                    analyzer_id=ANALYZER_ID,
+                    path=path,
+                    reason=LedgerReason.PYTHON_SOURCE_DECODE_ERROR,
+                )
+            )
+            continue
+        if source_classification is None:
+            source_classification = resolve_python_source_classification(
+                path,
+                content,
+                source_classifications=source_classifications,
+                raw_file_cache=raw_file_cache,
+            )
+            try:
+                budget.check_runtime()
+            except _BehavioralResourceLimitError as exc:
+                terminal_limit = exc
+                ledger_events.append(_partial_limit_event(path, exc))
+                continue
+        if source_classification is PythonSourceClassification.NON_PYTHON:
+            continue
         if content is None:
             event = ledger_event(
                 outcome=LedgerOutcome.FAILED,
@@ -975,10 +1109,19 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 )
             else:
                 event = ledger_event(
-                    outcome=LedgerOutcome.COMPLETED,
+                    outcome=(
+                        LedgerOutcome.PARTIAL
+                        if source_classification is PythonSourceClassification.AMBIGUOUS
+                        else LedgerOutcome.COMPLETED
+                    ),
                     phase="behavioral",
                     analyzer_id=ANALYZER_ID,
                     path=path,
+                    reason=(
+                        LedgerReason.PYTHON_SOURCE_AMBIGUOUS
+                        if source_classification is PythonSourceClassification.AMBIGUOUS
+                        else None
+                    ),
                     emitted_finding_ids=[finding.finding_id for finding in path_findings],
                 )
         ledger_events.append(event)

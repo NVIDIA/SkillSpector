@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import pytest
+from markdown_it import MarkdownIt
 from typer.testing import CliRunner
 
 from skillspector.cli import app
@@ -120,6 +121,8 @@ def test_report_formats_show_explicit_scope(tmp_path, output_format):
     )
     assert result.exit_code == 0, result.output
     text = output.read_text()
+    if output_format == "markdown":
+        text = MarkdownIt().enable("table").render(text)
     assert "fixtures/*" in text
     assert "fixtures/attack.sh" in text
     assert "user_exclusion" in text
@@ -216,8 +219,6 @@ def test_terminal_patterns_preserve_rich_brackets(tmp_path, pattern):
 
 
 def test_markdown_patterns_use_lossless_code_spans(tmp_path):
-    from markdown_it import MarkdownIt
-
     (tmp_path / "SKILL.md").write_text("# Demo\nA harmless skill.\n")
     output = tmp_path.parent / f"{tmp_path.name}-patterns.md"
     patterns = ["fixtures/*", "tests/*", "tests/`name`.*"]

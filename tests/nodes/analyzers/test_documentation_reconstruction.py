@@ -54,7 +54,7 @@ def successful_llm_transport(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setattr("skillspector.mcp_server.is_llm_available", lambda: (True, ""))
     graph_module = importlib.import_module("skillspector.graph")
     monkeypatch.setattr(graph_module, "is_llm_available", lambda: (True, ""))
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, ""))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, ""))
     scan_graph = graph_module.create_graph()
     monkeypatch.setattr("skillspector.cli.graph", scan_graph)
     monkeypatch.setattr("skillspector.mcp_server.graph", scan_graph)
@@ -362,9 +362,92 @@ def test_list_fence_closes_before_following_inline_documentation(opening: str, i
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
+def test_nested_list_fence_uses_container_relative_indentation() -> None:
+    content = (
+        "3. Inspect the configuration:\n"
+        "   - Check the active value:\n"
+        "     ```bash\n"
+        "     echo harmless\n"
+        "     rm -rf /\n"
+        "     ```\n"
+    )
+
+    projected = tm_module._markdown_shell_text(content, lambda: None)
+
+    assert "```" not in projected
+    assert "echo harmless" in projected
+    assert "rm -rf /" in projected
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    "opening,indent",
+    [("- ~~~sh", "  "), ("- Modes:\n  - Commands:\n    ~~~sh", "    "), ("-\t~~~sh", "\t")],
+)
+@pytest.mark.parametrize("threat_location", [None, "inside", "after"])
+def test_list_fence_dedent_preserves_prose_and_commands(
+    newline: str, opening: str, indent: str, threat_location: str | None
+) -> None:
+    content = opening + "\n" + indent + "printf ok\n"
+    if threat_location == "inside":
+        content += indent + "rm -rf /\n"
+    content += "\nThe interface doesn't match the spec.\n"
+    if threat_location == "after":
+        content += "```sh\nrm -rf /\n```\n"
+    content += "Ordinary documentation.\n" * 500
+    content = content.replace("\n", newline)
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm_module]
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert any(finding.rule_id == "TM1" for finding in result["findings"]) is (
+        threat_location is not None
+    )
+
+
+@pytest.mark.parametrize("language", ["tcl", "verilog"])
+def test_nested_list_fence_keeps_typed_fence_quote_ownership(language: str) -> None:
+    # A nested list fence takes the same typed-fence path as a top-level fence:
+    # a shell quote in it is never owned as a hardware literal.
+    content = (
+        "3. Inspect the configuration:\n"
+        "   - Check the active value:\n"
+        f"     ```{language}\n"
+        "     // echo '1'\n"
+        "     sh -c '$CMD -rf /'\n"
+        "     ```\n"
+    )
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm_module]
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(("relative_indent", "opens"), [(3, True), (4, False)])
+def test_list_fence_container_relative_indentation_boundary(
+    relative_indent: int, opens: bool
+) -> None:
+    indent = " " * (2 + relative_indent)
+    content = f"- Check the active value:\n{indent}```bash\n{indent}echo harmless\n{indent}```\n"
+
+    projected = tm_module._markdown_shell_text(content, lambda: None)
+
+    assert ("```" not in projected) is opens
+    assert "echo harmless" in projected
+
+
 @pytest.mark.parametrize("opening,indent", [("   ```sh", "      "), ("- - ```sh", "        ")])
 def test_deeply_indented_marker_does_not_close_fence(opening: str, indent: str) -> None:
-    content = opening + "\n" + indent + "```\n" + _LITERAL_BACKTICK_COMMAND + "\n```\n"
+    # Keep the command inside the list; dedenting would itself end its fence.
+    command_indent = "    " if opening.startswith("-") else ""
+    content = (
+        opening + "\n" + indent + "```\n" + command_indent + _LITERAL_BACKTICK_COMMAND + "\n```\n"
+    )
     projected = tm_module._markdown_shell_text(content, lambda: None)
     assert _LITERAL_BACKTICK_COMMAND in projected
 

@@ -20,16 +20,25 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import yaml
 from pydantic import BaseModel
 
-from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
-from skillspector.llm_analyzer_base import LLMAnalyzerBase
+from skillspector.inspection_ledger import (
+    LedgerOutcome,
+    LedgerReason,
+    LedgerRecordType,
+    finalize_ledger,
+)
+from skillspector.llm_analyzer_base import BatchExecutionResult, BatchFailure, LLMAnalyzerBase
 from skillspector.llm_utils import AgentCLIChatModel
 from skillspector.nodes.analyzers import mcp_tool_poisoning
 from skillspector.nodes.deduplicate import deduplicate
@@ -238,6 +247,46 @@ def _mock_tp4_structured_llm(
         lambda **_kwargs: _FakeChatModel(structured_llm),
     )
     return structured_llm
+
+
+@pytest.fixture
+def patch_openai_chat_model(monkeypatch: pytest.MonkeyPatch):
+    """Use the real ChatOpenAI binder/parser with a recorded model factory."""
+    from langchain_openai import ChatOpenAI
+
+    from skillspector import llm_analyzer_base, llm_utils
+
+    monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_REASONING_EFFORT", raising=False)
+    bindings: list[dict[str, object]] = []
+    original = ChatOpenAI.with_structured_output
+
+    def record_binding(self, schema, **kwargs):
+        bindings.append(kwargs)
+        return original(self, schema, **kwargs)
+
+    monkeypatch.setattr(ChatOpenAI, "with_structured_output", record_binding)
+
+    def configure(provider="openai", *, controls=None, provider_hint=None):
+        def factory(**kwargs):
+            llm = ChatOpenAI(
+                model=kwargs["model"],
+                api_key="sk-test",
+                base_url="https://example.invalid/v1",
+                **(controls or {}),
+            )
+            llm_utils.register_chat_model_provider(llm, provider)
+            return llm
+
+        monkeypatch.setattr(llm_analyzer_base, "get_chat_model", factory)
+        monkeypatch.setattr(
+            llm_utils,
+            "get_active_provider",
+            lambda: SimpleNamespace(structured_output_method=lambda _model: provider_hint),
+        )
+        return bindings
+
+    return configure
 
 
 # Alias used by node import at module level
@@ -1615,6 +1664,120 @@ class TestTP4MarkdownFences:
 
 
 class TestTP4Fallbacks:
+    def test_opus5_openai_tp4_binds_tool_output_for_initial_and_refreshed_models(
+        self, monkeypatch: pytest.MonkeyPatch, patch_openai_chat_model
+    ) -> None:
+        from skillspector import llm_analyzer_base
+
+        bindings = patch_openai_chat_model()
+        analyzer = mcp_tool_poisoning._TP4Analyzer(
+            model="azure/anthropic/claude-opus-5", timeout=lambda: 30.0
+        )
+        monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
+        analyzer._model_for_call()
+        assert bindings == [
+            {"method": "function_calling", "include_raw": True},
+            {"method": "function_calling", "include_raw": True},
+        ]
+
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "json_schema")
+        mcp_tool_poisoning._TP4Analyzer(model="azure/anthropic/claude-opus-5")
+        assert bindings[-1] == {"method": "json_schema", "include_raw": True, "strict": True}
+
+    @pytest.mark.parametrize(
+        "provider", ["openai_compatible", "nv_inference", "azure_openai", "nv_build"]
+    )
+    def test_opus5_tp4_does_not_force_tool_output_on_other_providers(
+        self, monkeypatch: pytest.MonkeyPatch, patch_openai_chat_model, provider
+    ) -> None:
+        from skillspector import llm_analyzer_base
+
+        bindings = patch_openai_chat_model(provider)
+        analyzer = mcp_tool_poisoning._TP4Analyzer(
+            model="azure/anthropic/claude-opus-5", timeout=lambda: 30.0
+        )
+        monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
+        analyzer._model_for_call()
+        assert bindings == [{"include_raw": True, "strict": True}] * 2
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "azure/anthropic/claude-sonnet-4-6",
+            "azure/anthropic/claude-opus-5-20260901",
+            "azure/anthropic/claude-opus-5:latest",
+            "claude-opus-5",
+            "AZURE/ANTHROPIC/CLAUDE-OPUS-5",
+        ],
+    )
+    def test_opus5_tp4_exact_label_excludes_aliases(self, patch_openai_chat_model, model):
+        bindings = patch_openai_chat_model()
+        mcp_tool_poisoning._TP4Analyzer(model=model)
+        assert bindings == [{"include_raw": True, "strict": True}]
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "none"])
+    def test_reasoning_env_skips_preference_on_initial_and_refreshed_models(
+        self, monkeypatch, patch_openai_chat_model, effort
+    ):
+        from skillspector import llm_analyzer_base
+
+        bindings = patch_openai_chat_model()
+        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", effort)
+        analyzer = mcp_tool_poisoning._TP4Analyzer(
+            model="azure/anthropic/claude-opus-5", timeout=lambda: 30.0
+        )
+        monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
+        analyzer._model_for_call()
+        assert bindings == [{"include_raw": True, "strict": True}] * 2
+
+    @pytest.mark.parametrize(
+        "controls",
+        [
+            {"reasoning_effort": "high"},
+            {"reasoning": {"effort": "medium"}},
+            {"model_kwargs": {"thinking": {"type": "enabled", "budget_tokens": 1024}}},
+            {"extra_body": {"thinking": {"type": "enabled", "budget_tokens": 1024}}},
+            {"extra_body": {"reasoning_effort": "high"}},
+        ],
+    )
+    def test_model_reasoning_controls_skip_preference_on_construction_and_refresh(
+        self, monkeypatch, patch_openai_chat_model, controls
+    ):
+        from skillspector import llm_analyzer_base
+
+        bindings = patch_openai_chat_model(controls=controls)
+        analyzer = mcp_tool_poisoning._TP4Analyzer(
+            model="azure/anthropic/claude-opus-5", timeout=lambda: 30.0
+        )
+        monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
+        analyzer._model_for_call()
+        assert bindings == [{"include_raw": True, "strict": True}] * 2
+
+    @pytest.mark.parametrize(
+        "override,hint,expected",
+        [
+            ("function_calling", "json_schema", "function_calling"),
+            ("json_schema", "function_calling", "json_schema"),
+            (None, "function_calling", "function_calling"),
+            (None, "json_schema", "json_schema"),
+        ],
+    )
+    def test_explicit_method_choices_win_with_reasoning(
+        self, monkeypatch, patch_openai_chat_model, override, hint, expected
+    ):
+        bindings = patch_openai_chat_model(provider_hint=hint)
+        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", "high")
+        if override is not None:
+            monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", override)
+        mcp_tool_poisoning._TP4Analyzer(model="azure/anthropic/claude-opus-5")
+        assert bindings == [
+            {
+                "method": expected,
+                "include_raw": True,
+                **({"strict": True} if expected == "json_schema" else {}),
+            }
+        ]
+
     def test_configured_output_language_is_included(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_OUTPUT_LANGUAGE", "German")
         _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
@@ -1661,6 +1824,148 @@ class TestTP4Fallbacks:
             LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
         )
         assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_wrapped_json_schema_response_stays_incomplete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", AsyncMock())
+        structured_llm = _mock_tp4_structured_llm(
+            monkeypatch,
+            [{"json": {"is_mismatch": False}} for _ in range(4)],
+        )
+
+        result = node(state)
+
+        assert structured_llm.calls == 4
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+        assert any(
+            event.get("reason_code") is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+            for event in result["inspection_ledger"]
+        )
+
+    def test_tool_refusal_stays_incomplete(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A structured call that keeps returning None ends degraded, not fatal (#843)."""
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", AsyncMock())
+        structured_llm = _mock_tp4_structured_llm(monkeypatch, [None, None, None, None])
+
+        result = node(state)
+
+        assert structured_llm.calls == 4
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        assert [
+            (event["outcome"], event["reason_code"], event["error_class"]) for event in semantic
+        ] == [
+            (
+                LedgerOutcome.SKIPPED,
+                LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+                "ValidationError",
+            )
+        ]
+        assert result["llm_call_log"][0]["ok"] is False
+        completeness, _ = finalize_ledger(
+            {
+                "components": state["components"],
+                "findings": result["findings"],
+                "inspection_ledger": result["inspection_ledger"],
+                "analyzer_status_events": result["analyzer_status_events"],
+            }
+        )
+        assert completeness["execution_successful"] is True
+        assert completeness["is_complete"] is False
+
+    def test_missing_structured_response_is_retried(self, monkeypatch: pytest.MonkeyPatch):
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        sleep = AsyncMock()
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", sleep)
+        structured_llm = _mock_tp4_structured_llm(monkeypatch, [None, {"is_mismatch": False}])
+
+        result = node(state)
+
+        assert structured_llm.calls == 2
+        sleep.assert_called_once_with(0.5)
+        assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
+        assert result["analyzer_status_events"][0]["status"] == "completed"
+
+    def test_bedrock_forced_tool_call_answered_in_prose_is_retried(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bedrock's tool parser returns None for a reply with no tool call (#843)."""
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        from langchain_aws import ChatBedrockConverse
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        from skillspector import llm_utils
+        from skillspector.providers.bedrock import (
+            BEDROCK_DEFAULT_MODEL,
+            BEDROCK_DEFAULT_REGION,
+            BedrockProvider,
+        )
+
+        assert BedrockProvider().forced_tool_choice_supported(BEDROCK_DEFAULT_MODEL)
+        calls = []
+
+        async def answer_in_prose(*_args, **_kwargs):
+            calls.append(1)
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="refused"))])
+
+        monkeypatch.setattr(ChatBedrockConverse, "_agenerate", answer_in_prose)
+        monkeypatch.setattr(llm_utils, "get_active_provider", BedrockProvider)
+        monkeypatch.setattr(
+            "skillspector.llm_analyzer_base.get_chat_model",
+            lambda **kwargs: ChatBedrockConverse(
+                model=kwargs["model"],
+                client=MagicMock(),
+                bedrock_client=MagicMock(),
+                region_name=BEDROCK_DEFAULT_REGION,
+            ),
+        )
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", AsyncMock())
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        state["model_config"] = {"default": BEDROCK_DEFAULT_MODEL}
+
+        result = node(state)
+
+        assert len(calls) == 4
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+        assert any(
+            event.get("reason_code") is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+            and event.get("error_class") == "ValidationError"
+            for event in result["inspection_ledger"]
+        )
+        assert not any(
+            event["outcome"] is LedgerOutcome.FAILED for event in result["inspection_ledger"]
+        )
+
+    def test_opus5_function_calling_refusal_stays_incomplete(
+        self, monkeypatch: pytest.MonkeyPatch, patch_openai_chat_model
+    ) -> None:
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+        from langchain_openai import ChatOpenAI
+
+        patch_openai_chat_model()
+        calls = []
+
+        async def refuse(*_args, **_kwargs):
+            calls.append(1)
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="refused"))])
+
+        monkeypatch.setattr(ChatOpenAI, "_agenerate", refuse)
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", AsyncMock())
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        state["model_config"] = {"default": "azure/anthropic/claude-opus-5"}
+        result = node(state)
+        assert len(calls) == 4
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+        assert any(
+            event.get("reason_code") is LedgerReason.LLM_RESPONSE_INVALID_TOOL
+            and event.get("error_class") == "ValidationError"
+            for event in result["inspection_ledger"]
+        )
 
     def test_malformed_response_is_retried(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)
@@ -1759,6 +2064,48 @@ class TestTP4Telemetry:
     """TP4 records llm_call_log so the report's degradation detector counts it
     consistently with the semantic analyzers and the meta-analyzer."""
 
+    @pytest.mark.parametrize("kind", ["refused", "mixed", "runtime", "unexpected"])
+    def test_only_explicit_refusals_omit_transport_error(self, monkeypatch, kind) -> None:
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        state["components"].append("second.py")
+        state["file_cache"]["second.py"] = "print(2)"
+        state["component_metadata"].append(
+            {"path": "second.py", "type": "python", "executable": True}
+        )
+        _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+
+        async def outcomes(self, batches, **_kwargs):
+            assert len(batches) >= 2
+            if kind == "unexpected":
+                return BatchExecutionResult(successful=[(batch, []) for batch in batches])
+            failures = []
+            for index, batch in enumerate(batches):
+                reason = LedgerReason.LLM_RESPONSE_REFUSED
+                if kind == "runtime":
+                    reason = LedgerReason.RUNTIME_LIMIT
+                elif kind == "mixed" and index:
+                    reason = LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+                failures.append(
+                    BatchFailure(batch=batch, error_class="ValidationError", reason=reason)
+                )
+            return BatchExecutionResult(failures=failures)
+
+        monkeypatch.setattr(LLMAnalyzerBase, "arun_batches_detailed", outcomes)
+        result = node(state)
+        call = result["llm_call_log"][0]
+        assert call["ok"] is False
+        if kind == "refused":
+            assert call["error"] is None
+            semantic = [
+                event for event in result["inspection_ledger"] if event["phase"] == "semantic"
+            ]
+            assert semantic and all(
+                event["reason_code"] is LedgerReason.LLM_RESPONSE_REFUSED for event in semantic
+            )
+        else:
+            assert "TP4 LLM batch failed" in call["error"]
+        assert result["analyzer_status_events"][0]["status"] != "completed"
+
     def test_successful_call_records_ok_true(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)
         _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
@@ -1790,6 +2137,193 @@ class TestTP4Telemetry:
         state = _make_state("mcp_mismatched_skill", use_llm=False)
         result = node(state)
         assert "llm_call_log" not in result
+
+
+class TestTP4PlaintextRecovery:
+    @pytest.mark.parametrize("confidence", [None, 0.6, 0.9])
+    @pytest.mark.parametrize(
+        "reason,expected_outcome,call_ok",
+        [
+            (LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED, LedgerOutcome.PARTIAL, True),
+            (LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED, LedgerOutcome.FAILED, False),
+            (LedgerReason.RUNTIME_LIMIT, LedgerOutcome.PARTIAL, False),
+        ],
+    )
+    def test_partial_findings_and_unknowns_keep_terminal_evidence(
+        self, monkeypatch, confidence, reason, expected_outcome, call_ok
+    ):
+        assert mcp_tool_poisoning._TP4Analyzer.recovery_required_fields == ("confidence",)
+
+        class RecoveryAnalyzer:
+            inference_usage = []
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def arun_batches_detailed(self, batches):
+                assert len(batches) == 1
+                batch = batches[0]
+                assessments = (
+                    []
+                    if confidence is None
+                    else [
+                        mcp_tool_poisoning._TP4AnalysisResult(
+                            is_mismatch=True,
+                            confidence=confidence,
+                            mismatched_capabilities=["network access"],
+                        )
+                    ]
+                )
+                terminal = BatchFailure(batch, "RecoveryStopped", reason)
+                return BatchExecutionResult(
+                    recovered=[(batch, assessments)],
+                    warnings=[terminal] if call_ok else [],
+                    failures=[] if call_ok else [terminal],
+                )
+
+        monkeypatch.setattr(mcp_tool_poisoning, "_TP4Analyzer", RecoveryAnalyzer)
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Read local files."},
+                "file_cache": {"tool.py": "print('local')\n"},
+                "component_metadata": [{"path": "tool.py", "type": "python"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert len(result.findings) == (0 if confidence is None else 1)
+        if confidence is not None:
+            finding = result.findings[0]
+            assert finding.rule_id == "TP4"
+            assert finding.severity == ("HIGH" if confidence >= 0.7 else "MEDIUM")
+            assert finding.evidence["assessment_complete"] is False
+            assert "llm-format-recovery" in finding.tags
+        producers = [
+            event for event in result.ledger if event["record_type"] is LedgerRecordType.WORK_ITEM
+        ]
+        (event,) = producers
+        assert event["outcome"] is (
+            LedgerOutcome.PARTIAL if confidence is not None else expected_outcome
+        )
+        assert event["reason_code"] is reason
+        assert event["emitted_finding_ids"] == [finding.finding_id for finding in result.findings]
+        assert event["error_class"] != "UnexpectedStructuredResponse"
+        assert result.record["ok"] is call_ok
+        completeness, _ = finalize_ledger(
+            {
+                "components": ["tool.py"],
+                "findings": result.findings,
+                "inspection_ledger": result.ledger,
+                "analyzer_status_events": [
+                    mcp_tool_poisoning.analyzer_status_for_events(
+                        "mcp_tool_poisoning", result.ledger
+                    )
+                ],
+            }
+        )
+        assert completeness["execution_successful"] is (
+            expected_outcome is not LedgerOutcome.FAILED
+        )
+        assert not any(
+            row["reason_code"]
+            in {LedgerReason.UNACCOUNTED_WORK, LedgerReason.FINDING_ACCOUNTING_ERROR}
+            for row in completeness["ledger_exceptions"]
+        )
+
+    @pytest.mark.parametrize(
+        "failure_reason",
+        [None, LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED, LedgerReason.RUNTIME_LIMIT],
+    )
+    def test_formatting_warning_does_not_mask_a_finding_cap(self, monkeypatch, failure_reason):
+        class RecoveryAnalyzer:
+            inference_usage = []
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def arun_batches_detailed(self, batches):
+                return BatchExecutionResult(
+                    recovered=[
+                        (
+                            batch,
+                            [
+                                mcp_tool_poisoning._TP4AnalysisResult(
+                                    is_mismatch=True,
+                                    confidence=0.9,
+                                    mismatched_capabilities=[batch.file_path],
+                                )
+                            ],
+                        )
+                        for batch in batches
+                    ],
+                    warnings=[
+                        BatchFailure(
+                            batch,
+                            "UnverifiedAssessment",
+                            LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED,
+                        )
+                        for batch in (batches if failure_reason is None else batches[:1])
+                    ],
+                    failures=[]
+                    if failure_reason is None
+                    else [BatchFailure(batches[1], "RecoveryStopped", failure_reason)],
+                )
+
+        monkeypatch.setattr(mcp_tool_poisoning, "_TP4Analyzer", RecoveryAnalyzer)
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_FINDINGS", 1)
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Read local files."},
+                "file_cache": {"first.py": "print('first')\n", "second.py": "print('second')\n"},
+                "component_metadata": [
+                    {"path": "first.py", "type": "python"},
+                    {"path": "second.py", "type": "python"},
+                ],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert len(result.findings) == 1
+        assert any(event["reason_code"] is LedgerReason.OUTPUT_LIMIT for event in result.ledger)
+        warnings = [
+            event
+            for event in result.ledger
+            if event["reason_code"] is LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+        ]
+        assert len(warnings) == 1
+        assert warnings[0]["emitted_finding_ids"] == [result.findings[0].finding_id]
+        assert all(
+            event["outcome"] is LedgerOutcome.PARTIAL
+            for event in result.ledger
+            if event["record_type"] is LedgerRecordType.WORK_ITEM
+        )
+        assert len({event["work_id"] for event in result.ledger}) == len(result.ledger)
+        if failure_reason is not None:
+            (system,) = [
+                event for event in result.ledger if event["record_type"] is LedgerRecordType.SYSTEM
+            ]
+            assert system["reason_code"] is failure_reason
+            assert result.record["ok"] is False
+        completeness, _ = finalize_ledger(
+            {
+                "components": ["first.py", "second.py"],
+                "findings": result.findings,
+                "inspection_ledger": result.ledger,
+                "analyzer_status_events": [
+                    mcp_tool_poisoning.analyzer_status_for_events(
+                        "mcp_tool_poisoning", result.ledger
+                    )
+                ],
+            }
+        )
+        assert completeness["execution_successful"] is (
+            failure_reason is not LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+        )
+        assert not any(
+            row["reason_code"]
+            in {LedgerReason.UNACCOUNTED_WORK, LedgerReason.FINDING_ACCOUNTING_ERROR}
+            for row in completeness["ledger_exceptions"]
+        )
 
 
 class TestInspectionLedgerStatus:
@@ -1824,6 +2358,231 @@ class TestInspectionLedgerStatus:
 
 
 class TestResourceBounds:
+    @pytest.mark.parametrize(
+        ("value", "expected", "warns"),
+        [
+            (None, 256, False),
+            ("1", 1, False),
+            (" 145 ", 145, False),
+            ("00145", 145, False),
+            ("512", 512, False),
+            ("4096", 4096, False),
+            ("", 256, False),
+            (" \t", 256, False),
+            ("0", 256, True),
+            ("-1", 256, True),
+            ("+3", 256, True),
+            ("4097", 256, True),
+            ("1.5", 256, True),
+            ("256.0", 256, True),
+            ("1_024", 256, True),
+            ("１２", 256, True),
+            ("nan", 256, True),
+            ("inf", 256, True),
+            ("not-a-number", 256, True),
+        ],
+    )
+    def test_tp4_batch_environment_parsing(
+        self, value: str | None, expected: int, warns: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level("WARNING", logger=mcp_tool_poisoning.__name__):
+            assert mcp_tool_poisoning._tp4_max_batches_from_environment(value) == expected
+
+        warnings = [
+            record
+            for record in caplog.records
+            if record.name == mcp_tool_poisoning.__name__ and record.levelname == "WARNING"
+        ]
+        assert bool(warnings) is warns
+        if warns:
+            assert "SKILLSPECTOR_TP4_MAX_BATCHES" in warnings[0].getMessage()
+        if value == "not-a-number":
+            assert value not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("value", "expected"), [(None, 256), ("3", 3), ("512", 512), ("bad", 256)]
+    )
+    def test_tp4_batch_environment_is_bound_in_fresh_process(
+        self, tmp_path: Path, value: str | None, expected: int
+    ) -> None:
+        module_path = Path(mcp_tool_poisoning.__file__).resolve()
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(module_path.parents[3])
+        environment.pop("SKILLSPECTOR_TP4_MAX_BATCHES", None)
+        if value is not None:
+            environment["SKILLSPECTOR_TP4_MAX_BATCHES"] = value
+        process = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import json; from skillspector.nodes.analyzers import mcp_tool_poisoning as m; "
+                "print(json.dumps([m.TP4_MAX_BATCHES, m.__file__]))",
+            ],
+            cwd=tmp_path,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        limit, imported_path = json.loads(process.stdout)
+        assert limit == expected
+        assert Path(imported_path).resolve() == module_path
+
+    @pytest.mark.parametrize(
+        ("batch_limit", "fence_count", "expected_calls", "is_partial"),
+        [
+            (None, 64, 64, False),
+            (None, 65, 65, False),
+            (None, 128, 128, False),
+            (None, 129, 129, False),
+            (None, 145, 145, False),
+            (None, 255, 255, False),
+            (None, 256, 256, False),
+            (None, 257, 256, True),
+            (3, 3, 3, False),
+            (3, 4, 3, True),
+            (300, 257, 257, False),
+        ],
+    )
+    def test_tp4_batch_boundaries_preserve_late_findings_and_source_ranges(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        batch_limit: int | None,
+        fence_count: int,
+        expected_calls: int,
+        is_partial: bool,
+    ) -> None:
+        effective_limit = (
+            mcp_tool_poisoning.DEFAULT_TP4_MAX_BATCHES if batch_limit is None else batch_limit
+        )
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCHES", effective_limit)
+        content = "".join(f"```python\nprint({index})\n```\n" for index in range(fence_count))
+        responses = [{"is_mismatch": False} for _ in range(expected_calls - 1)]
+        responses.append(
+            {
+                "is_mismatch": True,
+                "confidence": 0.9,
+                "mismatched_capabilities": ["network access"],
+            }
+        )
+        structured = _mock_tp4_structured_llm(monkeypatch, responses)
+
+        result = node(
+            {
+                "manifest": {"name": "bounded", "description": "Runs local calculations."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "use_llm": True,
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert structured.calls == expected_calls
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        completed = [event for event in semantic if event["outcome"] is LedgerOutcome.COMPLETED]
+        assert [(event["path"], event["start_line"], event["end_line"]) for event in completed] == [
+            ("guide.md", index * 3 + 2, index * 3 + 2) for index in range(expected_calls)
+        ]
+        finding = result["findings"][0]
+        assert len(result["findings"]) == 1
+        assert finding.evidence["code_path"] == "guide.md"
+        assert finding.evidence["code_start_line"] == (expected_calls - 1) * 3 + 2
+        assert finding.evidence["code_end_line"] == (expected_calls - 1) * 3 + 2
+        assert completed[-1]["emitted_finding_ids"] == [finding.finding_id]
+        partial = [event for event in semantic if event["outcome"] is LedgerOutcome.PARTIAL]
+        if is_partial:
+            assert len(partial) == 1
+            assert partial[0]["path"] == "guide.md"
+            assert partial[0]["reason_code"] is LedgerReason.OUTPUT_LIMIT
+            assert partial[0]["observed_records"] == expected_calls + 1
+            assert partial[0]["limit_records"] == effective_limit
+            assert partial[0]["start_line"] is None
+            assert partial[0]["end_line"] is None
+            assert result["analyzer_status_events"][0]["status"] == "degraded"
+        else:
+            assert partial == []
+            assert result["analyzer_status_events"][0]["status"] == "completed"
+
+    @pytest.mark.parametrize("tail", ["oversized", "provider_error", "deadline"])
+    def test_tp4_late_incomplete_work_remains_visible(
+        self, monkeypatch: pytest.MonkeyPatch, tail: str
+    ) -> None:
+        content = "```python\nprint('local')\n```\n" * 64
+        responses: list[object] = [{"is_mismatch": False} for _ in range(64)]
+        if tail == "oversized":
+            content += "```python\n" + "x" * 128_000 + "\n```\n"
+            expected_outcome = LedgerOutcome.PARTIAL
+            expected_reason = LedgerReason.SIZE_LIMIT
+        else:
+            content += "```python\nprint('last')\n```\n"
+            if tail == "provider_error":
+                responses.append(RuntimeError("provider failure"))
+                expected_outcome = LedgerOutcome.FAILED
+                expected_reason = LedgerReason.LLM_BATCH_FAILED
+            else:
+                responses.append(mcp_tool_poisoning.LLMRuntimeLimitError("deadline"))
+                expected_outcome = LedgerOutcome.PARTIAL
+                expected_reason = LedgerReason.RUNTIME_LIMIT
+        structured = _mock_tp4_structured_llm(monkeypatch, responses)
+
+        result = node(
+            {
+                "manifest": {"name": "bounded", "description": "Runs local calculations."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "use_llm": True,
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert structured.calls == (64 if tail == "oversized" else 65)
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        assert sum(event["outcome"] is LedgerOutcome.COMPLETED for event in semantic) == 64
+        incomplete = [
+            event for event in semantic if event["outcome"] is not LedgerOutcome.COMPLETED
+        ]
+        assert len(incomplete) == 1
+        assert incomplete[0]["outcome"] is expected_outcome
+        assert incomplete[0]["reason_code"] is expected_reason
+        assert incomplete[0]["path"] == "guide.md"
+        assert incomplete[0]["start_line"] == incomplete[0]["end_line"] == 194
+        assert result["analyzer_status_events"][0]["status"] == (
+            "failed" if tail == "provider_error" else "degraded"
+        )
+
+    def test_tp4_expanded_batch_allowance_keeps_finding_output_cap(self, monkeypatch):
+        structured = _mock_tp4_structured_llm(
+            monkeypatch,
+            [
+                {
+                    "is_mismatch": True,
+                    "confidence": 0.9,
+                    "mismatched_capabilities": [f"undeclared capability {index}"],
+                }
+                for index in range(65)
+            ],
+        )
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Runs local calculations."},
+                "file_cache": {"guide.md": "```python\nprint('local')\n```\n" * 65},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert structured.calls == 65
+        assert len(result.findings) == 64
+        partial = [event for event in result.ledger if event["outcome"] is LedgerOutcome.PARTIAL]
+        assert len(partial) == 1
+        assert partial[0]["reason_code"] is LedgerReason.OUTPUT_LIMIT
+        assert partial[0]["observed_findings"] == 65
+        assert partial[0]["limit_findings"] == 64
+        assert partial[0]["path"] == "guide.md"
+        assert partial[0]["start_line"] == partial[0]["end_line"] == 194
+
     def test_static_finding_cap_is_enforced_during_detector_construction(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

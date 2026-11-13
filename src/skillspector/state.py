@@ -36,6 +36,7 @@ from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
+    bounded_inspection_notices,
     ledger_event,
 )
 from skillspector.logging_config import get_logger
@@ -43,7 +44,7 @@ from skillspector.models import Finding
 
 logger = get_logger(__name__)
 
-DEFAULT_MAX_WORKFLOW_SECONDS = 600.0
+DEFAULT_MAX_WORKFLOW_SECONDS = 1080.0
 
 
 def _workflow_max_seconds_from_environment(value: str | None) -> float:
@@ -230,14 +231,24 @@ def merge_inspection_ledger(
     ]
 
 
+def merge_inspection_notices(
+    existing: list[dict[str, object]], updates: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    return bounded_inspection_notices([*existing, *updates])
+
+
 class SkillspectorState(TypedDict, total=False):
     """Graph state shared by all nodes."""
 
     # Input: resolve_input node consumes input_path or skill_path, sets skill_path
     input_path: str | None
+    # Only trusted local transports may use the operator's Git credentials.
+    allow_git_credentials: bool
     skill_path: str | None
     # Relative identity of a wrapped/downloaded explicit file, distinct from passive assets.
     primary_file_path: str | None
+    # Local parent used only for bounded path-metadata checks on single-file scans.
+    primary_file_parent_path: str | None
     # Set/reset by resolve_input from the actual selected source. None means
     # materialization could not establish a current-skill identity; analyzers
     # must not substitute generated directory names or manifest-only aliases.
@@ -256,9 +267,18 @@ class SkillspectorState(TypedDict, total=False):
     local_file_cache: dict[str, str]
     # Raw bytes remain the canonical source for YARA and content classification.
     raw_file_cache: dict[str, bytes]
+    # Byte-derived Python execution identity shared by every analyzer branch.
+    python_source_classifications: dict[str, str]
+    # Paths whose Python applicability could not be resolved before the shared deadline.
+    python_source_classification_limitations: dict[str, str]
+    # Paths withheld from text/AST consumers after strict PEP 263 decode failure.
+    python_source_decode_failures: dict[str, str]
     # External-model consumers use the redacted projection for sensitive local files.
     llm_file_cache: dict[str, str]
     artifact_inventory: list[ArtifactRecord]
+    # Opt-in, local-only inspection of exact artifacts from supported npm locks.
+    inspect_dependencies: bool
+    dependency_inspection: dict[str, object]
     artifact_references: list[BundleReference]
     reference_resolution: dict[str, object]
     # Retained for compatibility with the persisted workflow-state schema.
@@ -272,6 +292,7 @@ class SkillspectorState(TypedDict, total=False):
     # Accumulated canonical findings. Same-ID meta updates replace in place.
     findings: Annotated[list[Finding], merge_findings_by_id]
     inspection_ledger: Annotated[list[InspectionLedgerEvent], merge_inspection_ledger]
+    inspection_notices: Annotated[list[dict[str, object]], merge_inspection_notices]
     analyzer_status_events: Annotated[list[AnalyzerStatusEvent], operator.add]
     effective_finding_ids: list[str]
     # Whether meta-analysis had provider-eligible findings when it ran.  This
@@ -309,6 +330,8 @@ class SkillspectorState(TypedDict, total=False):
     # When it is inside the scan target, build_context excludes only that file
     # so waiver text cannot scan itself or enter regenerated fingerprints.
     baseline_path: str | None
+    # Explicit root opt-in for a local ZIP, applied after safe materialization.
+    use_shipped_baseline: bool
     show_suppressed: bool
     suppressed_findings: list[object]
     # Kept findings as baseline suppression saw them: one per occurrence, before
@@ -342,6 +365,9 @@ class SkillspectorState(TypedDict, total=False):
     # Report generation uses this to distinguish unavailable requested analysis from an
     # explicit static-only scan while analyzers continue to honor use_llm.
     llm_requested: bool
+    # Sanitized reason captured when caller preflight disables requested execution.
+    # Presence (including None) preserves that result without probing a new provider context.
+    llm_preflight_error: str | None
     # Explicit caller scope, recorded in public coverage accounting.
     exclude_patterns: list[str]
     # Monotonic provenance flag: content rooted beneath a hidden/local-only
@@ -459,6 +485,7 @@ class AnalyzerNodeResponse(TypedDict):
 
     findings: list[Finding]
     inspection_ledger: NotRequired[list[InspectionLedgerEvent]]
+    inspection_notices: NotRequired[list[dict[str, object]]]
     analyzer_status_events: NotRequired[list[AnalyzerStatusEvent]]
     structured_summaries: NotRequired[list[dict[str, object]]]
     # LLM-backed analyzers also report one telemetry record; static analyzers
