@@ -477,7 +477,12 @@ def test_fallback_auth_failure_keeps_real_error(deepseek_like_endpoint):
     )
     assert not outcome.successful
     assert len(outcome.failures) == 1
-    assert outcome.failures[0].error_class == "OpenAIAuthenticationError"
+    # langchain-openai names the same 401 differently across versions:
+    # OpenAIAuthenticationError (>= 1.4) wraps openai.AuthenticationError.
+    assert outcome.failures[0].error_class in {
+        "AuthenticationError",
+        "OpenAIAuthenticationError",
+    }
     assert outcome.failures[0].reason is not LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
     assert len(requests) == 2
     assert requests[0]["response_format"]["type"] == "json_schema"
@@ -498,7 +503,10 @@ async def test_async_fallback_auth_failure_keeps_real_error(deepseek_like_endpoi
     )
     assert not outcome.successful
     assert len(outcome.failures) == 1
-    assert outcome.failures[0].error_class == "OpenAIAuthenticationError"
+    assert outcome.failures[0].error_class in {
+        "AuthenticationError",
+        "OpenAIAuthenticationError",
+    }
     assert outcome.failures[0].reason is not LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
     assert len(requests) == 2
     assert requests[0]["response_format"]["type"] == "json_schema"
