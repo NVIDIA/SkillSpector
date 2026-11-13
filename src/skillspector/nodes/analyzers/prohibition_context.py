@@ -118,10 +118,7 @@ _YARA_AGENT_CONTEXT = re.compile(
 _FOLLOWING_SECTION = re.compile(
     r"\A[ \t]*(?:\r?\n[ \t]*)+#{1,6}[ \t]+(?P<title>[^\r\n]+)(?:\r?\n|\Z)"
 )
-_SECTION_QUALIFIER = re.compile(
-    r"\b(?:exceptions?|conditions?|overrides?|scope|policy|first|last|once|twice)\b",
-    re.IGNORECASE,
-)
+_INDEPENDENT_SECTION_TITLE = re.compile(r"(?:output|results?|answers?|summary)", re.IGNORECASE)
 
 
 def is_directly_prohibited(
@@ -212,7 +209,7 @@ def is_directly_prohibited(
             section = _FOLLOWING_SECTION.match(following_raw)
             if section is not None:
                 title = normalized_security_view(section.group("title")).text.translate(_MARKDOWN)
-                if not _LEADING_QUALIFIER.search(title) and not _SECTION_QUALIFIER.search(title):
+                if _INDEPENDENT_SECTION_TITLE.fullmatch(title.strip().rstrip("#").rstrip()):
                     # A heading alone proves nothing. The first instruction
                     # must still be independently understood by this helper.
                     independent = _NEXT_INSTRUCTION.match(following_raw[section.end() :].lstrip())
