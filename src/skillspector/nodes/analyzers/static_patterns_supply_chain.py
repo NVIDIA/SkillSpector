@@ -16,7 +16,7 @@
 """Static patterns: supply chain (SC1–SC10) and trigger analysis (TR1–TR3).
 
 SC1–SC3: regex-based pattern matching (original implementation).
-SC4: Known vulnerable dependencies — live OSV.dev lookup with static fallback.
+SC4: Known vulnerable dependencies — OSV lookup with static fallback.
 SC5: Abandoned dependencies — flags known-abandoned or archived packages.
 SC6: Typosquatting — flags package names similar to popular packages.
 SC7: Untrusted container image — flags image signature / registry-verification bypass.
@@ -3096,7 +3096,7 @@ def _sc4_from_osv(
         one vulnerability.  Callers can use this to decide which packages
         still need a fallback lookup.
     """
-    findings, covered, _limitations = _sc4_from_osv_detailed(
+    findings, covered, _limitations, _local_checked = _sc4_from_osv_detailed(
         packages,
         ecosystem,
         file_path,
@@ -3113,7 +3113,7 @@ def _sc4_from_osv_detailed(
     *,
     timeout_seconds: float | None = None,
     budget: OsvQueryBudget | None = None,
-) -> tuple[list[AnalyzerFinding], set[str], list[OsvQueryLimitation]]:
+) -> tuple[list[AnalyzerFinding], set[str], list[OsvQueryLimitation], frozenset[int] | None]:
     """Run a bounded OSV lookup and retain its non-fatal limitation metadata."""
     pkg_pairs = [(name, version) for name, version, _ in packages]
     if budget is not None:
@@ -3197,7 +3197,10 @@ def _sc4_from_osv_detailed(
     limitations = (
         list(osv_results.limitations) if isinstance(osv_results, QueryBatchResults) else []
     )
-    return findings, covered, limitations
+    local_checked = (
+        osv_results.local_checked if isinstance(osv_results, QueryBatchResults) else None
+    )
+    return findings, covered, limitations, local_checked
 
 
 def _sc4_from_fallback(
@@ -3440,8 +3443,8 @@ def _analyze_dependencies_detailed(
             )
         findings.extend(extra[:remaining])
 
-    # SC4: Live OSV.dev lookup, then static fallback for uncovered packages
-    osv_findings, osv_covered, osv_limitations = _sc4_from_osv_detailed(
+    # SC4: OSV lookup, then static fallback for uncovered packages.
+    osv_findings, osv_covered, osv_limitations, local_checked = _sc4_from_osv_detailed(
         packages,
         ecosystem,
         file_path,
@@ -3451,13 +3454,25 @@ def _analyze_dependencies_detailed(
     )
     limitations.extend(osv_limitations)
     retain(osv_findings)
-    uncovered_packages = [p for p in packages if p[0].lower().replace("_", "-") not in osv_covered]
+    if local_checked is None:
+        uncovered_packages = [
+            p for p in packages if p[0].lower().replace("_", "-") not in osv_covered
+        ]
+    else:
+        # An empty, completed snapshot lookup is a valid result. Coverage is
+        # per coordinate so a match for one version cannot cover another.
+        uncovered_packages = [pkg for i, pkg in enumerate(packages) if i not in local_checked]
     fallback_findings = _sc4_from_fallback(uncovered_packages, fallback_db, file_path, tag)
     if fallback_findings:
         logger.debug(
             "SC4: using static fallback for %d uncovered packages", len(uncovered_packages)
         )
-    elif uncovered_packages and not osv_findings and not was_osv_reachable(osv_budget):
+    elif (
+        local_checked is None
+        and uncovered_packages
+        and not osv_findings
+        and not was_osv_reachable(osv_budget)
+    ):
         # OSV.dev was unreachable and fallback found nothing — surface the gap
         retain(
             [
@@ -4305,92 +4320,100 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     dependency_packages_seen = 0
     dependency_findings_seen = 0
     osv_budget = OsvQueryBudget.create(dependency_remaining_seconds())
-    for path in components:
-        is_dep_file = _is_dependency_manifest(path)
-        if not is_dep_file:
-            continue
-        dependency_files_seen += 1
-        if dependency_files_seen > max(0, MAX_DEPENDENCY_FILES_PER_SCAN):
-            record_limitation(
-                path,
-                OsvQueryLimitation(
-                    reason=LedgerReason.OUTPUT_LIMIT,
-                    observed_records=dependency_files_seen,
-                    limit_records=max(0, MAX_DEPENDENCY_FILES_PER_SCAN),
-                ),
-                f"{ANALYZER_ID}_dependencies",
-            )
-            break
-        remaining_packages = max(
-            0,
-            MAX_DEPENDENCY_PACKAGES_PER_SCAN - dependency_packages_seen,
-        )
-        remaining_dependency_findings = max(
-            0,
-            min(
-                MAX_DEPENDENCY_FINDINGS_PER_SCAN - dependency_findings_seen,
-                MAX_FINDING_OUTPUT_RECORDS - len(findings),
-            ),
-        )
-        if remaining_packages <= 0 or remaining_dependency_findings <= 0:
-            record_limitation(
-                path,
-                OsvQueryLimitation(
-                    reason=LedgerReason.OUTPUT_LIMIT,
-                    observed_records=(
-                        dependency_packages_seen + 1
-                        if remaining_packages <= 0
-                        else dependency_findings_seen + 1
+    try:
+        for path in components:
+            is_dep_file = _is_dependency_manifest(path)
+            if not is_dep_file:
+                continue
+            dependency_files_seen += 1
+            if dependency_files_seen > max(0, MAX_DEPENDENCY_FILES_PER_SCAN):
+                record_limitation(
+                    path,
+                    OsvQueryLimitation(
+                        reason=LedgerReason.OUTPUT_LIMIT,
+                        observed_records=dependency_files_seen,
+                        limit_records=max(0, MAX_DEPENDENCY_FILES_PER_SCAN),
                     ),
-                    limit_records=(
-                        MAX_DEPENDENCY_PACKAGES_PER_SCAN
-                        if remaining_packages <= 0
-                        else MAX_DEPENDENCY_FINDINGS_PER_SCAN
+                    f"{ANALYZER_ID}_dependencies",
+                )
+                break
+            remaining_packages = max(
+                0,
+                MAX_DEPENDENCY_PACKAGES_PER_SCAN - dependency_packages_seen,
+            )
+            remaining_dependency_findings = max(
+                0,
+                min(
+                    MAX_DEPENDENCY_FINDINGS_PER_SCAN - dependency_findings_seen,
+                    MAX_FINDING_OUTPUT_RECORDS - len(findings),
+                ),
+            )
+            if remaining_packages <= 0 or remaining_dependency_findings <= 0:
+                record_limitation(
+                    path,
+                    OsvQueryLimitation(
+                        reason=LedgerReason.OUTPUT_LIMIT,
+                        observed_records=(
+                            dependency_packages_seen + 1
+                            if remaining_packages <= 0
+                            else dependency_findings_seen + 1
+                        ),
+                        limit_records=(
+                            MAX_DEPENDENCY_PACKAGES_PER_SCAN
+                            if remaining_packages <= 0
+                            else MAX_DEPENDENCY_FINDINGS_PER_SCAN
+                        ),
                     ),
-                ),
-                f"{ANALYZER_ID}_dependencies",
-            )
-            break
-        shared_remaining = dependency_remaining_seconds()
-        if shared_remaining <= 0:
-            record_limitation(
+                    f"{ANALYZER_ID}_dependencies",
+                )
+                break
+            shared_remaining = dependency_remaining_seconds()
+            if shared_remaining <= 0:
+                record_limitation(
+                    path,
+                    OsvQueryLimitation(
+                        reason=LedgerReason.RUNTIME_LIMIT,
+                        observed_seconds=max(0.0, time.monotonic() - dependency_started_at),
+                        limit_seconds=dependency_runtime_limit,
+                    ),
+                    f"{ANALYZER_ID}_dependencies",
+                )
+                break
+            content = file_cache.get(path)
+            if content is None:
+                continue
+            dep_findings, dependency_limitations, packages_seen = _analyze_dependencies_detailed(
+                content,
                 path,
-                OsvQueryLimitation(
-                    reason=LedgerReason.RUNTIME_LIMIT,
-                    observed_seconds=max(0.0, time.monotonic() - dependency_started_at),
-                    limit_seconds=dependency_runtime_limit,
-                ),
-                f"{ANALYZER_ID}_dependencies",
+                locked_versions.get(_python_lock_scope(path)),
+                npm_locked_versions.get(str(Path(path).parent)),
+                max_packages=min(MAX_DEPENDENCY_PACKAGES_PER_FILE, remaining_packages),
+                max_findings=min(MAX_DEPENDENCY_FINDINGS_PER_FILE, remaining_dependency_findings),
+                timeout_seconds=shared_remaining,
+                osv_budget=osv_budget,
             )
-            break
-        content = file_cache.get(path)
-        if content is None:
-            continue
-        dep_findings, dependency_limitations, packages_seen = _analyze_dependencies_detailed(
-            content,
-            path,
-            locked_versions.get(_python_lock_scope(path)),
-            npm_locked_versions.get(str(Path(path).parent)),
-            max_packages=min(MAX_DEPENDENCY_PACKAGES_PER_FILE, remaining_packages),
-            max_findings=min(MAX_DEPENDENCY_FINDINGS_PER_FILE, remaining_dependency_findings),
-            timeout_seconds=shared_remaining,
-            osv_budget=osv_budget,
-        )
-        dependency_packages_seen += packages_seen
-        dependency_findings = [analyzer_finding_to_finding(af) for af in dep_findings]
-        dependency_findings_seen += len(dependency_findings)
-        findings.extend(dependency_findings)
-        record_extra_findings(
-            path,
-            dependency_findings,
-            f"{ANALYZER_ID}_dependencies",
-        )
-        for limitation in dependency_limitations:
-            record_limitation(
+            dependency_packages_seen += packages_seen
+            dependency_findings = [analyzer_finding_to_finding(af) for af in dep_findings]
+            dependency_findings_seen += len(dependency_findings)
+            findings.extend(dependency_findings)
+            record_extra_findings(
                 path,
-                limitation,
+                dependency_findings,
                 f"{ANALYZER_ID}_dependencies",
             )
+            for limitation in dependency_limitations:
+                record_limitation(
+                    path,
+                    limitation,
+                    f"{ANALYZER_ID}_dependencies",
+                )
+        if osv_budget.local_db_path is not None:
+            response["osv_lookup"] = {
+                "source": "local",
+                "snapshots": osv_budget.snapshot_metadata(),
+            }
+    finally:
+        osv_budget.close()
 
     # TR1–TR3: trigger analysis from manifest
     manifest: dict[str, object] = state.get("manifest") or {}

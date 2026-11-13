@@ -27,7 +27,7 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 - **Multi-format input**: Scan Git repos, URLs, zip files, directories, or single files
 - **71 vulnerability patterns** across 17 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
 - **Two-stage analysis**: Fast static analysis + optional LLM semantic evaluation
-- **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
+- **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with optional local snapshots and a built-in fallback
 - **Multiple output formats**: Terminal, JSON, Markdown, and SARIF reports
 - **Risk scoring**: 0-100 score with severity labels and clear recommendations
 - **Baseline / false-positive suppression**: Accept known findings via a glob-rule or fingerprint baseline so re-scans surface only *new* issues ([docs](docs/SUPPRESSION.md))
@@ -1074,7 +1074,7 @@ verifies signatures, certificate chains, transparency logs, or signer identity.
 
 The LLM prompt includes anti-jailbreak protections to prevent malicious skills from manipulating the analysis.
 
-## Live Vulnerability Lookups (SC4)
+## Vulnerability Lookups (SC4)
 
 SC4 uses the [OSV.dev](https://osv.dev) API to check dependencies against the full Open Source Vulnerabilities database — covering tens of thousands of advisories across PyPI and npm.
 
@@ -1087,7 +1087,37 @@ SC4 uses the [OSV.dev](https://osv.dev) API to check dependencies against the fu
   can resolve unpinned manifest dependencies. Malformed entries and unsupported
   VCS/local sources are reported as incomplete dependency checks.
 
-The tool requires outbound HTTPS access to `api.osv.dev` for live vulnerability data. When that is not available, findings are limited to the static fallback list.
+### Offline OSV snapshots
+
+Set `SKILLSPECTOR_OSV_DB_PATH` to a directory containing the [OSV per-ecosystem
+snapshots](https://google.github.io/osv-scanner/usage/offline-mode/#manual-database-download):
+
+```text
+/opt/osv-db/
+├── PyPI/all.zip
+└── npm/all.zip
+```
+
+Provision the ecosystems you scan and refresh the archives outside SkillSpector.
+A read-only mount works. For example:
+
+```sh
+SKILLSPECTOR_OSV_DB_PATH=/opt/osv-db skillspector scan ./my-skill --no-llm --format json
+```
+
+When configured, SC4 only reads local snapshots and never calls OSV.dev,
+even if an archive is missing or unusable. It checks exact versions using
+PyPI or npm version ordering and reuses each ecosystem's index within the scan.
+JSON reports include the source, ecosystem, archive size, and file modification
+time in `metadata.osv_lookup`. File modification time reflects the local file,
+which may differ from the OSV publication date.
+
+Missing, malformed, unsupported, or truncated data is reported as incomplete
+coverage. The built-in list is used for unchecked coordinates. Unresolved
+versions may show advisory history and remain unchecked. Set
+`SKILLSPECTOR_OSV_TIMEOUT` to adjust the lookup timeout, subject to the scan's
+shared deadline. The snapshot setting only controls SC4, independently of the
+LLM provider and other features that may use the network.
 
 ## Locked npm dependency contents (opt-in)
 
@@ -1118,7 +1148,7 @@ SkillSpector is defense-in-depth, not a sandbox. Know what it does and does not 
 
 - **It never executes the scanned skill.** All analysis is static (regex, Python AST, YARA) plus optional LLM evaluation of file *contents* — the skill's code is never run.
 - **LLM analysis sends analyzer-eligible file contents to the configured provider.** When LLM analysis is enabled (the default), file contents are sent to the active `SKILLSPECTOR_PROVIDER` endpoint. DSSE payloads and readable signing metadata are included. Use `--no-llm` to keep contents local (static analysis only).
-- **SC4 sends dependency names to OSV.dev.** The supply-chain check queries [OSV.dev](https://osv.dev) with the package names and versions the skill declares, to look up known CVEs. This is fundamental to the check and runs even with `--no-llm`. It sends dependency coordinates (not file contents), requires no API key, and falls back to a bundled list when OSV.dev is unreachable.
+- **SC4 sends dependency names to OSV.dev by default.** The supply-chain check queries [OSV.dev](https://osv.dev) with the package names and versions the skill declares, to look up known CVEs. This is fundamental to the check and runs even with `--no-llm`. It sends dependency coordinates (not file contents), requires no API key, and falls back to a bundled list when OSV.dev is unreachable. Configure `SKILLSPECTOR_OSV_DB_PATH` to keep SC4 lookups local.
 - **It does not sandbox the host.** SkillSpector flags risky patterns *before* you install a skill; it does not contain or isolate a skill you choose to install anyway.
 
 ## Limitations

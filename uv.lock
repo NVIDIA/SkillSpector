@@ -2738,6 +2738,15 @@ wheels = [
 ]
 
 [[package]]
+name = "semver"
+version = "3.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0e/50/2932d6434608c7d954d0d4f4b71b697260e3b40c802425fc84c1eed12440/semver-3.1.1.tar.gz", hash = "sha256:149b26cabada6f63212f97e94505d21578cb1d280cf714827f328d5e70765fea", size = 292174, upload-time = "2026-11-09T11:38:46.145Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/57/1d/793b054cbd0a2e0b4694dacc22bad066d6635ce85dd6cdd1f98d95169e9b/semver-3.1.1-py3-none-any.whl", hash = "sha256:c00cf7dac88a352bc6a4a997d6ac0bf95ba835c589bc0c54f7b76f9e2a45123a", size = 18905, upload-time = "2026-11-09T11:38:44.556Z" },
+]
+
+[[package]]
 name = "setuptools"
 version = "82.0.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2785,6 +2794,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "regex" },
     { name = "rich" },
+    { name = "semver" },
     { name = "tree-sitter" },
     { name = "tree-sitter-javascript" },
     { name = "typer" },
@@ -2840,6 +2850,7 @@ requires-dist = [
     { name = "regex", specifier = "==2026.5.9" },
     { name = "rich", specifier = ">=14.3.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15.0" },
+    { name = "semver", specifier = ">=3.1,<4" },
     { name = "skillspector", extras = ["langgraph-dev"], marker = "extra == 'dev'" },
     { name = "skillspector", extras = ["mcp"], marker = "extra == 'dev'" },
     { name = "tree-sitter", specifier = "==0.25.2" },
