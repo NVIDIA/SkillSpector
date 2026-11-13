@@ -115,7 +115,7 @@ def test_go_new_request_with_context_reads_and_wrong_case_are_not_e1(content: st
     ("raw", "quoted"),
     [
         (
-            "client.Post(`https://receiver.example/upload`, \"text/plain\", body)",
+            'client.Post(`https://receiver.example/upload`, "text/plain", body)',
             'client.Post("https://receiver.example/upload", "text/plain", body)',
         ),
         (
@@ -136,4 +136,4 @@ def test_go_raw_string_literals_match_interpreted_strings(raw: str, quoted: str)
 
 
 def test_go_raw_string_receiver_with_non_http_url_is_not_e1() -> None:
-    assert not _e1("client.Post(`/relative/path`, \"text/plain\", body)", "main.go")
+    assert not _e1('client.Post(`/relative/path`, "text/plain", body)', "main.go")
