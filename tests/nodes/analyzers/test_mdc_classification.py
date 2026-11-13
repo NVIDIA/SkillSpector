@@ -122,7 +122,10 @@ def test_mdc_inferred_metadata_selects_tp4_fence(
         )
 
     analyzer = SimpleNamespace(
-        inference_usage=[], arun_batches_detailed=AsyncMock(side_effect=inspect_batches)
+        inference_usage=[],
+        build_prompt=lambda batch: batch.content,
+        _prompt_fits_budget=lambda prompt: len(prompt.encode("utf-8")) <= 8192 * 4,
+        arun_batches_detailed=AsyncMock(side_effect=inspect_batches),
     )
     monkeypatch.setattr(mcp_tool_poisoning, "_TP4Analyzer", lambda *_args, **_kwargs: analyzer)
     monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 8192)
