@@ -83,7 +83,7 @@ def test_download_without_execution_is_not_sc2(content: str) -> None:
     "content",
     [
         "irm https://data.example/status.json; 'Get-Date' | iex",
-        "Invoke-RestMethod https://data.example/status.json; \"Get-Date\" | Invoke-Expression",
+        'Invoke-RestMethod https://data.example/status.json; "Get-Date" | Invoke-Expression',
         "(New-Object Net.WebClient).DownloadString('https://data.example/a'); 'Get-Date' | iex",
         "irm https://data.example/status.json; 'Get-Date' | pwsh",
         "irm https://data.example/status.json; 'Get-Date' | powershell -",
