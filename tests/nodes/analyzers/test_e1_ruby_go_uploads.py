@@ -74,3 +74,66 @@ def test_go_upload_is_reported(content: str) -> None:
 )
 def test_read_only_or_unrelated_code_is_not_e1(content: str, file_path: str) -> None:
     assert not _e1(content, file_path), content
+
+
+@pytest.mark.parametrize("verb", ["POST", "PUT", "PATCH"])
+@pytest.mark.parametrize(
+    "context",
+    [
+        "ctx",
+        "context.Background()",
+        "context.TODO()",
+        "r.Context()",
+        "req.Context()",
+        "context.WithTimeout(ctx, 5*time.Second)",
+        "context.WithValue(context.Background(), key, val)",
+    ],
+)
+def test_go_new_request_with_context_expressions_are_reported(context: str, verb: str) -> None:
+    constant = f"http.Method{verb.capitalize()}"
+    for method in (constant, f'"{verb}"', f"`{verb}`"):
+        content = f"req, _ := http.NewRequestWithContext({context}, {method}, target, body)"
+        assert len(_e1(content, "main.go")) == 1, content
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, target, nil)",
+        'req, _ := http.NewRequestWithContext(r.Context(), "GET", target, nil)',
+        "req, _ := http.NewRequestWithContext(context.WithTimeout(ctx, d), `GET`, target, nil)",
+        'req, _ := http.NewRequestWithContext(ctx, "post", target, body)',
+        "req, _ := http.NewRequestWithContext(ctx, `post`, target, body)",
+        "req, _ := http.NewRequest(`post`, target, body)",
+    ],
+)
+def test_go_new_request_with_context_reads_and_wrong_case_are_not_e1(content: str) -> None:
+    assert not _e1(content, "main.go"), content
+
+
+@pytest.mark.parametrize(
+    ("raw", "quoted"),
+    [
+        (
+            "client.Post(`https://receiver.example/upload`, \"text/plain\", body)",
+            'client.Post("https://receiver.example/upload", "text/plain", body)',
+        ),
+        (
+            "client.PostForm(`https://receiver.example/upload`, values)",
+            'client.PostForm("https://receiver.example/upload", values)',
+        ),
+        ("http.NewRequest(`POST`, target, body)", 'http.NewRequest("POST", target, body)'),
+        ("http.NewRequest(`PUT`, target, body)", 'http.NewRequest("PUT", target, body)'),
+        (
+            "http.NewRequestWithContext(ctx, `PATCH`, target, body)",
+            'http.NewRequestWithContext(ctx, "PATCH", target, body)',
+        ),
+    ],
+)
+def test_go_raw_string_literals_match_interpreted_strings(raw: str, quoted: str) -> None:
+    assert len(_e1(quoted, "main.go")) == 1, quoted
+    assert len(_e1(raw, "main.go")) == 1, raw
+
+
+def test_go_raw_string_receiver_with_non_http_url_is_not_e1() -> None:
+    assert not _e1("client.Post(`/relative/path`, \"text/plain\", body)", "main.go")
