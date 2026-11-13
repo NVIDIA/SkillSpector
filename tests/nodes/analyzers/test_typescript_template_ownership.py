@@ -382,6 +382,72 @@ def test_postfix_increment_before_a_slash_does_not_open_a_regex() -> None:
     )
 
 
+@pytest.mark.parametrize("keyword", ["return", "delete", "typeof"])
+def test_a_keyword_property_before_a_slash_does_not_open_a_regex(keyword: str) -> None:
+    # ``return`` is a keyword and also a legal property name. After a dot the
+    # identifier is a member, so the slash divides; reading it as a regex ran
+    # past the ``eval`` call that must keep the sample unproven.
+    source = (
+        f"const node = {{ {keyword}: 4 }};\n"
+        f"const label = `${{node.{keyword} / eval(payload) / 2}}`;"
+    )
+
+    assert typescript_template_spans(source, lambda: None) is None
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="typescript")
+        is True
+    )
+
+
+@pytest.mark.parametrize("keyword", ["return", "delete", "typeof"])
+def test_ledger_keeps_partial_status_for_a_keyword_property_division(keyword: str) -> None:
+    path = "scripts/run.ts"
+    source = (
+        f"const node = {{ {keyword}: 4 }};\n"
+        f"const label = `${{node.{keyword} / eval(payload) / 2}}`;"
+    )
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: source + _PADDING}}, [tm]
+    )
+
+    row = result["inspection_ledger"][0]
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+def test_a_private_keyword_property_before_a_slash_does_not_open_a_regex() -> None:
+    # A private name sits after ``#`` instead of ``.`` but is still a property,
+    # so the same division rule applies to ``this.#return``.
+    source = (
+        "class Counter { #return = 2; #label = this.#return / eval(payload) / 2; }\n"
+        "const label = `${item.name}`;"
+    )
+
+    assert typescript_template_spans(source, lambda: None) is None
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="typescript")
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("const label = `${obj.return / 2}`;", id="member-division"),
+        pytest.param(
+            "function f() { return /`/.test(value); }\nconst label = `${item.name}`;",
+            id="keyword-regex",
+        ),
+    ],
+)
+def test_member_context_does_not_disturb_genuine_slashes(source: str) -> None:
+    # The division still leaves the benign template owned, and a regex after a
+    # real keyword is still a regex: its backtick is not read as a template.
+    starts, _ = typescript_template_spans(source, lambda: None) or ((), ())
+    assert starts == (source.index("`", source.index("const label")),)
+
+
 def test_an_incomplete_block_does_not_claim_ownership() -> None:
     # The host block is never closed, so the source is incomplete and the
     # conservative shell reading must survive.
