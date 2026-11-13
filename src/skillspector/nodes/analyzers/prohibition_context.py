@@ -59,13 +59,16 @@ _CHINESE_DIRECT_PREFIX = re.compile(
 _CHINESE_SENTENCE_END = re.compile(rf"[.!?;。！？{LINE_BREAK_CHARS}]")
 _CHINESE_CLAUSE_BREAK = re.compile(rf"[.!?;。！？{LINE_BREAK_CHARS}]")
 _CHINESE_LEADING_QUALIFIER = re.compile(
-    r"(?:除非|如果|假如|只有|仅当|否则|当[^，。；：！？\n]{0,20}时|在[^，。；：！？\n]{0,40}?(?:情况|条件)下)"
+    r"(?:除非|如果|假如|只有|[仅僅]当|否则|[当當][^，。；：！？\n]{0,20}[时時]|在[^，。；：！？\n]{0,40}?(?:情况|条件)下)"
 )
+# 仅当 / 当…时 differ between scripts (僅當 / 當…時 in Traditional),
+# so the pattern carries both spellings; a Traditional condition limits
+# the prohibition exactly as a simplified one does.
 # Clause breaks for the leading-context check below. The ideographic comma
 # 、 and the fullwidth comma ， separate clauses in Chinese prose, so a
 # condition in an earlier clause does not govern the prohibition.
 _CHINESE_LEADING_BREAK = re.compile(rf"[.!?;。！？、，{LINE_BREAK_CHARS}]")
-_CHINESE_EXCEPTION = re.compile(r"(?:除非|但是|不过|然而|除外|如果|假如|只有|仅当|否则)")
+_CHINESE_EXCEPTION = re.compile(r"(?:除非|但是|不过|然而|除外|如果|假如|只有|[仅僅]当|否则)")
 _CHINESE_DISAVOWAL = re.compile(r"(?:忽略|无视|违背|撤销|取消|废除|不再适用|过时)")
 _CHINESE_REFERENTIAL = re.compile(r"(?:输出它|透露它|泄露它|照做|这样做|按此执行)")
 _CHINESE_FOLLOWING_OVERRIDE = re.compile(
