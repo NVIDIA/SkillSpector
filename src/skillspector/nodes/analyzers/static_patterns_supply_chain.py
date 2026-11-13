@@ -139,6 +139,13 @@ SC1_PROSE_PATTERNS = [
     (r"(?:don't|do\s+not)\s+(?:pin|lock|specify)\s+(?:package\s+)?versions?", 0.7),
 ]
 SC1_PATTERNS = SC1_CODE_PATTERNS + SC1_PROSE_PATTERNS
+_PS_WEB_CMDLET = r"(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod)"
+_PS_FETCH_START = rf"\b(?:{_PS_WEB_CMDLET}|curl|wget)[ \t]|\.DownloadString\s*\("
+# One unit of a PowerShell pipeline segment: a quoted string, or any character
+# that is not an unquoted statement/pipeline separator.
+_PS_PIPELINE_CHAR = r"\"[^\"\n]*\"|'[^'\n]*'|[^|;\n\"']"
+# Same, but also stops at ``)`` so a wrapped fetch operand ends with its call.
+_PS_OPERAND_CHAR = r"\"[^\"\n]*\"|'[^'\n]*'|[^|;)\n\"']"
 SC2_CODE_PATTERNS = [
     (r"curl\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh", 0.9),
     (r"wget\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh", 0.9),
@@ -152,25 +159,26 @@ SC2_CODE_PATTERNS = [
     (r"new\s+Function\s*\([^)]*fetch\s*\(", 0.9),
     (r"subprocess\.[^(]+\([^)]*(?:curl|wget)\s+https?://", 0.8),
     # PowerShell download cradles: fetched text piped to, or wrapped by,
-    # Invoke-Expression / a script block / a PowerShell host.
+    # Invoke-Expression / a script block / a PowerShell host.  Matches stay
+    # inside one PowerShell pipeline: an unquoted ``;``, ``|`` or newline ends
+    # the span, while quoted argument data may contain them.  The wrapper forms
+    # also capture the fetch operand so trusted-host classification sees the URL.
     (
-        r"(?:\b(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod|curl|wget)[ \t]|\.DownloadString\s*\()"
-        r"[^|\n]*\|\s*(?:iex|Invoke-Expression)\b",
+        rf"(?:{_PS_FETCH_START})(?:{_PS_PIPELINE_CHAR})*\|\s*(?:iex|Invoke-Expression)\b",
         0.9,
     ),
     (
-        r"\b(?:iex|Invoke-Expression)\b[^\n;|]*?"
-        r"(?:\.DownloadString\s*\(|\(\s*(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b)",
+        rf"\b(?:iex|Invoke-Expression)\b(?:{_PS_PIPELINE_CHAR})*?"
+        rf"(?:\.DownloadString\s*\(|\(\s*{_PS_WEB_CMDLET}\b)(?:{_PS_OPERAND_CHAR})*",
         0.9,
     ),
     (
-        r"\[scriptblock\]::Create\s*\([^\n;|]*?"
-        r"(?:\.DownloadString\s*\(|\(\s*(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b)",
+        rf"\[scriptblock\]::Create\s*\((?:{_PS_PIPELINE_CHAR})*?"
+        rf"(?:\.DownloadString\s*\(|\(\s*{_PS_WEB_CMDLET}\b)(?:{_PS_OPERAND_CHAR})*",
         0.9,
     ),
     (
-        r"(?:\b(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod|curl|wget)[ \t]|\.DownloadString\s*\()"
-        r"[^|\n]*\|\s*(?:pwsh|powershell)(?:\.exe)?\b",
+        rf"(?:{_PS_FETCH_START})(?:{_PS_PIPELINE_CHAR})*\|\s*(?:pwsh|powershell)(?:\.exe)?\b",
         0.9,
     ),
 ]
