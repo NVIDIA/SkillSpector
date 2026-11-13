@@ -2017,6 +2017,250 @@ class TestTP4Fallbacks:
         assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
 
 
+class TestTP4SerializedBudget:
+    @staticmethod
+    def _state(content: str) -> dict:
+        return {
+            "manifest": {"name": "bounded", "description": "Runs local calculations."},
+            "file_cache": {"tool.py": content},
+            "component_metadata": [{"path": "tool.py", "type": "python"}],
+            "use_llm": True,
+            "model_config": {"default": "test-model"},
+        }
+
+    @pytest.mark.parametrize(
+        ("text", "ending", "configured_counter", "byte_cap"),
+        [
+            ("a" * 80, "\n", False, None),
+            ("界" * 80, "\r\n", False, None),
+            ("a" * 80, "\n", True, 4096),
+            ("界" * 80, "\r\n", True, 4096),
+        ],
+    )
+    def test_final_serialized_fit_preserves_every_line(
+        self, monkeypatch, text, ending, configured_counter, byte_cap
+    ):
+        from skillspector import llm_analyzer_base
+
+        content = "".join(f"value_{index} = '{text}'{ending}" for index in range(120))
+
+        def counter(value):
+            size = len(value.encode("utf-8"))
+            return (size + 1) // 2 if configured_counter else size
+
+        if configured_counter:
+            monkeypatch.setattr(
+                llm_analyzer_base,
+                "_input_token_counter",
+                lambda _model: (counter, "configured_test_counter"),
+            )
+        monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 4096)
+        monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda _model: 4096)
+        monkeypatch.setattr(llm_analyzer_base, "_cli_max_input_bytes", lambda: byte_cap)
+        monkeypatch.setenv("SKILLSPECTOR_OUTPUT_LANGUAGE", "French")
+        structured = _mock_tp4_structured_llm(
+            monkeypatch, [{"is_mismatch": False} for _ in range(256)]
+        )
+
+        result = node(self._state(content))
+
+        assert structured.calls > 1
+        submitted = []
+        for prompt in structured.prompts:
+            serialized = prompt + llm_analyzer_base.structured_output_instructions(
+                mcp_tool_poisoning._TP4AnalysisResult
+            )
+            assert counter(serialized) + llm_analyzer_base.REQUEST_FRAMING_TOKENS <= 4096
+            if byte_cap is not None:
+                assert len(serialized.encode("utf-8")) <= byte_cap
+            assert "in French" in prompt
+            submitted.append(
+                prompt.split("### tool.py (python)\n", 1)[1].split(
+                    mcp_tool_poisoning._TP4_PROMPT_SUFFIX, 1
+                )[0]
+            )
+        assert "".join(submitted) == content
+        completed = [
+            event
+            for event in result["inspection_ledger"]
+            if event["phase"] == "semantic" and event["outcome"] is LedgerOutcome.COMPLETED
+        ]
+        assert len(completed) == structured.calls
+        lines = content.splitlines(keepends=True)
+        next_line = 1
+        for event, body in zip(completed, submitted, strict=True):
+            assert event["path"] == "tool.py"
+            assert event["start_line"] == next_line
+            assert body == "".join(lines[next_line - 1 : event["end_line"]])
+            next_line = event["end_line"] + 1
+        assert next_line == len(lines) + 1
+        assert result["llm_call_log"][0]["ok"] is True
+
+    def test_coarse_oversized_lines_never_create_a_client(self, monkeypatch):
+        monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 4096)
+        factory = MagicMock(side_effect=AssertionError("no applicable bounded code"))
+        monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", factory)
+
+        result = node(self._state("x" * 20_000 + "\n"))
+
+        factory.assert_not_called()
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        assert [(event["start_line"], event["end_line"]) for event in semantic] == [(1, 1)]
+        assert semantic[0]["reason_code"] is LedgerReason.SIZE_LIMIT
+        assert semantic[0]["outcome"] is LedgerOutcome.PARTIAL
+        assert "llm_call_log" not in result
+
+    def test_irreducible_wrapper_is_probed_once_and_not_submitted(self, monkeypatch):
+        from skillspector import llm_analyzer_base
+
+        counter = MagicMock(return_value=100_000)
+        monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 4096)
+        monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda _model: 4096)
+        monkeypatch.setattr(
+            llm_analyzer_base, "_input_token_counter", lambda _model: (counter, "test_counter")
+        )
+        structured = _mock_tp4_structured_llm(monkeypatch, [])
+        content = "print('local')\n" * 200
+
+        result = node(self._state(content))
+
+        assert structured.calls == 0
+        assert counter.call_count == 1
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        assert len(semantic) == 1
+        assert semantic[0]["reason_code"] is LedgerReason.SIZE_LIMIT
+        assert semantic[0]["outcome"] is LedgerOutcome.PARTIAL
+        assert (semantic[0]["start_line"], semantic[0]["end_line"]) == (1, 200)
+        assert semantic[0].get("observed_characters") is None
+        assert semantic[0].get("limit_characters") is None
+        assert "llm_call_log" not in result
+
+    def test_unfit_single_line_does_not_drop_later_fitting_code(self, monkeypatch):
+        from skillspector import llm_analyzer_base
+
+        monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 4096)
+        monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda _model: 4096)
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+
+        result = node(self._state("# " + "界" * 3000 + "\nprint('later')\n"))
+
+        assert structured.calls == 1
+        assert "print('later')" in structured.prompts[0]
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        assert [(event["start_line"], event["end_line"]) for event in semantic] == [(1, 1), (2, 2)]
+        assert semantic[0]["outcome"] is LedgerOutcome.PARTIAL
+        assert semantic[0]["reason_code"] is LedgerReason.SIZE_LIMIT
+        assert semantic[0].get("observed_characters") is None
+        assert semantic[1]["outcome"] is LedgerOutcome.COMPLETED
+
+    @pytest.mark.parametrize("limit", ["batches", "bytes"])
+    def test_refinement_keeps_existing_aggregate_limits(self, monkeypatch, limit):
+        from skillspector import llm_analyzer_base
+
+        monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 4096)
+        monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda _model: 4096)
+        monkeypatch.delenv("SKILLSPECTOR_OUTPUT_LANGUAGE", raising=False)
+        if limit == "batches":
+            monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCHES", 2)
+            expected_reason = LedgerReason.OUTPUT_LIMIT
+        else:
+            monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_TOTAL_INPUT_BYTES", 6500)
+            expected_reason = LedgerReason.TOTAL_BYTES_LIMIT
+        structured = _mock_tp4_structured_llm(
+            monkeypatch, [{"is_mismatch": False} for _ in range(256)]
+        )
+        content = "".join(f"value_{index} = '{'a' * 80}'\n" for index in range(300))
+
+        result = node(self._state(content))
+
+        assert structured.calls > 0
+        if limit == "batches":
+            assert structured.calls == 2
+        else:
+            assert sum(len(prompt.encode("utf-8")) for prompt in structured.prompts) <= 6500
+        assert any(
+            event["reason_code"] is expected_reason and event["outcome"] is LedgerOutcome.PARTIAL
+            for event in result["inspection_ledger"]
+        )
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    @pytest.mark.parametrize(
+        ("error", "outcome", "reason"),
+        [
+            (ValueError("invalid model"), LedgerOutcome.FAILED, LedgerReason.LLM_BATCH_FAILED),
+            (
+                mcp_tool_poisoning.LLMRuntimeLimitError("deadline"),
+                LedgerOutcome.PARTIAL,
+                LedgerReason.RUNTIME_LIMIT,
+            ),
+        ],
+    )
+    def test_constructor_failure_keeps_candidate_scope(self, monkeypatch, error, outcome, reason):
+        factory = MagicMock(side_effect=error)
+        monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", factory)
+
+        result = node(self._state("print('first')\nprint('second')\n"))
+
+        factory.assert_called_once()
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        assert len(semantic) == 1
+        assert semantic[0]["path"] == "tool.py"
+        assert (semantic[0]["start_line"], semantic[0]["end_line"]) == (1, 2)
+        assert semantic[0]["outcome"] is outcome
+        assert semantic[0]["reason_code"] is reason
+
+    @pytest.mark.parametrize("runtime", [False, True])
+    @pytest.mark.parametrize("prior_file", [False, True])
+    def test_planning_error_retains_prior_batches_and_unplanned_remainder(
+        self, monkeypatch, runtime, prior_file
+    ):
+        from skillspector import llm_analyzer_base
+
+        monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 4096)
+        monkeypatch.setattr(llm_analyzer_base, "get_max_input_tokens", lambda _model: 4096)
+        structured = _mock_tp4_structured_llm(monkeypatch, [])
+        original = mcp_tool_poisoning._TP4Analyzer._prompt_fits_budget
+        accepted_code = False
+
+        def fail_after_first_fit(analyzer, prompt):
+            nonlocal accepted_code
+            if accepted_code:
+                if runtime:
+                    raise mcp_tool_poisoning.LLMRuntimeLimitError("deadline")
+                raise ValueError("prompt fitting failed")
+            fits = original(analyzer, prompt)
+            if fits and "value_" in prompt:
+                accepted_code = True
+            return fits
+
+        monkeypatch.setattr(
+            mcp_tool_poisoning._TP4Analyzer, "_prompt_fits_budget", fail_after_first_fit
+        )
+        content = "".join(f"value_{index} = '{'a' * 80}'\n" for index in range(120))
+        state = self._state(content)
+        if prior_file:
+            state["file_cache"] = {"first.py": "value_first = 1\n", "tool.py": content}
+            state["component_metadata"].insert(0, {"path": "first.py", "type": "python"})
+
+        result = node(state)
+
+        assert accepted_code
+        assert structured.calls == 0
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        expected_outcome = LedgerOutcome.PARTIAL if runtime else LedgerOutcome.FAILED
+        expected_reason = LedgerReason.RUNTIME_LIMIT if runtime else LedgerReason.LLM_BATCH_FAILED
+        assert all(event["outcome"] is expected_outcome for event in semantic)
+        assert all(event["reason_code"] is expected_reason for event in semantic)
+        for path, source in state["file_cache"].items():
+            covered = [
+                line
+                for event in semantic
+                if event["path"] == path
+                for line in range(event["start_line"], event["end_line"] + 1)
+            ]
+            assert covered == list(range(1, len(source.splitlines()) + 1))
+
+
 class TestTP4Concurrency:
     def test_batches_run_concurrently_within_the_shared_limit(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2154,11 +2398,10 @@ class TestTP4PlaintextRecovery:
     ):
         assert mcp_tool_poisoning._TP4Analyzer.recovery_required_fields == ("confidence",)
 
-        class RecoveryAnalyzer:
-            inference_usage = []
+        _mock_tp4_structured_llm(monkeypatch, [])
 
-            def __init__(self, *_args, **_kwargs):
-                pass
+        class RecoveryAnalyzer(mcp_tool_poisoning._TP4Analyzer):
+            inference_usage = []
 
             async def arun_batches_detailed(self, batches):
                 assert len(batches) == 1
@@ -2235,11 +2478,10 @@ class TestTP4PlaintextRecovery:
         [None, LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED, LedgerReason.RUNTIME_LIMIT],
     )
     def test_formatting_warning_does_not_mask_a_finding_cap(self, monkeypatch, failure_reason):
-        class RecoveryAnalyzer:
-            inference_usage = []
+        _mock_tp4_structured_llm(monkeypatch, [])
 
-            def __init__(self, *_args, **_kwargs):
-                pass
+        class RecoveryAnalyzer(mcp_tool_poisoning._TP4Analyzer):
+            inference_usage = []
 
             async def arun_batches_detailed(self, batches):
                 return BatchExecutionResult(
