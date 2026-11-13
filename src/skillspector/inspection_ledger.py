@@ -89,6 +89,7 @@ class LedgerReason(StrEnum):
     SYNTAX_ERROR = "syntax_error"
     LLM_BATCH_FAILED = "llm_batch_failed"
     LLM_STRUCTURED_RESPONSE_INVALID = "llm_structured_response_invalid"
+    LLM_STRUCTURED_OUTPUT_REJECTED = "llm_structured_output_rejected"
     LLM_RESPONSE_REFUSED = "llm_response_refused"
     LLM_RESPONSE_TRUNCATED = "llm_response_truncated"
     LLM_RESPONSE_INCOMPLETE = "llm_response_incomplete"
@@ -436,6 +437,10 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.LLM_BATCH_FAILED: "LLM analysis failed for this file range.",
     LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
         "LLM response could not be validated after bounded recovery."
+    ),
+    LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED: (
+        "Provider rejected structured output (response_format unsupported; "
+        "tool-calling fallback also rejected)."
     ),
     LedgerReason.LLM_RESPONSE_REFUSED: "The model declined to complete this assessment.",
     LedgerReason.LLM_RESPONSE_TRUNCATED: "The model's answer was cut short by its output limit.",
