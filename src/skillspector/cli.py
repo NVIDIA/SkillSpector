@@ -3579,6 +3579,13 @@ def baseline(
             help="Skip LLM analysis when generating the baseline (static analysis only).",
         ),
     ] = False,
+    yara_rules_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--yara-rules-dir",
+            help="Directory containing additional YARA rule files (.yar/.yara) to load alongside built-in rules.",
+        ),
+    ] = None,
     reason: Annotated[
         str,
         typer.Option(
@@ -3614,7 +3621,12 @@ def baseline(
             set_level("DEBUG")
             err_console.print("[dim]Scanning to build baseline...[/dim]")
         # output_format is irrelevant here; we consume findings, not report_body.
-        state = _scan_state(input_path, FormatChoice.json, no_llm)
+        state = _scan_state(
+            input_path,
+            FormatChoice.json,
+            no_llm,
+            yara_rules_dir=str(yara_rules_dir.resolve()) if yara_rules_dir else None,
+        )
         if not to_stdout:
             state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
