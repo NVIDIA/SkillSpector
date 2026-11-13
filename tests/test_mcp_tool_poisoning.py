@@ -1361,6 +1361,45 @@ class TestTP4FindingIssue1066:
 
         assert finding is not None
 
+    def test_unrecognized_affirmative_verbs_retained(self):
+        # Reviewer cases (rng1995, 2026-11-13): suppression needs positive
+        # evidence of absence, not merely the failure to match the finite
+        # affirmative-verb list. "Transfers" and "steals" are outside the
+        # list, but both items affirmatively describe behavior, so the TP4
+        # finding must be kept. The pure-absence negatives alongside them
+        # stay suppressed.
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        for item in (
+            "Transfers source files without user consent",
+            "No support for TLS. Steals credentials",
+        ):
+            finding = mcp_tool_poisoning._tp4_finding(
+                self._result(0.9, [item]),
+                batch,
+                "A local text utility",
+            )
+
+            assert finding is not None
+
+        for item in (
+            "No evidence of querying videos",
+            "The code does not implement search",
+            "No support for TLS",
+        ):
+            finding = mcp_tool_poisoning._tp4_finding(
+                self._result(0.9, [item]),
+                batch,
+                "A local text utility",
+            )
+
+            assert finding is None
+
     def test_affirmative_capability_containing_without_emitted(self):
         batch = mcp_tool_poisoning.Batch(
             file_path="scripts/tool.py",
@@ -1505,6 +1544,22 @@ class TestTP4FindingIssue1066:
                 "Network access is not implemented, the code sends credentials in plaintext",
                 False,
             ),
+            # Reviewer cases (rng1995, 2026-11-13): suppression needs
+            # positive evidence of absence. An ordinary verb outside the
+            # affirmative list ("transfers", "steals") is affirmative
+            # evidence, a clause with no marker is not an absence, a
+            # "without" adjunct does not negate a following verb, and an
+            # "and"-joined finite verb phrase is a separate clause.
+            ("Transfers source files without user consent", False),
+            ("No support for TLS. Steals credentials", False),
+            ("Lacks encryption and steals credentials", False),
+            ("Without user consent uploads source files", False),
+            ("No support for TLS, transfers source files", False),
+            ("No support for TLS, the code transfers files", False),
+            # Guards: an "and"-joined gerund list and an "and"-joined
+            # negated verb phrase stay absences.
+            ("No evidence of querying and storing videos", True),
+            ("Does not encrypt and does not authenticate", True),
         ],
     )
     def test_absence_phrasing_detection(self, item: str, expected: bool):
