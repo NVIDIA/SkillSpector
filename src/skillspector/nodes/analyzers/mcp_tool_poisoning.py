@@ -58,6 +58,7 @@ from skillspector.nodes.analyzers.whitespace_padding import (
 )
 from skillspector.providers import get_active_provider
 from skillspector.resource_limits import bounded_capacity
+from skillspector.semantic_runtime import STRUCTURED_OUTPUT_UNAVAILABLE_ERROR
 from skillspector.state import (
     AnalyzerNodeResponse,
     LLMCallRecord,
@@ -1647,10 +1648,26 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                 failure.reason is LedgerReason.LLM_RESPONSE_REFUSED
                 for failure in batch_outcome.failures
             )
+            structured_output_only = (
+                not unexpected_response
+                and bool(batch_outcome.failures)
+                and not batch_outcome.successful
+                and not batch_outcome.recovered
+                and all(
+                    failure.reason is LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
+                    for failure in batch_outcome.failures
+                )
+            )
             result.record = llm_call_record(
                 ANALYZER_ID,
                 ok=False,
-                error=None if refusal_only else f"TP4 LLM batch failed: {error_class}",
+                error=(
+                    STRUCTURED_OUTPUT_UNAVAILABLE_ERROR
+                    if structured_output_only
+                    else None
+                    if refusal_only
+                    else f"TP4 LLM batch failed: {error_class}"
+                ),
             )
         else:
             result.record = llm_call_record(ANALYZER_ID, ok=True)

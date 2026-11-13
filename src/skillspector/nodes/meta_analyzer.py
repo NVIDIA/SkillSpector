@@ -52,6 +52,7 @@ from skillspector.llm_analyzer_base import (
     _project_line_fragments,
     append_output_language_instruction,
     estimate_tokens,
+    llm_call_record_for_outcome,
 )
 from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
@@ -1059,7 +1060,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             "llm_call_log": [
                 # Formatting warnings retain partial coverage in the ledger;
                 # genuine provider/runtime failures still mark the call failed.
-                llm_call_record("meta_analyzer", ok=not detailed.failures)
+                llm_call_record_for_outcome("meta_analyzer", detailed)
             ],
             "inference_usage": analyzer.inference_usage,
         }
