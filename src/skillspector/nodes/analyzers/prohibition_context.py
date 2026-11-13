@@ -222,7 +222,7 @@ def is_directly_prohibited(
         if independent is not None and (
             section_proof or independent.group("return_result") is not None
         ):
-            # A result-return sentence proves only the end of this instruction,
+            # An independent sentence proves only the end of this instruction,
             # not any unseen or unexplained condition that follows it.
             if independent_source[independent.end() :].strip(" \t\r\n.!?;") or end + len(
                 raw_tail
