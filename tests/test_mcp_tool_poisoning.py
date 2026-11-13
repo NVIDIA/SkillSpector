@@ -2179,7 +2179,8 @@ class TestTP4SerializedBudget:
         else:
             assert sum(len(prompt.encode("utf-8")) for prompt in structured.prompts) <= 6500
         assert any(
-            event["reason_code"] is expected_reason and event["outcome"] is LedgerOutcome.PARTIAL
+            event.get("reason_code") is expected_reason
+            and event["outcome"] is LedgerOutcome.PARTIAL
             for event in result["inspection_ledger"]
         )
         assert result["analyzer_status_events"][0]["status"] == "degraded"
