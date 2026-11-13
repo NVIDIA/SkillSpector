@@ -205,6 +205,7 @@ def is_directly_prohibited(
         following = following_raw.lstrip()
         following = _LIST_PREFIX.sub("", following, count=1)
         independent_source = following
+        section_proof = False
         independent = _NEXT_INSTRUCTION.match(following) if following else None
         if following and independent is None:
             section = _FOLLOWING_SECTION.match(following_raw)
@@ -215,9 +216,12 @@ def is_directly_prohibited(
                     # must still be independently understood by this helper.
                     independent_source = following_raw[section.end() :].lstrip()
                     independent = _NEXT_INSTRUCTION.match(independent_source)
+                    section_proof = independent is not None
         if following and independent is None:
             return False
-        if independent is not None and independent.group("return_result") is not None:
+        if independent is not None and (
+            section_proof or independent.group("return_result") is not None
+        ):
             # A result-return sentence proves only the end of this instruction,
             # not any unseen or unexplained condition that follows it.
             if independent_source[independent.end() :].strip(" \t\r\n.!?;") or end + len(
