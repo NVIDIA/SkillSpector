@@ -852,7 +852,7 @@ Options:
   --help                                       Show this message and exit
 
 # Generate a baseline of all current findings (see docs/SUPPRESSION.md)
-skillspector baseline <path> [-o FILE] [--no-llm] [--reason TEXT]
+skillspector baseline <path> [-o FILE] [--no-llm] [--yara-rules-dir PATH] [--reason TEXT]
 ```
 
 Report files and new baselines use private permissions (0600). Existing baselines

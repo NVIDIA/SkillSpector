@@ -8613,3 +8613,32 @@ def test_scan_report_saved_message_shows_bracketed_path_literally(tmp_path: Path
     )
     assert "out[b].json" in "".join(result.output.split())
     assert report.exists()
+
+
+@pytest.mark.parametrize("output_name", ["baseline.yaml", "baseline.json", "-"])
+@pytest.mark.parametrize("custom_rules", [False, True])
+def test_baseline_custom_rules_match_scan_configuration(
+    tmp_path, monkeypatch, output_name, custom_rules
+):
+    """Baseline generation must use the same normalized rule path as scan."""
+    monkeypatch.chdir(tmp_path)
+    states = []
+
+    def invoke(state):
+        states.append(state)
+        return {
+            "active_findings": [_finding("YR4", "marker")],
+            "file_cache": {"SKILL.md": "marker"},
+        }
+
+    monkeypatch.setattr(cli.graph, "invoke", invoke)
+    args = ["baseline", str(tmp_path), "--no-llm", "-o", output_name]
+    if custom_rules:
+        args += ["--yara-rules-dir", "rules"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert states[0].get("yara_rules_dir") == (str(tmp_path / "rules") if custom_rules else None)
+    data = yaml.safe_load(
+        result.stdout if output_name == "-" else (tmp_path / output_name).read_text()
+    )
+    assert len(data["fingerprints"]) == 1
