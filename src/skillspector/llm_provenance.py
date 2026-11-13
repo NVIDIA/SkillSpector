@@ -37,6 +37,7 @@ _TEMPERATURE_ADAPTERS = frozenset(
         "anthropic_proxy",
         "azure_openai",
         "bedrock",
+        "minimax",
         "nv_build",
         "nv_inference",
         "ollama",
@@ -45,12 +46,13 @@ _TEMPERATURE_ADAPTERS = frozenset(
     }
 )
 _SEED_ADAPTERS = frozenset(
-    {"azure_openai", "nv_build", "nv_inference", "ollama", "openai", "openai_compatible"}
+    {"azure_openai", "minimax", "nv_build", "nv_inference", "ollama", "openai", "openai_compatible"}
 )
 _REASONING_EFFORT_ADAPTERS = frozenset(
     {
         "anthropic",
         "anthropic_proxy",
+        "minimax",
         "nv_build",
         "nv_inference",
         "ollama",
