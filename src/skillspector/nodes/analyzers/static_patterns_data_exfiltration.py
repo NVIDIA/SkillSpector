@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import itertools
+import posixpath
 import re
 import sys
 from collections.abc import Iterator, Sequence
@@ -31,16 +32,23 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
 from .common import (
+    LOGICAL_LINE_BREAK,
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
     apply_import_aliases,
     get_context,
     get_context_from_lines,
     get_line_number,
+    logical_line_starts,
     resolve_call_name,
     resolve_dotted_name,
 )
 from .pattern_defaults import PatternCategory
+from .static_patterns_supply_chain import (
+    _sc2_has_unproved_compound_context,
+    _sc2_logical_command,
+    _shell_tokens,
+)
 from .static_patterns_tool_misuse import _bounded_shell_tokens
 
 logger = get_logger(__name__)
@@ -183,6 +191,139 @@ E5_PATTERNS = [
     (r"\.upload_blob\s*\(", 0.55),  # Azure SDK
 ]
 
+_CLOUD_DOWNLOAD_AWS_FLAGS = frozenset(
+    {"--quiet", "--only-show-errors", "--no-progress", "--no-sign-request", "--dryrun"}
+)
+_CLOUD_DOWNLOAD_AWS_VALUE_OPTIONS = frozenset({"--region", "--profile", "--include", "--exclude"})
+_CLOUD_DOWNLOAD_SHELL_META = re.compile(r"[;&|<>(){}\[\]*?$\x60%!#~\x00-\x1f\x7f]")
+_CLOUD_DOWNLOAD_BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]*")
+_CLOUD_DOWNLOAD_CONTEXT_CHARS = 4_096
+_CLOUD_DOWNLOAD_SAFE_SET = re.compile(
+    r"set[ \t]+(?:-[efu]+[ \t]+)*(?:-[efu]+|-[efu]*o[ \t]+pipefail)"
+)
+_CLOUD_DOWNLOAD_SAFE_SHEBANG = re.compile(
+    r"#![ \t]*(?:/usr(?:/local)?)?/bin/(?:env[ \t]+)?(?:ba|da|k|z)?sh(?:[ \t]+-[eu]+)?"
+)
+
+
+def _is_literal_cloud_download(
+    content: str,
+    offset: int,
+    line_starts: tuple[int, ...],
+    file_path: str,
+    file_type: str,
+) -> bool:
+    """Prove only a bounded, standalone, non-destructive cloud download.
+
+    The existing shell helpers retain unknown context and cap logical commands
+    at 4096 characters. No line or enclosing match is rewritten: callers decide
+    separately for every E5 occurrence, including nested or later uploads.
+    """
+    if file_type not in {"shell", "markdown", "text"} or file_path.lower().endswith(
+        (".ps1", ".psm1", ".psd1", ".bat", ".cmd")
+    ):
+        return False
+    if offset > _CLOUD_DOWNLOAD_CONTEXT_CHARS or _sc2_has_unproved_compound_context(
+        content, offset, ()
+    ):
+        return False
+    preamble = content[:offset]
+    if any(
+        separator.group(0) not in {"\n", "\r\n"}
+        for separator in LOGICAL_LINE_BREAK.finditer(preamble)
+    ):
+        # Shells end a line, and so a comment, only at a newline. Splitting at a
+        # form feed, lone CR or Unicode separator would hide the rest of that
+        # shell line (such as a function rebinding the cloud command) as a comment.
+        return False
+    if preamble.startswith("#!") and (
+        _CLOUD_DOWNLOAD_SAFE_SHEBANG.fullmatch(preamble.split("\n", 1)[0].rstrip(" \t\r")) is None
+    ):
+        # A shebang is not a comment when the file is executed: env -S assignments,
+        # interpreter options or a relative interpreter can change PATH or load
+        # setup code before the transfer runs. Only plain shell interpreters qualify.
+        return False
+    directory_changed = False
+    for line in preamble.split("\n"):
+        setup = line.strip(" \t\r")
+        if not setup or setup.startswith("#"):
+            continue
+        if _CLOUD_DOWNLOAD_SAFE_SET.fullmatch(setup):
+            continue
+        if "\\" in setup or _CLOUD_DOWNLOAD_SHELL_META.search(setup):
+            return False
+        setup_tokens = _shell_tokens(setup)
+        if setup_tokens == ["popd"] or (
+            setup_tokens
+            and len(setup_tokens) == 2
+            and setup_tokens[0] in {"cd", "chdir", "pushd"}
+            and setup_tokens[1]
+            and not setup_tokens[1].startswith("-")
+        ):
+            directory_changed = True
+            continue
+        # Unknown setup can load or replace the cloud command. Even an earlier
+        # download can overwrite an executable, so only the preambles above
+        # preserve this proof; do not enumerate unsafe command-loading forms.
+        return False
+    command = _sc2_logical_command(content, offset, line_starts)
+    if command is None or "\\" in command or _CLOUD_DOWNLOAD_SHELL_META.search(command) is not None:
+        return False
+    tokens = _shell_tokens(command)
+    if not tokens:
+        return False
+    if tokens[:3] in (["aws", "s3", "cp"], ["aws", "s3", "sync"]):
+        scheme = "s3://"
+        arguments = iter(tokens[3:])
+        flags = _CLOUD_DOWNLOAD_AWS_FLAGS
+        if tokens[2] == "cp":
+            flags = flags | {"--recursive"}
+        value_options = _CLOUD_DOWNLOAD_AWS_VALUE_OPTIONS
+    elif tokens[:2] in (["gsutil", "cp"], ["gsutil", "rsync"]):
+        scheme = "gs://"
+        arguments = iter(tokens[2:])
+        flags = frozenset({"-r"})
+        value_options = frozenset()
+    else:
+        # In particular, mv and sync deletion flags do more than copy data.
+        return False
+
+    operands: list[str] = []
+    for argument in arguments:
+        if argument in flags:
+            continue
+        if argument in value_options:
+            value = next(arguments, "")
+            if not value or value.startswith("-"):
+                return False
+        elif argument.startswith("-"):
+            return False
+        else:
+            operands.append(argument)
+    if len(operands) != 2:
+        return False
+    source, destination = operands
+    if not source.startswith(scheme):
+        return False
+    bucket = source[len(scheme) :].split("/", 1)[0]
+    if _CLOUD_DOWNLOAD_BUCKET.fullmatch(bucket) is None:
+        return False
+    if directory_changed and not destination.startswith("/"):
+        # A relative file may resolve to a stream after cd /dev (or a directory
+        # stack change). Absolute destinations do not depend on this setup.
+        return False
+    normalized_destination = posixpath.normpath(destination)
+    # A static local destination cannot be a cloud URI, stream or shell expansion.
+    # Colons remain conservative for other URL schemes and host-language paths.
+    return (
+        bool(destination)
+        and destination != "-"
+        and ":" not in destination
+        and not destination.startswith("//")
+        and normalized_destination not in {"/dev", "/proc", "/sys"}
+        and not normalized_destination.startswith(("/dev/", "/proc/", "/sys/"))
+    )
+
 
 def _e1_shell_regions(content: str, file_type: str) -> tuple[tuple[int, int], ...]:
     """Identify source regions whose physical separators have shell semantics.
@@ -305,7 +446,9 @@ def _iter_e1_shell_matches(
     covered = 0
     for start, end in command_ranges:
         if end is None:
-            yield from compiled.finditer(content, max(start, covered))
+            yield from static_runner.iter_pattern_matches(
+                compiled, content, start=max(start, covered)
+            )
             return
         if start < covered:
             continue
@@ -1189,7 +1332,9 @@ def analyze(
                 pattern, content, re.IGNORECASE | re.MULTILINE
             )
         else:
-            e1_matches = re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE)
+            e1_matches = static_runner.iter_pattern_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            )
         for match in e1_matches:
             line_num = get_line_number(content, match.start())
             adj = (
@@ -1223,7 +1368,7 @@ def analyze(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in E2_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -1244,7 +1389,7 @@ def analyze(
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in E3_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -1279,9 +1424,16 @@ def analyze(
                     complete_match=match.group(0),
                 )
             )
-    # E5: cloud-storage exfiltration. Example filtering is delegated to the runner.
+    # E5: retain uploads and uncertain directions; lower only proven downloads.
+    line_starts = logical_line_starts(content[: _CLOUD_DOWNLOAD_CONTEXT_CHARS + 1])
     for pattern, confidence in E5_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
+            if _is_literal_cloud_download(
+                content, match.start(), line_starts, file_path, file_type
+            ):
+                continue
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(

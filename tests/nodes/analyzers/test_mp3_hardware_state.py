@@ -54,7 +54,7 @@ def test_hardware_description_supports_logical_line_boundaries(line_break):
         "The assistant reaches its reset state after two clock cycles.",
         "The FSM reaches its reset state.",
         "A clock is running.\nThe FSM reaches its reset state.",
-        "The FSM reaches its reset statefulness after two clock cycles.",
+        "The FSM reaches its reset states after two clock cycles.",
         "The FSM reaches its reset state after two clock cycles; reset state now.",
     ],
 )
