@@ -2021,6 +2021,39 @@ class TestTP4MarkdownFences:
         ]
         assert size_limited == []
 
+    def test_oversized_line_does_not_hide_fitting_line_after_context_shrinks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """An oversized line must not reserve budget away from a line that fits."""
+        long_prose = "Background narrative sentence. " * 60
+        oversized_line = "x" * 128_000 + "\n"
+        fitting_line = "y" * 126_000 + "\n"
+        content = f"{long_prose}\n```python\n{oversized_line}{fitting_line}```\n"
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documents a helper."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert structured.calls == 1
+        assert fitting_line.strip() in structured.prompts[0]
+        assert oversized_line.strip() not in structured.prompts[0]
+        partial = [
+            event
+            for event in result.ledger
+            if event.get("outcome") is LedgerOutcome.PARTIAL
+            and event.get("path") == "guide.md"
+            and event.get("reason_code") is LedgerReason.SIZE_LIMIT
+        ]
+        assert len(partial) == 1
+        assert partial[0]["start_line"] == 3
+        assert partial[0]["end_line"] == 3
+
     def test_no_applicable_markdown_keeps_clean_status(self, monkeypatch: pytest.MonkeyPatch):
         structured = _mock_tp4_structured_llm(monkeypatch, [])
         result = node(

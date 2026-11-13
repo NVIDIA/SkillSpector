@@ -1239,12 +1239,17 @@ def _tp4_line_tokens(line: str) -> int:
     return max(1, (len(line) + 3) // 4)
 
 
-def _tp4_max_line_tokens(content: str) -> int:
-    """Return the largest single-line token estimate in *content*."""
-    return max(
-        (_tp4_line_tokens(line) for line in content.splitlines(keepends=True)),
-        default=1,
-    )
+def _tp4_max_line_tokens(content: str, *, max_tokens: int | None = None) -> int:
+    """Return the largest single-line token estimate in *content*.
+
+    When *max_tokens* is set, only lines that fit that ceiling are considered.
+    """
+    largest = 1
+    for line in content.splitlines(keepends=True):
+        line_tokens = _tp4_line_tokens(line)
+        if max_tokens is None or line_tokens <= max_tokens:
+            largest = max(largest, line_tokens)
+    return largest
 
 
 def _tp4_line_chunks(content: str, max_tokens: int) -> Iterator[_TP4CodeChunk]:
@@ -1474,9 +1479,13 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
             header_tokens = estimate_tokens(header)
             code_floor = TP4_MIN_CODE_TOKENS
             if had_context:
-                max_line_tokens = _tp4_max_line_tokens(candidate.content)
-                if max_line_tokens <= code_token_budget - header_tokens:
-                    code_floor = max(code_floor, max_line_tokens)
+                code_floor = max(
+                    code_floor,
+                    _tp4_max_line_tokens(
+                        candidate.content,
+                        max_tokens=code_token_budget - header_tokens,
+                    ),
+                )
             fixed = len(header) + len(_TP4_CONTEXT_OPEN) + 1 + len(_TP4_CONTEXT_CLOSE)
             room = (code_token_budget - code_floor) * 4 - fixed
             if had_context:
