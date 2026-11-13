@@ -40,6 +40,7 @@ from rich.text import Text
 from skillspector import __version__ as skillspector_version
 from skillspector.dependency_sources import redact_text
 from skillspector.inference_usage import looks_like_credential, sanitize_inference_usage
+from skillspector.input_origin import input_origin
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
     RESOURCE_MEASUREMENT_UNITS,
@@ -791,6 +792,7 @@ def _build_sarif(
     analysis_completeness: Mapping[str, object] | None = None,
     execution_successful: bool = True,
     structured_summaries: list[dict[str, object]] | None = None,
+    origin: dict[str, str] | None = None,
 ) -> dict[str, object]:
     """Build one SARIF invocation with canonical inspection notifications."""
     results: list[SarifResult] = []
@@ -1144,6 +1146,7 @@ def _build_sarif(
                     results=results,
                     columnKind="unicodeCodePoints",
                     invocations=invocations,
+                    properties={"inputOrigin": origin} if origin is not None else None,
                 )
             ],
         }
@@ -1246,6 +1249,7 @@ def _format_terminal(
     show_suppressed: bool = False,
     analysis_completeness: Mapping[str, object] | None = None,
     execution_successful: bool = True,
+    origin: dict[str, str] | None = None,
 ) -> str:
     """Generate styled Rich output with literal, control-safe dynamic text."""
     suppressed = suppressed or []
@@ -1262,6 +1266,9 @@ def _format_terminal(
     )
     console.print(Text.assemble("\n", ("Skill: ", "bold"), _terminal_text(skill_name)))
     console.print(Text.assemble(("Source: ", "bold"), _terminal_text(source)))
+    if origin is not None:
+        console.print(Text.assemble(("Input origin: ", "bold"), _terminal_text(origin["source"])))
+        console.print(Text.assemble(("Input type: ", "bold"), _terminal_text(origin["type"])))
     console.print(f"[bold]Scanned:[/bold] {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
     severity_colors = {
@@ -1652,6 +1659,7 @@ def _format_json(
     semantic_runtime_incomplete: bool = False,
     runtime_available: bool | None = None,
     provider_availability: tuple[bool, str | None] | None = None,
+    origin: dict[str, str] | None = None,
 ) -> str:
     """Generate JSON report string."""
     suppressed = suppressed or []
@@ -1661,6 +1669,7 @@ def _format_json(
             "name": skill_name,
             "source": skill_path or "",
             "scanned_at": datetime.now(UTC).isoformat(),
+            **({"origin": origin} if origin is not None else {}),
         },
         "risk_assessment": {
             "score": risk_score,
@@ -1821,6 +1830,7 @@ def _format_markdown(
     show_suppressed: bool = False,
     analysis_completeness: Mapping[str, object] | None = None,
     execution_successful: bool = True,
+    origin: dict[str, str] | None = None,
 ) -> str:
     """Generate Markdown report string."""
     suppressed = suppressed or []
@@ -1831,6 +1841,9 @@ def _format_markdown(
     lines.append("# SkillSpector Security Report\n")
     lines.append(f"**Skill:** {_markdown_cell(skill_name)}  ")
     lines.append(f"**Source:** {_markdown_code(source)}  ")
+    if origin is not None:
+        lines.append(f"**Input origin:** {_markdown_code(origin['source'])}  ")
+        lines.append(f"**Input type:** {_markdown_cell(origin['type'])}  ")
     lines.append(f"**Scanned:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}  ")
     lines.append("")
 
@@ -1994,6 +2007,15 @@ def report(state: SkillspectorState) -> dict[str, object]:
     has_executable_scripts = state.get("has_executable_scripts", False)
     manifest = state.get("manifest") or {}
     skill_path = state.get("skill_path")
+    raw_origin = state.get("input_origin")
+    origin = None
+    if (
+        isinstance(raw_origin, dict)
+        and isinstance(raw_origin.get("source"), str)
+        and isinstance(raw_origin.get("type"), str)
+        and raw_origin.get("type") in {"directory", "file", "zip", "git", "url"}
+    ):
+        origin = input_origin(raw_origin["source"], raw_origin["type"])
     output_format = state.get("output_format") or "sarif"
     llm_requested, use_llm = semantic_runtime_intent(state)
     raw_llm_call_log = state.get("llm_call_log")
@@ -2198,6 +2220,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
         analysis_completeness=analysis_completeness,
         execution_successful=execution_successful,
         structured_summaries=structured_summaries,
+        origin=origin,
     )
     if output_format == "terminal":
         report_body = _format_terminal(
@@ -2217,6 +2240,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             show_suppressed=show_suppressed,
             analysis_completeness=analysis_completeness,
             execution_successful=execution_successful,
+            origin=origin,
         )
     elif output_format == "json":
         report_body = _format_json(
@@ -2249,6 +2273,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             semantic_runtime_incomplete=semantic_runtime_incomplete,
             runtime_available=runtime_available,
             provider_availability=(provider_available, provider_error),
+            origin=origin,
         )
     elif output_format == "markdown":
         report_body = _format_markdown(
@@ -2268,6 +2293,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             show_suppressed=show_suppressed,
             analysis_completeness=analysis_completeness,
             execution_successful=execution_successful,
+            origin=origin,
         )
     else:
         report_body = json.dumps(sarif_report, indent=2)

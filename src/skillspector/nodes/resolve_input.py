@@ -30,6 +30,7 @@ from skillspector.input_handler import (
     selected_source_identity_for_input,
     validate_local_input_path,
 )
+from skillspector.input_origin import input_origin
 from skillspector.logging_config import get_logger
 from skillspector.state import (
     SkillspectorState,
@@ -66,6 +67,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             temp_dir = handler.temp_dir_for_cleanup()
             update: dict[str, object] = {
                 "skill_path": str(resolved),
+                "input_origin": input_origin(input_path, source_type),
                 "primary_file_path": handler.primary_file_path,
                 "primary_file_parent_path": handler.primary_file_parent_path,
                 "selected_source_identity": selected_source_identity_for_input(
@@ -115,6 +117,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             resolved = validate_local_input_path(Path(skill_path))
             return {
                 "skill_path": str(resolved),
+                "input_origin": input_origin(skill_path, "directory"),
                 "primary_file_path": None,
                 "selected_source_identity": resolved.name or None,
                 "temp_dir_for_cleanup": None,
@@ -124,6 +127,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             logger.warning("Could not resolve skill_path: %s", e)
             return {
                 "skill_path": None,
+                "input_origin": None,
                 "primary_file_path": None,
                 "selected_source_identity": None,
                 "temp_dir_for_cleanup": None,
@@ -132,6 +136,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
 
     return {
         "skill_path": None,
+        "input_origin": None,
         "primary_file_path": None,
         "selected_source_identity": None,
         "temp_dir_for_cleanup": None,
