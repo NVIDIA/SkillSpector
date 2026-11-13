@@ -33,6 +33,12 @@ this model``).  What replaces it depends on the platform:
   ``tool_choice`` left at ``auto`` and ask for the call in the prompt, as on
   Bedrock.
 
+  That last shape is also the recovery path for any OpenAI-compatible
+  gateway: when a gateway answers the ``json_schema`` response format with
+  HTTP 400, the analyzers rebind the schema as an unforced tool call
+  (:func:`skillspector.llm_utils.bind_structured_output_fallback`) and retry
+  the batch once, instead of failing every batch on the first shape.
+
 Gateway and Bedrock model IDs namespace or prefix the model name
 (``azure/anthropic/claude-opus-5-5``, ``us.anthropic.claude-opus-5-5``);
 :func:`model_name` reads it back so every route applies the same rules.
