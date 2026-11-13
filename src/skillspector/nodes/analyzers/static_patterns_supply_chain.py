@@ -33,6 +33,7 @@ from __future__ import annotations
 import ast
 import base64
 import codecs
+import functools
 import io
 import json
 import os
@@ -90,6 +91,13 @@ from .osv_client import (
     was_osv_reachable,
 )
 from .pattern_defaults import PatternCategory
+from .static_patterns_tool_misuse import (
+    _ROOT_GLOB_COMMAND_CHARS,
+    _bounded_shell_tokens,
+    _markdown_shell_text,
+    _skip_backtick_substitution,
+    _skip_command_substitution,
+)
 from .static_runner import analyzer_finding_to_finding
 
 logger = get_logger(__name__)
@@ -149,6 +157,27 @@ SC2_PROSE_PATTERNS = [
     (r"run\s+(?:this|the)\s+(?:following\s+)?(?:curl|wget)\s+command", 0.6),
 ]
 SC2_PATTERNS = SC2_CODE_PATTERNS + SC2_PROSE_PATTERNS
+_SC2_SHELL_PATTERNS = frozenset(SC2_CODE_PATTERNS[:6])
+_SC2_FETCH_COMMAND = re.compile(r"(?:curl|wget)\s+", re.IGNORECASE)
+_SC2_SUBSTITUTION_START = re.compile(r"\$\(|`")
+_SC2_ATTACHED_EXECUTOR = re.compile(
+    r"(?:\||&&)\s*(?:sudo\s+)?(?:bash|sh|python3?|node|ruby|perl)",
+    re.IGNORECASE,
+)
+_SC2_FENCE_LINE = re.compile(
+    rf"(?:\A|{LOGICAL_LINE_BREAK.pattern})[ \t]*(?P<marker>`{{3,}}|~{{3,}})"
+    r"[^\r\n\v\f\x1c-\x1e\x85\u2028\u2029]*"
+)
+_SC2_COMPOUND_TOKEN = re.compile(
+    r"(?P<quoted>\"(?:\\.|[^\"\\])*\"|'[^']*')"
+    r"|(?P<escaped>\\[\s\S])"
+    r"|(?P<comment>(?<![^\s;&|()<>])\#[^\r\n]*)"
+    r"|(?P<heredoc><{2})"
+    r"|(?P<word>(?<![^\s;|&(){}])(?:if|fi|for|while|until|select|done|case|esac|begin|end|function)"
+    r"(?=[\s;|&(){}]|\Z))"
+    r"|(?P<delimiter>[(){}])|(?P<unclosed_quote>['\"`])",
+)
+_SC2_CLAUSE_PREFIX = re.compile(r"[ \t]*(?:(?:then|do|else|elif|time(?:[ \t]+-p)?|!)[ \t]+)*")
 _INSTALLER_WARNING = re.compile(r"\b(?:warning|caution)\b", re.IGNORECASE)
 _INTERNAL_INSTALLER = re.compile(
     r"\binternal\b[^\n]{0,80}\binstaller\b|\binstaller\b[^\n]{0,80}\binternal\b",
@@ -377,21 +406,22 @@ SC3_PROSE_PATTERNS = [
 SC3_PATTERNS = SC3_CODE_PATTERNS + SC3_PROSE_PATTERNS
 # Shell decode-to-execute chains run on every file type, like SC2, because
 # SKILL.md instructions and hook configs carry shell commands too.
+# These two exact rules retain the audited bounded native path. Additional
+# shell rules default to the interruptible matcher until separately reviewed.
+_SC3_BOUNDED_PIPE_PATTERN = (
+    rf"{_SC3_SHELL_DECODER}(?:{_SC3_HERE_STRING}\\?['\"]?"
+    rf"[A-Za-z0-9+/=]{{0,{_MAX_SHELL_LITERAL_CHARS}}}+)?+{_SC3_PIPE_SEGMENT}"
+    rf"(?:\|(?!\|)&?{_SC3_PIPE_SEGMENT}){{0,3}}?{_SC3_PIPE_EXECUTOR}"
+)
+_SC3_BOUNDED_SUBSTITUTION_PATTERN = (
+    rf"{_SC3_SUBSTITUTION_EXECUTOR}[^()`\n]{{0,{_MAX_SHELL_LITERAL_CHARS}}}?"
+    rf"{_SC3_SHELL_DECODER}"
+)
 SC3_SHELL_PATTERNS = [
-    (
-        # A here-string literal can outgrow a pipeline stage, so it is consumed
-        # whole, and possessively, before the first stage.
-        rf"{_SC3_SHELL_DECODER}(?:{_SC3_HERE_STRING}\\?['\"]?"
-        rf"[A-Za-z0-9+/=]{{0,{_MAX_SHELL_LITERAL_CHARS}}}+)?+{_SC3_PIPE_SEGMENT}"
-        rf"(?:\|(?!\|)&?{_SC3_PIPE_SEGMENT}){{0,3}}?{_SC3_PIPE_EXECUTOR}",
-        0.9,
-    ),
-    (
-        rf"{_SC3_SUBSTITUTION_EXECUTOR}[^()`\n]{{0,{_MAX_SHELL_LITERAL_CHARS}}}?"
-        rf"{_SC3_SHELL_DECODER}",
-        0.9,
-    ),
+    (_SC3_BOUNDED_PIPE_PATTERN, 0.9),
+    (_SC3_BOUNDED_SUBSTITUTION_PATTERN, 0.9),
 ]
+
 
 # SC7: Untrusted Container Image — pulling images with signature/registry
 # verification turned off. These flags disable image trust regardless of the
@@ -496,95 +526,265 @@ _ABANDONED_PACKAGES: set[str] = {
 # SC6: Typosquatting — popular packages and edit-distance check
 # ---------------------------------------------------------------------------
 
-_POPULAR_PYPI: set[str] = {
-    "requests",
-    "numpy",
-    "pandas",
-    "flask",
-    "django",
-    "boto3",
-    "setuptools",
-    "pip",
-    "urllib3",
-    "pyyaml",
-    "cryptography",
-    "pillow",
-    "pydantic",
-    "sqlalchemy",
-    "pytest",
-    "click",
-    "jinja2",
-    "httpx",
-    "aiohttp",
-    "fastapi",
-    "celery",
-    "paramiko",
-    "beautifulsoup4",
-    "lxml",
-    "scrapy",
-    "redis",
-    "pymongo",
-    "psycopg2",
-    "matplotlib",
-    "scipy",
-    "scikit-learn",
-    "tensorflow",
-    "torch",
-    "keras",
-    "transformers",
-    "openai",
-    "langchain",
-    "gunicorn",
-    "uvicorn",
-    "rich",
-    "typer",
-    "black",
-    "ruff",
-    "mypy",
-    "pylint",
-    "flake8",
-    "isort",
-    "perseus-ctx",
-    "mimir-mcp",
-}
+_POPULAR_PYPI: frozenset[str] = frozenset(
+    {
+        "requests",
+        "numpy",
+        "pandas",
+        "flask",
+        "django",
+        "boto3",
+        "setuptools",
+        "pip",
+        "urllib3",
+        "pyyaml",
+        "cryptography",
+        "pillow",
+        "pydantic",
+        "sqlalchemy",
+        "pytest",
+        "click",
+        "jinja2",
+        "httpx",
+        "aiohttp",
+        "fastapi",
+        "celery",
+        "paramiko",
+        "beautifulsoup4",
+        "lxml",
+        "scrapy",
+        "redis",
+        "pymongo",
+        "psycopg2",
+        "matplotlib",
+        "scipy",
+        "scikit-learn",
+        "tensorflow",
+        "torch",
+        "keras",
+        "transformers",
+        "openai",
+        "langchain",
+        "gunicorn",
+        "uvicorn",
+        "rich",
+        "typer",
+        "black",
+        "ruff",
+        "mypy",
+        "pylint",
+        "flake8",
+        "isort",
+        "colorama",
+        "python-dateutil",
+        "discord.py",
+        "python-dotenv",
+        "pycryptodome",
+        "perseus-ctx",
+        "mimir-mcp",
+    }
+)
 
-_POPULAR_NPM: set[str] = {
-    "express",
-    "react",
-    "react-dom",
-    "next",
-    "vue",
-    "angular",
-    "lodash",
-    "axios",
-    "moment",
-    "chalk",
-    "commander",
-    "inquirer",
-    "webpack",
-    "babel",
-    "eslint",
-    "prettier",
-    "typescript",
-    "jest",
-    "mocha",
-    "chai",
-    "puppeteer",
-    "socket.io",
-    "mongoose",
-    "sequelize",
-    "passport",
-    "jsonwebtoken",
-    "dotenv",
-    "cors",
-    "body-parser",
-    "nodemon",
-    "pm2",
-}
+_POPULAR_NPM: frozenset[str] = frozenset(
+    {
+        "express",
+        "react",
+        "react-dom",
+        "next",
+        "vue",
+        "angular",
+        "lodash",
+        "axios",
+        "moment",
+        "chalk",
+        "commander",
+        "inquirer",
+        "webpack",
+        "babel",
+        "eslint",
+        "prettier",
+        "typescript",
+        "jest",
+        "mocha",
+        "chai",
+        "puppeteer",
+        "socket.io",
+        "mongoose",
+        "sequelize",
+        "passport",
+        "jsonwebtoken",
+        "dotenv",
+        "cors",
+        "body-parser",
+        "nodemon",
+        "pm2",
+        "electron",
+        "discord.js",
+        "ethers",
+        "cross-env",
+        "jquery",
+        "nodemailer",
+        "bootstrap",
+    }
+)
+
+# SC6 known-legitimate neighbours: established packages whose names fall within
+# the typosquat threshold of a _POPULAR_* entry and are never reported. Built by
+# running SC6 against the top 15,000 PyPI packages (hugovk/top-pypi-packages,
+# 30-day list) and npm-high-impact (~17,300 names). Six PyPI names that a manual
+# review keeps flagged (beautifulsoup, dydantic, httpr, pyyml, slack, xoto3) are
+# deliberately left out. The resulting 97 -> 6 (PyPI) and 26 -> 0 (npm) counts are
+# in-sample: names outside those two lists can still be flagged. Established
+# packages reported from outside the sample in review (#647) were checked one by
+# one (repository, age, downloads) and added: jets, jqueryui, bootstrap3,
+# bootstrap5 (npm), colormap (PyPI). python-direnv (PyPI) was reviewed too and is
+# kept flagged on purpose (#687): little history, two edits from python-dotenv.
+_KNOWN_LEGIT_PYPI: frozenset[str] = frozenset(
+    {
+        "afsapi",
+        "aioftp",
+        "aiortsp",
+        "astrapy",
+        "bcpandas",
+        "blake3",
+        "boto",
+        "canvas",
+        "colormap",
+        "cpplint",
+        "crick",
+        "djangoql",
+        "djlint",
+        "fasta2a",
+        "fastai",
+        "fastar",
+        "fastui",
+        "grequests",
+        "httpx2",
+        "hyper",
+        "ipytest",
+        "j2lint",
+        "k5test",
+        "lkml",
+        "lml",
+        "mip",
+        "niquests",
+        "open3d",
+        "openapi3",
+        "openbb",
+        "opencc",
+        "opendal",
+        "openlit",
+        "openmim",
+        "openml",
+        "openmm",
+        "p4p",
+        "panda3d",
+        "pandasai",
+        "pandasql",
+        "pandoc",
+        "pantab",
+        "pid",
+        "pin",
+        "pipe",
+        "pipx",
+        "piq",
+        "piqp",
+        "psycopg",
+        "psycopg-c",
+        "pyaml",
+        "pybamm",
+        "pycryptodomex",
+        "pydbml",
+        "pygame",
+        "pygaul",
+        "pylama",
+        "pylast",
+        "pylink",
+        "pymantic",
+        "pymzml",
+        "pynacl",
+        "pynini",
+        "pynvml",
+        "pyqwest",
+        "pyrect",
+        "pysaml2",
+        "pytango",
+        "pytket",
+        "pytoml",
+        "rltest",
+        "ruyaml",
+        "scanpy",
+        "scapy",
+        "scipp",
+        "scramp",
+        "scrapli",
+        "scrapydo",
+        "scrypt",
+        "shyaml",
+        "sip",
+        "sodapy",
+        "syrupy",
+        "tclint",
+        "tensorflowjs",
+        "tftest",
+        "torchx",
+        "unicon",
+        "unicorn",
+        "usort",
+        "vastai",
+        "vyper",
+        "willow",
+        "x-transformers",
+    }
+)
+
+_KNOWN_LEGIT_NPM: frozenset[str] = frozenset(
+    {
+        "angular2",
+        "bootstrap3",
+        "bootstrap5",
+        "chat",
+        "commondir",
+        "commoner",
+        "crossvent",
+        "cypress",
+        "docdash",
+        "dtslint",
+        "electrodb",
+        "enquirer",
+        "esquery",
+        "expresso",
+        "ext",
+        "gaxios",
+        "getenv",
+        "jets",
+        "jqueryui",
+        "jshint",
+        "jslint",
+        "keypress",
+        "mquery",
+        "net",
+        "nuxt",
+        "oxlint",
+        "preact",
+        "radash",
+        "react-dnd",
+        "test",
+        "tether",
+        "tslint",
+        "ttypescript",
+        "vm2",
+        "vuex",
+    }
+)
 
 
 def _edit_distance(a: str, b: str) -> int:
-    """Compute Levenshtein edit distance between two strings."""
+    """Compute Levenshtein edit distance between two strings.
+
+    SC6 now uses ``_osa_distance``; this plain Levenshtein is kept as the
+    reference the unit tests compare it against (a swap counts as two edits).
+    """
     if len(a) < len(b):
         return _edit_distance(b, a)
     if len(b) == 0:
@@ -599,18 +799,90 @@ def _edit_distance(a: str, b: str) -> int:
     return prev_row[-1]
 
 
-def _is_typosquat(pkg_name: str, popular: set[str], max_distance: int = 2) -> str | None:
-    """Return the popular package name if pkg_name is a close-but-not-exact match."""
-    normalized = pkg_name.lower().replace("_", "-")
+def _osa_distance(a: str, b: str) -> int:
+    """Optimal string alignment distance between two strings.
+
+    Levenshtein plus adjacent transpositions: swapping two neighbouring
+    characters ("recat" vs "react") is a single typing slip, so it counts as
+    one edit instead of two. Short transposition typosquats then pass the
+    relative-distance guard in ``_is_typosquat``.
+    """
+    rows, cols = len(a) + 1, len(b) + 1
+    d = [[0] * cols for _ in range(rows)]
+    for i in range(rows):
+        d[i][0] = i
+    for j in range(cols):
+        d[0][j] = j
+    for i in range(1, rows):
+        for j in range(1, cols):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+    return d[-1][-1]
+
+
+def _typosquat_normalize(name: str, pep503: bool) -> str:
+    """Normalize a package name for SC6 comparisons.
+
+    PyPI treats runs of ``-``, ``_`` and ``.`` as equivalent (PEP 503), so
+    ``discord-py`` *is* ``discord.py``. npm does not (``socket-io`` and
+    ``socket.io`` are distinct packages), so npm keeps the historical rule.
+    """
+    if pep503:
+        return re.sub(r"[-_.]+", "-", name).lower()
+    return name.lower().replace("_", "-")
+
+
+@functools.lru_cache(maxsize=32)
+def _typosquat_targets(names: frozenset[str], pep503: bool) -> tuple[tuple[str, str], ...]:
+    """Return ``(name, normalized name)`` pairs sorted by name, once per name set.
+
+    SC6 runs for every dependency, so normalizing and sorting the popular and
+    known-legitimate sets on each call used to dominate the per-scan cost.
+    """
+    return tuple(sorted((name, _typosquat_normalize(name, pep503)) for name in names))
+
+
+@functools.lru_cache(maxsize=32)
+def _typosquat_normalized_set(names: frozenset[str], pep503: bool) -> frozenset[str]:
+    """Return the normalized names of ``names`` (cached, see ``_typosquat_targets``)."""
+    return frozenset(norm for _, norm in _typosquat_targets(names, pep503))
+
+
+def _is_typosquat(
+    pkg_name: str,
+    popular: set[str],
+    max_distance: int = 2,
+    *,
+    known_legit: frozenset[str] = frozenset(),
+    pep503: bool = False,
+) -> str | None:
+    """Return the popular package name if pkg_name is a close-but-not-exact match.
+
+    ``known_legit`` lists established packages whose names happen to fall
+    within the threshold of a popular one (``psycopg`` vs ``psycopg2``,
+    ``preact`` vs ``react``); they are never reported.
+    """
+    normalized = _typosquat_normalize(pkg_name, pep503)
+    popular_set = popular if isinstance(popular, frozenset) else frozenset(popular)
+    legit_set = known_legit if isinstance(known_legit, frozenset) else frozenset(known_legit)
     # A known package must win over any earlier, similar name (e.g. gunicorn
     # sorts before uvicorn). Apply the same normalization on both sides.
-    if any(normalized == name.lower().replace("_", "-") for name in popular):
+    if normalized in _typosquat_normalized_set(popular_set, pep503):
         return None
-    for popular_name in sorted(popular):
-        pop_norm = popular_name.lower().replace("_", "-")
-        if len(normalized) < 3 or len(pop_norm) < 3:
+    if normalized in _typosquat_normalized_set(legit_set, pep503):
+        return None
+    if len(normalized) < 3:
+        return None
+    for popular_name, pop_norm in _typosquat_targets(popular_set, pep503):
+        if len(pop_norm) < 3:
             continue
-        dist = _edit_distance(normalized, pop_norm)
+        # OSA distance is never below the length difference, so this skip is
+        # exact and avoids the quadratic distance computation for most pairs.
+        if abs(len(normalized) - len(pop_norm)) > max_distance:
+            continue
+        dist = _osa_distance(normalized, pop_norm)
         if not 0 < dist <= max_distance:
             continue
         # Relative-distance guard: a genuine typosquat perturbs only a small
@@ -618,8 +890,8 @@ def _is_typosquat(pkg_name: str, popular: set[str], max_distance: int = 2) -> st
         # under an absolute distance of 2 (e.g. "task" is edit-distance 2 from
         # "flask" yet is a real package) and are not typosquats. Require
         # dist/len <= 1/3, so short names need an all-but-one-character match
-        # while longer names may still differ by two (e.g. "reqeusts" vs
-        # "requests").
+        # while longer names may still differ by two (e.g. "reqeuts" vs
+        # "requests": one swap plus one deletion).
         shorter = min(len(normalized), len(pop_norm))
         if dist * 3 > shorter:
             continue
@@ -727,13 +999,34 @@ _DESCRIPTION_ACTIVATION_CONDITION_RE = re.compile(
 )
 
 # Universal-scope signals for description clauses. The scope must be
-# unconditional: a subject qualifier such as "about PostgreSQL" keeps the
-# clause describing a capability, not a catch-all trigger.
+# unconditional: a subject or domain qualifier such as "about PostgreSQL",
+# "with PDF files" or "related to Kubernetes" keeps the clause describing a
+# capability, not a catch-all trigger. Up to three leading determiners,
+# quantifiers or "of" are transparent ("about this codebase", "about any AWS
+# service", "about all the services", "about all of the services" are still
+# bounded by the noun after them). A qualifier whose object is only a pronoun
+# or a generic noun ("anything with it", "anything with anyone", "anything
+# with any of them", "anything related to any topic", "any messages with any
+# content") bounds nothing and stays universal. Broad prepositions ("in",
+# "for", "on") are deliberately not qualifiers: "any message in the chat" is
+# still every message.
+_DESCRIPTION_SCOPE_DETERMINER = (
+    r"(?:the|a|an|this|that|these|those|any|all|every|each|some|"
+    r"my|your|our|their|its|his|her)"
+)
+_DESCRIPTION_UNBOUNDED_OBJECT = (
+    r"(?:it|them|you|me|us|him|her|anything|everything|whatever|something|"
+    r"nothing|anyone|anybody|someone|somebody|everyone|everybody|nobody|"
+    r"topics?|subjects?|things?|content)"
+)
 _DESCRIPTION_UNIVERSAL_SCOPE_RE = re.compile(
     r"\b(?:"
     r"anything|everything|whatever|"
     r"(?:all|any|every)\s+(?:messages?|requests?|questions?|queries?|inputs?|tasks?)"
-    r")\b(?!\s+about\b)",
+    r")\b"
+    r"(?!\s+(?:about|with|involving|regarding|concerning|(?:related|relating)\s+to)\s+"
+    rf"(?:(?:{_DESCRIPTION_SCOPE_DETERMINER}|of)\s+){{0,3}}"
+    rf"(?!(?:{_DESCRIPTION_UNBOUNDED_OBJECT}|{_DESCRIPTION_SCOPE_DETERMINER}|of)\b)[a-z0-9])",
     re.IGNORECASE,
 )
 
@@ -744,21 +1037,44 @@ _DESCRIPTION_UNIVERSAL_SCOPE_RE = re.compile(
 # "CI/CD" must not read as invocation intent for "build".
 _DESCRIPTION_INVOCATION_RE = re.compile(
     r"\b(?:commands?|slash|invoke[sd]?|invoking|intercept(?:s|ed|ing)?|"
-    r"override[sd]?|overriding|shadow(?:s|ed|ing)?)\b|(?<![\w/])/[a-z]",
+    r"override[sd]?|overriding|overridden|shadow(?:s|ed|ing)?)\b|(?<![\w/])/[a-z]",
     re.IGNORECASE,
 )
 
-# Command-interception signals for the TR2 shadow-command rule. Unlike the
+# Command-interception evidence for the TR2 shadow-command rule. Unlike the
 # broader extraction gate above, this requires an actual
 # invocation/interception/override claim (or a literal slash-command token):
 # merely discussing commands as a noun ("Show available build commands",
 # "documents the build and test commands") describes documentation or help
 # prose, not shadowing intent, so it must not establish TR2 on its own.
-_DESCRIPTION_COMMAND_INTERCEPTION_RE = re.compile(
+# The shadowed command must also be the object of that evidence, not any
+# built-in word that happens to share the clause: a slash-command token names
+# a command by its whole name ("/ask-matt" is "ask-matt", not the built-in
+# "ask"), and an interception verb governs the built-ins that follow it in
+# the clause ("Intercepts and replaces the built-in deploy command"). A
+# slash-command token that is not a built-in ("/ask-matt") stays one name, and
+# a home-relative path ("~/build") is not a slash command.
+_DESCRIPTION_SLASH_COMMAND_RE = re.compile(r"(?<![\w/.~])/([a-z][\w-]*)", re.IGNORECASE)
+_DESCRIPTION_INTERCEPTION_VERB_RE = re.compile(
     r"\b(?:invoke[sd]?|invoking|intercept(?:s|ed|ing)?|"
-    r"override[sd]?|overriding|shadow(?:s|ed|ing)?)\b|(?<![\w/])/[a-z]",
+    r"override[sd]?|overriding|overridden|shadow(?:s|ed|ing)?)\b",
     re.IGNORECASE,
 )
+# Passive interception claims name the command before the verb: "the built-in
+# deploy command is intercepted", "types deploy it is intercepted", "the deploy
+# command will be intercepted", "deploy commands are now shadowed". The
+# auxiliary may be "is"/"are" (optionally "being"), "gets", "will be" or
+# "has/have been", and one adverb may precede the participle. The adverb slot
+# takes a short list plus "-ly" words, so a negation ("is not intercepted",
+# "is never shadowed") does not count.
+_DESCRIPTION_PASSIVE_INTERCEPTION_RE = re.compile(
+    r"(?<![\w/.~-])/?([a-z][\w-]*)\s+(?:commands?\s+|it\s+)?"
+    r"(?:(?:is|are)(?:\s+being)?|gets?|will\s+be|ha(?:s|ve)\s+been)\s+"
+    r"(?:(?:always|now|also|still|already|[a-z]+ly)\s+)?"
+    r"(?:intercepted|overridden|shadowed|invoked)\b",
+    re.IGNORECASE,
+)
+_DESCRIPTION_COMMAND_TOKEN_RE = re.compile(r"(?<![\w/.~-])/?([a-z][\w-]*)", re.IGNORECASE)
 
 # Trigger-phrase extraction for the TR1 broad/short-trigger rule on
 # descriptions: the word or phrase the skill claims to activate on, as in
@@ -779,19 +1095,6 @@ _DESCRIPTION_TRIGGER_PHRASE_RE = re.compile(
     r"['\"]?(?P<phrase>[A-Za-z][\w-]*(?:\s+[A-Za-z][\w-]*){0,7})['\"]?",
     re.IGNORECASE,
 )
-
-# Trailing discourse words that modify the utterance rather than name trigger
-# content. When the captured phrase is a broad single word followed only by
-# these deictics ("says hello there"), the skill names the broad word and the
-# rest is trailing prose, so TR1 still fires; a content word after the broad
-# word ("code review", "the zone") names a multiword phrase and stays TR1
-# negative, matching the legacy trigger grammar.
-_DESCRIPTION_TRAILING_DISCOURSE_WORDS: set[str] = {
-    "there",
-    "here",
-    "now",
-    "then",
-}
 
 # Bare universal-scope statements: the whole clause is a catch-all scope
 # ("all messages"), which the legacy trigger grammar also flags as TR3.
@@ -886,6 +1189,33 @@ def _description_condition_has_universal_scope(clause: str) -> bool:
     span = rest[: boundary.start()] if boundary else rest
     span = span[:_MAX_DESCRIPTION_CONDITION_SPAN]
     return _DESCRIPTION_UNIVERSAL_SCOPE_RE.search(span) is not None
+
+
+def _description_shadowed_commands(clause: str) -> list[str]:
+    """Built-in commands a description clause claims to invoke or intercept.
+
+    Only commands tied to interception evidence count: a slash-command token
+    whose whole name is a built-in, a built-in named anywhere after an
+    invocation/interception/override verb in the clause, or a built-in that a
+    passive claim names right before its auxiliary ("deploy is intercepted",
+    "deploy command has been overridden").
+    Returns the sorted set of shadowed built-in commands.
+    """
+    shadowed = {
+        match.group(1).lower()
+        for match in _DESCRIPTION_SLASH_COMMAND_RE.finditer(clause)
+        if match.group(1).lower() in _BUILTIN_COMMANDS
+    }
+    verb = _DESCRIPTION_INTERCEPTION_VERB_RE.search(clause)
+    if verb is not None:
+        tokens = _DESCRIPTION_COMMAND_TOKEN_RE.findall(clause[verb.end() :])
+        shadowed.update(t.lower() for t in tokens if t.lower() in _BUILTIN_COMMANDS)
+    shadowed.update(
+        match.group(1).lower()
+        for match in _DESCRIPTION_PASSIVE_INTERCEPTION_RE.finditer(clause)
+        if match.group(1).lower() in _BUILTIN_COMMANDS
+    )
+    return sorted(shadowed)
 
 
 def _extract_description_trigger_clauses(description: str) -> tuple[list[str], int]:
@@ -1045,6 +1375,16 @@ def _extract_packages_from_requirements_detailed(
     largest_omitted: int | None = None
     if limit is not None and limit <= 0:
         return results, largest_omitted
+    # decode_text() decodes with plain "utf-8", which never strips a leading
+    # byte-order mark, so a BOM-prefixed requirements.txt would otherwise make
+    # the first requirement unparseable and silently drop it from SC4/OSV
+    # analysis. Strip leading BOMs here, scoped to manifest parsing only:
+    # decode_text() itself stays untouched because other analyzers treat
+    # U+FEFF as a hidden-character injection signal in file bodies.
+    # Single linear prefix strip: a per-character slicing loop here would
+    # copy ~n(n-1)/2 characters for n leading BOMs before any spec limit
+    # is checked, with no cancellation point in this preprocessing step.
+    content = content.lstrip("\ufeff")
     for line_num, line in _logical_requirement_lines(content):
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("-"):
@@ -1066,7 +1406,12 @@ def _extract_packages_from_requirements_detailed(
     return results, largest_omitted
 
 
-_NPM_DEPENDENCY_SECTIONS = ("dependencies", "devDependencies", "peerDependencies")
+_NPM_DEPENDENCY_SECTIONS = (
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+)
 
 
 def _package_json_line(content: str, section: str, name: str) -> int:
@@ -1143,7 +1488,9 @@ def _extract_packages_from_package_json_scan(
     in_deps = False
     for i, line in enumerate(content.splitlines(), 1):
         stripped = line.strip()
-        if re.search(r'"(?:dependencies|devDependencies|peerDependencies)"', stripped):
+        if re.search(
+            r'"(?:dependencies|devDependencies|peerDependencies|optionalDependencies)"', stripped
+        ):
             in_deps = True
             continue
         if in_deps and stripped.startswith("}"):
@@ -1162,6 +1509,7 @@ def _extract_packages_from_package_json(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract (package_name, version_or_None, line_number) from package.json content.
 
@@ -1174,10 +1522,15 @@ def _extract_packages_from_package_json(
         return []
     try:
         data = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
         return _extract_packages_from_package_json_scan(content, limit=limit)
     if not isinstance(data, dict):
         return []
+    # npm installs an optionalDependencies entry in place of a same-name "dependencies" entry.
+    optional = data.get("optionalDependencies")
+    overridden = set(optional) if isinstance(optional, dict) else set()
     dependencies: list[tuple[str, str, str]] = []
     for section in _NPM_DEPENDENCY_SECTIONS:
         deps = data.get(section)
@@ -1185,6 +1538,8 @@ def _extract_packages_from_package_json(
             continue
         for name, spec in deps.items():
             if not isinstance(name, str) or not isinstance(spec, str):
+                continue
+            if section == "dependencies" and name in overridden:
                 continue
             dependencies.append((section, name, spec))
             if limit is not None and len(dependencies) >= max(0, limit):
@@ -1213,6 +1568,7 @@ def _extract_packages_from_pyproject(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract (package_name, version_or_None, line_number) from pyproject.toml.
 
@@ -1225,7 +1581,9 @@ def _extract_packages_from_pyproject(
         return []
     try:
         data = tomllib.loads(content)
-    except tomllib.TOMLDecodeError:
+    except (ValueError, RecursionError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
         return []
 
     specs: list[str] = []
@@ -1485,9 +1843,29 @@ def _normalize_package_name(name: str) -> str:
     return name.lower().replace("_", "-")
 
 
+def _dependency_filename(file_path: str) -> str:
+    """Return a normalized basename so documentation is not mistaken for a manifest."""
+    return file_path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _is_requirements_file(file_path: str) -> bool:
+    normalized_path = file_path.replace("\\", "/").lower()
+    path_parts = normalized_path.split("/")
+    filename = path_parts[-1]
+    if filename in {"requirements", "requirements.txt", "requirements.in"} or re.fullmatch(
+        r"(?:requirements[-_][a-z0-9_-]+|[a-z0-9][a-z0-9_-]*[-_]requirements)\.(?:txt|in)",
+        filename,
+    ):
+        return True
+    return "requirements" in path_parts[:-1] and bool(
+        re.fullmatch(r"[a-z0-9][a-z0-9_-]*\.(?:txt|in)", filename)
+    )
+
+
 def _is_python_lockfile(file_path: str) -> bool:
-    lower_path = file_path.lower()
-    return "uv.lock" in lower_path or "poetry.lock" in lower_path or _is_pipenv_lockfile(file_path)
+    return _dependency_filename(file_path) in {"uv.lock", "poetry.lock"} or _is_pipenv_lockfile(
+        file_path
+    )
 
 
 def _normalize_npm_package_name(name: str) -> str:
@@ -1502,8 +1880,18 @@ def _normalize_npm_package_name(name: str) -> str:
 
 
 def _is_npm_lockfile(file_path: str) -> bool:
-    lower_path = file_path.lower()
-    return lower_path.endswith(("package-lock.json", "npm-shrinkwrap.json"))
+    return _dependency_filename(file_path) in {"package-lock.json", "npm-shrinkwrap.json"}
+
+
+def _is_dependency_manifest(file_path: str) -> bool:
+    """Recognize supported manifest names, not prose files that merely mention them."""
+    filename = _dependency_filename(file_path)
+    return (
+        _is_requirements_file(file_path)
+        or filename in {"package.json", "pyproject.toml", "setup.py", "pipfile", "pipfile.lock"}
+        or _is_python_lockfile(file_path)
+        or _is_npm_lockfile(file_path)
+    )
 
 
 def _npm_lock_line_index(content: str) -> dict[str, int]:
@@ -1523,7 +1911,11 @@ def _npm_lock_line_index(content: str) -> dict[str, int]:
     return index
 
 
-def _npm_lock_entries(content: str) -> list[tuple[str, str, int, int]]:
+def _npm_lock_entries(
+    content: str,
+    *,
+    on_parse_error: Callable[[str], None] | None = None,
+) -> list[tuple[str, str, int, int]]:
     """Extract (name, version, line, depth) for every install recorded in an npm lockfile.
 
     Covers both layouts: ``lockfileVersion`` 2/3 keep every install under ``packages`` keyed by
@@ -1540,7 +1932,11 @@ def _npm_lock_entries(content: str) -> list[tuple[str, str, int, int]]:
     """
     try:
         data = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, RecursionError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
+        return []
+    except TypeError:
         return []
     if not isinstance(data, dict):
         return []
@@ -1590,12 +1986,14 @@ def _extract_packages_from_npm_lock(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract exact package versions from an npm lockfile."""
     if limit is not None and limit <= 0:
         return []
     found: list[tuple[str, str | None, int]] = [
-        (name, version, line) for name, version, line, _depth in _npm_lock_entries(content)
+        (name, version, line)
+        for name, version, line, _depth in _npm_lock_entries(content, on_parse_error=on_parse_error)
     ]
     return found if limit is None else found[:limit]
 
@@ -1604,13 +2002,16 @@ def _extract_packages_from_toml_lock(
     content: str,
     *,
     limit: int | None = None,
+    on_parse_error: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str | None, int]]:
     """Extract exact package versions from TOML lockfiles such as uv.lock and poetry.lock."""
     if limit is not None and limit <= 0:
         return []
     try:
         data = tomllib.loads(content)
-    except tomllib.TOMLDecodeError:
+    except (ValueError, RecursionError) as error:
+        if on_parse_error is not None:
+            on_parse_error(type(error).__name__)
         return []
     packages = data.get("package")
     if not isinstance(packages, list):
@@ -1813,7 +2214,7 @@ def _collect_npm_locked_versions(
         if timeout_seconds is not None and time.monotonic() - started_at >= timeout_seconds:
             break
         content = file_cache.get(path)
-        if not content:
+        if content is None:
             continue
         files_read += 1
         for name, version, _line_num, depth in _npm_lock_entries(content):
@@ -1844,11 +2245,189 @@ def _version_lt(v1: str, v2: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _sc2_substitution_ranges(shell_text: str) -> list[tuple[int, int]]:
+    """Locate nested output flows; Markdown fences are not shell backticks."""
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    while marker := _SC2_SUBSTITUTION_START.search(shell_text, cursor):
+        start = marker.start()
+        limit = min(len(shell_text), start + _ROOT_GLOB_COMMAND_CHARS)
+        skip = (
+            _skip_command_substitution if marker.group(0) == "$(" else _skip_backtick_substitution
+        )
+        end = skip(shell_text, start, limit)
+        if end is None:
+            ranges.append((start, len(shell_text)))
+            break
+        ranges.append((start, end))
+        cursor = end
+    return ranges
+
+
+def _sc2_has_unproved_compound_context(
+    content: str, offset: int, fence_ends: tuple[int, ...]
+) -> bool:
+    """A child terminator cannot disconnect an enclosing command's output flow.
+
+    This is a conservative ownership guard, not a compound-shell evaluator.
+    Balanced quotes and comments cannot close a parent group. Unclosed groups,
+    conditionals, loops, case statements and truncated context retain legacy
+    evidence rather than granting a single-command boundary.
+    """
+    start = max(0, offset - _ROOT_GLOB_COMMAND_CHARS)
+    fence_index = bisect_right(fence_ends, offset)
+    if fence_index and fence_ends[fence_index - 1] >= start:
+        start = fence_ends[fence_index - 1]
+    elif start > 0:
+        return True
+    stack: list[str] = []
+    endings = {
+        "if": "fi",
+        "for": "done",
+        "while": "done",
+        "until": "done",
+        "select": "done",
+        "case": "esac",
+        "begin": "end",
+        "function": "end",
+        "(": ")",
+        "{": "}",
+    }
+    for token in _SC2_COMPOUND_TOKEN.finditer(content, start, offset):
+        if token.lastgroup in {"unclosed_quote", "heredoc"}:
+            return True
+        if token.lastgroup == "escaped" and any(char in token.group(0) for char in "\r\n"):
+            # Shell lexing removes continuations before recognizing reserved words.
+            return True
+        if token.lastgroup not in {"word", "delimiter"}:
+            continue
+        value = token.group(0)
+        if token.lastgroup == "word" or value == "}":
+            boundary = max(content.rfind(char, start, token.start()) for char in "\n;|&(){}")
+            if _SC2_CLAUSE_PREFIX.fullmatch(content[boundary + 1 : token.start()]) is None:
+                if value == "}":
+                    return True
+                continue
+        if value in endings:
+            stack.append(endings[value])
+        elif stack and value == stack[-1]:
+            stack.pop()
+        elif value in {"fi", "done", "esac", "end", "}"}:
+            return True
+        # A case arm's ')' is not a parenthesis-group close.
+        elif value == ")" and ")" in stack:
+            return True
+    return bool(stack)
+
+
+def _sc2_shell_command_ranges(content: str, file_type: str) -> tuple[tuple[int, int | None], ...]:
+    """Bound fetch/executor matches to a shell command without rewriting source.
+
+    A newline or semicolon after a completed fetch is not a pipe into an
+    interpreter elsewhere in the document. Reuse the bounded shell parser so
+    quoted newlines, line continuations and nested substitutions stay intact.
+    An unproved boundary retains the existing conservative regex behavior.
+    """
+    ranges: list[tuple[int, int | None]] = []
+    # Project fence delimiters once. Inline ticks remain conservative shell syntax.
+    shell_text = (
+        _markdown_shell_text(content, lambda: None, complete_context=False)
+        if file_type in {"markdown", "text"}
+        else content
+    )
+    proof_text = shell_text
+    if file_type in {"markdown", "text"}:
+        # Logical lines establish documentary ownership, but Unicode/control
+        # separators remain native shell argument data during command parsing.
+        proof_text = LOGICAL_LINE_BREAK.sub(
+            lambda line_break: "\n" + " " * (len(line_break.group(0)) - 1), shell_text
+        )
+    fences = tuple(
+        (fence.start(), fence.end())
+        for fence in _SC2_FENCE_LINE.finditer(content)
+        if shell_text[fence.start("marker") : fence.end("marker")].isspace()
+    )
+    fence_starts = tuple(start for start, _ in fences)
+    fence_ends = tuple(end for _, end in fences)
+    substitutions = _sc2_substitution_ranges(shell_text)
+    substitution_index = 0
+    for fetch in _SC2_FETCH_COMMAND.finditer(content):
+        while (
+            substitution_index < len(substitutions)
+            and substitutions[substitution_index][1] <= fetch.start()
+        ):
+            substitution_index += 1
+        if (
+            substitution_index < len(substitutions)
+            and substitutions[substitution_index][0] < fetch.start()
+        ):
+            # A parent echo/printf can pass substitution output into a later
+            # interpreter. A child command's newline/closing delimiter does
+            # not prove that the fetch and outer executor are disconnected.
+            ranges.append((fetch.start(), None))
+            break
+        if _sc2_has_unproved_compound_context(
+            shell_text, fetch.start(), fence_ends
+        ) or _sc2_has_unproved_compound_context(proof_text, fetch.start(), fence_ends):
+            ranges.append((fetch.start(), None))
+            break
+        fence_index = bisect_right(fence_starts, fetch.start())
+        document_end = fence_starts[fence_index] if fence_index < len(fences) else len(content)
+        parse_start = max(0, fetch.start() - _ROOT_GLOB_COMMAND_CHARS)
+        # One extra character distinguishes a parser limit from a genuine EOF.
+        parse_end = min(document_end, fetch.start() + 4 + _ROOT_GLOB_COMMAND_CHARS + 1)
+        _, local_end, limited = _bounded_shell_tokens(
+            shell_text[parse_start:parse_end],
+            fetch.start() - parse_start,
+            fetch.start() + 4 - parse_start,
+        )
+        command_end = parse_start + local_end
+        if (
+            limited
+            or content[command_end : command_end + 1] in {"'", '"', "`", ")"}
+            # CMD caret continuation is outside the Bourne parser's proof.
+            or re.search(r"\^[ \t]*\r?$", content[fetch.start() : command_end]) is not None
+            # A logical-line view cannot turn argument data into a group close.
+            or _sc2_has_unproved_compound_context(shell_text, command_end, fence_ends)
+            or _sc2_has_unproved_compound_context(proof_text, command_end, fence_ends)
+        ):
+            # Preserve legacy nonoverlapping matching on uncertain syntax,
+            # rather than repeatedly parsing overlapping suffixes.
+            ranges.append((fetch.start(), None))
+            break
+        executor = _SC2_ATTACHED_EXECUTOR.match(content, command_end)
+        if executor is not None:
+            ranges.append((fetch.start(), executor.end()))
+    return tuple(ranges)
+
+
+def _iter_sc2_shell_matches(
+    pattern: str,
+    content: str,
+    command_ranges: tuple[tuple[int, int | None], ...],
+) -> Iterator[re.Match[str]]:
+    compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    covered = 0
+    for start, end in command_ranges:
+        if end is None:
+            yield from static_runner.iter_pattern_matches(
+                compiled, content, start=max(start, covered)
+            )
+            return
+        if start < covered:
+            continue
+        match = compiled.match(content, start, end)
+        if match is not None:
+            yield match
+            covered = match.end()
+
+
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for supply chain patterns (SC1–SC3, SC7)."""
     findings: list[AnalyzerFinding] = []
     line_starts = logical_line_starts(content)
     content_lines = content.splitlines()
+    shell_command_ranges = _sc2_shell_command_ranges(content, file_type)
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
@@ -1866,16 +2445,13 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
     tag = [PatternCategory.SUPPLY_CHAIN.value]
 
-    is_dep_file = any(
-        n in file_path.lower()
-        for n in ["requirements", "package.json", "pyproject.toml", "setup.py", "pipfile"]
-    )
+    is_dep_file = _is_dependency_manifest(file_path)
     if is_dep_file:
         for pattern, confidence in SC1_PATTERNS:
             matches = (
                 static_runner.iter_paragraph_matches
                 if (pattern, confidence) in SC1_PROSE_PATTERNS
-                else re.finditer
+                else static_runner.iter_pattern_matches
             )
             for match in matches(pattern, content, re.MULTILINE):
                 line_num = line_number(match.start())
@@ -1893,12 +2469,17 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     )
                 )
     for pattern, confidence in SC2_PATTERNS:
-        matches = (
-            static_runner.iter_paragraph_matches
-            if (pattern, confidence) in SC2_PROSE_PATTERNS
-            else re.finditer
-        )
-        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+        if (pattern, confidence) in _SC2_SHELL_PATTERNS:
+            matches = _iter_sc2_shell_matches(pattern, content, shell_command_ranges)
+        elif (pattern, confidence) in SC2_PROSE_PATTERNS:
+            matches = static_runner.iter_paragraph_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            )
+        else:
+            matches = static_runner.iter_pattern_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            )
+        for match in matches:
             line_num = line_number(match.start())
             mt = match.group(0)
             warned_internal_installer = _is_warned_internal_installer(
@@ -2005,15 +2586,21 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     sc3_patterns = (
         SC3_PATTERNS
         if file_type in ("python", "javascript", "shell", "perl", "powershell", "other")
+        or file_path.lower().endswith(".mdc")
         else []
     )
     if has_shell_decoder:
         sc3_patterns = sc3_patterns + SC3_SHELL_PATTERNS
     for pattern, confidence in sc3_patterns:
+        # Shell-decoder rules already bound every stage/literal and use atomic
+        # or possessive ambiguous groups. Keep their audited native matcher;
+        # the interruptible engine adds enough cost to reject dense input.
         matches = (
-            static_runner.iter_paragraph_matches
+            re.finditer
+            if pattern in (_SC3_BOUNDED_PIPE_PATTERN, _SC3_BOUNDED_SUBSTITUTION_PATTERN)
+            else static_runner.iter_paragraph_matches
             if (pattern, confidence) in SC3_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = line_number(match.start())
@@ -2032,7 +2619,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     # SC7: untrusted container image. Example filtering is delegated to the runner.
     for pattern, confidence in SC7_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = line_number(match.start())
             findings.append(
                 AnalyzerFinding(
@@ -2469,6 +3058,15 @@ def _sc4_from_osv_detailed(
                 f" — {len(vulns)} advisory(ies): {vuln_desc}"
             )
             matched_text = f"{pkg_name}=={pkg_version}"
+            explanation = (
+                "OSV returned vulnerability advisories matching the dependency's resolved "
+                "version. Review the matched advisories to assess their impact."
+            )
+            remediation = (
+                "Review the matched advisories in OSV (osv.dev) for affected and fixed releases. "
+                "If a fixed release is available, update to a release that addresses the "
+                "matched advisories; otherwise remove or replace the affected dependency."
+            )
         else:
             # No resolvable version: OSV was queried by name only, so these advisories are
             # NOT matched against the release that will actually be installed — they are the
@@ -2484,6 +3082,17 @@ def _sc4_from_osv_detailed(
                 " whether the installed release is affected"
             )
             matched_text = pkg_name
+            explanation = (
+                "OSV returned advisories for this package, but its resolved version is "
+                "unknown. A package-name lookup does not establish whether the installed "
+                "release is affected by those advisories."
+            )
+            remediation = (
+                "Determine the dependency's exact resolved version from the environment or "
+                "lockfile and compare it with the advisories in OSV (osv.dev). If it is "
+                "affected, use a verified fixed release or remove or replace the dependency "
+                "when no fix is available."
+            )
         findings.append(
             AnalyzerFinding(
                 rule_id="SC4",
@@ -2493,6 +3102,8 @@ def _sc4_from_osv_detailed(
                 confidence=confidence,
                 tags=tag,
                 matched_text=matched_text,
+                explanation=explanation,
+                remediation=remediation,
             )
         )
     limitations = (
@@ -2524,6 +3135,16 @@ def _sc4_from_fallback(
                         confidence=confidence,
                         tags=tag,
                         matched_text=pkg_name,
+                        explanation=(
+                            "The static fallback database identifies this package as vulnerable "
+                            "or malicious without a version threshold. This evidence does not "
+                            "identify an available fixed release."
+                        ),
+                        remediation=(
+                            "Review the cited advisory and remove or replace the affected "
+                            "dependency with a maintained alternative. Do not assume a version "
+                            "upgrade resolves the issue without verifying the advisory."
+                        ),
                     )
                 )
             elif pkg_version and _version_lt(pkg_version, max_safe):
@@ -2539,6 +3160,16 @@ def _sc4_from_fallback(
                         confidence=confidence,
                         tags=tag,
                         matched_text=f"{pkg_name}=={pkg_version}",
+                        explanation=(
+                            "The dependency's resolved version is below the fixed-version "
+                            "threshold recorded in the static fallback database. Review the "
+                            "cited advisory to confirm applicability."
+                        ),
+                        remediation=(
+                            f"Update the dependency to version {max_safe} or later, as recorded "
+                            "in the static fallback database, and verify the cited advisory "
+                            "and compatibility before installing."
+                        ),
                     )
                 )
     return findings
@@ -2576,14 +3207,15 @@ def _analyze_dependencies_detailed(
     limitations: list[OsvQueryLimitation] = []
     tag = [PatternCategory.SUPPLY_CHAIN.value]
 
-    lower_path = file_path.lower()
-    is_lockfile = _is_python_lockfile(lower_path)
-    is_npm_lock = _is_npm_lockfile(lower_path)
+    filename = _dependency_filename(file_path)
+    is_lockfile = _is_python_lockfile(file_path)
+    is_npm_lock = _is_npm_lockfile(file_path)
     is_python_dep = (
-        any(n in lower_path for n in ["requirements", "pyproject.toml", "setup.py", "pipfile"])
+        _is_requirements_file(file_path)
+        or filename in {"pyproject.toml", "setup.py", "pipfile", "pipfile.lock"}
         or is_lockfile
     )
-    is_npm_dep = "package.json" in lower_path or is_npm_lock
+    is_npm_dep = filename == "package.json" or is_npm_lock
 
     if not is_python_dep and not is_npm_dep:
         return findings, limitations, 0
@@ -2597,18 +3229,34 @@ def _analyze_dependencies_detailed(
     )
     extraction_limit = package_limit + 1
 
+    def record_parse_error(error_class: str) -> None:
+        limitations.append(
+            OsvQueryLimitation(
+                reason=LedgerReason.DEPENDENCY_PARSE_ERROR,
+                error_class=error_class,
+            )
+        )
+
     if is_python_dep:
-        if Path(file_path).name.lower() in {"pipfile", "pipfile.lock"}:
+        if filename in {"pipfile", "pipfile.lock"}:
             packages, parse_limitations = _extract_packages_from_pipenv(
                 content,
                 is_lockfile=_is_pipenv_lockfile(file_path),
                 limit=extraction_limit,
             )
             limitations.extend(parse_limitations)
-        elif "pyproject.toml" in lower_path:
-            packages = _extract_packages_from_pyproject(content, limit=extraction_limit)
+        elif filename == "pyproject.toml":
+            packages = _extract_packages_from_pyproject(
+                content,
+                limit=extraction_limit,
+                on_parse_error=record_parse_error,
+            )
         elif is_lockfile:
-            packages = _extract_packages_from_toml_lock(content, limit=extraction_limit)
+            packages = _extract_packages_from_toml_lock(
+                content,
+                limit=extraction_limit,
+                on_parse_error=record_parse_error,
+            )
         else:
             packages, oversized_spec = _extract_packages_from_requirements_detailed(
                 content,
@@ -2627,18 +3275,28 @@ def _analyze_dependencies_detailed(
         ecosystem = ECOSYSTEM_PYPI
         fallback_db = _FALLBACK_VULNERABLE_PYPI
         popular = _POPULAR_PYPI
+        known_legit = _KNOWN_LEGIT_PYPI
     else:
         if is_npm_lock:
-            packages = _extract_packages_from_npm_lock(content, limit=extraction_limit)
+            packages = _extract_packages_from_npm_lock(
+                content,
+                limit=extraction_limit,
+                on_parse_error=record_parse_error,
+            )
         else:
             packages = _apply_locked_versions(
-                _extract_packages_from_package_json(content, limit=extraction_limit),
+                _extract_packages_from_package_json(
+                    content,
+                    limit=extraction_limit,
+                    on_parse_error=record_parse_error,
+                ),
                 npm_locked_versions,
                 _normalize_npm_package_name,
             )
         ecosystem = ECOSYSTEM_NPM
         fallback_db = _FALLBACK_VULNERABLE_NPM
         popular = _POPULAR_NPM
+        known_legit = _KNOWN_LEGIT_NPM
 
     if len(packages) > package_limit:
         limitations.append(
@@ -2711,7 +3369,7 @@ def _analyze_dependencies_detailed(
         logger.debug(
             "SC4: using static fallback for %d uncovered packages", len(uncovered_packages)
         )
-    elif uncovered_packages and not osv_findings and not was_osv_reachable():
+    elif uncovered_packages and not osv_findings and not was_osv_reachable(osv_budget):
         # OSV.dev was unreachable and fallback found nothing — surface the gap
         retain(
             [
@@ -2728,6 +3386,18 @@ def _analyze_dependencies_detailed(
                     confidence=1.0,
                     tags=tag,
                     matched_text="SC4 fallback active",
+                    explanation=(
+                        "The live vulnerability lookup failed, and the limited static fallback "
+                        "database found no matching advisory. Vulnerability coverage is "
+                        "incomplete; this does not establish that the dependencies are "
+                        "vulnerable or safe."
+                    ),
+                    remediation=(
+                        "Retry the scan and verify dependency versions against current "
+                        "advisories before relying on the incomplete results. If the lookup "
+                        "timed out or the network was unavailable, check connectivity to "
+                        "api.osv.dev or adjust SKILLSPECTOR_OSV_TIMEOUT before retrying."
+                    ),
                 )
             ]
         )
@@ -2753,7 +3423,12 @@ def _analyze_dependencies_detailed(
             )
 
         # SC6: Typosquatting
-        similar = _is_typosquat(pkg_name, popular)
+        similar = _is_typosquat(
+            pkg_name,
+            popular,
+            known_legit=known_legit,
+            pep503=ecosystem == ECOSYSTEM_PYPI,
+        )
         if similar:
             retain(
                 [
@@ -2911,7 +3586,6 @@ def _analyze_triggers(
 
     for i, clause in enumerate(description_clauses, 1):
         clause_lower = clause.lower().strip()
-        words = clause_lower.split()
 
         # TR1 (description-calibrated): extract the trigger phrase the skill
         # claims to activate on ("whenever the user says hello") and apply
@@ -2922,17 +3596,11 @@ def _analyze_triggers(
             phrase = phrase_match.group("phrase")
             phrase_lower = phrase.lower()
             phrase_words = phrase_lower.split()
-            # A broad word followed only by trailing discourse words names
-            # the broad word ("says hello there"); anything else multiword
-            # names a phrase and is not an overly broad single-word trigger.
-            broad_head_with_prose_tail = (
-                len(phrase_words) > 1
-                and phrase_words[0] in _OVERLY_BROAD_SINGLE_WORDS
-                and all(word in _DESCRIPTION_TRAILING_DISCOURSE_WORDS for word in phrase_words[1:])
-            )
-            if (
-                len(phrase_words) == 1 and phrase_lower in _OVERLY_BROAD_SINGLE_WORDS
-            ) or broad_head_with_prose_tail:
+            # A multiword phrase names the complete bounded wording, even
+            # when its final word could also be read as discourse prose. In
+            # particular, "go there" and "work now" are valid phrases and
+            # must not be reduced to the broad heads "go" and "work".
+            if len(phrase_words) == 1 and phrase_lower in _OVERLY_BROAD_SINGLE_WORDS:
                 broad_word = phrase_words[0]
                 findings.append(
                     Finding(
@@ -2978,11 +3646,11 @@ def _analyze_triggers(
         # capability or documentation prose such as "Show available build
         # commands" merely discusses commands and stays out of the trigger
         # path. Invocation clauses pass the extraction gate on their own, so
-        # no broad-activation wording is required.
-        shadowed = sorted(
-            {cmd for cmd in _BUILTIN_COMMANDS if cmd in {w.lstrip("/") for w in words}}
-        )
-        if shadowed and _DESCRIPTION_COMMAND_INTERCEPTION_RE.search(clause):
+        # no broad-activation wording is required. The shadowed command must
+        # be the object of that claim: "/ask-matt" does not shadow "ask", and
+        # the noun "ask" elsewhere in the clause is not an invocation.
+        shadowed = _description_shadowed_commands(clause)
+        if shadowed:
             findings.append(
                 Finding(
                     rule_id="TR2",
@@ -3549,36 +4217,24 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     dependency_packages_seen = 0
     dependency_findings_seen = 0
     osv_budget = OsvQueryBudget.create(dependency_remaining_seconds())
+    # Stop analysis at the first cutoff, but account for every omitted manifest.
+    dependency_cutoff: OsvQueryLimitation | None = None
     for path in components:
-        lower_path = path.lower()
-        is_dep_file = any(
-            n in lower_path
-            for n in [
-                "requirements",
-                "package.json",
-                "package-lock.json",
-                "npm-shrinkwrap.json",
-                "pyproject.toml",
-                "setup.py",
-                "pipfile",
-                "uv.lock",
-                "poetry.lock",
-            ]
-        )
+        is_dep_file = _is_dependency_manifest(path)
         if not is_dep_file:
+            continue
+        if dependency_cutoff is not None:
+            record_limitation(path, dependency_cutoff, f"{ANALYZER_ID}_dependencies")
             continue
         dependency_files_seen += 1
         if dependency_files_seen > max(0, MAX_DEPENDENCY_FILES_PER_SCAN):
-            record_limitation(
-                path,
-                OsvQueryLimitation(
-                    reason=LedgerReason.OUTPUT_LIMIT,
-                    observed_records=dependency_files_seen,
-                    limit_records=max(0, MAX_DEPENDENCY_FILES_PER_SCAN),
-                ),
-                f"{ANALYZER_ID}_dependencies",
+            dependency_cutoff = OsvQueryLimitation(
+                reason=LedgerReason.OUTPUT_LIMIT,
+                observed_records=dependency_files_seen,
+                limit_records=max(0, MAX_DEPENDENCY_FILES_PER_SCAN),
             )
-            break
+            record_limitation(path, dependency_cutoff, f"{ANALYZER_ID}_dependencies")
+            continue
         remaining_packages = max(
             0,
             MAX_DEPENDENCY_PACKAGES_PER_SCAN - dependency_packages_seen,
@@ -3591,36 +4247,30 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             ),
         )
         if remaining_packages <= 0 or remaining_dependency_findings <= 0:
-            record_limitation(
-                path,
-                OsvQueryLimitation(
-                    reason=LedgerReason.OUTPUT_LIMIT,
-                    observed_records=(
-                        dependency_packages_seen + 1
-                        if remaining_packages <= 0
-                        else dependency_findings_seen + 1
-                    ),
-                    limit_records=(
-                        MAX_DEPENDENCY_PACKAGES_PER_SCAN
-                        if remaining_packages <= 0
-                        else MAX_DEPENDENCY_FINDINGS_PER_SCAN
-                    ),
+            dependency_cutoff = OsvQueryLimitation(
+                reason=LedgerReason.OUTPUT_LIMIT,
+                observed_records=(
+                    dependency_packages_seen + 1
+                    if remaining_packages <= 0
+                    else dependency_findings_seen + 1
                 ),
-                f"{ANALYZER_ID}_dependencies",
+                limit_records=(
+                    MAX_DEPENDENCY_PACKAGES_PER_SCAN
+                    if remaining_packages <= 0
+                    else MAX_DEPENDENCY_FINDINGS_PER_SCAN
+                ),
             )
-            break
+            record_limitation(path, dependency_cutoff, f"{ANALYZER_ID}_dependencies")
+            continue
         shared_remaining = dependency_remaining_seconds()
         if shared_remaining <= 0:
-            record_limitation(
-                path,
-                OsvQueryLimitation(
-                    reason=LedgerReason.RUNTIME_LIMIT,
-                    observed_seconds=max(0.0, time.monotonic() - dependency_started_at),
-                    limit_seconds=dependency_runtime_limit,
-                ),
-                f"{ANALYZER_ID}_dependencies",
+            dependency_cutoff = OsvQueryLimitation(
+                reason=LedgerReason.RUNTIME_LIMIT,
+                observed_seconds=max(0.0, time.monotonic() - dependency_started_at),
+                limit_seconds=dependency_runtime_limit,
             )
-            break
+            record_limitation(path, dependency_cutoff, f"{ANALYZER_ID}_dependencies")
+            continue
         content = file_cache.get(path)
         if content is None:
             continue

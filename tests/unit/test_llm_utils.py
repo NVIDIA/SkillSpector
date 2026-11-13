@@ -23,6 +23,9 @@ in the active provider — see ``tests/unit/test_providers.py``.
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
+import textwrap
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -59,7 +62,6 @@ from skillspector.providers import (
     use_provider,
 )
 from skillspector.providers.nv_build import NvBuildProvider
-from skillspector.providers.openai import OpenAIProvider
 from skillspector.structured_response import (
     MAX_RESPONSE_CHARS,
     MAX_RESPONSE_DEPTH,
@@ -76,7 +78,6 @@ _LLM_ENV_VARS = (
     "SKILLSPECTOR_REASONING_EFFORT",
     "SKILLSPECTOR_MODEL",
     "SKILLSPECTOR_PROVIDER",
-    "SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD",
 )
 
 
@@ -86,6 +87,69 @@ def _clean_llm_env(monkeypatch: pytest.MonkeyPatch):
     for var in _LLM_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     yield
+
+
+@pytest.mark.parametrize("kind", ["provider", "controls"])
+def test_model_metadata_cleanup_can_reenter_registration(kind: str) -> None:
+    """Collect an older model during registration without stranding pytest."""
+    script = textwrap.dedent(
+        """
+        import gc
+        import sys
+        import weakref
+
+        from skillspector import inference_usage, llm_utils
+
+        gc.disable()
+
+        class Model:
+            pass
+
+        class CollectingRegistry(dict):
+            armed = False
+
+            def __setitem__(self, key, value):
+                if self.armed:
+                    self.armed = False
+                    gc.collect()
+                super().__setitem__(key, value)
+
+        registry = CollectingRegistry()
+        if sys.argv[1] == "provider":
+            llm_utils._CHAT_MODEL_PROVIDERS = registry
+
+            def register(model):
+                llm_utils.register_chat_model_provider(model, "test-provider")
+        else:
+            inference_usage._CHAT_MODEL_CONTROLS = registry
+
+            def register(model):
+                inference_usage.register_chat_model_controls(
+                    model, {"temperature": 0.25},
+                    requested_controls={"temperature": 0.5},
+                )
+
+        old = Model()
+        old.cycle = old
+        old_id, old_ref = id(old), weakref.ref(old)
+        register(old)
+        del old
+        registry.armed = True
+        current = Model()
+        register(current)
+        assert old_ref() is None
+        assert old_id not in registry
+        if sys.argv[1] == "provider":
+            assert llm_utils.chat_model_provider_name(current) == "test-provider"
+        else:
+            assert inference_usage.chat_model_controls(current) == {"temperature": 0.25}
+            assert inference_usage.chat_model_requested_controls(current) == {"temperature": 0.5}
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, kind], capture_output=True, text=True, timeout=20
+    )
+    assert result.returncode == 0, result.stderr
 
 
 class TestCredentialResolution:
@@ -281,6 +345,16 @@ class TestChatCompletion:
 
 
 class TestIsLlmAvailable:
+    def test_unbound_gemini_uses_bounded_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "gemini")
+        resolve = MagicMock(return_value=("token", "https://example.invalid"))
+        monkeypatch.setattr(
+            "skillspector.providers.gemini.provider.GeminiProvider.resolve_credentials", resolve
+        )
+
+        assert is_llm_available(timeout=7) == (True, None)
+        resolve.assert_called_once_with(timeout=7)
+
     def test_returns_true_when_credentials_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "k")
         ok, msg = is_llm_available()
@@ -631,7 +705,7 @@ class TestGetChatModelCLIAdapter:
         provider = MagicMock()
         provider.complete.return_value = '{"verdict": "ok"}'
         model = AgentCLIChatModel(provider, "claude-sonnet-4-6", 1024, timeout=30.0)
-        runnable = model.with_structured_output(_Schema)
+        runnable = model.with_structured_output(_Schema, method=method)
 
         model.set_timeout(4.5)
         runnable.invoke("prompt")
@@ -772,7 +846,7 @@ class TestGetChatModel:
 
         llm = get_chat_model()
 
-        assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
+        assert _chat_model_name(llm) == "gpt-6.1-sol"
 
     def test_graph_model_config_matches_openai_fallback_client(
         self, monkeypatch: pytest.MonkeyPatch
@@ -782,8 +856,8 @@ class TestGetChatModel:
         model = build_model_config()["default"]
         llm = get_chat_model(model=model)
 
-        assert model == OpenAIProvider.DEFAULT_MODEL
-        assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
+        assert model == "gpt-6.1-sol"
+        assert _chat_model_name(llm) == "gpt-6.1-sol"
 
     def test_explicit_model_still_overrides_openai_fallback(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1071,6 +1145,8 @@ class TestStructuredOutputMethod:
     def test_chat_openai_with_tool_choice_disabled_asks_for_the_call(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        from skillspector.providers.openai_compatible import OpenAICompatibleProvider
+
         monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
         monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
         llm, requests = _stub_chat_openai(
@@ -1084,11 +1160,7 @@ class TestStructuredOutputMethod:
             ],
         )
         chain = bind_structured_output(
-            llm,
-            Verdict,
-            "spark-x2.5",
-            provider=_PlainProvider(),
-            preferred_method="function_calling",
+            llm, Verdict, "spark-x2.5", provider=OpenAICompatibleProvider()
         )
         with pytest.raises(StructuredOutputParseError, match="Verdict"):
             chain.invoke("analyse this")  # type: ignore[attr-defined]

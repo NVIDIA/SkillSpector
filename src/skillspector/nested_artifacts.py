@@ -49,9 +49,16 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.passive_svg import is_structurally_valid_passive_svg
 from skillspector.python_ast import PythonSourceClassification, classify_python_source
+from skillspector.resource_limits import bounded_capacity
 
 ARCHIVE_MAX_DEPTH = 3
-ARCHIVE_MAX_MEMBERS = 1_000
+ARCHIVE_MAX_MEMBERS = bounded_capacity("SKILLSPECTOR_ARCHIVE_MAX_MEMBERS", 4_096, 10_000)
+ARCHIVE_MAX_MEMBER_BYTES = bounded_capacity(
+    "SKILLSPECTOR_ARCHIVE_MAX_MEMBER_BYTES", MAX_FILE_BYTES, MAX_ANALYZABLE_FILE_BYTES
+)
+ARCHIVE_MAX_WORKSHEET_BYTES = bounded_capacity(
+    "SKILLSPECTOR_ARCHIVE_MAX_MEMBER_BYTES", MAX_ANALYZABLE_FILE_BYTES, MAX_ANALYZABLE_FILE_BYTES
+)
 ARCHIVE_MAX_UNCOMPRESSED_BYTES = 25 * 1024 * 1024
 ARCHIVE_MAX_CENTRAL_DIRECTORY_BYTES = 4 * 1024 * 1024
 ARCHIVE_MAX_COMPRESSION_RATIO = 100
@@ -814,6 +821,7 @@ def _virtual_type(
     suffix = Path(path).suffix.lower()
     return {
         ".md": "markdown",
+        ".mdc": "markdown",
         ".markdown": "markdown",
         ".py": "python",
         ".pyw": "python",
@@ -1332,7 +1340,7 @@ def _inspect_zip_bytes(
                 )
                 continue
             member_limit = (
-                MAX_ANALYZABLE_FILE_BYTES
+                min(ARCHIVE_MAX_WORKSHEET_BYTES, MAX_ANALYZABLE_FILE_BYTES)
                 if safe_name in worksheet_parts
                 else budget.max_member_bytes
             )
@@ -2233,7 +2241,7 @@ def inspect_nested_artifacts(
         max_members=member_limit,
         max_uncompressed_bytes=byte_limit,
         max_central_directory_bytes=ARCHIVE_MAX_CENTRAL_DIRECTORY_BYTES,
-        max_member_bytes=MAX_FILE_BYTES,
+        max_member_bytes=ARCHIVE_MAX_MEMBER_BYTES,
         max_depth=ARCHIVE_MAX_DEPTH,
         max_compression_ratio=ARCHIVE_MAX_COMPRESSION_RATIO,
         deadline=deadline,

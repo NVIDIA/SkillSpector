@@ -40,6 +40,7 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 from . import static_runner
 from .common import get_context, get_line_number
 from .pattern_defaults import PatternCategory
+from .prohibition_context import is_directly_prohibited
 
 logger = get_logger(__name__)
 
@@ -118,7 +119,7 @@ AS3_CODE_PATTERNS = [
         r"(?:os\.listdir|os\.scandir|glob\.glob|Path\.iterdir)\s*\([^)]*\.(?:claude|codex|gemini)/skills?",
         0.9,
     ),
-    (r"(?:ls|find|dir)\s+[^|&;\n]*\.(?:claude|codex|gemini)/skills?", 0.85),
+    (r"(?<![\w-])g?(?:ls|find|dir)\s+[^|&;\n]*\.(?:claude|codex|gemini)/skills?", 0.85),
     # Reading other skills' SKILL.md files
     (r"open\s*\(\s*['\"][^'\"]*SKILL\.md['\"].*?\bother\b", 0.85),
     # Accessing skills/CURRENT or adjacent skill directories
@@ -159,7 +160,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in AS1_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -181,7 +182,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         matches = (
             static_runner.iter_paragraph_matches
             if (pattern, confidence) in AS2_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -200,12 +201,13 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
 
     for pattern, confidence in AS3_PATTERNS:
+        is_prose = (pattern, confidence) in AS3_PROSE_PATTERNS
         matches = (
-            static_runner.iter_paragraph_matches
-            if (pattern, confidence) in AS3_PROSE_PATTERNS
-            else re.finditer
+            static_runner.iter_paragraph_matches if is_prose else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            if is_prose and is_directly_prohibited(content, match.start(), match.end()):
+                continue
             full_match = match.group(0)
             if _is_current_skill_path_reference(
                 full_match, _CURRENT_SKILL_IDENTIFIERS.get()

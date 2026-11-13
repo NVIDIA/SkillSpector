@@ -26,8 +26,10 @@ import binascii
 import json
 import os
 import re
+import shlex
 import tarfile
 from collections.abc import Callable, Mapping
+from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from stat import S_ISREG
 from time import monotonic
@@ -76,6 +78,7 @@ from skillspector.nested_artifacts import (
     is_executable_content,
 )
 from skillspector.oms import project_oms_content
+from skillspector.providers import prepare_chat_model_imports
 from skillspector.python_ast import (
     PythonSourceClassification,
     classify_python_source,
@@ -146,6 +149,7 @@ def _is_allowed_inactive_git_hook_template(path: str, probe: bytes) -> bool:
 # File type by extension
 _FILE_TYPES: dict[str, str] = {
     ".md": "markdown",
+    ".mdc": "markdown",
     ".markdown": "markdown",
     ".py": "python",
     ".pyw": "python",
@@ -825,6 +829,78 @@ def _is_hidden_component(path: str) -> bool:
     return any(part.startswith(".") for part in path.replace("\\", "/").split("/") if part)
 
 
+def _is_conventional_skill_script(skill_dir: Path, path: str, data: bytes) -> bool:
+    """Return whether a visible source script belongs to a standard agent skill directory."""
+    parts = path.replace("\\", "/").split("/")
+    if len(parts) < 4 or parts[0:2] not in ([".agents", "skills"], [".claude", "skills"]):
+        return False
+    skill_name = parts[2]
+    if (
+        not skill_name
+        or skill_name.startswith(".")
+        or any(part.startswith(".") for part in parts[3:])
+    ):
+        return False
+    suffix = Path(parts[-1]).suffix.lower()
+    if suffix not in {
+        ".bash",
+        ".cjs",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".php",
+        ".pl",
+        ".ps1",
+        ".py",
+        ".rb",
+        ".sh",
+        ".ts",
+        ".tsx",
+        ".zsh",
+    } or has_binary_executable_magic(data):
+        return False
+
+    first_line = data.splitlines()[0] if data.splitlines() else b""
+    if first_line.startswith(b"#!"):
+        try:
+            tokens = shlex.split(first_line[2:].decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, ValueError):
+            return False
+        if not tokens:
+            return False
+        interpreter = Path(tokens[0]).name
+        if interpreter == "env":
+            interpreter = next(
+                (token for token in tokens[1:] if not token.startswith("-") and "=" not in token),
+                "",
+            )
+        interpreter = Path(interpreter).name.removesuffix(".exe").lower()
+        compatible = {
+            ".bash": {"bash"},
+            ".cjs": {"node", "nodejs", "bun"},
+            ".js": {"node", "nodejs", "bun", "deno"},
+            ".jsx": {"node", "nodejs", "bun", "deno"},
+            ".mjs": {"node", "nodejs", "bun", "deno"},
+            ".php": {"php"},
+            ".pl": {"perl"},
+            ".ps1": {"pwsh", "powershell"},
+            ".py": {"python", "python2", "python3", "pypy", "pypy3"},
+            ".rb": {"ruby"},
+            ".sh": {"sh", "bash", "dash", "ksh", "zsh"},
+            ".ts": {"node", "nodejs", "bun", "deno", "tsx"},
+            ".tsx": {"node", "nodejs", "bun", "deno", "tsx"},
+            ".zsh": {"zsh"},
+        }
+        if not interpreter or interpreter not in compatible[suffix]:
+            return False
+
+    skill_root = skill_dir.joinpath(*parts[:3])
+    return any(
+        (manifest := skill_root / name).is_file() and not _is_symlink(manifest)
+        for name in ("SKILL.md", "skill.md")
+    )
+
+
 def _decode_base64_json(value: object) -> dict[str, object] | None:
     """Decode a strict base64 JSON object, returning ``None`` on malformed input."""
     if not isinstance(value, str) or not value:
@@ -981,6 +1057,12 @@ def _build_component_metadata(
             "size_bytes": size_bytes,
         }
         hidden_component = _is_hidden_component(path)
+        conventional_skill_script = (
+            executable
+            and hidden_component
+            and not source_local_only
+            and _is_conventional_skill_script(skill_dir, path, data)
+        )
         if hidden_component or source_local_only:
             component["local_only"] = True
             if hidden_component:
@@ -988,7 +1070,7 @@ def _build_component_metadata(
             if source_local_only:
                 component["hidden_ancestor"] = True
                 component["source_local_only"] = True
-            if executable:
+            if executable and (source_local_only or not conventional_skill_script):
                 component.update(
                     {
                         "outer_path": path,
@@ -1001,6 +1083,9 @@ def _build_component_metadata(
                         "concealment_reasons": ["hidden_artifact"],
                     }
                 )
+            elif executable:
+                component["concealed_executable"] = False
+                component["hidden_skill_script_llm_review_withheld"] = True
         metadata.append(component)
         if _expired(path):
             break
@@ -1092,6 +1177,24 @@ def _mark_unanalyzed_executables(
             )
         )
     return events
+
+
+def _note_hidden_skill_scripts_not_sent_to_llm(
+    component_metadata: list[dict[str, object]],
+) -> list[InspectionLedgerEvent]:
+    """Expose the local-only boundary without turning helpers into SC9 findings."""
+    return [
+        ledger_event(
+            outcome=LedgerOutcome.SKIPPED,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="llm_eligibility",
+            path=str(component["path"]),
+            reason=LedgerReason.HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY,
+        )
+        for component in component_metadata
+        if component.get("hidden_skill_script_llm_review_withheld") is True
+        and isinstance(component.get("path"), str)
+    ]
 
 
 def _redact_for_external_model(path: str, content: str) -> str:
@@ -2673,6 +2776,43 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         excluded_artifacts,
         excluded_inspection_gaps,
     ) = _walk_skill_files(skill_dir, state)
+    patterns = state.get("exclude_patterns", [])
+    if len(patterns) > 128 or any(
+        not isinstance(pattern, str)
+        or not pattern
+        or len(pattern) > 1024
+        or pattern.startswith("/")
+        or "\\" in pattern
+        or ".." in pattern.split("/")
+        or any(ord(char) < 32 for char in pattern)
+        for pattern in patterns
+    ):
+        raise ValueError("Exclusions require at most 128 relative POSIX globs (1-1024 characters)")
+    if any(
+        fnmatchcase(manifest, pattern)
+        for manifest in ("SKILL.md", "skill.md")
+        for pattern in patterns
+    ):
+        raise ValueError("--exclude must not match the required SKILL.md manifest")
+    user_excluded = sorted(
+        path
+        for path in inventoried_components
+        if any(fnmatchcase(path, pattern) for pattern in patterns)
+    )
+    user_excluded_set = set(user_excluded)
+    inventoried_components = [
+        path for path in inventoried_components if path not in user_excluded_set
+    ]
+    user_exclusion_events = [
+        ledger_event(
+            outcome=LedgerOutcome.SKIPPED,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="explicit_exclusion",
+            path=path,
+            reason=LedgerReason.USER_EXCLUSION,
+        )
+        for path in user_excluded
+    ]
     selected_baseline = _selected_baseline_component(state, skill_dir, inventoried_components)
     selected_baselines = frozenset({selected_baseline} if selected_baseline else set())
     for path in selected_baselines:
@@ -2716,6 +2856,20 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             MAX_TOTAL_CACHED_BYTES - sum(len(data) for data in raw_file_cache.values()),
         ),
         incomplete_exclusions=excluded_inspection_gaps,
+    )
+    artifact_inventory.extend(
+        {
+            "path": path,
+            "content_kind": ContentKind.OPAQUE,
+            "disposition": ArtifactDisposition.PARTIAL,
+            "size_bytes": 0,
+            "decodable": False,
+            "contains_nul": False,
+            "misleading_extension": False,
+            "referenced": False,
+            "reason": LedgerReason.USER_EXCLUSION.value,
+        }
+        for path in user_excluded
     )
     artifact_inventory = sorted(
         [*artifact_inventory, *excluded_inventory], key=lambda item: item["path"]
@@ -2823,12 +2977,17 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                         else None
                     ),
                     known_paths=sorted(
-                        dict.fromkeys([*inventoried_components, *excluded_artifacts])
+                        dict.fromkeys(
+                            [*inventoried_components, *excluded_artifacts, *user_excluded]
+                        )
                     ),
                     clock=monotonic,
                     deadline=processing_deadline,
                 )
         references = resolution.records
+        for reference in references:
+            if reference.get("target_path") in user_excluded_set:
+                reference["disposition"] = ArtifactDisposition.PARTIAL
         primary_artifact = inventory_by_path.get(primary_path)
         primary_partial = (
             primary_artifact is not None
@@ -3761,6 +3920,12 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         {item["path"]: item for item in artifact_inventory},
         raw_file_cache,
     )
+    use_llm = state.get("use_llm", True)
+    hidden_skill_llm_events = (
+        _note_hidden_skill_scripts_not_sent_to_llm(component_metadata)
+        if use_llm is not False
+        else []
+    )
     has_executable_scripts = (
         has_executable_scripts
         or any(bool(metadata.get("executable")) for metadata in nested.metadata)
@@ -3776,7 +3941,16 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         if target and target in disposition_by_path:
             reference["disposition"] = disposition_by_path[target]
 
-    use_llm = state.get("use_llm", True)
+    remaining_seconds = transitive_remaining_seconds(state)
+    if use_llm and remaining_seconds is not None and remaining_seconds > 0:
+        try:
+            prepare_chat_model_imports()
+        except Exception as exc:
+            # Optional eager imports must preserve normal provider failure handling.
+            logger.debug("Could not prepare AI transport imports (%s)", type(exc).__name__)
+        remaining_seconds = transitive_remaining_seconds(state)
+        if remaining_seconds is not None and remaining_seconds <= 0:
+            logger.debug("Workflow deadline reached while preparing AI transport imports")
     model_config = build_model_config() if use_llm else {}
     llm_provenance = (
         capture_llm_provenance(model_config)
@@ -3802,6 +3976,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "inspection_ledger": _bounded_ledger_output(
             [
                 *discovery_events,
+                *user_exclusion_events,
                 *prework_events,
                 *signature_events,
                 *baseline_events,
@@ -3816,6 +3991,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 *structured_events,
                 *postprocessing_events,
                 *coverage_policy_events,
+                *hidden_skill_llm_events,
             ]
         ),
         "ast_cache": {},

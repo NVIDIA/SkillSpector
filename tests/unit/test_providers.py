@@ -26,13 +26,17 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 import skillspector.providers as providers_module
+import skillspector.providers._agent_cli as agent_cli_module
+import skillspector.providers._agent_cli_base as agent_cli_base_module
 import skillspector.providers.anthropic.provider as anthropic_provider_module
 from skillspector.inference_usage import chat_model_controls, chat_model_requested_controls
+from skillspector.llm_utils import get_chat_model
 from skillspector.providers import (
     NO_LLM_API_KEY_MESSAGE,
     chat_models,
@@ -110,6 +114,135 @@ class FakeProvider:
         return self.chat_model
 
 
+@pytest.mark.parametrize(
+    ("name", "credentials"),
+    [
+        ("openai", {"OPENAI_API_KEY": "test"}),
+        ("nv_build", {"NVIDIA_INFERENCE_KEY": "test"}),
+        ("ollama", {}),
+        (
+            "openai_compatible",
+            {
+                "SKILLSPECTOR_COMPAT_API_KEY": "test",
+                "SKILLSPECTOR_COMPAT_BASE_URL": "https://example.invalid/v1",
+            },
+        ),
+        (
+            "azure_openai",
+            {"AZURE_OPENAI_API_KEY": "test", "AZURE_OPENAI_ENDPOINT": "https://example.invalid"},
+        ),
+    ],
+)
+def test_prepare_transport_imports_without_creating_a_client(
+    monkeypatch: pytest.MonkeyPatch, name: str, credentials: dict[str, str]
+) -> None:
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", name)
+    for key, value in credentials.items():
+        monkeypatch.setenv(key, value)
+    imports: list[str] = []
+    monkeypatch.setattr(chat_models, "import_module", imports.append)
+
+    def unexpected_client(*args, **kwargs):
+        pytest.fail("Import preparation must not construct an unused client")
+
+    monkeypatch.setattr(chat_models, "ChatOpenAI", unexpected_client)
+    monkeypatch.setattr(chat_models, "AzureChatOpenAI", unexpected_client)
+    providers_module.prepare_chat_model_imports()
+
+    assert imports == ["httpcore", "openai.resources.chat.completions.completions"]
+
+
+@pytest.mark.parametrize("name", ["openai", "nv_build", "openai_compatible", "azure_openai"])
+def test_prepare_transport_imports_skips_unconfigured_bound_provider(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", name)
+    for key in (
+        "SKILLSPECTOR_COMPAT_API_KEY",
+        "SKILLSPECTOR_COMPAT_BASE_URL",
+        "AZURE_OPENAI_API_KEY",
+        "AZURE_OPENAI_ENDPOINT",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    imports: list[str] = []
+    monkeypatch.setattr(chat_models, "import_module", imports.append)
+
+    token = use_provider(get_active_provider())
+    try:
+        providers_module.prepare_chat_model_imports()
+    finally:
+        reset_provider(token)
+
+    assert imports == []
+
+
+def test_prepare_transport_imports_uses_actual_unbound_openai_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = NvBuildProvider()
+    monkeypatch.setattr(providers_module, "_select_active_provider", lambda: provider)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-fallback")
+    imports: list[str] = []
+    monkeypatch.setattr(chat_models, "import_module", imports.append)
+    monkeypatch.setattr(
+        provider, "prepare_chat_model_imports", lambda: pytest.fail("Wrong transport")
+    )
+
+    providers_module.prepare_chat_model_imports()
+
+    assert imports == ["httpcore", "openai.resources.chat.completions.completions"]
+
+
+def test_prepare_transport_imports_does_not_fall_back_for_explicit_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-fallback")
+    imports: list[str] = []
+    monkeypatch.setattr(chat_models, "import_module", imports.append)
+
+    token = use_provider(NvBuildProvider())
+    try:
+        providers_module.prepare_chat_model_imports()
+    finally:
+        reset_provider(token)
+
+    assert imports == []
+
+
+@pytest.mark.parametrize("name", ["claude_cli", "bedrock", "gemini", "anthropic_proxy", "custom"])
+def test_prepare_transport_imports_does_not_probe_providers_without_the_hook(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", name)
+    provider = get_active_provider() if name != "custom" else FakeProvider(name)
+    token = use_provider(provider)
+    try:
+        monkeypatch.setattr(
+            provider, "resolve_credentials", lambda: pytest.fail("Unexpected credential probe")
+        )
+        if has_cli_capability(provider):
+            monkeypatch.setattr(
+                provider, "is_available", lambda: pytest.fail("Unexpected CLI probe")
+            )
+        providers_module.prepare_chat_model_imports()
+    finally:
+        reset_provider(token)
+
+
+def test_prepare_transport_import_failure_does_not_construct_a_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+
+    def failed_import(name: str):
+        raise ImportError(name)
+
+    monkeypatch.setattr(chat_models, "import_module", failed_import)
+    with pytest.raises(ImportError, match="httpcore"):
+        providers_module.prepare_chat_model_imports()
+
+
 @pytest.fixture(autouse=True)
 def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     """Isolate provider-related env vars and the YAML cache for each test."""
@@ -122,10 +255,14 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("SKILLSPECTOR_TEMPERATURE", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_SEED", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_SCHEME", raising=False)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
     providers_module._INJECTED_PROVIDER.set(None)
     registry._load.cache_clear()
     yield
@@ -366,7 +503,7 @@ class TestOpenAIProvider:
     def test_default_model(self) -> None:
         provider = OpenAIProvider()
         assert provider.resolve_model() == "gpt-6.1-sol"
-        # All slots inherit DEFAULT_MODEL — gpt-6.1-sol everywhere.
+        # All slots retain the released maintenance default.
         assert provider.resolve_model("meta_analyzer") == "gpt-6.1-sol"
         assert provider.get_context_length(provider.DEFAULT_MODEL) == 1_050_000
         assert provider.get_max_output_tokens(provider.DEFAULT_MODEL) == 128_000
@@ -401,9 +538,98 @@ class TestOpenAIProvider:
             "gpt-5.6-sol",
             "gpt-5.6",
             "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6.1-sol",
         ):
             assert provider.get_context_length(model) == 1_050_000
             assert provider.get_max_output_tokens(model) == 128_000
+
+    def test_each_model_is_mapped_once(self) -> None:
+        """Every bundled registry maps each model ID exactly once.
+
+        ``yaml.safe_load`` collapses a repeated key to its last mapping,
+        so value-only lookup assertions stay green while the resolved
+        budget becomes loader-dependent. Reading keys via ``yaml.compose``
+        catches the duplication that lookup loops cannot.
+        """
+        root = Path(__file__).resolve().parents[2]
+        registries = [
+            root / "model_registry.yaml",
+            *root.glob("src/skillspector/providers/*/model_registry.yaml"),
+        ]
+        assert registries, "expected at least one bundled model registry"
+        for registry_path in registries:
+            doc = yaml.compose(registry_path.read_text(encoding="utf-8"))
+            models = next(v for k, v in doc.value if k.value == "models")
+            keys = [k.value for k, v in models.value]
+            assert len(keys) == len(set(keys)), (
+                f"{registry_path.name} maps {[k for k in keys if keys.count(k) > 1]} twice"
+            )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ROOT_MODEL_REGISTRY = REPO_ROOT / "model_registry.yaml"
+MODEL_REGISTRIES = sorted(
+    [ROOT_MODEL_REGISTRY]
+    + list((REPO_ROOT / "src" / "skillspector" / "providers").glob("*/model_registry.yaml"))
+)
+
+
+def _model_keys_as_written(registry_path: Path) -> list[str]:
+    """Return the ``models`` keys in document order, duplicates included.
+
+    ``yaml.safe_load`` keeps only the last of a repeated key, so asserting on
+    resolved budgets cannot see a model that was mapped twice. Composing the
+    node tree preserves every key exactly as the file spells it.
+    """
+    document = yaml.compose(registry_path.read_text(encoding="utf-8"))
+    for key_node, value_node in document.value:
+        if key_node.value == "models":
+            return [key.value for key, _ in value_node.value]
+    raise AssertionError(f"{registry_path} has no top-level 'models' mapping")
+
+
+class TestModelRegistryFiles:
+    """Integrity of the shipped YAML registries themselves."""
+
+    def test_registries_are_discovered(self) -> None:
+        # Guards the glob: an empty list would make the checks below vacuous.
+        assert ROOT_MODEL_REGISTRY in MODEL_REGISTRIES
+        assert len(MODEL_REGISTRIES) > 1
+
+    @pytest.mark.parametrize(
+        "registry_path",
+        MODEL_REGISTRIES,
+        ids=lambda path: path.relative_to(REPO_ROOT).as_posix(),
+    )
+    def test_each_model_is_mapped_once(self, registry_path: Path) -> None:
+        # Loaders disagree on duplicate keys — most keep the last mapping,
+        # strict ones reject the document — so mapping one model twice makes
+        # the resolved budget loader-dependent and lets the copies drift apart
+        # while value-only assertions stay green.
+        keys = _model_keys_as_written(registry_path)
+        duplicates = sorted({key for key in keys if keys.count(key) > 1})
+        assert not duplicates, f"{registry_path} maps these models more than once: {duplicates}"
+
+    def test_root_registry_replaces_bundled_yaml(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The repo-root file is the documented SKILLSPECTOR_MODEL_REGISTRY sample."""
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(ROOT_MODEL_REGISTRY))
+        provider = OpenAIProvider()
+
+        # Gateway-prefixed ids that only the root registry carries.
+        assert provider.get_context_length("openai/openai/gpt-5.3-chat") == 128_000
+        assert provider.get_max_output_tokens("openai/openai/gpt-5.3-chat") == 16_384
+        assert provider.get_context_length("azure/anthropic/claude-sonnet-4-6") == 1_000_000
+
+        # Budgets the root registry must keep in step with the bundled YAML,
+        # since an override replaces that file instead of merging with it.
+        assert provider.get_context_length("gpt-5.6-sol") == 1_050_000
+        assert provider.get_max_output_tokens("gpt-5.6-sol") == 128_000
+
+        # Same replacement rule from the other side: a bundled-only model has
+        # no budget at all while the override is in force.
+        assert provider.get_context_length("gpt-6-astra") is None
 
 
 class TestAnthropicProvider:
@@ -483,6 +709,17 @@ class TestAnthropicProvider:
         llm = AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123)
         assert isinstance(llm, ChatAnthropic)
         assert str(llm.anthropic_api_url).rstrip("/") == "http://localhost:8787"
+
+    def test_bearer_auth_scheme_sends_authorization_header(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "gateway-token")
+        monkeypatch.setenv("ANTHROPIC_AUTH_SCHEME", "bearer")
+        llm = AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123)
+        assert isinstance(llm, ChatAnthropic)
+        for client in (llm._client, llm._async_client):
+            assert client.default_headers["Authorization"] == "Bearer gateway-token"
+            assert "X-Api-Key" not in client.default_headers
 
     @pytest.mark.parametrize("effort", ["provider-specific-value"])
     def test_reasoning_effort_passthrough(
@@ -974,6 +1211,63 @@ class TestAntigravityCLIProvider:
         available, reason = AntigravityCLIProvider().is_available()
         assert available is False
         assert reason
+
+
+class TestAgentCLISessionCostWarning:
+    """A usable CLI provider warns once that every LLM call is a full session."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_warned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(agent_cli_base_module, "_cost_warned", set())
+
+    def test_warns_once_when_available(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(agent_cli_module, "is_available", lambda name: (True, None))
+        provider = ClaudeCLIProvider()
+        with caplog.at_level("WARNING", logger=agent_cli_base_module.logger.name):
+            assert provider.is_available() == (True, None)
+            assert provider.is_available() == (True, None)
+        warnings = [r for r in caplog.records if "separate claude session" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "--no-llm" in warnings[0].getMessage()
+
+    def test_silent_when_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(agent_cli_module, "is_available", lambda name: (False, "not logged in"))
+        with caplog.at_level("WARNING", logger=agent_cli_base_module.logger.name):
+            assert ClaudeCLIProvider().is_available() == (False, "not logged in")
+        assert not [r for r in caplog.records if "separate claude session" in r.getMessage()]
+
+    def test_warns_before_first_cli_call_without_availability_probe(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # `skillspector scan` builds its chat model before any CLI call and only
+        # probes is_available() from the report node, after the calls have run.
+        def _no_probe(name: str) -> tuple[bool, str | None]:
+            raise AssertionError("the scan path must warn without probing availability")
+
+        warned_before_call: list[bool] = []
+
+        def _run_agent_cli(binary: str, prompt: str, **kwargs: object) -> str:
+            warned_before_call.append(
+                any("separate claude session" in r.getMessage() for r in caplog.records)
+            )
+            return "pong"
+
+        monkeypatch.setattr(agent_cli_module, "is_available", _no_probe)
+        monkeypatch.setattr(agent_cli_module, "run_agent_cli", _run_agent_cli)
+        token = use_provider(ClaudeCLIProvider())
+        try:
+            with caplog.at_level("WARNING", logger=agent_cli_base_module.logger.name):
+                assert get_chat_model().invoke("ping").content == "pong"
+                assert get_chat_model().invoke("ping").content == "pong"
+        finally:
+            reset_provider(token)
+        assert warned_before_call == [True, True]
+        warnings = [r for r in caplog.records if "separate claude session" in r.getMessage()]
+        assert len(warnings) == 1
 
 
 class TestAgentCLIProviderMetadata:

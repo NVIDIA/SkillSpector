@@ -36,6 +36,7 @@ from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
+    bounded_inspection_notices,
     ledger_event,
 )
 from skillspector.logging_config import get_logger
@@ -230,6 +231,12 @@ def merge_inspection_ledger(
     ]
 
 
+def merge_inspection_notices(
+    existing: list[dict[str, object]], updates: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    return bounded_inspection_notices([*existing, *updates])
+
+
 class SkillspectorState(TypedDict, total=False):
     """Graph state shared by all nodes."""
 
@@ -269,6 +276,9 @@ class SkillspectorState(TypedDict, total=False):
     # External-model consumers use the redacted projection for sensitive local files.
     llm_file_cache: dict[str, str]
     artifact_inventory: list[ArtifactRecord]
+    # Opt-in, local-only inspection of exact artifacts from supported npm locks.
+    inspect_dependencies: bool
+    dependency_inspection: dict[str, object]
     artifact_references: list[BundleReference]
     reference_resolution: dict[str, object]
     # Retained for compatibility with the persisted workflow-state schema.
@@ -282,6 +292,7 @@ class SkillspectorState(TypedDict, total=False):
     # Accumulated canonical findings. Same-ID meta updates replace in place.
     findings: Annotated[list[Finding], merge_findings_by_id]
     inspection_ledger: Annotated[list[InspectionLedgerEvent], merge_inspection_ledger]
+    inspection_notices: Annotated[list[dict[str, object]], merge_inspection_notices]
     analyzer_status_events: Annotated[list[AnalyzerStatusEvent], operator.add]
     effective_finding_ids: list[str]
     # Whether meta-analysis had provider-eligible findings when it ran.  This
@@ -352,7 +363,11 @@ class SkillspectorState(TypedDict, total=False):
     # Report generation uses this to distinguish unavailable requested analysis from an
     # explicit static-only scan while analyzers continue to honor use_llm.
     llm_requested: bool
+    # Sanitized reason captured when caller preflight disables requested execution.
+    # Presence (including None) preserves that result without probing a new provider context.
     llm_preflight_error: str | None
+    # Explicit caller scope, recorded in public coverage accounting.
+    exclude_patterns: list[str]
     # Monotonic provenance flag: content rooted beneath a hidden/local-only
     # source remains in deterministic analysis but never enters provider input.
     source_local_only: bool
@@ -468,6 +483,7 @@ class AnalyzerNodeResponse(TypedDict):
 
     findings: list[Finding]
     inspection_ledger: NotRequired[list[InspectionLedgerEvent]]
+    inspection_notices: NotRequired[list[dict[str, object]]]
     analyzer_status_events: NotRequired[list[AnalyzerStatusEvent]]
     structured_summaries: NotRequired[list[dict[str, object]]]
     # LLM-backed analyzers also report one telemetry record; static analyzers

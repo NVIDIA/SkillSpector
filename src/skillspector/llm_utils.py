@@ -44,6 +44,7 @@ import weakref
 from collections.abc import Coroutine, Mapping
 from typing import Any, NoReturn
 
+from google.auth.exceptions import RefreshError
 from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
@@ -74,6 +75,7 @@ from skillspector.providers import (
     resolve_provider_credentials,
 )
 from skillspector.providers.chat_models import UnsupportedControlError, resolve_reasoning_effort
+from skillspector.providers.gemini import GeminiProvider
 from skillspector.providers.openai import OpenAIProvider
 from skillspector.structured_response import (
     MAX_RESPONSE_CHARS,
@@ -88,7 +90,8 @@ from skillspector.structured_response import (
 )
 
 _CHAT_MODEL_PROVIDERS: dict[int, tuple[weakref.ReferenceType[object], str]] = {}
-_CHAT_MODEL_PROVIDERS_LOCK = threading.Lock()
+# Cyclic GC may synchronously reenter this registry through weakref cleanup.
+_CHAT_MODEL_PROVIDERS_LOCK = threading.RLock()
 
 
 def register_chat_model_provider(chat_model: object, provider: object) -> None:
@@ -176,9 +179,11 @@ def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
                 max_tokens=get_max_output_tokens(model),
                 timeout=timeout,
             )
+        elif isinstance(provider, GeminiProvider):
+            provider.resolve_credentials(timeout=timeout)
         else:
             _resolve_llm_credentials()
-    except (ValueError, TimeoutError) as exc:
+    except (ValueError, RefreshError, TimeoutError) as exc:
         return False, str(exc)
     control_error = unsupported_control_error(timeout)
     return control_error is None, control_error
@@ -308,6 +313,20 @@ def _complete_agent_cli(
     )
 
 
+def structured_output_instructions(schema: type) -> str:
+    """Text a CLI provider's structured call appends after the analyzer prompt.
+
+    Exposed so prompt budgeting can measure the exact bytes the transport adds.
+    """
+    schema_json = json.dumps(schema.model_json_schema(), indent=2)
+    return (
+        "\n\n"
+        "Respond with ONLY a single JSON object conforming to the JSON Schema "
+        "below. Do not wrap it in markdown code fences and do not add any prose "
+        f"before or after the JSON.\n\nJSON Schema:\n{schema_json}"
+    )
+
+
 class _StructuredAgentCLIModel:
     """Mimics ``ChatOpenAI.with_structured_output(schema)`` for a CLI provider.
 
@@ -322,13 +341,7 @@ class _StructuredAgentCLIModel:
         self._schema = schema
 
     def _augment(self, prompt: str) -> str:
-        schema_json = json.dumps(self._schema.model_json_schema(), indent=2)
-        return (
-            f"{prompt}\n\n"
-            "Respond with ONLY a single JSON object conforming to the JSON Schema "
-            "below. Do not wrap it in markdown code fences and do not add any prose "
-            f"before or after the JSON.\n\nJSON Schema:\n{schema_json}"
-        )
+        return f"{prompt}{structured_output_instructions(self._schema)}"
 
     def _complete(self, prompt: str) -> str:
         """Return provider output before structured parsing begins."""
@@ -435,7 +448,7 @@ class AgentCLIChatModel:
     def with_structured_output(
         self, schema: type, method: str | None = None
     ) -> _StructuredAgentCLIModel:
-        del method  # Agent CLI adapters always validate the response against the schema.
+        del method  # parity with LangChain chat models; the CLI transport always asks for JSON
         return _StructuredAgentCLIModel(self, schema)
 
     def set_timeout(self, timeout: float | None) -> None:
@@ -737,6 +750,12 @@ def get_chat_model(
     """
     provider = get_active_provider()
     if has_cli_capability(provider):
+        # Every CLI call is a full agent session on the user's plan. Warn here,
+        # before the analyzers fan out; the scan path only probes availability
+        # from the report node, after the calls have run.
+        warn_session_cost = getattr(provider, "warn_session_cost", None)
+        if callable(warn_session_cost):
+            warn_session_cost()
         resolved_model = model or provider.resolve_model()
         chat_model = AgentCLIChatModel(
             provider,
