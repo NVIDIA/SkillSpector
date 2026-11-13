@@ -244,6 +244,8 @@ class SkillspectorState(TypedDict, total=False):
     input_path: str | None
     # Only trusted local transports may use the operator's Git credentials.
     allow_git_credentials: bool
+    # Sanitized report-only acquisition identity; never used to resolve findings.
+    input_origin: dict[str, str] | None
     skill_path: str | None
     # Relative identity of a wrapped/downloaded explicit file, distinct from passive assets.
     primary_file_path: str | None

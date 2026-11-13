@@ -383,3 +383,17 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
 | **Add analyzer** | Implement node returning `{"findings": list[Finding]}`, register in `nodes/analyzers/__init__.py` |
 | **Initial checks** | `make test-unit`, `make lint`, `make format-check`; see [Testing](#7-testing) for scope |
 | **Full contributor tests** | `make test` includes integration tests that may call a configured LLM provider; review [Testing](#7-testing) and provider prerequisites first |
+
+
+### Report input origin
+
+The resolver stores sanitized `input_origin` metadata separately from `skill_path`
+(the local scan root). JSON exposes it as `skill.origin`; SARIF exposes it as
+`runs[].properties.inputOrigin`. Both contain `source` and `type` (`directory`,
+`file`, `zip`, `url`, or `git`). Terminal and Markdown display the same metadata.
+The MCP rendered report includes it; compact MCP responses omit that report as usual.
+Local input spelling, including relative paths and whitespace, is retained. URL
+userinfo, the entire query and fragments are omitted. Git scp-style inputs are
+rendered as credential-free SSH URLs. This records acquisition origin, not a
+content digest or a resolved revision. Existing working-directory sources,
+finding locations, nested provenance and cleanup retain their semantics.
