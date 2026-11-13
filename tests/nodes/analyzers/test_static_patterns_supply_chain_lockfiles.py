@@ -666,6 +666,103 @@ def test_npm_workspace_alias_shadows_ancestor_registry_pin(
     assert (alias_name, "4.17.20") in [(name, version) for name, version, _line in audited]
 
 
+@pytest.mark.parametrize("lock_version", [2, 3])
+@pytest.mark.parametrize("lock_name", ["package-lock.json", "npm-shrinkwrap.json"])
+@pytest.mark.parametrize("linked_name", ["lodash", "@scope/helper"])
+@pytest.mark.parametrize(
+    "slot",
+    [
+        {"resolved": "lib/local", "link": True},
+        # A version on a link entry still describes local code, not a registry release.
+        {"resolved": "lib/local", "link": True, "version": "1.0.0"},
+        # Any occupied slot shadows ancestor installs, even when it records no version.
+        {"resolved": "lib/local"},
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_npm_workspace_link_shadows_ancestor_registry_pin(
+    lock_version, lock_name, linked_name, slot, reverse
+):
+    content = json.dumps(
+        {
+            "lockfileVersion": lock_version,
+            "packages": {
+                "": {"workspaces": ["packages/*"]},
+                "packages/a": {"name": "a", "version": "1.0.0"},
+                "packages/b": {"name": "b", "version": "1.0.0"},
+                "lib/local": {"name": linked_name, "version": "1.0.0"},
+                f"node_modules/{linked_name}": {"version": "4.17.20"},
+                "node_modules/ws": {"version": "8.20.0"},
+                f"packages/a/node_modules/{linked_name}": slot,
+            },
+        }
+    )
+    cache = {lock_name: content, "packages/a/package.json": "{}", "packages/b/package.json": "{}"}
+    components = list(reversed(cache)) if reverse else list(cache)
+    resolved = supply_chain._collect_npm_locked_versions(cache, components)
+    manifest = json.dumps(
+        {
+            "dependencies": {
+                linked_name: "file:../../lib/local",
+                "ws": "^8.20.0",
+                "explicit": "1.0.0",
+            }
+        }
+    )
+    packages = supply_chain._apply_locked_versions(
+        supply_chain._extract_packages_from_package_json(manifest),
+        resolved["packages/a"],
+        supply_chain._normalize_npm_package_name,
+    )
+    assert [(name, version) for name, version, _line in packages] == [
+        (linked_name, None),
+        ("ws", "8.20.0"),
+        ("explicit", "1.0.0"),
+    ]
+    assert resolved["."][linked_name] == "4.17.20"
+    assert resolved["packages/b"][linked_name] == "4.17.20"
+    # The ancestor install still receives its own lockfile audit.
+    audited = supply_chain._extract_packages_from_npm_lock(content)
+    assert (linked_name, "4.17.20") in [(name, version) for name, version, _line in audited]
+
+
+def test_npm_workspace_link_does_not_send_the_ancestor_pin_to_osv(monkeypatch):
+    queries = []
+
+    def capture_packages(packages, ecosystem, **_kwargs):
+        queries.append(list(packages))
+        return [[] for _ in packages]
+
+    monkeypatch.setattr(supply_chain, "query_batch", capture_packages)
+    cache = {
+        "package-lock.json": json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"workspaces": ["packages/*"]},
+                    "packages/a": {"name": "a", "version": "1.0.0"},
+                    "lib/local": {"name": "lodash", "version": "1.0.0"},
+                    "node_modules/lodash": {"version": "4.17.20"},
+                    "packages/a/node_modules/lodash": {"resolved": "lib/local", "link": True},
+                },
+            }
+        ),
+        "packages/a/package.json": '{"dependencies": {"lodash": "file:../../lib/local"}}',
+    }
+    supply_chain.node(
+        {
+            "components": list(cache),
+            "file_cache": cache,
+            "local_file_cache": cache,
+            "manifest": {},
+            "component_metadata": [],
+        }
+    )
+
+    assert [("lodash", None)] in queries
+    assert [("lodash", "4.17.20")] not in queries
+
+
 def test_npm_v1_workspace_uses_recorded_link_and_nearest_locked_install():
     cache = {
         "package-lock.json": json.dumps(
