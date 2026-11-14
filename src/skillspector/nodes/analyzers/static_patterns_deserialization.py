@@ -13,12 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: insecure deserialization across languages (DS1–DS4).
+"""Static patterns: insecure deserialization across languages (DS1–DS5).
 
 Python deserialization is detected with AST/taint precision by ``behavioral_ast``
 (AST10) and ``behavioral_taint_tracking`` (TT6). This module provides *breadth* for
-the non-Python scripts a skill may bundle (PHP, Ruby, and JavaScript/TypeScript) via
-language-gated regex signatures. Matching is anchored to each language's dangerous
+the non-Python scripts a skill may bundle (PHP, Ruby, JavaScript/TypeScript, and
+Java) via language-gated regex signatures. Matching is anchored to each language's dangerous
 deserializer so a signature only runs against files of that language, keeping false
 positives low. Node and analyze() live in one module.
 """
@@ -57,6 +57,7 @@ _LANG_BY_EXT: dict[str, str] = {
     ".jsx": "javascript",
     ".ts": "javascript",
     ".tsx": "javascript",
+    ".java": "java",
 }
 
 # language -> [(rule_id, message, severity, [(regex, confidence), ...]), ...]
@@ -99,6 +100,32 @@ _LANG_RULES: dict[str, list[tuple[str, str, Severity, list[tuple[str, float]]]]]
             ],
         ),
     ],
+    "java": [
+        (
+            "DS5",
+            "Unsafe Java deserialization (ObjectInputStream/XMLDecoder/XStream/Jackson/SnakeYAML)",
+            Severity.HIGH,
+            [
+                # Native Java deserialization: ObjectInputStream construction.
+                (r"\bnew\s+ObjectInputStream\s*\(", 0.85),
+                # The readObject() call itself. Empty parens only, so a
+                # `private void readObject(ObjectInputStream in)` method
+                # declaration (custom deserialization hook) does not match.
+                (r"\breadObject\s*\(\s*\)", 0.7),
+                # java.beans.XMLDecoder: XML-encoded Java objects, known RCE.
+                (r"\bnew\s+XMLDecoder\s*\(", 0.8),
+                # XStream.fromXML(): untrusted XML -> arbitrary objects (RCE
+                # unless an explicit type allowlist is configured).
+                (r"\bfromXML\s*\(", 0.75),
+                # Jackson polymorphic typing: gadget-chain RCE on untrusted JSON.
+                (r"\benableDefaultTyping\s*\(", 0.65),
+                (r"\bactivateDefaultTyping\s*\(", 0.65),
+                # SnakeYAML constructed with the unsafe Constructor: arbitrary
+                # types are instantiated. (SafeConstructor does not match.)
+                (r"\bnew\s+Yaml\s*\(\s*new\s+Constructor\b", 0.7),
+            ],
+        ),
+    ],
 }
 
 # Pre-compiled: language -> [(rule_id, message, severity, compiled_regex, confidence), ...]
@@ -121,7 +148,7 @@ def _language_for(file_path: str) -> str | None:
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
-    """Detect insecure deserialization signatures in non-Python skill scripts (DS1–DS4)."""
+    """Detect insecure deserialization signatures in non-Python skill scripts (DS1–DS5)."""
     language = _language_for(file_path)
     if language is None:
         return []
