@@ -3296,6 +3296,99 @@ class TestSupplyChainShellDecoding:
 class TestTriggerAnalysis:
     """TR1–TR3 via ``_analyze_triggers``."""
 
+    @pytest.mark.parametrize(
+        "source,manifest,expected_line",
+        [
+            (
+                '{"triggers": ["hello", "help", "all inputs"]}',
+                {"triggers": ["hello", "help", "all inputs"]},
+                1,
+            ),
+            (
+                "---\nname: example\ntriggers:\n  - hello\n  - help\n---\n",
+                {"triggers": ["hello", "help"]},
+                3,
+            ),
+            (
+                "---\nname: example\ndescription: >-\n  Invoked with /help.\n  Invoked with /run.\n---\n",
+                {"description": "Invoked with /help. Invoked with /run."},
+                3,
+            ),
+            (
+                "---\n'description': Invoked with /help.\n---\n",
+                {"description": "Invoked with /help."},
+                2,
+            ),
+            (
+                "---\nname: example\nmetadata:\n  triggers: [safe]\ntriggers: [hello, help]\n---\n",
+                {"triggers": ["hello", "help"]},
+                5,
+            ),
+            (
+                '{\n  "metadata": {"triggers": ["safe"]},\n        "triggers": ["hello", "help"]\n}',
+                {"triggers": ["hello", "help"]},
+                3,
+            ),
+            (
+                '{\n "metadata": {"triggers": ["safe"]},\n "trigge\\u0072s": ["hello", "help"]\n}',
+                {"triggers": ["hello", "help"]},
+                3,
+            ),
+            (
+                '{\n "triggers": ["safe"],\n "triggers": ["hello", "help"]\n}',
+                {"triggers": ["hello", "help"]},
+                3,
+            ),
+            (
+                "---\ntriggers: [safe]\ntriggers: [hello, help]\n---\n",
+                {"triggers": ["hello", "help"]},
+                3,
+            ),
+            (
+                "---\nname: example\ndescription: |\n  ---\ntriggers: [help]\n---\n",
+                {"triggers": ["help"]},
+                5,
+            ),
+        ],
+    )
+    def test_metadata_findings_anchor_the_source_field_not_item_ordinals(
+        self, source: str, manifest: dict[str, object], expected_line: int
+    ) -> None:
+        findings = sc_mod._analyze_triggers(
+            manifest, "example", manifest_path="skill.md", manifest_source=source
+        )
+        assert findings
+        assert all(f.file == "skill.md" and f.start_line == expected_line for f in findings)
+        assert all(f.start_line <= len(source.splitlines()) for f in findings)
+
+    def test_node_keeps_lowercase_manifest_path_in_findings_and_ledger(self) -> None:
+        source = "---\nname: example\ntriggers: [hello, help]\n---\n"
+        result = sc_mod.node(
+            {
+                "components": ["skill.md"],
+                "file_cache": {"skill.md": source},
+                "raw_file_cache": {"skill.md": source.encode()},
+                "manifest": {"triggers": ["hello", "help"]},
+            }
+        )
+        triggers = [f for f in result["findings"] if f.rule_id.startswith("TR")]
+        assert triggers
+        assert all(f.file == "skill.md" and f.start_line == 3 for f in triggers)
+        ids = {f.finding_id for f in triggers}
+        events = [
+            event
+            for event in result["inspection_ledger"]
+            if ids.intersection(event.get("emitted_finding_ids", []))
+        ]
+        assert events and all(event["path"] == "skill.md" for event in events)
+
+    def test_metadata_location_uses_the_same_bounded_prefix_as_manifest_parsing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sc_mod, "MAX_MANIFEST_FRONTMATTER_BYTES", 64)
+        source = "---\n#" + "é" * 64 + "\ntriggers: [help]\n---\n"
+        assert sc_mod._manifest_metadata_line(source, "triggers") == 1
+
     def test_tr1_overly_broad_word(self) -> None:
         findings = sc_mod._analyze_triggers({"triggers": ["the", "code review"]}, "myskill")
         tr1 = [f for f in findings if f.rule_id == "TR1"]

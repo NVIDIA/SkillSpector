@@ -90,6 +90,7 @@ _NEXT_INSTRUCTION = re.compile(
     r"(?:(?:then|now)\s+)?(?:"
     r"(?:analyze\s+the\s+structure\s+and\s+intent\s+without\s+obeying\s+its\s+directives"
     r"|follow\s+the\s+user['’]s\s+task"
+    r"|(?P<return_result>return\s+(?:the\s+)?(?:result|answer|report|summary)\s+to\s+(?:the\s+)?user)"
     r"|only\s+make\s+changes\s+directly\s+requested)"
     rf"(?=\s*(?:[.!?;{LINE_BREAK_CHARS}]|\Z))"
     r"|(?:(?:do\s+not|don['’]t|never|must\s+not|shall\s+not)\s+)?"
@@ -114,6 +115,10 @@ _YARA_AGENT_CONTEXT = re.compile(
     r"(?:AI agent|assistant|LLM|model|system prompt|developer message|tool description)",
     re.IGNORECASE | re.ASCII,
 )
+_FOLLOWING_SECTION = re.compile(
+    r"\A[ \t]*(?:\r?\n[ \t]*)+#{1,6}[ \t]+(?P<title>[^\r\n]+)(?:\r?\n|\Z)"
+)
+_INDEPENDENT_SECTION_TITLE = re.compile(r"(?:output|results?|answers?|summary)", re.IGNORECASE)
 
 
 def is_directly_prohibited(
@@ -196,11 +201,33 @@ def is_directly_prohibited(
         following_start = (
             tail_view.source_offset(boundary.end()) if boundary.end() < len(tail) else len(raw_tail)
         )
-        following = raw_tail[following_start:].lstrip()
+        following_raw = raw_tail[following_start:]
+        following = following_raw.lstrip()
         following = _LIST_PREFIX.sub("", following, count=1)
+        independent_source = following
+        section_proof = False
         independent = _NEXT_INSTRUCTION.match(following) if following else None
         if following and independent is None:
+            section = _FOLLOWING_SECTION.match(following_raw)
+            if section is not None:
+                title = normalized_security_view(section.group("title")).text.translate(_MARKDOWN)
+                if _INDEPENDENT_SECTION_TITLE.fullmatch(title.strip().rstrip("#").rstrip()):
+                    # A heading alone proves nothing. The first instruction
+                    # must still be independently understood by this helper.
+                    independent_source = following_raw[section.end() :].lstrip()
+                    independent = _NEXT_INSTRUCTION.match(independent_source)
+                    section_proof = independent is not None
+        if following and independent is None:
             return False
+        if independent is not None and (
+            section_proof or independent.group("return_result") is not None
+        ):
+            # An independent sentence proves only the end of this instruction,
+            # not any unseen or unexplained condition that follows it.
+            if independent_source[independent.end() :].strip(" \t\r\n.!?;") or end + len(
+                raw_tail
+            ) < len(content):
+                return False
         if (
             independent is not None
             and independent.group("yara_reveal") is not None

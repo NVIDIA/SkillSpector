@@ -132,7 +132,7 @@ _APPROVAL_OBJECT = (
 )
 _APPROVAL_ACTION = re.compile(
     rf"\b(?P<action>(?:add|install|introduce|make|delete|remove|modify|run|execute|send)"
-    rf"\s+{_APPROVAL_OBJECT}|deploy)\s+$",
+    rf"\s+{_APPROVAL_OBJECT}|deploy|(?:claim|report|declare)\s+(?:success|completion))\s+$",
     re.IGNORECASE,
 )
 _NO_UNAPPROVED_ACTION = re.compile(rf"\bno\s+(?P<object>{_APPROVAL_OBJECT})\s+$", re.IGNORECASE)
