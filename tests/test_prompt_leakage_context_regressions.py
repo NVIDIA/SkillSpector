@@ -129,9 +129,11 @@ def test_cross_window_extraction_survives_graph_reports(tmp_path: Path, output_f
         {"skill_path": str(tmp_path), "output_format": output_format, "use_llm": False}
     )
     _assert_report_contract(result, output_format, "refs/guide.md", 2)
-    # The current-main MP2/P9 findings contribute 24 points for this exact
-    # reference-file fixture; retaining P6 restores its additional 21 points.
-    assert result["risk_score"] == 45
+    # MP2/P9 plus the retained P6 finding. Within P9, the three strongest findings
+    # (all MEDIUM at 0.8) take the diminishing weights regardless of analyzer output
+    # order: 8 + 4 + 2 = 14, where input-order allocation (0.7, 0.7, 0.8) gave 12.5
+    # and the score was 45.
+    assert result["risk_score"] == 47
 
 
 def _assert_report_contract(

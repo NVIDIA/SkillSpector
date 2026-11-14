@@ -19,6 +19,7 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 - **[Development guide](docs/DEVELOPMENT.md)** — Architecture, package layout, and how to extend the analyzer pipeline.
 - **[Security policy](SECURITY.md)** — Report suspected vulnerabilities privately to NVIDIA PSIRT.
 - **[Analysis resource bounds](docs/ANALYSIS_RESOURCE_BOUNDS.md)** — Fail-closed bundle, parser, nested-artifact, ledger, and finding ceilings.
+- **[Verification boundary](docs/VERIFICATION.md)** — Executable safety contracts around deterministic scoring and LLM enrichment.
 - **[Pi extension](docs/PI_EXTENSION.md)** — Install SkillSpector as a Pi tool for scanning skills from inside agent sessions.
 - **[OpenCode extension](docs/OPENCODE_EXTENSION.md)** — Install SkillSpector as an OpenCode tool and `/skillspector` command for scanning skills from inside agent sessions.
 
