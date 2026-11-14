@@ -141,6 +141,7 @@ FILE_TYPES: dict[str, str] = {
     ".mjs": "javascript",
     ".cjs": "javascript",
     ".ts": "typescript",
+    ".tsx": "typescript",
     ".rb": "ruby",
     ".pl": "perl",
     ".go": "go",
