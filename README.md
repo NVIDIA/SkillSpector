@@ -17,6 +17,7 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 
 - **[Scan agent skills before installation](https://docs.nvidia.com/skills/scanning-agent-skills)** — Hosted guide: when to scan, how to read a report, and how to gate installs.
 - **[Development guide](docs/DEVELOPMENT.md)** — Architecture, package layout, and how to extend the analyzer pipeline.
+- **[Security policy](SECURITY.md)** — Report suspected vulnerabilities privately to NVIDIA PSIRT.
 - **[Analysis resource bounds](docs/ANALYSIS_RESOURCE_BOUNDS.md)** — Fail-closed bundle, parser, nested-artifact, ledger, and finding ceilings.
 - **[Pi extension](docs/PI_EXTENSION.md)** — Install SkillSpector as a Pi tool for scanning skills from inside agent sessions.
 - **[OpenCode extension](docs/OPENCODE_EXTENSION.md)** — Install SkillSpector as an OpenCode tool and `/skillspector` command for scanning skills from inside agent sessions.
@@ -65,10 +66,10 @@ uv venv .venv && source .venv/bin/activate
 
 # Install for production use
 make install
-
-# Or install with development dependencies
-make install-dev
 ```
+
+To contribute, follow the [Development setup](#setup) for a supported Python
+interpreter and development dependencies.
 
 ### Docker (no Python required)
 
@@ -771,7 +772,7 @@ Issues (2)
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
 | `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3`; other provider/model combinations keep their endpoint defaults. The value applies to every model slot, so the `anthropic` `meta_analyzer` default receives the same effort as the analyzers. `gpt-6.1-sol` accepts only `low`, `medium`, `high`, `xhigh`, or `max`; any other value stops a scan before analysis (exit code 2). | Optional |
 | `SKILLSPECTOR_OUTPUT_LANGUAGE` | Short, single-line language label (letters, numbers, spaces, `_`, or `-`; maximum 64 characters) for human-readable LLM finding text such as messages, explanations, and remediation. Rule IDs, severity values, paths, code, and other machine-readable values remain unchanged. Unset, blank, or invalid values preserve the default output language. | Optional |
-| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves the provider default. Lower values can reduce run-to-run variation but do not guarantee identical output. `gpt-6.1-sol` rejects every explicit temperature, including `1`. `claude-opus-5-5` and `claude-sonnet-5-5` accept only `1.0` on the native Anthropic endpoint ([API compatibility rule](https://platform.claude.com/docs/en/api/messages/create)); gateways, proxies, and Bedrock still reject every explicit value for these models. Unsupported settings on active LLM slots stop a scan before analysis (exit code 2). Static scans (`--no-llm`) skip provider initialization and control validation. A Bedrock application-inference-profile ARN hides the model name, so declare `sampling: rejected` for it in the model registry. | Optional |
+| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves the provider default. Lower values can reduce run-to-run variation but do not guarantee identical output. `gpt-6.1-sol` rejects every explicit temperature, including `1`. Claude Opus 4.7 and later, Sonnet 5, Fable 5, Mythos 5 and Haiku 5 models (for example `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-5-5`) accept only `1.0` on the native Anthropic endpoint ([API compatibility rule](https://platform.claude.com/docs/en/api/messages/create)); gateways, proxies, and Bedrock still reject every explicit value for these models. Unsupported settings on active LLM slots stop a scan before analysis (exit code 2). Static scans (`--no-llm`) skip provider initialization and control validation. A Bedrock application-inference-profile ARN hides the model name, so declare `sampling: rejected` for it in the model registry. | Optional |
 | `SKILLSPECTOR_SEED` | Optional integer sampling seed for OpenAI-compatible and Azure OpenAI providers. Other hosted providers and CLI providers do not receive it. Provider support remains model-dependent; `gpt-6.1-sol` receives it, but OpenAI treats `seed` as best-effort, so output can still differ between runs. | Optional |
 | `SKILLSPECTOR_COMPACT_PROMPTS` | Opt-in compact line numbering in LLM prompts: numbered lines render as `L1:`, `L2:` instead of zero-padded `L01:`, `L02:`. Accepted truthy values are `1`, `true`, and `yes` (case-insensitive; surrounding whitespace is trimmed). Unset or any other value keeps the default zero-padded format. | Optional |
 | `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
@@ -864,7 +865,7 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
   "skill": { "name": "...", "source": "...", "scanned_at": "<ISO 8601>" },
   "risk_assessment": { "score": 0, "severity": "LOW", "recommendation": "SAFE" },
   "components": [ { "path": "...", "type": "...", "lines": 0, "executable": false, "size_bytes": 0 } ],
-  "issues": [ { "id": "...", "category": "...", "severity": "...", "confidence": 0.0, "location": { "file": "...", "start_line": 0 } } ],
+  "issues": [ { "id": "...", "category": "...", "severity": "...", "confidence": 0.0, "location": { "file": "...", "start_line": 0 }, "surface": "code" } ],
   "metadata": {
     "has_executable_scripts": false,
     "skillspector_version": "...",
@@ -891,6 +892,10 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
 
 - `risk_assessment.severity` ∈ `LOW | MEDIUM | HIGH | CRITICAL`.
 - `risk_assessment.recommendation` ∈ `SAFE | CAUTION | DO_NOT_INSTALL`, mapped from severity: `LOW → SAFE`, `MEDIUM → CAUTION`, `HIGH`/`CRITICAL → DO_NOT_INSTALL`.
+- `issues[].surface` and `suppressed[].surface` are advisory, heuristic labels for where a finding landed:
+  `code | instructions | docs | tests | comments | config`. JSON expands compacted groups into one `issues[]` entry
+  per occurrence, each with its own `surface`; SARIF emits `properties.surface` on each result. The label is
+  path/line-based and the scanned author can influence it, so do not use it as the sole suppression or security signal.
 - `metadata.llm_error` appears only when LLM analysis was requested but unavailable.
 - Archive-member components retain their virtual `path` and include `outer_path`, `nested_path`,
   and container provenance. Virtual paths identify in-memory members, not on-disk files; see
@@ -940,28 +945,69 @@ SkillSpector computes the score band and recommendation; how strict the gate is 
 
 ### Setup
 
-All `make` targets assume a virtual environment is already created and activated. The Makefile uses **uv** if available, else **pip**.
+This is the canonical setup recipe for contributing from this checkout. Use
+**Python 3.12-3.15** (`>=3.12,<3.16`, as defined in [pyproject.toml](pyproject.toml)),
+Git, and `make`. A release tag can have a different Python range; check that
+tag's metadata. The commands below use Bash or Zsh.
+
+With **uv** installed:
 
 ```bash
-# Clone, create venv, activate, install dev dependencies
 git clone https://github.com/NVIDIA/skillspector.git
 cd skillspector
-uv venv .venv && source .venv/bin/activate
-# or: python3 -m venv .venv && source .venv/bin/activate
+uv venv --python 3.12 .venv
+source .venv/bin/activate
 make install-dev
-
-# Run tests
-make test
-
-# Run tests with coverage
-make test-cov
-
-# Run linting
-make lint
-
-# Format code
-make format
 ```
+
+If uv is not installed, clone the repository and enter it as above, then use
+an installed supported Python interpreter with `venv` and pip:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+make install-dev
+```
+
+Create and activate the virtual environment before running any `make` target.
+`make install-dev` uses `uv sync --all-extras` when uv is available, otherwise
+`pip install -e ".[dev]"`.
+
+Start with these local checks:
+
+```bash
+make test-unit
+make lint
+make format-check
+```
+
+`make test-unit` excludes tests marked `integration` or `provider`. This selection
+does not cover every CI job or guarantee network isolation.
+
+Some unit tests start loopback HTTP servers and local multiprocessing sockets.
+Restricted agent sandboxes can deny these operations. Keep the failing
+command and traceback, and use an appropriately permitted environment for a
+diagnostic rerun. Report that result separately; a passing subset does not make
+the original full target pass. See the
+[contributor onboarding check](docs/validation/CONTRIBUTOR_ONBOARDING.md).
+
+Before submitting a PR, [CONTRIBUTING.md](CONTRIBUTING.md#how-to-contribute)
+requires `make test`. It runs both `test-unit` and `test-integration`; integration
+tests invoke the full graph and may send test content to a configured LLM provider.
+Review the [provider configuration](docs/DEVELOPMENT.md#10-environment-and-configuration)
+and credentials or local-service prerequisites before running it:
+
+```bash
+make test
+```
+
+`make test-provider` makes live provider requests and requires the corresponding
+provider configuration; see [Live provider tests](docs/DEVELOPMENT.md#live-provider-tests).
+`make test-cov` runs the same marker-filtered selection as `test-unit`, with coverage.
+
+`make format` applies lint fixes and formats files **in place**. Run it before
+committing when changes are needed, review the diff, then recheck with `make lint`
+and `make format-check`.
 
 ## How It Works
 
@@ -1087,8 +1133,15 @@ Apache License 2.0 - see [LICENSE](LICENSE) for details.
 
 ## Contributing
 
+Report suspected security vulnerabilities, including vulnerabilities in SkillSpector
+itself, privately to NVIDIA PSIRT by following [SECURITY.md](SECURITY.md). Do not
+report them through GitHub issues, pull requests, or Discussions.
+
 Contributions are welcome! Please read our contributing guidelines and submit pull requests.
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/NVIDIA/skillspector/issues)
+- **Security vulnerabilities**: Follow [SECURITY.md](SECURITY.md) to report privately
+  to NVIDIA PSIRT. Do not report them through GitHub issues, pull requests, or Discussions.
+- **Issues**: [GitHub Issues](https://github.com/NVIDIA/skillspector/issues) for
+  non-security bugs, false positives, and feature requests. Use minimal, sanitized reproductions.

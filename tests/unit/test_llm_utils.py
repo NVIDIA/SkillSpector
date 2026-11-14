@@ -59,6 +59,12 @@ from skillspector.providers import (
     use_provider,
 )
 from skillspector.providers.nv_build import NvBuildProvider
+from skillspector.structured_response import (
+    MAX_RESPONSE_CHARS,
+    MAX_RESPONSE_DEPTH,
+    ResponseIssue,
+    completed_response_text,
+)
 
 _LLM_ENV_VARS = (
     "ANTHROPIC_API_KEY",
@@ -431,7 +437,34 @@ class TestGetChatModelCLIAdapter:
         ) as fake_complete:
             msg = get_chat_model(model="claude-sonnet-4-6").invoke("hi")
         assert msg.content == "hello"
+        assert completed_response_text(msg) == "hello"
+        assert msg.response_metadata["completion_source"] == "cli_process"
         assert "timeout" not in fake_complete.call_args[1]
+
+    async def test_async_plain_cli_reply_retains_completion(self) -> None:
+        provider = MagicMock()
+        provider.complete.return_value = "Severity: HIGH"
+        adapter = AgentCLIChatModel(provider, "any-model", 1024)
+
+        message = await adapter.ainvoke("requested field")
+
+        assert completed_response_text(message) == "Severity: HIGH"
+        assert provider.complete.call_count == 1
+
+    @pytest.mark.parametrize(
+        "failure", [RuntimeError("CLI exited nonzero"), TimeoutError("deadline")]
+    )
+    async def test_failed_cli_invocation_never_creates_a_completed_message(self, failure) -> None:
+        provider = MagicMock()
+        provider.complete.side_effect = failure
+        adapter = AgentCLIChatModel(provider, "any-model", 1024)
+
+        with patch("skillspector.llm_utils._AgentCLIMessage") as message_type:
+            with pytest.raises(type(failure)):
+                adapter.invoke("requested field")
+            with pytest.raises(type(failure)):
+                await adapter.ainvoke("requested field")
+        message_type.assert_not_called()
 
     def test_adapter_preserves_the_legacy_cli_provider_signature(self) -> None:
         class _Schema(BaseModel):
@@ -542,6 +575,61 @@ class TestGetChatModelCLIAdapter:
                 )
 
     @pytest.mark.parametrize("method", [None, "json_schema", "function_calling"])
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "No security issues found.",
+            '{"score": 1}',
+            '{"verdict": 1}',
+            "",
+            '{"verdict": ',
+            '{"verdict": "safe", "verdict": "unsafe"}',
+            '{"verdict": "safe"} {"verdict": "unsafe"}',
+            '{"verdict": NaN}',
+        ],
+    )
+    async def test_cli_plaintext_recovery_is_shared_by_sync_async_and_output_methods(
+        self, method, raw
+    ):
+        class _Schema(BaseModel):
+            verdict: str
+
+        provider = MagicMock()
+        provider.complete.return_value = raw
+        adapter = AgentCLIChatModel(provider, "any-model", 1024)
+        runnable = adapter.with_structured_output(_Schema, method=method)
+
+        with pytest.raises(StructuredOutputParseError) as sync_error:
+            runnable.invoke("assessment")
+        with pytest.raises(StructuredOutputParseError) as async_error:
+            await runnable.ainvoke("assessment")
+
+        assert sync_error.value.recovery_text == raw.strip()
+        assert async_error.value.recovery_text == raw.strip()
+        assert provider.complete.call_count == 2
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "x" * (MAX_RESPONSE_CHARS + 1),
+            '{"verdict": ' + "[" * MAX_RESPONSE_DEPTH,
+        ],
+    )
+    def test_cli_recovery_keeps_resource_limits_ineligible(self, raw):
+        class _Schema(BaseModel):
+            verdict: str
+
+        provider = MagicMock()
+        provider.complete.return_value = raw
+        runnable = AgentCLIChatModel(provider, "any-model", 1024).with_structured_output(_Schema)
+
+        with pytest.raises(StructuredOutputParseError) as error:
+            runnable.invoke("assessment")
+
+        assert error.value.recovery_text is None
+        assert error.value.issue == ResponseIssue.LIMIT
+
+    @pytest.mark.parametrize("method", [None, "json_schema", "function_calling"])
     def test_set_timeout_reaches_structured_wrapper(self, method: str | None) -> None:
         """A retargeted deadline applies to structured wrappers made earlier."""
 
@@ -574,9 +662,11 @@ class TestGetChatModelCLIAdapter:
             requested_model="claude-sonnet-4-6",
         )
 
-        with pytest.raises(ValueError, match="JSON"):
+        with pytest.raises(StructuredOutputParseError, match="JSON") as error:
             _invoke_with_usage(runnable, "prompt", collector)
 
+        assert error.value.recovery_text == provider.complete.return_value
+        assert provider.complete.call_count == 1
         assert collector.response_received is True
         assert collector.snapshot()[0]["provider"] == "claude_cli"
         assert sanitize_inference_usage(collector.snapshot()) == []
@@ -609,6 +699,8 @@ class TestGetChatModelCLIAdapter:
         )
 
         assert all(isinstance(result, ValueError) for result in results)
+        assert all(result.recovery_text == provider.complete.return_value for result in results)
+        assert provider.complete.call_count == 2
         assert all(collector.response_received for collector in collectors)
         assert all(collector.snapshot()[0]["provider"] == "claude_cli" for collector in collectors)
         assert all(sanitize_inference_usage(collector.snapshot()) == [] for collector in collectors)
@@ -1034,7 +1126,8 @@ class TestStructuredOutputMethod:
         assert chain.invoke("analyse this") == Verdict(summary="ok")  # type: ignore[attr-defined]
         prompt, request = requests[0]
         assert prompt == "analyse this"
-        assert request["response_format"] is Verdict
+        assert request["response_format"]["type"] == "json_schema"
+        assert request["response_format"]["json_schema"]["strict"] is True
         assert "tools" not in request
 
     def test_cli_adapter_accepts_the_method_keyword(self) -> None:

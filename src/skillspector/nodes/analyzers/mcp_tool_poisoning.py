@@ -23,18 +23,18 @@ import os
 import re
 import time
 import unicodedata
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import cast
 
-from langchain_openai.chat_models.base import BaseChatOpenAI
 from pydantic import BaseModel, Field, field_validator
 
-from skillspector.inference_usage import InferenceUsageRecord, chat_model_controls
+from skillspector.inference_usage import InferenceUsageRecord
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
+    LedgerRecordType,
     analyzer_status_event,
     analyzer_status_for_events,
     ledger_event,
@@ -47,7 +47,7 @@ from skillspector.llm_analyzer_base import (
     append_output_language_instruction,
     estimate_tokens,
 )
-from skillspector.llm_utils import chat_model_provider_name, run_async
+from skillspector.llm_utils import run_async
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding, compute_match_fingerprint
 from skillspector.nodes.analyzers.static_runner import MAX_FINDINGS_PER_ANALYZER
@@ -57,7 +57,7 @@ from skillspector.nodes.analyzers.whitespace_padding import (
     padding_run_match_fingerprint,
 )
 from skillspector.providers import get_active_provider
-from skillspector.providers.chat_models import resolve_reasoning_effort
+from skillspector.resource_limits import bounded_capacity
 from skillspector.state import (
     AnalyzerNodeResponse,
     LLMCallRecord,
@@ -75,10 +75,16 @@ logger = logging.getLogger(__name__)
 
 _FRAMEWORK_TAGS = ["ASI02", "AML.T0080"]
 TP3_MAX_PARAM_DESC_LENGTH = 500
-TP4_MAX_FILES = 128
-TP4_MAX_TOTAL_CODE_BYTES = 4 * 1024 * 1024
-TP4_MAX_TOTAL_INPUT_BYTES = 4 * 1024 * 1024
-TP4_MAX_FILE_CODE_BYTES = 1024 * 1024
+TP4_MAX_FILES = bounded_capacity("SKILLSPECTOR_TP4_MAX_FILES", 128, 10_000)
+TP4_MAX_TOTAL_CODE_BYTES = bounded_capacity(
+    "SKILLSPECTOR_TP4_MAX_TOTAL_CODE_BYTES", 4 * 1024 * 1024, 64 * 1024 * 1024
+)
+TP4_MAX_TOTAL_INPUT_BYTES = bounded_capacity(
+    "SKILLSPECTOR_TP4_MAX_TOTAL_INPUT_BYTES", 4 * 1024 * 1024, 64 * 1024 * 1024
+)
+TP4_MAX_FILE_CODE_BYTES = bounded_capacity(
+    "SKILLSPECTOR_TP4_MAX_FILE_CODE_BYTES", 1024 * 1024, 16 * 1024 * 1024
+)
 DEFAULT_TP4_MAX_BATCHES = 256
 TP4_MAX_BATCHES_CEILING = 4096
 TP4_MAX_BATCH_INPUT_TOKENS = 32_000
@@ -904,28 +910,6 @@ _TP4_EXECUTABLE_TYPES = frozenset(
     {"python", "javascript", "typescript", "shell", "ruby", "go", "rust"}
 )
 
-# Track the exact-label gateway workaround in the public PR:
-# https://github.com/NVIDIA/SkillSpector/pull/691
-# Dated/suffixed aliases are deliberately excluded. Only the openai route has
-# reproduced wrapper evidence; other providers retain their own method hints.
-_TP4_TOOL_OUTPUT_MODELS = frozenset({"azure/anthropic/claude-opus-5"})
-
-
-def _tp4_reasoning_configured(llm: BaseChatOpenAI) -> bool:
-    """Avoid an automatic forced tool choice when reasoning controls are set."""
-    if resolve_reasoning_effort() is not None:
-        return True
-    if chat_model_controls(llm).get("reasoning_effort") is not None:
-        return True
-    if any(getattr(llm, name, None) is not None for name in ("reasoning_effort", "reasoning")):
-        return True
-    for controls in (llm.model_kwargs, llm.extra_body):
-        if isinstance(controls, Mapping) and any(
-            controls.get(name) is not None for name in ("reasoning_effort", "reasoning", "thinking")
-        ):
-            return True
-    return False
-
 
 class _TP4AnalysisResult(BaseModel):
     """Validated response from the description-behavior mismatch check."""
@@ -949,21 +933,7 @@ class _TP4Analyzer(LLMAnalyzerBase):
     """Run TP4 through the shared structured-output analyzer lifecycle."""
 
     response_schema = _TP4AnalysisResult
-
-    def _structured_output_preference(self, llm: object) -> str | None:
-        # The OpenAI-compatible Opus 5 gateway sometimes wraps json_schema
-        # output in a {"json": ...} object instead of the requested schema.
-        # Tool calling returns the exact TP4 schema on the same gateway, but
-        # forcing a tool may conflict with configured reasoning/thinking.
-        # Explicit environment/provider method choices still take precedence.
-        if (
-            isinstance(llm, BaseChatOpenAI)
-            and chat_model_provider_name(llm) == "openai"
-            and self.model in _TP4_TOOL_OUTPUT_MODELS
-            and not _tp4_reasoning_configured(llm)
-        ):
-            return "function_calling"
-        return None
+    recovery_required_fields = ("confidence",)
 
     def __init__(
         self,
@@ -1551,11 +1521,17 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
         batch_outcome = run_async(analyzer.arun_batches_detailed(batches))
         result.inference_usage = cast(list[InferenceUsageRecord], analyzer.inference_usage)
         seen_finding_ids: set[str] = set()
+        recovered_batches = {id(batch) for batch, _ in batch_outcome.recovered}
+        emitted_by_batch: dict[int, list[str]] = {}
+        capped_batches: set[int] = set()
         unexpected_response = False
-        for batch, assessments in batch_outcome.successful:
+        for batch, assessments in [*batch_outcome.successful, *batch_outcome.recovered]:
             batch_findings: list[Finding] = []
+            recovered = id(batch) in recovered_batches
             assessment = assessments[0] if assessments else None
             if not isinstance(assessment, _TP4AnalysisResult):
+                if recovered:
+                    continue
                 unexpected_response = True
                 result.ledger.append(
                     ledger_event(
@@ -1588,6 +1564,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                         limit_findings=TP4_MAX_FINDINGS,
                     )
                 )
+                capped_batches.add(id(batch))
                 continue
             finding = _tp4_finding(assessment, batch, description)
             if (
@@ -1595,9 +1572,15 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                 and finding.finding_id not in seen_finding_ids
                 and len(result.findings) < TP4_MAX_FINDINGS
             ):
+                if recovered:
+                    finding.tags.append("llm-format-recovery")
+                    finding.evidence["assessment_complete"] = False
                 result.findings.append(finding)
                 batch_findings.append(finding)
                 seen_finding_ids.add(finding.finding_id)
+            emitted_by_batch[id(batch)] = [item.finding_id for item in batch_findings]
+            if recovered:
+                continue
             result.ledger.append(
                 ledger_event(
                     analyzer_id=ANALYZER_ID,
@@ -1606,25 +1589,47 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     path=batch.file_path,
                     start_line=batch.start_line,
                     end_line=batch.end_line,
-                    emitted_finding_ids=[item.finding_id for item in batch_findings],
+                    emitted_finding_ids=emitted_by_batch[id(batch)],
                 )
             )
 
-        for failure in batch_outcome.failures:
+        for failure in [*batch_outcome.warnings, *batch_outcome.failures]:
+            batch_id = id(failure.batch)
+            retained_ids = emitted_by_batch.get(batch_id, [])
+            is_warning = failure.reason is LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+            terminal_outcome = (
+                LedgerOutcome.PARTIAL
+                if failure.reason is LedgerReason.RUNTIME_LIMIT or is_warning
+                else outcome_for_llm_batch_failure(failure.reason)
+            )
+            if (batch_id in capped_batches and not is_warning) or (
+                retained_ids and terminal_outcome is LedgerOutcome.FAILED
+            ):
+                result.ledger.append(
+                    ledger_event(
+                        record_type=LedgerRecordType.SYSTEM,
+                        outcome=terminal_outcome,
+                        phase=f"{ANALYZER_ID}:recovery",
+                        path=failure.batch.file_path,
+                        start_line=failure.batch.start_line,
+                        end_line=failure.batch.end_line,
+                        reason=failure.reason,
+                        error_class=failure.error_class,
+                    )
+                )
+            if batch_id in capped_batches:
+                continue
             result.ledger.append(
                 ledger_event(
                     analyzer_id=ANALYZER_ID,
-                    outcome=(
-                        LedgerOutcome.PARTIAL
-                        if failure.reason is LedgerReason.RUNTIME_LIMIT
-                        else outcome_for_llm_batch_failure(failure.reason)
-                    ),
+                    outcome=(LedgerOutcome.PARTIAL if retained_ids else terminal_outcome),
                     phase="semantic",
                     path=failure.batch.file_path,
                     start_line=failure.batch.start_line,
                     end_line=failure.batch.end_line,
                     reason=failure.reason,
                     error_class=failure.error_class,
+                    emitted_finding_ids=retained_ids,
                     observed_seconds=(
                         0.0 if failure.reason is LedgerReason.RUNTIME_LIMIT else None
                     ),
@@ -1638,10 +1643,14 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                 if batch_outcome.failures
                 else "UnexpectedStructuredResponse"
             )
+            refusal_only = not unexpected_response and all(
+                failure.reason is LedgerReason.LLM_RESPONSE_REFUSED
+                for failure in batch_outcome.failures
+            )
             result.record = llm_call_record(
                 ANALYZER_ID,
                 ok=False,
-                error=f"TP4 LLM batch failed: {error_class}",
+                error=None if refusal_only else f"TP4 LLM batch failed: {error_class}",
             )
         else:
             result.record = llm_call_record(ANALYZER_ID, ok=True)

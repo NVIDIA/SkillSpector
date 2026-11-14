@@ -19,11 +19,14 @@ from __future__ import annotations
 
 import logging
 import os
+from importlib import import_module
 from urllib.parse import urlparse
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_openai import ChatOpenAI
-from pydantic import SecretStr
+from langchain_core.outputs import ChatResult
+from langchain_openai import AzureChatOpenAI as _AzureChatOpenAI
+from langchain_openai import ChatOpenAI as _ChatOpenAI
+from pydantic import BaseModel, SecretStr
 
 from skillspector.inference_usage import (
     register_chat_model_controls,
@@ -37,6 +40,39 @@ MAX_SAMPLING_SEED = (1 << 63) - 1
 
 # Reasoning efforts GPT-6.1 Sol accepts; it rejects ``none`` and ``minimal``.
 GPT_6_1_SOL_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+class _RawToolArguments:
+    """Retain wire arguments before SDK parsing loses duplicate keys or empty text."""
+
+    def _create_chat_result(
+        self, response: dict | BaseModel, generation_info: dict | None = None
+    ) -> ChatResult:
+        result = super()._create_chat_result(response, generation_info)
+        payload = (
+            response
+            if isinstance(response, dict)
+            else response.model_dump(exclude={"choices": {"__all__": {"message": {"parsed"}}}})
+        )
+        for generation, choice in zip(result.generations, payload["choices"], strict=True):
+            calls = choice["message"].get("tool_calls")
+            if calls is not None:
+                generation.message.additional_kwargs["tool_calls"] = calls
+        return result
+
+
+class ChatOpenAI(_RawToolArguments, _ChatOpenAI):
+    """OpenAI-compatible invoke/ainvoke preserving original tool response evidence."""
+
+
+class AzureChatOpenAI(_RawToolArguments, _AzureChatOpenAI):
+    """Native Azure invoke/ainvoke with the same tool response evidence."""
+
+
+def prepare_openai_chat_model_imports() -> None:
+    """Load lazy transport/resource modules before concurrent CPU-heavy analysis."""
+    import_module("httpcore")
+    import_module("openai.resources.chat.completions.completions")
 
 
 class UnsupportedControlError(ValueError):

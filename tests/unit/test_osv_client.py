@@ -32,6 +32,7 @@ from skillspector.nodes.analyzers.osv_client import (
     _estimate_cvss_severity,
     _severity_from_vuln,
     clear_cache,
+    is_available,
     query_batch,
     was_osv_reachable,
 )
@@ -236,6 +237,46 @@ class TestQueryBatch:
         assert any(
             item.reason is LedgerReason.ANALYZER_RUNTIME_ERROR for item in results.limitations
         )
+
+    def test_bracketed_no_proxy_client_failure_returns_empty(self) -> None:
+        # httpx.InvalidURL is a bare Exception subclass, not an HTTPError or
+        # ValueError, so a bracketed IPv6 entry in no_proxy (e.g. "[::1]")
+        # used to escape query_batch() and fail the whole analyzer instead
+        # of falling back to static data (NVIDIA/SkillSpector#966).
+        with patch(
+            "skillspector.nodes.analyzers.osv_client.httpx.Client",
+            side_effect=httpx.InvalidURL("Invalid port: ':1]'"),
+        ):
+            results = query_batch([("requests", "2.31.0")], ECOSYSTEM_PYPI)
+
+        assert results == [[]]
+        assert any(
+            item.reason is LedgerReason.ANALYZER_RUNTIME_ERROR and item.error_class == "InvalidURL"
+            for item in results.limitations
+        )
+        assert was_osv_reachable() is False
+
+    def test_bracketed_no_proxy_env_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Same failure through real httpx environment parsing, no mocks.
+        monkeypatch.setenv("no_proxy", "[::1]")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("http_proxy", raising=False)
+        monkeypatch.delenv("https_proxy", raising=False)
+        monkeypatch.delenv("HTTP_PROXY", raising=False)
+        monkeypatch.delenv("HTTPS_PROXY", raising=False)
+
+        results = query_batch([("requests", "2.31.0")], ECOSYSTEM_PYPI)
+
+        assert results == [[]]
+        assert was_osv_reachable() is False
+
+    def test_bracketed_no_proxy_env_is_available_returns_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("no_proxy", "[::1]")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+
+        assert is_available() is False
 
     def test_timeout_returns_empty(self) -> None:
         mock_client = MagicMock()

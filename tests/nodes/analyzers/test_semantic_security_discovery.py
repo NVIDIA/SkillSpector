@@ -42,7 +42,7 @@ MOCK_PATCH_TARGET = "skillspector.llm_analyzer_base.get_chat_model"
 def _mock_get_chat_model(*_args, **_kwargs):
     """Return a mock chat model that supports with_structured_output."""
     mock_llm = MagicMock()
-    mock_llm.with_structured_output.return_value = MagicMock()
+    mock_llm.with_structured_output.return_value = MagicMock(ainvoke=AsyncMock())
     return mock_llm
 
 
@@ -357,8 +357,8 @@ class TestModelResolution:
     @patch(MOCK_PATCH_TARGET)
     def test_uses_analyzer_specific_model(self, mock_get_model: MagicMock) -> None:
         mock_llm = MagicMock()
-        mock_llm.with_structured_output.return_value = MagicMock()
-        mock_llm.with_structured_output.return_value.invoke = MagicMock(
+        mock_llm.with_structured_output.return_value = MagicMock(ainvoke=AsyncMock())
+        mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
             return_value=LLMAnalysisResult(findings=[])
         )
         mock_get_model.return_value = mock_llm
@@ -377,8 +377,8 @@ class TestModelResolution:
     @patch(MOCK_PATCH_TARGET)
     def test_falls_back_to_default_model(self, mock_get_model: MagicMock) -> None:
         mock_llm = MagicMock()
-        mock_llm.with_structured_output.return_value = MagicMock()
-        mock_llm.with_structured_output.return_value.invoke = MagicMock(
+        mock_llm.with_structured_output.return_value = MagicMock(ainvoke=AsyncMock())
+        mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
             return_value=LLMAnalysisResult(findings=[])
         )
         mock_get_model.return_value = mock_llm
@@ -395,8 +395,8 @@ class TestModelResolution:
         from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL
 
         mock_llm = MagicMock()
-        mock_llm.with_structured_output.return_value = MagicMock()
-        mock_llm.with_structured_output.return_value.invoke = MagicMock(
+        mock_llm.with_structured_output.return_value = MagicMock(ainvoke=AsyncMock())
+        mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
             return_value=LLMAnalysisResult(findings=[])
         )
         mock_get_model.return_value = mock_llm
