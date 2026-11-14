@@ -420,8 +420,17 @@ class TestExcessiveAgency:
         assert ea5[0].severity == Severity.HIGH
         assert ea5[0].location.start_line == 2
 
-    def test_ea5_continued_line_keeps_the_script_runner_exemption(self) -> None:
-        content = "python evaluate.py \\\n  -v --model claude-3-7-sonnet"
+    @pytest.mark.parametrize(
+        "continuation",
+        [
+            pytest.param("\\", id="posix_backslash"),
+            pytest.param("`", id="powershell_backtick"),
+            pytest.param("^", id="cmd_caret"),
+            pytest.param("^^^", id="cmd_escaped_caret_then_caret"),
+        ],
+    )
+    def test_ea5_continued_line_keeps_the_script_runner_exemption(self, continuation: str) -> None:
+        content = f"python evaluate.py {continuation}\n  -v --model claude-3-7-sonnet"
         findings = ea_mod.analyze(content, "SKILL.md", "markdown")
         assert not any(finding.rule_id == "EA5" for finding in findings)
 
@@ -429,6 +438,10 @@ class TestExcessiveAgency:
         "first_line",
         [
             pytest.param("python setup.py \\\\", id="escaped_backslash"),
+            pytest.param("python setup.py ^^", id="escaped_caret"),
+            pytest.param(
+                'python setup.py --label "first`nsecond" ``', id="escaped_powershell_backtick"
+            ),
             pytest.param("python setup.py  # build \\", id="comment_backslash"),
             pytest.param("python evaluate.py && \\", id="and_operator"),
             pytest.param("python evaluate.py || \\", id="or_operator"),

@@ -297,8 +297,9 @@ def _continued_executable(line: str, executable: str | None) -> str | None:
         return None
     body = line[: match.start()]
     marker = line[match.start()]
-    # "\\" is an escaped backslash, not a continuation.
-    if marker == "\\" and (len(body) - len(body.rstrip("\\"))) % 2 == 1:
+    # Each host escapes its own marker by doubling it ("\\", "^^", "``"), so a
+    # marker preceded by an odd run of the same marker is literal, not a continuation.
+    if (len(body) - len(body.rstrip(marker))) % 2 == 1:
         return None
     # A PowerShell continuation backtick follows whitespace. One closing a Markdown
     # inline-code span ("Use `notes.md`") does not, and pairs with an earlier one.
