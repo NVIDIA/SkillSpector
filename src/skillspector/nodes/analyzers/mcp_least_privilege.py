@@ -90,6 +90,15 @@ _CAPABILITY_PATTERNS: dict[str, list[str]] = {
         r"os\.listdir",
         r"os\.walk",
         r"glob\.glob",
+        # Go: os.ReadFile / os.Open / os.ReadDir, filepath.Walk / WalkDir / Glob,
+        # io.ReadAll, and the pre-1.16 ioutil aliases.
+        r"os\.readfile",
+        r"os\.open\b",
+        r"os\.readdir",
+        r"filepath\.walk",
+        r"filepath\.glob",
+        r"io\.readall",
+        r"ioutil\.readfile",
     ],
     "file_write": [
         rf"open\s*\([^)]{{0,{_MAX_CAPABILITY_MATCH_CHARS}}}['\"][wa]['\"]",
@@ -100,12 +109,21 @@ _CAPABILITY_PATTERNS: dict[str, list[str]] = {
         r"shutil\.copy",
         r"os\.rename",
         r"os\.mkdir",
+        # Go: os.WriteFile / os.Create / os.CreateTemp and the ioutil alias.
+        r"os\.writefile",
+        r"os\.create\b",
+        r"os\.createtemp",
+        r"ioutil\.writefile",
     ],
     "env": [
         r"os\.environ",
         r"os\.getenv",
         r"process\.env",
         r"\bdotenv\b",
+        # Go: os.Getenv is already covered by os.getenv above (case-insensitive);
+        # os.LookupEnv and os.ExpandEnv are the remaining idiomatic readers.
+        r"os\.lookupenv",
+        r"os\.expandenv",
     ],
     "mcp": [
         r"create_session",
