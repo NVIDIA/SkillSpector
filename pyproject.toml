@@ -52,6 +52,7 @@ dependencies = [
     "langsmith>=0.7.30",
     "yara-python>=4.5.0",
     "google-auth[requests]>=2.53.0",
+    "semver>=3.1,<4",
 ]
 
 [project.optional-dependencies]

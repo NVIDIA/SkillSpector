@@ -294,6 +294,7 @@ class SkillspectorState(TypedDict, total=False):
     inspection_ledger: Annotated[list[InspectionLedgerEvent], merge_inspection_ledger]
     inspection_notices: Annotated[list[dict[str, object]], merge_inspection_notices]
     analyzer_status_events: Annotated[list[AnalyzerStatusEvent], operator.add]
+    osv_lookup: dict[str, object]
     effective_finding_ids: list[str]
     # Whether meta-analysis had provider-eligible findings when it ran.  This
     # snapshot prevents later coverage findings from being mistaken for work
@@ -487,6 +488,7 @@ class AnalyzerNodeResponse(TypedDict):
     inspection_ledger: NotRequired[list[InspectionLedgerEvent]]
     inspection_notices: NotRequired[list[dict[str, object]]]
     analyzer_status_events: NotRequired[list[AnalyzerStatusEvent]]
+    osv_lookup: NotRequired[dict[str, object]]
     structured_summaries: NotRequired[list[dict[str, object]]]
     # LLM-backed analyzers also report one telemetry record; static analyzers
     # omit it (NotRequired keeps the key optional for them).

@@ -1653,6 +1653,7 @@ def _format_json(
     semantic_runtime_incomplete: bool = False,
     runtime_available: bool | None = None,
     provider_availability: tuple[bool, str | None] | None = None,
+    osv_lookup: dict[str, object] | None = None,
 ) -> str:
     """Generate JSON report string."""
     suppressed = suppressed or []
@@ -1690,6 +1691,8 @@ def _format_json(
         ),
         "execution_successful": execution_successful,
     }
+    if osv_lookup is not None:
+        cast(dict[str, object], data["metadata"])["osv_lookup"] = osv_lookup
     data["analysis_completeness"] = dict(analysis_completeness or {})
     completeness = analysis_completeness or {}
     recovery_warnings = completeness.get("warnings")
@@ -2265,6 +2268,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             semantic_runtime_incomplete=semantic_runtime_incomplete,
             runtime_available=runtime_available,
             provider_availability=(provider_available, provider_error),
+            osv_lookup=state.get("osv_lookup"),
         )
     elif output_format == "markdown":
         report_body = _format_markdown(
