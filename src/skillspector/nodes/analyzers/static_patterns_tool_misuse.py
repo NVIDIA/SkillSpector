@@ -9326,6 +9326,31 @@ def _blank_line_local_paired_backticks(line: str) -> str:
     return "".join(chars)
 
 
+# CommonMark HTML block type 6 tag names. Raw-text tags and the comment,
+# processing-instruction, declaration, and CDATA starts are checked separately.
+_MARKDOWN_HTML_BLOCK_TAGS = frozenset(
+    "address article aside base basefont blockquote body caption center col colgroup "
+    "dd details dialog dir div dl dt fieldset figcaption figure footer form frame "
+    "frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link main menu "
+    "menuitem nav noframes ol optgroup option p param search section summary table "
+    "tbody td tfoot th thead title tr track ul".split()
+)
+
+_MARKDOWN_HTML_BLOCK_TAG_RE = re.compile(r"</?([A-Za-z][A-Za-z0-9-]*)(?=[\s/>]|$)")
+_MARKDOWN_HTML_SPECIAL_START_RE = re.compile(
+    r"<(?:pre|script|style|textarea)(?=[\s/>]|$)|<!--|<\?|<![A-Z]|<!\[CDATA\[",
+    re.I,
+)
+
+
+def _markdown_html_block_interrupts_paragraph(leading: str) -> bool:
+    """Return whether a line starts an HTML block that may interrupt a paragraph."""
+    if _MARKDOWN_HTML_SPECIAL_START_RE.match(leading):
+        return True
+    match = _MARKDOWN_HTML_BLOCK_TAG_RE.match(leading)
+    return match is not None and match[1].casefold() in _MARKDOWN_HTML_BLOCK_TAGS
+
+
 def _markdown_shell_text(
     content: str,
     check_runtime: Callable[[], None],
@@ -9560,6 +9585,19 @@ def _markdown_shell_text(
             # Single '-' still starts an empty item; '---' remains thematic.
             separator = False
         html_open = re.match(r"<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|[!?/])", leading)
+        if (
+            html_open
+            and paragraph_open
+            and runs
+            and not has_list_marker
+            and not _markdown_html_block_interrupts_paragraph(leading)
+        ):
+            # A pending inline-code run proves the paragraph continues across
+            # the soft break. Inline HTML cannot start a block inside that
+            # body; raw-text and block-level starts still interrupt. A new
+            # list item ends the paragraph first, so its content starts a
+            # fresh block where inline HTML may open an HTML block.
+            html_open = None
         lazy_list_paragraph = (
             paragraph_open
             and paragraph_in_list
