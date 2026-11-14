@@ -2165,6 +2165,26 @@ def _has_literal_printf_arguments(inner: str) -> bool:
     return command == "printf" and not limited
 
 
+def _printf_invocation_has_following_operator(inner: str) -> bool:
+    """Return whether a leading printf invocation is followed by shell operators.
+
+    A pipeline, command list, or redirection after the printf words means
+    the substitution's output is produced by another command (or discarded),
+    so the value is runtime-dependent data rather than a bounded printf
+    result. The word reader consumes quoted words whole, so an operator
+    inside the printf arguments (``'a|b'``) does not count, and an
+    unresolved boundary stays fail-closed. A comment start is not an
+    operator: the printf invocation is complete before it.
+    """
+    cursor = 0
+    while True:
+        word, cursor, limited = _next_shell_invocation_word(inner, cursor, lambda: None)
+        if word is None:
+            if limited or cursor >= len(inner):
+                return False
+            return inner[cursor] in ";|&()<>"
+
+
 def _static_printf_substitution(
     content: str,
     start: int,
@@ -2208,10 +2228,27 @@ def _static_printf_substitution(
     if quoted_result and not backtick and not literal_result:
         command, _, _ = _next_shell_invocation_word(inner, 0, lambda: None)
         if command == "printf":
+            if _printf_invocation_has_following_operator(inner):
+                # The printf output is piped (or listed/redirected) into
+                # another command, so the substitution's value is that
+                # command's runtime-dependent output, not a bounded printf
+                # result. Return unresolved without a parse-limit diagnostic.
+                return None
             failed()
             return None
     invocation_diagnostics: list[StaticParserDiagnostic] = []
     recognized, arguments = _printf_invocation_arguments(inner, diagnostics=invocation_diagnostics)
+    if (
+        recognized
+        and not backtick
+        and not literal_result
+        and _printf_invocation_has_following_operator(inner)
+    ):
+        # Same treatment for allowlisted wrappers (``command``/``builtin``/
+        # ``env``) whose first word is not literally ``printf``. Scoped to
+        # ``$(...)`` only: a backtick substitution keeps its runtime-command
+        # gap, as the quoted-result branch above does.
+        return None
     if not recognized or (not literal_result and re.search(r"[;|&<>\r\n]", inner) is not None):
         if diagnostics is not None and invocation_diagnostics:
             diagnostics.extend(item.shifted(inner_start) for item in invocation_diagnostics[:1])
@@ -2466,6 +2503,16 @@ def _is_printf_substitution(
     recognized, _ = _printf_invocation_arguments(
         inner, check_runtime=runtime_check, diagnostics=invocation_diagnostics
     )
+    if recognized and not backtick and _printf_invocation_has_following_operator(inner):
+        # A pipeline, command list, or redirection after the printf words
+        # means the substitution's value is produced by another command,
+        # so this is not a bounded printf substitution: the value is
+        # runtime-dependent data, as for an ``echo`` pipeline, and its
+        # failure to resolve statically is not a coverage gap. Scoped to
+        # ``$(...)`` only: a backtick substitution is the runtime command
+        # itself, so its gap is preserved instead of being treated as
+        # resolved data.
+        return False
     if recognized or not check_command_context:
         if recognized and diagnostics is not None:
             diagnostics.extend(item.shifted(inner_start) for item in invocation_diagnostics[:1])
