@@ -1798,6 +1798,100 @@ _PATH_FUNCTIONS = frozenset(
 )
 
 
+_IDENTIFIER_ESCAPE_PATTERN = re.compile(
+    r"\\(?:u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))"
+)
+
+
+def _decoded_identifier_text(program: JavaScriptProgram, node: Node) -> str:
+    """Return the identifier spelling with JS escape sequences resolved.
+
+    ``\\u0052egExp``, ``\\u{52}egExp`` and ``\\x52egExp`` all bind the name
+    RegExp, so raw source spelling cannot be compared against override
+    names or recorded bindings. An invalid escape is left as-is, which
+    keeps the proof fail-closed.
+    """
+    spelling = program.text(node)
+    if "\\" not in spelling:
+        return spelling
+
+    def _replace(match: re.Match[str]) -> str:
+        code_point = next(group for group in match.groups() if group is not None)
+        try:
+            return chr(int(code_point, 16))
+        except (ValueError, OverflowError):
+            return match.group(0)
+
+    return _IDENTIFIER_ESCAPE_PATTERN.sub(_replace, spelling)
+
+
+def _is_regexp_constructor(program: JavaScriptProgram, node: Node) -> bool:
+    """True only for the global RegExp name used as a new-expression constructor.
+
+    Any local binding of the name still poisons the proof through its own
+    identifier or shorthand binding node, so this exempts only the
+    constructor position itself.
+    """
+    parent = node.parent
+    return (
+        node.type == "identifier"
+        and program.text(node) == "RegExp"
+        and parent is not None
+        and parent.type == "new_expression"
+        and parent.child_by_field_name("constructor") == node
+    )
+
+
+def _regex_receiver_call(program: JavaScriptProgram, value: Node) -> Node | None:
+    """Return the .exec/.test member for a direct regex receiver, else None.
+
+    The call must take no template-string argument: a template argument
+    keeps the conservative reading, same as for a literal receiver.
+    """
+    member = value.parent
+    call = None if member is None else member.parent
+    if (
+        member is not None
+        and member.type == "member_expression"
+        and member.child_by_field_name("object") == value
+        and _callable_member(program, member) in {"exec", "test"}
+        and call is not None
+        and call.type == "call_expression"
+        and call.child_by_field_name("function") == member
+        and call.child_by_field_name("arguments") is not None
+        and call.child_by_field_name("arguments").type != "template_string"
+    ):
+        return member
+    return None
+
+
+def _const_regex_binding(program: JavaScriptProgram, value: Node) -> Node | None:
+    """Return the const binding for a regex value, or None when unproven.
+
+    Only a top-level or function-body const declarator proves the binding.
+    let/var, nested scopes and destructuring stay fail-closed, and the
+    reference check in _ordinary_native_calls still requires every other
+    use of the name to be a .test/.exec call on that binding.
+    """
+    member = value.parent
+    if member is None or member.type != "variable_declarator":
+        return None
+    binding = member.child_by_field_name("name")
+    declaration = member.parent
+    if (
+        binding is None
+        or binding.type != "identifier"
+        or member.child_by_field_name("value") != value
+        or declaration is None
+        or declaration.type != "lexical_declaration"
+        or declaration.children[0].type != "const"
+        or declaration.parent is None
+        or declaration.parent.type not in {"program", "statement_block"}
+    ):
+        return None
+    return binding
+
+
 def _ordinary_native_calls(
     program: JavaScriptProgram, check_runtime: Callable[[], None]
 ) -> tuple[set[int], set[int]]:
@@ -1810,7 +1904,7 @@ def _ordinary_native_calls(
     references: dict[str, list[Node]] = {}
     path_bindings: dict[str, tuple[Node, bool]] = {}
     regex_calls: list[Node] = []
-    regex_bindings: dict[str, Node] = {}
+    regex_bindings: dict[str, list[Node]] = {}
     intrinsic_override = False
     path_unproven = False
     path_imports = 0
@@ -1838,9 +1932,23 @@ def _ordinary_native_calls(
             "shorthand_property_identifier_pattern",
         }:
             references.setdefault(program.text(node), []).append(node)
-        if node.type in {"identifier", "property_identifier", "string"}:
-            spelling = program.text(node).strip("\"'")
-            if spelling in override_names:
+        if node.type in {
+            "identifier",
+            "property_identifier",
+            "string",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            # Shorthand bindings bind the name too: catch ({RegExp}) and
+            # for (const {RegExp} of ...) bind through
+            # shorthand_property_identifier_pattern, not identifier. Only the
+            # constructor-position identifier itself is exempted, and
+            # _is_regexp_constructor only matches identifier nodes, so a
+            # shorthand node spelling an override name always poisons.
+            # The spelling is decoded first: {\u0052egExp} binds RegExp,
+            # and raw source spelling would miss the override name.
+            spelling = _decoded_identifier_text(program, node).strip("\"'")
+            if spelling in override_names and not _is_regexp_constructor(program, node):
                 intrinsic_override = True
             if spelling in {"syncBuiltinESMExports", "require", "getBuiltinModule"}:
                 path_unproven = True
@@ -1869,40 +1977,32 @@ def _ordinary_native_calls(
         if node.type == "this":
             intrinsic_override = True
         if node.type == "regex":
-            member = node.parent
-            call = None if member is None else member.parent
-            if (
-                member is not None
-                and member.type == "member_expression"
-                and member.child_by_field_name("object") == node
-                and _callable_member(program, member) in {"exec", "test"}
-                and call is not None
-                and call.type == "call_expression"
-                and call.child_by_field_name("function") == member
-                and call.child_by_field_name("arguments") is not None
-                and call.child_by_field_name("arguments").type != "template_string"
-            ):
+            member = _regex_receiver_call(program, node)
+            if member is not None:
                 if _callable_member(program, member) == "exec":
                     regex_calls.append(member)
-            elif member is not None and member.type == "variable_declarator":
-                binding = member.child_by_field_name("name")
-                declaration = member.parent
-                if (
-                    binding is not None
-                    and binding.type == "identifier"
-                    and member.child_by_field_name("value") == node
-                    and declaration is not None
-                    and declaration.type == "lexical_declaration"
-                    and declaration.children[0].type == "const"
-                    and declaration.parent is not None
-                    and declaration.parent.type in {"program", "statement_block"}
-                ):
-                    regex_bindings[program.text(binding)] = binding
-                else:
-                    intrinsic_override = True
+            elif (binding := _const_regex_binding(program, node)) is not None:
+                regex_bindings.setdefault(program.text(binding), []).append(binding)
             else:
                 # Even an argument can expose the shared RegExp prototype.
                 intrinsic_override = True
+        if node.type == "new_expression":
+            constructor = node.child_by_field_name("constructor")
+            if (
+                constructor is not None
+                and constructor.type == "identifier"
+                and program.text(constructor) == "RegExp"
+            ):
+                member = _regex_receiver_call(program, node)
+                if member is not None:
+                    if _callable_member(program, member) == "exec":
+                        regex_calls.append(member)
+                elif (binding := _const_regex_binding(program, node)) is not None:
+                    regex_bindings.setdefault(program.text(binding), []).append(binding)
+                else:
+                    # A constructed regex that escapes as a value can expose
+                    # the shared RegExp prototype, same as a literal.
+                    intrinsic_override = True
         if node.type == "call_expression":
             callee = node.child_by_field_name("function")
             arguments = node.child_by_field_name("arguments")
@@ -1945,26 +2045,42 @@ def _ordinary_native_calls(
                     else:
                         path_unproven = True
             pending.extend(specifier.named_children)
-    for name, binding in regex_bindings.items():
-        for reference in references[name]:
-            check_runtime()
-            if reference == binding:
-                continue
-            member = reference.parent
-            call = None if member is None else member.parent
-            if not (
-                member is not None
-                and member.type == "member_expression"
-                and member.child_by_field_name("object") == reference
-                and _callable_member(program, member) == "test"
-                and call is not None
-                and call.type == "call_expression"
-                and call.child_by_field_name("function") == member
-                and call.child_by_field_name("arguments") is not None
-                and call.child_by_field_name("arguments").type != "template_string"
-            ):
-                intrinsic_override = True
-                break
+    for name, bindings in regex_bindings.items():
+        # The proof belongs to one binding, so only references that can
+        # resolve to it count. A const inside a function body must not
+        # prove an outer or sibling receiver with the same name: the
+        # final `re` in `function local() { const re = /x/; re.test(t); }
+        # re.exec(...)` is outside that binding's scope, so it is skipped
+        # here and stays unowned. Every same-named binding is validated:
+        # a later binding must not overwrite an earlier one, or an escape
+        # of the earlier binding would go unchecked. References before the
+        # declaration are validated too, matching the old loop: a closure
+        # defined before the declaration can run after initialization, so
+        # a mutation or escape there refuses the proof like any other use.
+        for binding in bindings:
+            declarator = binding.parent
+            declaration = None if declarator is None else declarator.parent
+            scope = None if declaration is None else declaration.parent
+            for reference in references[name]:
+                check_runtime()
+                if reference == binding:
+                    continue
+                if (
+                    scope is None
+                    or declarator is None
+                    or not (scope.start_byte <= reference.start_byte < scope.end_byte)
+                ):
+                    continue
+                # Only .test/.exec calls on the binding are owned. Any other
+                # use, including a second binding of the same name, a parameter
+                # or import shadow, an escaping reference, or a template
+                # argument, keeps the conservative reading for the whole file.
+                member = _regex_receiver_call(program, reference)
+                if member is None:
+                    intrinsic_override = True
+                    break
+                if _callable_member(program, member) == "exec":
+                    regex_calls.append(member)
     for reference in references.get("Object", ()):
         parent = reference.parent
         if (
@@ -2147,7 +2263,10 @@ def _pattern_binding_names(
         check_runtime()
         node = pending.pop()
         if node.type in {"identifier", "shorthand_property_identifier_pattern"}:
-            names.add(program.text(node))
+            # Decode escape sequences: {\u0052egExp} binds RegExp, and
+            # the plain constructor name must match the recorded binding
+            # for the uncertain-binding check to see the shadow.
+            names.add(_decoded_identifier_text(program, node))
         elif node.type in {"assignment_pattern", "object_assignment_pattern"}:
             left = node.child_by_field_name("left")
             if left is not None:
@@ -2187,6 +2306,12 @@ def _has_shell_execution_call(
             value = node.child_by_field_name("right")
         elif node.type == "formal_parameters":
             target = node
+        elif node.type == "catch_clause":
+            # A catch parameter binds like a formal parameter, including
+            # destructured forms such as catch ({RegExp}). Without this, a
+            # caught arbitrary constructor could borrow the global RegExp
+            # proof in _ordinary_native_calls.
+            target = node.child_by_field_name("parameter")
         elif node.type == "arrow_function":
             target = node.child_by_field_name("parameter")
         elif node.type == "import_statement":
@@ -2273,13 +2398,20 @@ def _has_shell_execution_call(
                     pending_names.append(alias)
     for node in program.nodes:
         check_runtime()
-        if node.type in {"identifier", "shorthand_property_identifier"} or (
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        } or (
             node.type == "property_identifier"
             and node.parent is not None
             and node.parent.type == "member_expression"
         ):
             spelling = program.text(node)
             # Escaped names and extracted callable aliases are not resolved here.
+            # The pattern form is included too: catch ({\u0052egExp}) binds
+            # an escaped name, and it must fail closed like any other
+            # escaped identifier.
             if (
                 "\\" in spelling
                 or spelling == "Reflect"
