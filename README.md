@@ -621,7 +621,7 @@ remain unproved; literal absolute file destinations are still eligible.
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
 | SC1 | Unpinned Dependencies | LOW | No version constraints on packages |
-| SC2 | External Script Fetching | HIGH | curl \| bash and remote code execution |
+| SC2 | External Script Fetching | HIGH | curl \| bash, PowerShell `irm \| iex` and remote code execution |
 | SC3 | Obfuscated Code | HIGH | Base64/hex encoded execution |
 | SC4 | Known Vulnerable Dependencies | HIGH | Dependencies with known CVEs (live OSV.dev lookup) |
 | SC5 | Abandoned Dependencies | MEDIUM | Unmaintained packages without security updates |
