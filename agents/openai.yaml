@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Scanner"
+  short_description: "Scan AI agent skills for security risks"
+  default_prompt: "Use $skill-scanner to scan this agent skill before I install it."
