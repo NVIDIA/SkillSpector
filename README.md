@@ -21,6 +21,11 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 - **[Analysis resource bounds](docs/ANALYSIS_RESOURCE_BOUNDS.md)** — Fail-closed bundle, parser, nested-artifact, ledger, and finding ceilings.
 - **[Pi extension](docs/PI_EXTENSION.md)** — Install SkillSpector as a Pi tool for scanning skills from inside agent sessions.
 - **[OpenCode extension](docs/OPENCODE_EXTENSION.md)** — Install SkillSpector as an OpenCode tool and `/skillspector` command for scanning skills from inside agent sessions.
+- **[LLM analyzer base guide](docs/LLM_ANALYZER_BASE_GUIDE.md)** — How to build LLM-powered analyzer nodes on top of `LLMAnalyzerBase`.
+- **[Dependency source redirection](docs/DEPENDENCY_SOURCE_REDIRECTION.md)** — How SC10 findings flag a skill that changes where its packages are fetched from.
+- **[Live vulnerability lookups (SC4)](docs/SC4-osv-live-vulnerability-lookups.md)** — How SC4 checks dependencies against OSV.dev.
+- **[Eval dataset scanning](docs/EVAL_DATASETS.md)** — Which eval dataset files the static pattern analyzers skip.
+- **[MCP least-privilege analysis (LP1–LP4)](docs/B.3.1-mcp-least-privilege.md)** and **[MCP tool-poisoning detection (TP1–TP4)](docs/B.3.2-mcp-tool-poisoning.md)** — Design notes for the MCP analyzers.
 
 ## Features
 
