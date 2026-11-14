@@ -53,6 +53,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -455,7 +456,8 @@ def _parse_gemini_output(raw: str) -> str:
 
 # ---------------------------------------------------------------------------
 # OpenCode CLI invocation (verified against opencode 1.18.31-1.18.35 and 1.19.0-1.19.4;
-# per-version evidence beside _OPENCODE_SUPPORTED_VERSIONS)
+# per-version evidence beside _OPENCODE_SUPPORTED_VERSIONS; 2.x takes the
+# separate path beside _OPENCODE_SUPPORTED_VERSIONS_V2, #1084)
 # ---------------------------------------------------------------------------
 
 
@@ -494,6 +496,61 @@ _OPENCODE_SUPPORTED_VERSIONS = frozenset(
         (1, 19, 4),
     }
 )
+# OpenCode 2.x is a separate verified set, never merged into the 1.x set:
+# its policy delivery and preflight differ completely (see
+# _opencode_config_2x and _parse_opencode_debug_agents). On 2.x,
+# OPENCODE_CONFIG_CONTENT is honoured (a content-defined agent resolves
+# with its permissions, verified live on real 2.2.7) and the project
+# opencode.jsonc is the policy file the preflight verifies through
+# `debug agents`; OPENCODE_DISABLE_PROJECT_CONFIG=1 disables that project
+# file entirely, so the child environment must not set it (verified live:
+# with the flag set, a /etc/opencode/plugins marker plugin loads despite
+# the project policy denying it). Widening the 1.x set would admit a
+# runtime whose deny-all policy cannot be verified that way.
+# Evidence per member (live matrix on 2.2.6 and 2.2.7, #1084): a project
+# opencode.jsonc in the working directory is honoured and the probe agent
+# resolves to the deny-ending permission list recorded in the issue;
+# OPENCODE_PERMISSION does not change resolved agent permissions;
+# `run --pure` is an unknown flag (help text, exit 1) so the 2.x argv omits
+# it; `run --format json` keeps the 1.x event envelope;
+# `auth list --format json` prints [] when unauthenticated. Plugin
+# isolation (finding 1, live on real 2.2.7 with a marker plugin in
+# /etc/opencode/plugins): the system plugin loads without any project control
+# (its code runs in the server); `policies` denying `plugin.use` for `*` stops
+# the load entirely (no import, no activation), but only when the project file
+# is actually read and no higher layer allows it: a system-level `plugin.use`
+# allow outranks the project deny, so before any 2.x server starts the
+# preflight and the auth probe inspect the platform system directory and
+# refuse when it configures plugins or allows `plugin.use` (see
+# _check_opencode_system_sources). A `plugins: ["-*"]` remove op was tried
+# and rejected: it only stops activation (the module is still imported
+# first) and it empties `debug agents`, which would fail the preflight
+# closed and make 2.x unadmittable. Each widening
+# adds one triple with its own evidence, as for 1.x.
+_OPENCODE_SUPPORTED_VERSIONS_V2 = frozenset(
+    {
+        (2, 2, 6),
+        (2, 2, 7),
+    }
+)
+# Platform system configuration directory OpenCode 2.x discovers at startup
+# (per-platform values from the pinned opencode discovery.ts: /etc/opencode
+# on Linux, /Library/Application Support/opencode on macOS,
+# %ProgramData%\opencode on Windows). A system-level ``plugin.use`` allow
+# outranks the project deny, and a plugin listed or installed here loads
+# into the server before the project policy is read, so the 2.x preflight
+# and auth probe refuse to start when this directory configures plugins
+# (see _check_opencode_system_sources). Tests monkeypatch this constant to
+# a temporary directory; production code reads the module global at call
+# time and must never capture it at import.
+if sys.platform == "win32":
+    _OPENCODE_SYSTEM_CONFIG_DIR = os.path.join(
+        os.environ.get("ProgramData", r"C:\ProgramData"), "opencode"
+    )
+elif sys.platform == "darwin":
+    _OPENCODE_SYSTEM_CONFIG_DIR = "/Library/Application Support/opencode"
+else:
+    _OPENCODE_SYSTEM_CONFIG_DIR = "/etc/opencode"
 # Markers of a Zen free-tier refusal. Zen answers 403 to
 # any call carrying the deny-all isolation (OPENCODE_CONFIG_CONTENT or
 # OPENCODE_PERMISSION alone suffices; verified by env bisect), so free-tier
@@ -540,6 +597,61 @@ def _opencode_config(agent_name: str) -> str:
     )
 
 
+def _opencode_config_2x(agent_name: str) -> str:
+    """Build the 2.x project policy (``opencode.jsonc``) for one agent identity.
+
+    OpenCode 2.x honours ``OPENCODE_CONFIG_CONTENT`` (verified live on real
+    2.2.7: a content-defined agent resolves), but the deny-all policy is
+    delivered as a project ``opencode.jsonc`` in the per-run temporary
+    directory instead, because that is the file the preflight verifies
+    through ``debug agents``. Both the agent-local ``permissions`` list and
+    the top-level ``permissions`` list deny every action; the preflight
+    verifies the resolved list through ``debug agents``. The shape is the
+    one measured live on 2.2.6/2.2.7: a user-level config can append rules
+    after the project file, so the file alone proves nothing and the
+    preflight check on the resolved list stays load-bearing.
+
+    External plugins (``#1084``, finding 1): 2.x drops the 1.x isolation
+    hooks (``OPENCODE_PURE``, ``OPENCODE_TEST_MANAGED_CONFIG_DIR``), and the
+    system directory (``/etc/opencode`` on Linux) is still discovered, so a
+    machine-wide ``/etc/opencode/plugins`` plugin stays eligible to load
+    even with an empty inline ``plugin`` list. The control is a ``policies``
+    deny on ``plugin.use`` for every target: the deny is checked in the
+    plugin loader before the module is imported, so a denied plugin's code
+    never runs, however it was configured. Verified live on real 2.2.7 with
+    a marker plugin in ``/etc/opencode/plugins`` (top-level code writes a
+    marker on import, ``setup`` writes a second marker on activation):
+    with this policy neither marker appears, and the probe agent still
+    resolves. A ``plugins: ["-*"]`` remove op was tried and rejected: it
+    only stops activation (the module is still imported first, so on its
+    own it does not close the boundary), and it empties ``debug agents``
+    entirely, which would fail the preflight closed and make 2.x
+    unadmittable. A system-level policy allow outranks this project deny
+    by design, so the deny alone does not close the boundary either: the
+    2.x preflight and auth probe run :func:`_check_opencode_system_sources`
+    before any server starts and refuse when the platform system directory
+    configures plugins or allows ``plugin.use``.
+    """
+    deny_all = [{"action": "*", "resource": "*", "effect": "deny"}]
+    return json.dumps(
+        {
+            "$schema": "https://opencode.ai/config.json",
+            "agents": {
+                agent_name: {
+                    "description": "SkillSpector text-only semantic analysis",
+                    "mode": "primary",
+                    "permissions": deny_all,
+                }
+            },
+            "permissions": deny_all,
+            "policies": [
+                {"action": "plugin.use", "resource": "*", "effect": "deny"},
+            ],
+        },
+        separators=(",", ":"),
+    )
+
+
 def _parse_opencode_version(raw: bytes) -> tuple[int, int, int] | None:
     """Parse a stable semantic version triple from ``opencode --version``.
 
@@ -565,10 +677,47 @@ _OPENCODE_SUPPORTED_VERSIONS_TEXT = ", ".join(
     _format_opencode_version(version) for version in sorted(_OPENCODE_SUPPORTED_VERSIONS)
 )
 
+_OPENCODE_SUPPORTED_VERSIONS_V2_TEXT = ", ".join(
+    _format_opencode_version(version) for version in sorted(_OPENCODE_SUPPORTED_VERSIONS_V2)
+)
+
 
 def _is_supported_opencode_version(version: tuple[int, int, int] | None) -> bool:
     """Return whether a parsed version is a verified member of the set."""
     return version is not None and version in _OPENCODE_SUPPORTED_VERSIONS
+
+
+def _is_supported_opencode_version_v2(version: tuple[int, int, int] | None) -> bool:
+    """Return whether a parsed version is a verified member of the 2.x set."""
+    return version is not None and version in _OPENCODE_SUPPORTED_VERSIONS_V2
+
+
+def _probe_opencode_version(binary: str) -> tuple[int, int, int] | None:
+    """Return the installed OpenCode version triple, or ``None`` if unknowable.
+
+    Runs ``[binary, --version]`` once through the module's bounded driver
+    (the same path the preflight uses, so Popen stand-ins in tests keep
+    working). Any failure (missing binary, timeout, non-zero exit,
+    unparsable output, output over the cap) returns ``None`` so callers
+    keep the 1.x shape and the preflight fails closed on version. The
+    probe takes the scrubbed environment and passes no prompt or secret,
+    so it is safe to run before isolation is established.
+    """
+    try:
+        proc = subprocess.Popen(
+            [binary, "--version"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            env=_scrub_env(),
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    returncode, stdout_raw, _stderr_raw, overflow = _run_bounded(proc, b"", 15)
+    if overflow or returncode != 0:
+        return None
+    return _parse_opencode_version(stdout_raw)
 
 
 def _prepare_opencode_env(
@@ -589,13 +738,37 @@ def _prepare_opencode_env(
     The real OpenCode authentication store remains available so this CLI
     provider can use the user's existing login. OpenCode's internal plugins stay
     enabled for the same reason: they implement the OAuth logins (ChatGPT,
-    Copilot, GitLab, ...) and register no tools. External plugins remain off
-    through ``--pure`` / ``OPENCODE_PURE``. All mutable config, cache,
-    state, database, and temporary paths are redirected below the invocation's
-    already-isolated temporary root.
+    Copilot, GitLab, ...) and register no tools. External plugins stay off
+    through ``--pure`` / ``OPENCODE_PURE`` on 1.x; on 2.x those hooks are
+    gone, so the project policy denies ``plugin.use`` for every target
+    (see ``_opencode_config_2x``) and the preflight and auth probe refuse
+    to start when the platform system directory configures plugins or
+    allows ``plugin.use`` (see ``_check_opencode_system_sources``).
+    All mutable config, cache, state, database, and temporary paths are
+    redirected below the invocation's already-isolated temporary root.
+
+    ``OPENCODE_DISABLE_PROJECT_CONFIG`` is version-specific: it stays
+    set on 1.x and is omitted only on 2.x. On 1.x the deny-all policy
+    travels in ``OPENCODE_CONFIG_CONTENT`` and the flag is the only
+    thing stopping the ancestor configuration walk: a fresh temporary
+    directory can still sit beneath a repository containing
+    ``.opencode``, and without the flag 1.x walks up, finds that
+    project, and runs configuration initialisation there (verified live
+    on real 1.19.4: it writes a missing ``.gitignore`` into the
+    ancestor ``.opencode`` directory before the preflight finishes).
+    On 2.x the deny-all policy is delivered as a project
+    ``opencode.jsonc`` in the run's temporary directory, and the flag
+    disables that file entirely, so it must be omitted there (verified
+    live on real 2.2.7, #1084). An unknowable version keeps the 1.x
+    shape; the preflight fails closed on version before any inference.
     """
     env = {key: value for key, value in base_env.items() if not key.upper().startswith("OPENCODE_")}
     agent_name = _opencode_agent_name(argv)
+    # The flag decision needs the runtime version, which only the binary
+    # knows: probe it here the same way _build_opencode_argv does. A
+    # probe that cannot tell the version keeps the 1.x shape.
+    version = _probe_opencode_version(argv[0])
+    is_v2 = version is not None and version[0] == 2
     config_home = os.path.join(temp_root, "xdg-config")
     config_dir = os.path.join(config_home, "opencode")
     cache_home = os.path.join(temp_root, "xdg-cache")
@@ -626,7 +799,6 @@ def _prepare_opencode_env(
             "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
             "OPENCODE_DISABLE_LSP_DOWNLOAD": "1",
             "OPENCODE_DISABLE_MODELS_FETCH": "1",
-            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
             "OPENCODE_DISABLE_PRUNE": "1",
             "OPENCODE_DISABLE_TERMINAL_TITLE": "1",
             "OPENCODE_ENABLE_EXA": "0",
@@ -653,19 +825,307 @@ def _prepare_opencode_env(
             "XDG_STATE_HOME": state_home,
         }
     )
+    if not is_v2:
+        # 1.x only: keep OPENCODE_DISABLE_PROJECT_CONFIG=1. On 1.x the
+        # policy travels in OPENCODE_CONFIG_CONTENT, and without this
+        # flag the runtime walks up from the run directory and runs
+        # configuration initialisation in any ancestor .opencode
+        # project (verified live on real 1.19.4: it writes a missing
+        # .gitignore into the ancestor directory before the preflight
+        # finishes). On 2.x the flag must stay unset: the deny-all
+        # policy is a project opencode.jsonc in the run directory, and
+        # the flag disables that file entirely (verified live on real
+        # 2.2.7, #1084: with the flag set, a /etc/opencode/plugins
+        # marker plugin loads and activates despite the project policy
+        # denying it).
+        env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
     return env
+
+
+def _parse_opencode_debug_agents(stdout_raw: bytes, agent_name: str) -> None:
+    """Fail closed unless the 2.x resolved permissions end in a deny-all.
+
+    Parses ``opencode debug agents`` JSON: a list of agent objects, each
+    with an ``id`` and a ``permissions`` list of ``{action, resource,
+    effect}`` rules (verified on 2.2.6/2.2.7, #1084). OpenCode applies the
+    last matching rule, so the selected agent is safe only when its last
+    wildcard (``*``, ``*``) rule denies and no later rule grants or prompts
+    for anything: every rule after that final wildcard deny must itself
+    deny. A missing agent, a missing or malformed permission list, no
+    wildcard rule at all, a trailing wildcard allow, or any later allow or
+    ask all fail closed. User-level and organisation configs can append
+    rules after the project file, so this check reads the fully resolved
+    list rather than trusting the file that was written.
+    """
+    try:
+        agents = json.loads(stdout_raw.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentCLIError("OpenCode policy preflight returned malformed JSON") from exc
+    if not isinstance(agents, list):
+        raise AgentCLIError("OpenCode policy preflight returned a non-list agent set")
+    selected = None
+    for agent in agents:
+        if isinstance(agent, dict) and agent.get("id") == agent_name:
+            selected = agent
+            break
+    if selected is None:
+        raise AgentCLIError(
+            "OpenCode policy preflight could not find the selected agent "
+            f"{agent_name!r} in `debug agents` output"
+        )
+    permissions = selected.get("permissions")
+    if not isinstance(permissions, list) or not permissions:
+        raise AgentCLIError(
+            "OpenCode policy preflight found no resolved permissions for the selected agent"
+        )
+    rules: list[tuple[str, str, str]] = []
+    for rule in permissions:
+        if not isinstance(rule, dict):
+            raise AgentCLIError("OpenCode policy preflight found a malformed permission rule")
+        action = rule.get("action")
+        resource = rule.get("resource")
+        effect = rule.get("effect")
+        if (
+            not isinstance(action, str)
+            or not isinstance(resource, str)
+            or not isinstance(effect, str)
+        ):
+            raise AgentCLIError("OpenCode policy preflight found a malformed permission rule")
+        rules.append((action, resource, effect))
+    wildcard_indexes = [
+        index
+        for index, (action, resource, _effect) in enumerate(rules)
+        if action == "*" and resource == "*"
+    ]
+    if not wildcard_indexes:
+        raise AgentCLIError(
+            "OpenCode policy preflight found no wildcard rule for the selected agent"
+        )
+    last_wildcard = wildcard_indexes[-1]
+    if rules[last_wildcard][2] != "deny":
+        raise AgentCLIError(
+            "OpenCode policy preflight found the selected agent's last wildcard rule is not a deny"
+        )
+    for _action, _resource, effect in rules[last_wildcard + 1 :]:
+        if effect != "deny":
+            raise AgentCLIError(
+                "OpenCode policy preflight found a non-deny rule after the final wildcard deny"
+            )
+
+
+def _write_opencode_project_config(temp_root: str, agent_name: str) -> None:
+    """Write the 2.x project policy (``opencode.jsonc``) into ``temp_root``.
+
+    Called by the 2.x preflight, which already knows the version, so no
+    extra version probe is needed here. ``temp_root`` is also the run's
+    working directory, so OpenCode 2.x loads this file as the project
+    config for the inference call that follows. Any OSError propagates to
+    the caller, which fails closed before inference.
+    """
+    project_config = os.path.join(temp_root, "opencode.jsonc")
+    with open(project_config, "w", encoding="utf-8") as handle:
+        handle.write(_opencode_config_2x(agent_name))
+
+
+def _strip_opencode_jsonc_comments(text: str) -> str:
+    """Strip JSONC comments and trailing commas, leaving strings intact.
+
+    A regex would corrupt string values containing ``//`` or a trailing
+    ``,}`` (a URL, for example), so this walks the text once tracking
+    string and escape state instead. ``//`` runs to end of line and
+    ``/* ... */`` runs to its close; a comma whose next non-whitespace
+    character is ``}`` or ``]`` is dropped. An unterminated block comment
+    or string is left for ``json.loads`` to reject.
+    """
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    in_string = False
+    escaped = False
+    while index < length:
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if char == "/" and index + 1 < length and text[index + 1] == "/":
+            while index < length and text[index] != "\n":
+                index += 1
+            continue
+        if char == "/" and index + 1 < length and text[index + 1] == "*":
+            end = text.find("*/", index + 2)
+            if end == -1:
+                break
+            index = end + 2
+            continue
+        if char == ",":
+            lookahead = index + 1
+            while lookahead < length and text[lookahead] in " \t\r\n":
+                lookahead += 1
+            if lookahead < length and text[lookahead] in "}]":
+                index += 1
+                continue
+            out.append(char)
+            index += 1
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _load_opencode_system_config(path: str) -> dict[str, Any]:
+    """Parse a system ``opencode.json``/``opencode.jsonc`` file, or fail closed.
+
+    JSONC comments and trailing commas are tolerated; anything else
+    unparsable raises :class:`AgentCLIError` so an unreadable system
+    policy can never be treated as an empty one.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise AgentCLIError(
+            f"OpenCode system configuration {path!r} could not be read: {exc}"
+        ) from exc
+    try:
+        config = json.loads(_strip_opencode_jsonc_comments(raw))
+    except json.JSONDecodeError as exc:
+        raise AgentCLIError(
+            f"OpenCode system configuration {path!r} could not be parsed: {exc}"
+        ) from exc
+    if not isinstance(config, dict):
+        raise AgentCLIError(f"OpenCode system configuration {path!r} is not a JSON object")
+    return config
+
+
+def _check_opencode_system_sources() -> None:
+    """Fail closed when the platform system directory configures plugins.
+
+    2.x only. A system-level ``plugin.use`` allow outranks the project
+    deny (verified live on real 2.2.7: a configured system plugin runs
+    during startup while the agent permission check passes), so the
+    project policy alone cannot close the boundary. Before any 2.x
+    server starts (the preflight ``debug agents --standalone`` and the
+    ``auth list --standalone`` probe), inspect the platform system
+    directory (``_OPENCODE_SYSTEM_CONFIG_DIR``) and refuse when it
+    configures any plugin source:
+
+    - a ``policies`` rule with action exactly ``plugin.use`` and an
+      effect other than ``deny`` (``allow`` or ``ask`` both outrank the
+      project deny);
+    - any plugin listed in ``plugin`` or ``plugins`` (add operations
+      only: a ``-name`` removal entry configures no plugin);
+    - any entry under ``<system dir>/plugin`` or ``<system dir>/plugins``.
+
+    A missing system directory means no machine-wide source exists and
+    the check passes. A directory that cannot be listed, or a system
+    config file that cannot be read or parsed, fails closed: an
+    unreadable system policy must never be treated as an empty one.
+    """
+    system_dir = _OPENCODE_SYSTEM_CONFIG_DIR
+    try:
+        entries = os.listdir(system_dir)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise AgentCLIError(
+            f"OpenCode system configuration directory {system_dir!r} could not be listed: {exc}"
+        ) from exc
+    for filename in ("opencode.json", "opencode.jsonc"):
+        if filename not in entries:
+            continue
+        path = os.path.join(system_dir, filename)
+        config = _load_opencode_system_config(path)
+        policies = config.get("policies", [])
+        if not isinstance(policies, list):
+            raise AgentCLIError(
+                f"OpenCode system configuration {path!r} has a non-list 'policies' value"
+            )
+        for rule in policies:
+            if not isinstance(rule, dict):
+                raise AgentCLIError(
+                    f"OpenCode system configuration {path!r} has a malformed policy rule"
+                )
+            if rule.get("action") == "plugin.use" and rule.get("effect") != "deny":
+                raise AgentCLIError(
+                    "OpenCode system configuration "
+                    f"{path!r} allows 'plugin.use' (effect "
+                    f"{str(rule.get('effect'))!r}): a system allow outranks "
+                    "the project deny, so refusing to start a 2.x server"
+                )
+        for key in ("plugin", "plugins"):
+            if key not in config:
+                continue
+            listed = config[key]
+            if isinstance(listed, str):
+                listed = [listed]
+            elif isinstance(listed, dict):
+                listed = list(listed)
+            elif not isinstance(listed, list):
+                raise AgentCLIError(
+                    f"OpenCode system configuration {path!r} has a malformed {key!r} value"
+                )
+            for entry in listed:
+                if isinstance(entry, str) and (not entry or entry.startswith("-")):
+                    continue
+                raise AgentCLIError(
+                    "OpenCode system configuration "
+                    f"{path!r} lists plugin {entry!r}: refusing to start "
+                    "a 2.x server with a configured system plugin"
+                )
+    for subdir in ("plugin", "plugins"):
+        if subdir not in entries:
+            continue
+        plugin_dir = os.path.join(system_dir, subdir)
+        if not os.path.isdir(plugin_dir):
+            continue
+        try:
+            installed = os.listdir(plugin_dir)
+        except OSError as exc:
+            raise AgentCLIError(
+                f"OpenCode system plugin directory {plugin_dir!r} could not be listed: {exc}"
+            ) from exc
+        if installed:
+            raise AgentCLIError(
+                "OpenCode system plugin directory "
+                f"{plugin_dir!r} is not empty: refusing to start a 2.x "
+                "server with a configured system plugin"
+            )
 
 
 def _preflight_opencode_policy(
     binary: str, argv: list[str], child_env: dict[str, str], temp_root: str
 ) -> None:
-    """Fail closed unless OpenCode's fully resolved sensitive config is exact.
+    """Fail closed unless OpenCode's fully resolved policy is exact.
 
-    macOS MDM preferences are loaded after ``OPENCODE_CONFIG_CONTENT`` and do
-    not have a supported disable flag in any window version. Querying the final
+    1.x: ``debug config`` prints the resolved config, and macOS MDM
+    preferences are loaded after ``OPENCODE_CONFIG_CONTENT`` with no
+    supported disable flag in any window version. Querying the final
     config with the exact environment and directory prevents a managed
     ``share: auto`` (or another late source) from silently reopening ambient
     capabilities before the inference process is allowed to start.
+    2.x: ``debug config`` no longer prints resolved config, so the policy is
+    delivered as a project ``opencode.jsonc`` and verified through
+    ``debug agents``, which prints the resolved per-agent permission list
+    (#1084). ``OPENCODE_CONFIG_CONTENT`` is honoured on 2.x too (verified
+    live on real 2.2.7), so the preflight checks the resolved list the
+    server actually computes, not one file's text. Before that probe
+    starts a server, the preflight also runs the system-source gate
+    (:func:`_check_opencode_system_sources`): a system-level
+    ``plugin.use`` allow outranks the project deny, so a configured
+    system plugin would run during startup while the agent permission
+    check passes.
     """
 
     def run_probe(command: list[str], label: str) -> bytes:
@@ -693,16 +1153,48 @@ def _preflight_opencode_policy(
 
     version_raw = run_probe([binary, "--version"], "version")
     version = _parse_opencode_version(version_raw)
-    if not _is_supported_opencode_version(version):
-        version_text = version_raw.decode("utf-8", errors="replace").strip()
-        raise AgentCLIError(
-            "OpenCode security policy is verified only for versions "
-            f"{_OPENCODE_SUPPORTED_VERSIONS_TEXT}; found "
-            f"{version_text[:80]!r}"
-        )
+    if _is_supported_opencode_version(version):
+        agent_name = _opencode_agent_name(argv)
+        stdout_raw = run_probe([binary, "debug", "config"], "policy")
+        return _preflight_opencode_policy_v1(agent_name, stdout_raw)
+    if _is_supported_opencode_version_v2(version):
+        agent_name = _opencode_agent_name(argv)
+        # A system-level plugin.use allow outranks the project deny and a
+        # configured system plugin loads into the server before the project
+        # policy is read (verified live on real 2.2.7, #1086), so the gate
+        # runs before any 2.x server starts, including this preflight.
+        _check_opencode_system_sources()
+        try:
+            _write_opencode_project_config(temp_root, agent_name)
+        except OSError as exc:
+            raise AgentCLIError(
+                f"OpenCode policy preflight could not write the project policy: {exc}"
+            ) from exc
+        # --standalone runs a private server on an OS-assigned port for this
+        # command alone (verified on 2.2.6/2.2.7, #1084): the default service
+        # resolver would start a background service on the fixed channel
+        # port, so an ordinary service already using that port, or two
+        # overlapping scans, makes the isolated service fail to bind and
+        # the preflight fail. The standalone server dies with this command
+        # (its stdin lease closes), so no service is left behind.
+        stdout_raw = run_probe([binary, "debug", "agents", "--standalone"], "agents")
+        _parse_opencode_debug_agents(stdout_raw, agent_name)
+        return
+    version_text = version_raw.decode("utf-8", errors="replace").strip()
+    raise AgentCLIError(
+        "OpenCode security policy is verified only for versions "
+        f"{_OPENCODE_SUPPORTED_VERSIONS_TEXT} and "
+        f"{_OPENCODE_SUPPORTED_VERSIONS_V2_TEXT}; found "
+        f"{version_text[:80]!r}"
+    )
 
-    agent_name = _opencode_agent_name(argv)
-    stdout_raw = run_probe([binary, "debug", "config"], "policy")
+
+def _preflight_opencode_policy_v1(agent_name: str, stdout_raw: bytes) -> None:
+    """Verify the 1.x resolved config from ``debug config`` output.
+
+    Split out of :func:`_preflight_opencode_policy` so the 1.x subset check
+    stays untouched by the 2.x ``debug agents`` path.
+    """
     try:
         config = json.loads(stdout_raw.decode("utf-8", errors="strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -738,7 +1230,9 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
 
     Flags chosen (verified against ``opencode`` 1.18.31-1.19.4 ``run --help``,
     byte-identical across .34/.35/1.19.0 and across 1.19.1-1.19.4, whose
-    only change is the hidden ``--share`` flag):
+    only change is the hidden ``--share`` flag; on 2.2.6/2.2.7 ``run --help``
+    still offers ``--agent``/``--format json``/``--model`` but not ``--pure``,
+    #1084):
 
     ``run``
         Non-interactive single-shot mode. With no positional message, the
@@ -746,7 +1240,25 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
         reaches argv.
 
     ``--pure``
-        Run without external plugins.
+        Run without external plugins. 1.x only: ``--pure`` is an unknown
+        flag on 2.x (verified on 2.2.6/2.2.7, #1084: it prints the ``run``
+        help text and exits 1), so the 2.x argv omits it; plugin isolation
+        on 2.x comes from the project policy instead (``plugin.use`` deny
+        for every target, see ``_opencode_config_2x``). The version is
+        probed here so the flag decision is made before the preflight
+        runs; an unknowable version keeps the 1.x shape and the preflight
+        fails closed on version.
+
+    ``--standalone`` (2.x only)
+        Run with a private server instead of the background service. The
+        2.x ``run`` otherwise connects to an already-running service when
+        one exists, or starts one on the fixed channel port; either breaks
+        isolation (an ambient service, or a bind collision with one) and
+        leaves a daemon behind. The standalone server listens on an
+        OS-assigned port and dies with this command, so overlapping scans
+        cannot collide and no service is left behind (verified live on
+        2.2.7, #1084: a service already on the default port fails the
+        managed path, two concurrent standalone calls succeed).
 
     ``--agent skillspector-deny-all-<nonce>``
         Select the unguessable per-invocation agent installed through
@@ -779,10 +1291,14 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
     # (forwarded only when SKILLSPECTOR_MODEL is set).
     model_arg = ["--model", _validate_model_label(model)] if model else []
     agent_name = f"{_OPENCODE_AGENT_PREFIX}-{secrets.token_hex(16)}"
+    version = _probe_opencode_version(binary)
+    pure_arg = [] if version is not None and version[0] == 2 else ["--pure"]
+    standalone_arg = ["--standalone"] if version is not None and version[0] == 2 else []
     return [
         binary,
         "run",
-        "--pure",
+        *pure_arg,
+        *standalone_arg,
         "--agent",
         agent_name,
         "--format",
@@ -884,11 +1400,26 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
     """Check opencode is authenticated via ``opencode auth list`` (no inference).
 
     The caller must already have resolved ``binary``. The probe uses the same
-    scrubbed environment as inference, performs no inference, and completes
-    well under 15s. Fail-closed: probe error/timeout, non-zero exit, zero
-    parsed credentials everywhere, or unparseable output all return
-    ``(False, reason)``. ``True`` is returned only when at least one parsed
-    credential/environment-key count is positive.
+    scrubbed environment as inference, runs inside the same kind of
+    isolated temporary directory (``cwd=tmp_root``), performs no
+    inference, and completes well under 15s. On 2.x it first runs the
+    system-source gate (:func:`_check_opencode_system_sources`), then
+    writes the project policy into that directory and runs ``auth list
+    --standalone --format json``, so the probe uses a private server
+    instead of the background service on the fixed port and a
+    configured project plugin cannot load; a configured system plugin
+    is refused by the gate before the probe starts (verified live on
+    real 2.2.7: ``auth list --standalone --format json`` prints ``[]``
+    when unauthenticated). On 1.x the child environment keeps
+    ``OPENCODE_DISABLE_PROJECT_CONFIG=1`` (see
+    ``_prepare_opencode_env``), so the probe cannot walk up to an
+    ancestor project. Fail-closed: probe error/timeout, non-zero exit,
+    zero parsed credentials everywhere, or unparseable output all return
+    ``(False, reason)``. 1.x returns ``True`` only when at least one parsed
+    credential/environment-key count is positive. 2.x prints no counts, so
+    it runs ``auth list --standalone --format json`` and returns ``True``
+    only when the parsed array of integrations with connections is
+    non-empty (verified on 2.2.6/2.2.7: ``[]`` when unauthenticated, #1084).
     """
     tmp_root = tempfile.mkdtemp(prefix="skillspector_opencode_auth_")
     try:
@@ -900,22 +1431,49 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
                 capture_output=True,
                 shell=False,
                 timeout=15,
+                cwd=tmp_root,
                 env=child_env,
             )
-            if version_result.returncode != 0 or not _is_supported_opencode_version(
-                _parse_opencode_version(version_result.stdout or b"")
+            version = _parse_opencode_version(version_result.stdout or b"")
+            if version_result.returncode != 0 or (
+                not _is_supported_opencode_version(version)
+                and not _is_supported_opencode_version_v2(version)
             ):
                 return (
                     False,
                     "opencode_cli requires OpenCode "
-                    f"{_OPENCODE_SUPPORTED_VERSIONS_TEXT} "
+                    f"{_OPENCODE_SUPPORTED_VERSIONS_TEXT} or "
+                    f"{_OPENCODE_SUPPORTED_VERSIONS_V2_TEXT} "
                     "for its verified deny-all policy",
                 )
+            if _is_supported_opencode_version_v2(version):
+                # 2.x only: refuse a configured system plugin before the
+                # probe starts a server, exactly as the preflight does
+                # for inference (see _check_opencode_system_sources).
+                # The gate raises AgentCLIError; the auth check reports
+                # availability as a (False, reason) tuple, so convert it
+                # here instead of letting it escape to is_available.
+                try:
+                    _check_opencode_system_sources()
+                except AgentCLIError as exc:
+                    return False, str(exc)
+                # Then deliver the project policy into the isolated
+                # directory before the probe, exactly as the preflight
+                # does for inference, so a configured project plugin
+                # cannot load during availability. Any write failure is
+                # caught below and fails closed.
+                _write_opencode_project_config(tmp_root, _opencode_agent_name(policy_argv))
+            auth_argv = (
+                [binary, "auth", "list", "--standalone", "--format", "json"]
+                if _is_supported_opencode_version_v2(version)
+                else [binary, "auth", "list"]
+            )
             result = subprocess.run(
-                [binary, "auth", "list"],
+                auth_argv,
                 capture_output=True,
                 shell=False,
                 timeout=15,
+                cwd=tmp_root,
                 env=child_env,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
@@ -923,6 +1481,14 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
     finally:
         _cleanup_temp_dir(tmp_root)
     if result.returncode != 0:
+        return False, "opencode is not authenticated (run `opencode auth login`)"
+    if _is_supported_opencode_version_v2(version):
+        try:
+            entries = json.loads((result.stdout or b"").decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False, "opencode is not authenticated (run `opencode auth login`)"
+        if isinstance(entries, list) and entries:
+            return True, None
         return False, "opencode is not authenticated (run `opencode auth login`)"
     out = re.compile(r"\x1b\[[0-9;]*m").sub(
         "", (result.stdout or b"").decode("utf-8", errors="replace")

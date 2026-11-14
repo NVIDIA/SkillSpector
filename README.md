@@ -333,7 +333,7 @@ inference gateways.
 | `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | local Claude runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `codex_cli` | Disabled | Registered for compatibility; its read-only sandbox permits host-file reads | Use an HTTP API provider or another supported CLI provider |
 | `gemini_cli` | _(none — uses local CLI auth)_ | local `gemini` binary | local Gemini runtime fallback, or `SKILLSPECTOR_MODEL` |
-| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` (verified 1.18.31–1.18.35, 1.19.0–1.19.4) binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
+| `opencode_cli` | _(none, uses local CLI auth)_ | local `opencode` (verified 1.18.31–1.18.35, 1.19.0–1.19.4, 2.2.6–2.2.7) binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
 
 For `openai_compatible` gateways requiring extra HTTP headers, set
 `SKILLSPECTOR_COMPAT_HEADERS='{"X-Tenant-ID":"my-tenant","X-API-Key":"gateway-key"}'`.
@@ -847,7 +847,7 @@ Issues (2)
 
 > **CLI providers** (`claude_cli`, `gemini_cli`, `opencode_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
 >
-> `opencode_cli` currently fails closed unless the installed OpenCode version is one of the individually verified releases (`1.18.31`, `1.18.32`, `1.18.33`, `1.18.34`, `1.18.35`, `1.19.0`, `1.19.1`, `1.19.2`, `1.19.3`, `1.19.4`), whose configuration precedence and deny-all semantics are verified by this release; every other version, including prereleases, still fails closed.
+> `opencode_cli` currently fails closed unless the installed OpenCode version is one of the individually verified releases (`1.18.31`, `1.18.32`, `1.18.33`, `1.18.34`, `1.18.35`, `1.19.0`, `1.19.1`, `1.19.2`, `1.19.3`, `1.19.4`, `2.2.6`, `2.2.7`), whose configuration precedence and deny-all semantics are verified by this release; every other version, including prereleases, still fails closed. On 2.x the deny-all policy is delivered as a project `opencode.jsonc` and verified through `opencode debug agents`. `OPENCODE_CONFIG_CONTENT` is honoured on 2.x (verified live on 2.2.7), but the project file is the policy the preflight verifies. `OPENCODE_DISABLE_PROJECT_CONFIG=1` disables that project file, so it stays unset on 2.x and set only on 1.x. Before any 2.x server starts, SkillSpector also refuses when the platform system directory (`/etc/opencode` on Linux, `/Library/Application Support/opencode` on macOS, `%ProgramData%\opencode` on Windows) configures plugins or allows `plugin.use`, because a system-level allow outranks the project deny.
 
 ### CLI Options
 
