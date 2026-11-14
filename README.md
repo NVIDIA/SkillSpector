@@ -85,8 +85,10 @@ make docker-build
 **Scan a local directory** by mounting your current directory into `/scan`, the container's working directory:
 
 ```bash
-docker run --rm -v "$PWD:/scan" skillspector scan ./my-skill/ --no-llm
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/scan" skillspector scan ./my-skill/ --no-llm
 ```
+
+The image runs as an unprivileged user. `--user "$(id -u):$(id -g)"` runs it as you instead, so it can write reports into the mounted directory and they stay owned by you.
 
 **Scan with LLM analysis** by passing credentials with a local `.env` file:
 
@@ -99,6 +101,7 @@ EOF
 
 ```bash
 docker run --rm \
+  --user "$(id -u):$(id -g)" \
   -v "$PWD:/scan" \
   --env-file .env \
   skillspector scan ./my-skill/
@@ -108,6 +111,7 @@ Or pass credentials directly from your shell environment:
 
 ```bash
 docker run --rm \
+  --user "$(id -u):$(id -g)" \
   -v "$PWD:/scan" \
   -e SKILLSPECTOR_PROVIDER=anthropic \
   -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
@@ -117,7 +121,8 @@ docker run --rm \
 **Write a report to the host filesystem** by writing to the mounted directory:
 
 ```bash
-docker run --rm --user "$(id -u):$(id -g)" \
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
   -v "$PWD:/scan" \
   skillspector scan ./my-skill/ --no-llm --format json --output report.json
 ```
@@ -125,7 +130,7 @@ docker run --rm --user "$(id -u):$(id -g)" \
 **Optional alias** for repeated static scans:
 
 ```bash
-alias skillspector-docker='docker run --rm -v "$PWD:/scan" skillspector'
+alias skillspector-docker='docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/scan" skillspector'
 skillspector-docker scan ./my-skill/ --no-llm
 ```
 

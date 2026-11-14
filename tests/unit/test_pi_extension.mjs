@@ -185,6 +185,16 @@ test("keeps nested local paths local and scans workspace inputs without a prompt
   assert.equal(ctx.prompts.length, 0);
 });
 
+test("never passes a dash-led target to the CLI as an option", async (t) => {
+  const ctx = await setup(t);
+  await assert.rejects(ctx.scan({ target: "--output=/tmp/x" }, { hasUI: false }));
+  assert.equal(ctx.calls.length, 0);
+  writeFileSync(join(ctx.workspace, "-skill"), "synthetic skill");
+  await ctx.scan({ target: "./-skill" }, { hasUI: false });
+  assert.deepEqual(ctx.calls[0].args.slice(0, 2), ["scan", join(ctx.workspace, "-skill")]);
+  assert.equal(ctx.prompts.length, 0);
+});
+
 test("requires approval before exposing external targets or YARA rules to the CLI", async (t) => {
   const ctx = await setup(t);
   const secret = join(ctx.root, "private.md");
