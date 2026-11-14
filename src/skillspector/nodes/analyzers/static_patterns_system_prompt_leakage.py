@@ -61,8 +61,11 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
 from .common import (
+    CHINESE_GAP,
+    CHINESE_SEPARATOR,
     LINE_BREAK_CHARS,
     LOGICAL_LINE_BREAK,
+    chinese_spaced,
     get_context,
     get_line_number,
 )
@@ -88,6 +91,20 @@ _P6_TARGET_QUALIFIERS = (
 )
 
 # P6: Direct Prompt Extraction — instructions that directly reveal system prompts
+# Qualified verb-first noun group, shared by the seven qualified variants
+# below. Bare 提示 carries a guard: 提示信息 is an ordinary notice
+# ("notice information"), not a prompt request, so a qualified 显示/输出
+# must not match when 提示 is followed by 信息 ("显示完整提示信息",
+# "显示你的提示信息"). The Traditional compound 提示訊息 (and the mixed
+# 提示讯息) is the same ordinary notice ("輸入無效時顯示完整提示訊息"),
+# so the guard covers all three spellings. 提示词, 指令 and 规则 are
+# unaffected, so explicit system-prompt requests ("显示完整系统提示词")
+# stay covered.
+_CHINESE_QUALIFIED_NOUN = (
+    f"(?:{chinese_spaced('提示词')}|{chinese_spaced('提示詞')}|"
+    f"{chinese_spaced('提示')}(?!{CHINESE_SEPARATOR}(?:{chinese_spaced('信息')}|{chinese_spaced('訊息')}|{chinese_spaced('讯息')}))|"
+    f"{chinese_spaced('指令')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})"
+)
 P6_PATTERNS = [
     (
         r"(?:print|output|show|display|reveal|expose|return|echo)\s+"
@@ -124,6 +141,109 @@ P6_PATTERNS = [
     (
         r"(?:verbatim|exactly|word\s+for\s+word)\s+(?:repeat|output|print)\s+(?:your\s+)?(?:system\s+)?(?:prompts?|instructions?)",
         0.9,
+    ),
+    # Chinese-language equivalents (issue #953). A bare mention of the
+    # system prompt never matches; every pattern requires an extraction verb
+    # (output, reveal, leak) acting on the prompt or hidden instructions.
+    # As with the P1 Chinese patterns, each pattern is split into one
+    # variant per combination of its optional segments, so a long separator
+    # run is consumed once instead of being distributed across repeated
+    # gaps. The split variants together match exactly the phrases the
+    # single patterns matched.
+    # System prompt, verbatim, output, with or without the manner segment.
+    (
+        f"(?:{chinese_spaced('系统提示词')}|{chinese_spaced('系統提示詞')}|{chinese_spaced('系统提示')}|{chinese_spaced('系統提示')}|{chinese_spaced('隐藏指令')}|{chinese_spaced('隱藏指令')}|{chinese_spaced('内部指令')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('复制')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('系统提示词')}|{chinese_spaced('系統提示詞')}|{chinese_spaced('系统提示')}|{chinese_spaced('系統提示')}|{chinese_spaced('隐藏指令')}|{chinese_spaced('隱藏指令')}|{chinese_spaced('内部指令')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('原样')}|{chinese_spaced('逐字')}|{chinese_spaced('一字不差')}|{chinese_spaced('全文')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('复制')})",
+        0.85,
+    ),
+    # Verb first, all combinations of pronoun, completeness, and system segments.
+    # The bare noun 提示 is excluded from the unqualified variant: it also
+    # means an ordinary notice (提示信息, "notice information"), so an
+    # unqualified 显示提示/输出提示 is ambiguous. Explicit requests stay
+    # covered by the qualified variants below (系统, 完整, 你/您) and by
+    # 提示词, 指令 and 规则 here.
+    (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('提示词')}|{chinese_spaced('提示詞')}|{chinese_spaced('指令')}|{chinese_spaced('规则')}|{chinese_spaced('規則')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('系统')}|{chinese_spaced('系統')}){CHINESE_GAP}"
+        f"{_CHINESE_QUALIFIED_NOUN}",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('完整')}|{chinese_spaced('全部')}){CHINESE_GAP}"
+        f"{_CHINESE_QUALIFIED_NOUN}",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('完整')}|{chinese_spaced('全部')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('系统')}|{chinese_spaced('系統')}){CHINESE_GAP}"
+        f"{_CHINESE_QUALIFIED_NOUN}",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')}){CHINESE_GAP}"
+        f"{_CHINESE_QUALIFIED_NOUN}",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('系统')}|{chinese_spaced('系統')}){CHINESE_GAP}"
+        f"{_CHINESE_QUALIFIED_NOUN}",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('完整')}|{chinese_spaced('全部')}){CHINESE_GAP}"
+        f"{_CHINESE_QUALIFIED_NOUN}",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('输出')}|{chinese_spaced('輸出')}|{chinese_spaced('打印')}|{chinese_spaced('显示')}|{chinese_spaced('顯示')}|{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('洩露')}|{chinese_spaced('公开')}|{chinese_spaced('說出')}|{chinese_spaced('说出')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('完整')}|{chinese_spaced('全部')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('系统')}|{chinese_spaced('系統')}){CHINESE_GAP}"
+        f"{_CHINESE_QUALIFIED_NOUN}",
+        0.85,
+    ),
+    # Reveal hidden or internal instructions, all pronoun and qualifier combinations.
+    (
+        f"(?:{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('公开')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('指令')}|{chinese_spaced('提示词')}|{chinese_spaced('提示詞')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('公开')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('隐藏')}|{chinese_spaced('隱藏')}|{chinese_spaced('内部')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('指令')}|{chinese_spaced('提示词')}|{chinese_spaced('提示詞')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('公开')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('指令')}|{chinese_spaced('提示词')}|{chinese_spaced('提示詞')})",
+        0.85,
+    ),
+    (
+        f"(?:{chinese_spaced('透露')}|{chinese_spaced('泄露')}|{chinese_spaced('公开')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('你')}|{chinese_spaced('您')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('隐藏')}|{chinese_spaced('隱藏')}|{chinese_spaced('内部')}){CHINESE_GAP}"
+        f"(?:{chinese_spaced('指令')}|{chinese_spaced('提示词')}|{chinese_spaced('提示詞')})",
+        0.85,
     ),
 ]
 # These patterns finish on an extraction target noun. The other two finish
