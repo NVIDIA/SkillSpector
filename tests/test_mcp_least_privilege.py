@@ -627,6 +627,225 @@ class TestLP4OverDeclared:
             assert lp4.file == "SKILL.md"
 
 
+class TestLP4GoCapabilityPatterns:
+    """Go capability calls satisfy the matching declared permission (no LP4).
+
+    LP4 previously flagged env and file_read as over-declared in Go skills
+    because the capability patterns only covered Python and JavaScript calls
+    (issue #1121). Each positive case below fails before the fix and passes
+    after it.
+    """
+
+    @staticmethod
+    def _go_state(permissions: list[str], go_code: str) -> dict:
+        return {
+            "manifest": {"name": "go-skill", "permissions": permissions, "triggers": []},
+            "file_cache": {"main.go": go_code},
+            "component_metadata": [
+                {
+                    "path": "main.go",
+                    "type": "go",
+                    "executable": True,
+                    "lines": len(go_code.splitlines()),
+                    "size_bytes": len(go_code),
+                },
+            ],
+            "has_executable_scripts": True,
+            "components": ["main.go"],
+        }
+
+    @staticmethod
+    def _lp4_for_category(findings, category: str) -> list:
+        return [f for f in findings if f.rule_id == "LP4" and f"({category})" in (f.message or "")]
+
+    @pytest.mark.parametrize(
+        ("permission", "category", "go_code"),
+        [
+            pytest.param(
+                "env: MY_TOOL_CONFIG",
+                "env",
+                'package main\n\nimport "os"\n\nfunc main() {\n'
+                '\tpath, ok := os.LookupEnv("MY_TOOL_CONFIG")\n\t_ = path\n\t_ = ok\n}\n',
+                id="lookupenv",
+            ),
+            pytest.param(
+                "env: MY_TOOL_CONFIG",
+                "env",
+                'package main\n\nimport "os"\n\nfunc main() {\n'
+                '\tpath := os.ExpandEnv("$MY_TOOL_CONFIG")\n\t_ = path\n}\n',
+                id="expandenv",
+            ),
+            pytest.param(
+                "env: MY_TOOL_CONFIG",
+                "env",
+                'package main\n\nimport "os"\n\nfunc main() {\n'
+                '\tpath := os.Getenv("MY_TOOL_CONFIG")\n\t_ = path\n}\n',
+                id="getenv_unchanged",
+            ),
+            pytest.param(
+                "file_read: config.json",
+                "file_read",
+                'package main\n\nimport "os"\n\nfunc main() {\n'
+                '\tdata, err := os.ReadFile("config.json")\n\t_, _ = data, err\n}\n',
+                id="readfile",
+            ),
+            pytest.param(
+                "file_read: config.json",
+                "file_read",
+                'package main\n\nimport "os"\n\nfunc main() {\n'
+                '\tf, err := os.Open("config.json")\n\t_, _ = f, err\n}\n',
+                id="open",
+            ),
+            pytest.param(
+                "file_read: config.json",
+                "file_read",
+                'package main\n\nimport "os"\n\nfunc main() {\n'
+                '\tentries, err := os.ReadDir(".")\n\t_, _ = entries, err\n}\n',
+                id="readdir",
+            ),
+            pytest.param(
+                "file_read: config.json",
+                "file_read",
+                'package main\n\nimport (\n\t"io/fs"\n\t"path/filepath"\n)\n\n'
+                "func main() {\n"
+                '\t_ = filepath.WalkDir(".", func(path string, d fs.DirEntry, '
+                "err error) error { return nil })\n}\n",
+                id="walkdir",
+            ),
+            pytest.param(
+                "file_read: config.json",
+                "file_read",
+                'package main\n\nimport "path/filepath"\n\nfunc main() {\n'
+                '\tmatches, err := filepath.Glob("*.json")\n\t_, _ = matches, err\n}\n',
+                id="glob",
+            ),
+            pytest.param(
+                "file_read: config.json",
+                "file_read",
+                'package main\n\nimport "io"\n\n'
+                "func readAll(r io.Reader) ([]byte, error) {\n"
+                "\treturn io.ReadAll(r)\n}\n",
+                id="readall",
+            ),
+            pytest.param(
+                "file_write: out.json",
+                "file_write",
+                'package main\n\nimport "os"\n\nfunc main() {\n'
+                '\terr := os.WriteFile("out.json", []byte("x"), 0644)\n\t_ = err\n}\n',
+                id="writefile",
+            ),
+            pytest.param(
+                "file_write: out.json",
+                "file_write",
+                'package main\n\nimport "os"\n\nfunc main() {\n'
+                '\tf, err := os.CreateTemp("", "tmp-")\n\t_, _ = f, err\n}\n',
+                id="createtemp",
+            ),
+            pytest.param(
+                "file_write: out.json",
+                "file_write",
+                'package main\n\nimport "os"\n\nfunc main() {\n'
+                '\tf, err := os.Create("out.json")\n\t_, _ = f, err\n}\n',
+                id="create",
+            ),
+        ],
+    )
+    def test_go_capability_satisfies_permission(self, permission, category, go_code):
+        """The Go call covers its declared permission, so no LP4 fires."""
+        state = self._go_state([permission], go_code)
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp4 = self._lp4_for_category(findings, category)
+        assert lp4 == [], (
+            f"Go {category} call should satisfy {permission}, got: "
+            f"{[(f.rule_id, f.message) for f in findings]}"
+        )
+
+    def test_go_skill_without_capability_calls_still_lp4(self):
+        """A Go skill declaring permissions its code never uses still gets
+        LP4 for each one: the fix must not blanket-suppress LP4 for Go."""
+        state = self._go_state(
+            ["env: MY_TOOL_CONFIG", "file_read: config.json", "file_write: out.json"],
+            'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("hello")\n}\n',
+        )
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp4 = [f for f in findings if f.rule_id == "LP4"]
+        assert len(lp4) == 3, (
+            f"Expected 3 LP4 findings, got: {[(f.rule_id, f.message) for f in findings]}"
+        )
+        for category in ("env", "file_read", "file_write"):
+            assert self._lp4_for_category(findings, category), (
+                f"Expected LP4 for {category}, got: {[(f.rule_id, f.message) for f in findings]}"
+            )
+
+    def test_go_write_capability_without_declaration_fires_lp1(self):
+        """Declaring only file_read while Go code writes via os.WriteFile
+        fires LP1 for file_write: the new patterns feed LP1 as well."""
+        state = self._go_state(
+            ["file_read: config.json"],
+            'package main\n\nimport "os"\n\nfunc main() {\n'
+            '\tdata, _ := os.ReadFile("config.json")\n'
+            '\t_ = os.WriteFile("out.json", data, 0644)\n}\n',
+        )
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp1_write = [
+            f for f in findings if f.rule_id == "LP1" and "file_write" in (f.message or "")
+        ]
+        assert len(lp1_write) == 1, (
+            f"Expected one LP1 for undeclared file_write, got: "
+            f"{[(f.rule_id, f.message) for f in findings]}"
+        )
+
+    def test_python_and_js_detection_unchanged(self):
+        """Python and JavaScript capability detection is unchanged: os.getenv,
+        open(..., "r") and process.env still satisfy their permissions."""
+        cases = [
+            (
+                ["env: MY_TOOL_CONFIG"],
+                "agent.py",
+                'import os\npath = os.getenv("MY_TOOL_CONFIG")\n',
+                "python",
+            ),
+            (
+                ["file_read: config.json"],
+                "agent.py",
+                'with open("config.json", "r") as f:\n    data = f.read()\n',
+                "python",
+            ),
+            (
+                ["env: MY_TOOL_CONFIG"],
+                "agent.js",
+                "const path = process.env.MY_TOOL_CONFIG;\n",
+                "javascript",
+            ),
+        ]
+        for permissions, path, code, file_type in cases:
+            state: dict = {
+                "manifest": {"name": "py-js-skill", "permissions": permissions, "triggers": []},
+                "file_cache": {path: code},
+                "component_metadata": [
+                    {
+                        "path": path,
+                        "type": file_type,
+                        "executable": True,
+                        "lines": len(code.splitlines()),
+                        "size_bytes": len(code),
+                    },
+                ],
+                "has_executable_scripts": True,
+                "components": [path],
+            }
+            result = mcp_least_privilege.node(state)
+            findings = result["findings"]
+            lp4 = [f for f in findings if f.rule_id == "LP4"]
+            assert lp4 == [], (
+                f"{file_type} capability should satisfy {permissions}, got: "
+                f"{[(f.rule_id, f.message) for f in findings]}"
+            )
+
+
 class TestCleanSkill:
     def test_no_findings(self):
         """mcp_clean_skill: permissions match capabilities → zero LP findings."""
