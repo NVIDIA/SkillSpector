@@ -2625,6 +2625,105 @@ class TestSupplyChainDependencies:
         names = sorted(p[0] for p in sc_mod._extract_packages_from_pyproject(content))
         assert names == ["setuptools", "wheel"]
 
+    def test_pyproject_poetry_tables_extracted_with_exact_pins(self) -> None:
+        """Poetry tables yield names; bare versions are exact pins, ranges stay unpinned."""
+        content = (
+            "[tool.poetry.dependencies]\n"
+            'python = "^3.11"\n'
+            'requests = "2.31.0"\n'
+            'flask = "^2.0"\n'
+            'django = {version = "4.2.1", extras = ["argon2"]}\n'
+            'mylib = {git = "https://example.com/mylib.git"}\n'
+            "[tool.poetry.dev-dependencies]\n"
+            'pytest = "==7.4.0"\n'
+            "[tool.poetry.group.docs.dependencies]\n"
+            'sphinx = ">=5,<7"\n'
+        )
+        result = {p[0]: p[1] for p in sc_mod._extract_packages_from_pyproject(content)}
+        assert result == {
+            "requests": "2.31.0",
+            "flask": None,
+            "django": "4.2.1",
+            "mylib": None,
+            "pytest": "7.4.0",
+            "sphinx": None,
+        }
+        assert "python" not in result
+
+    @pytest.mark.parametrize(
+        "constraint",
+        [
+            '"1.2.3 || 1.2.4"',
+            '"1.2.3||1.2.4"',
+            '{version = "1.2.3 || 1.2.4"}',
+            '"1.2.3 1.2.4"',
+            '"1.2.*"',
+        ],
+    )
+    def test_pyproject_poetry_non_concrete_constraint_keeps_package_unpinned(
+        self, constraint: str
+    ) -> None:
+        """OR/space/wildcard constraints must not become invalid pins that drop the package."""
+        content = f"[tool.poetry.dependencies]\nrequests = {constraint}\n"
+        assert sc_mod._extract_packages_from_pyproject(content) == [("requests", None, 2)]
+
+    def test_pyproject_poetry_or_constraint_survives_name_based_analysis(self) -> None:
+        """The package stays visible to name-based SC checks (not silently dropped)."""
+        content = '[tool.poetry.dependencies]\nrequests = "1.2.3 || 1.2.4"\n'
+        packages = sc_mod._extract_packages_from_pyproject(content)
+        assert [p[0] for p in packages] == ["requests"]
+        # Same downstream entry point the scanner uses must not raise on the unpinned entry.
+        assert sc_mod._analyze_dependencies(content, "pyproject.toml") is not None
+
+    def test_pyproject_poetry_line_numbers(self) -> None:
+        content = '[tool.poetry.dependencies]\npython = "^3.11"\nrequests = "2.31.0"\n'
+        assert sc_mod._extract_packages_from_pyproject(content) == [("requests", "2.31.0", 3)]
+
+    def test_pyproject_pdm_hatch_uv_tables_extracted(self) -> None:
+        content = (
+            "[tool.pdm.dev-dependencies]\n"
+            'test = ["pytest==7.4.0", "coverage>=7"]\n'
+            "[tool.hatch.envs.default]\n"
+            'dependencies = ["httpx==0.27.0"]\n'
+            "[tool.hatch.envs.lint]\n"
+            'dependencies = ["ruff"]\n'
+            "[tool.uv]\n"
+            'dev-dependencies = ["mypy==1.8.0"]\n'
+        )
+        result = {p[0]: p[1] for p in sc_mod._extract_packages_from_pyproject(content)}
+        assert result == {
+            "pytest": "7.4.0",
+            "coverage": None,
+            "httpx": "0.27.0",
+            "ruff": None,
+            "mypy": "1.8.0",
+        }
+
+    def test_pyproject_tool_tables_honour_limit(self) -> None:
+        content = (
+            "[tool.poetry.dependencies]\n"
+            'python = "^3.11"\n'
+            'a = "1.0"\nb = "1.0"\nc = "1.0"\n'
+            "[tool.uv]\n"
+            'dev-dependencies = ["d==1.0", "e==1.0"]\n'
+        )
+        assert len(sc_mod._extract_packages_from_pyproject(content, limit=2)) == 2
+        assert len(sc_mod._extract_packages_from_pyproject(content, limit=4)) == 4
+        assert len(sc_mod._extract_packages_from_pyproject(content)) == 5
+
+    def test_pyproject_tool_config_sections_not_treated_as_packages(self) -> None:
+        content = (
+            "[tool.black]\nline-length = 100\n"
+            "[tool.mypy]\nstrict = true\n"
+            '[tool.poetry]\nname = "x"\nversion = "1.0"\n'
+        )
+        assert sc_mod._extract_packages_from_pyproject(content) == []
+
+    def test_pyproject_poetry_exact_pin_reaches_vulnerability_lookup(self) -> None:
+        """An exact Poetry pin must surface as a versioned package for SC4 lookups."""
+        content = '[tool.poetry.dependencies]\nrequests = "2.31.0"\n'
+        assert sc_mod._extract_packages_from_pyproject(content)[0][:2] == ("requests", "2.31.0")
+
 
 # ── Supply Chain Safe Patterns (SC2) ───────────────────────────────────
 

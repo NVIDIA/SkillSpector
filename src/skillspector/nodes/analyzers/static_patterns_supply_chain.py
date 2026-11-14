@@ -1563,6 +1563,97 @@ def _extract_packages_from_package_json(
     ]
 
 
+# A single concrete version: no whitespace, ``||`` disjunctions, commas or wildcards.
+_POETRY_CONCRETE_VERSION_RE = re.compile(r"[0-9][A-Za-z0-9.!+_-]*")
+
+
+def _poetry_constraint_spec(name: str, constraint: object) -> str:
+    """Render a Poetry ``name = constraint`` entry as a PEP 508 string.
+
+    Poetry treats a bare version (``"2.31.0"``) as an exact pin, so it becomes
+    ``name==2.31.0`` and reaches ``_pinned_version``. Ranges and Poetry-only operators
+    (``^2.28``, ``~2.28``, ``*``, ``>=1,<2``, ``1.2.3 || 1.2.4``) admit many releases and stay unpinned, as do
+    git/path/url dependencies and multiple-constraint lists. Lockfile reconciliation fills
+    exact versions from ``poetry.lock`` when present.
+    """
+    if isinstance(constraint, dict):
+        constraint = constraint.get("version")
+    if not isinstance(constraint, str):
+        return name
+    version = constraint.strip()
+    if version.startswith("=="):
+        version = version[2:].strip()
+    if _POETRY_CONCRETE_VERSION_RE.fullmatch(version):
+        return f"{name}=={version}"
+    return name
+
+
+def _collect_tool_table_specs(
+    tool: dict[str, object],
+    extend_specs: Callable[[object], None],
+    hints: dict[str, re.Pattern[str]],
+    *,
+    full: Callable[[], bool],
+) -> None:
+    """Feed Poetry/PDM/Hatch/uv dependency tables through the bounded ``extend_specs``.
+
+    Reads ``[tool.poetry.dependencies]``, ``[tool.poetry.dev-dependencies]``,
+    ``[tool.poetry.group.<name>.dependencies]``, ``[tool.pdm.dev-dependencies]``,
+    ``[tool.hatch.envs.<name>.dependencies]`` and ``[tool.uv.dev-dependencies]``.
+    Poetry's ``python`` key constrains the interpreter, not a package, and is skipped.
+    """
+
+    def poetry_table(table: object) -> None:
+        if not isinstance(table, dict):
+            return
+        for name, constraint in table.items():
+            if full():
+                return
+            if not isinstance(name, str) or name.lower() == "python":
+                continue
+            spec = _poetry_constraint_spec(name, constraint)
+            hints.setdefault(
+                spec,
+                re.compile(rf"(?m)^[ \t]*[\"']?{re.escape(name)}[\"']?[ \t]*="),
+            )
+            extend_specs([spec])
+
+    poetry = tool.get("poetry")
+    if isinstance(poetry, dict):
+        poetry_table(poetry.get("dependencies"))
+        poetry_table(poetry.get("dev-dependencies"))
+        groups = poetry.get("group")
+        if isinstance(groups, dict):
+            for group in groups.values():
+                if full():
+                    break
+                if isinstance(group, dict):
+                    poetry_table(group.get("dependencies"))
+
+    pdm = tool.get("pdm")
+    if isinstance(pdm, dict):
+        dev = pdm.get("dev-dependencies")
+        if isinstance(dev, dict):
+            for group in dev.values():
+                if full():
+                    break
+                extend_specs(group)
+
+    hatch = tool.get("hatch")
+    if isinstance(hatch, dict):
+        envs = hatch.get("envs")
+        if isinstance(envs, dict):
+            for env in envs.values():
+                if full():
+                    break
+                if isinstance(env, dict):
+                    extend_specs(env.get("dependencies"))
+
+    uv = tool.get("uv")
+    if isinstance(uv, dict):
+        extend_specs(uv.get("dev-dependencies"))
+
+
 def _extract_packages_from_pyproject(
     content: str,
     *,
@@ -1572,7 +1663,9 @@ def _extract_packages_from_pyproject(
     """Extract (package_name, version_or_None, line_number) from pyproject.toml.
 
     Reads PEP 621 ``[project]`` ``dependencies`` / ``optional-dependencies``,
-    PEP 735 ``[dependency-groups]``, and ``[build-system].requires``. Standard
+    PEP 735 ``[dependency-groups]``, ``[build-system].requires`` and the
+    tool-specific tables of Poetry, PDM, Hatch and uv (see
+    ``_collect_tool_table_specs``). Standard
     metadata keys (``requires-python``, ``name``, ``version``, ...) are not
     dependencies and must not be looked up as packages.
     """
@@ -1586,6 +1679,7 @@ def _extract_packages_from_pyproject(
         return []
 
     specs: list[str] = []
+    hints: dict[str, re.Pattern[str]] = {}
 
     def extend_specs(values: object) -> None:
         if not isinstance(values, list):
@@ -1616,6 +1710,14 @@ def _extract_packages_from_pyproject(
     build_system = data.get("build-system")
     if isinstance(build_system, dict) and (limit is None or len(specs) < max(0, limit)):
         extend_specs(build_system.get("requires"))
+    tool = data.get("tool")
+    if isinstance(tool, dict):
+        _collect_tool_table_specs(
+            tool,
+            extend_specs,
+            hints,
+            full=lambda: limit is not None and len(specs) >= max(0, limit),
+        )
 
     results: list[tuple[str, str | None, int]] = []
     for spec in specs:
@@ -1623,7 +1725,12 @@ def _extract_packages_from_pyproject(
         if not requirement:
             continue
         name, version = requirement
-        idx = content.find(spec)
+        hint = hints.get(spec)
+        if hint is not None:
+            match = hint.search(content)
+            idx = match.start() if match else -1
+        else:
+            idx = content.find(spec)
         line_num = get_line_number(content, idx) if idx >= 0 else 1
         results.append((name, version, line_num))
         if limit is not None and len(results) >= max(0, limit):
