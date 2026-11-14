@@ -1064,7 +1064,9 @@ _TP4_PROMPT_SUFFIX = """
 Flag a mismatch when code performs an undeclared capability, has a materially
 different primary purpose, accesses inconsistent resources, or has unrelated
 triggers. Do not flag supporting implementation details or over-declared
-permissions. Return the assessment using the structured output schema.
+permissions. A chunk may implement only one declared workflow step; do not
+flag omitted capabilities. Each entry must name what the code DOES. Return
+the assessment using the structured output schema.
 """
 
 
@@ -1148,6 +1150,320 @@ def _tp4_partial_event(
     )
 
 
+# Phrasings that describe an absence of functionality rather than a
+# capability the code performs. A TP4 assessment whose every
+# mismatched_capabilities entry matches one of these carries no affirmative
+# evidence of a mismatch (issue #1066): a partial snippet cannot be faulted
+# for omitting the rest of the declared workflow. The match alone is not
+# enough: an absence marker inside an item that also describes affirmative
+# behavior (for example "Uploads source files to an undeclared endpoint
+# without user consent") does not make the item an absence, so
+# _tp4_mismatched_item_is_absence suppresses only clauses positively
+# established to describe absence. A finite verb outside a marker's scope
+# is affirmative evidence whether or not it is in the affirmative verb
+# list, and a clause with no marker at all is not an absence.
+_TP4_ABSENCE_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"^no\b",
+        r"^not\b",
+        r"^cannot\b",
+        r"^can'?t\b",
+        r"\bdoes not\b",
+        r"\bdoesn'?t\b",
+        r"\bdo not\b",
+        r"\bdid not\b",
+        r"\bno evidence\b",
+        r"\bno implementation\b",
+        r"\bno support\b",
+        r"\bnot implement",
+        r"\blacks?\b",
+        r"\bmissing\b",
+        r"\bwithout\b",
+        r"\bfails? to\b",
+        r"\babsence of\b",
+        r"\bomits?\b",
+    )
+)
+
+
+_TP4_CLAUSE_SPLIT_PATTERN = re.compile(
+    r"\s*[.!?]+\s+|\s*;\s*|\s+but\s+|\s+however\s+|\s+although\s+|\s+though\s+|\s+while\s+|\s+whereas\s+"
+)
+
+_TP4_AFFIRMATIVE_VERB_ALTERNATION = (
+    r"access|archive|authenticate|backup|browse|call|collect|compress|"
+    r"connect|cop(?:y|ies|ied|ying)|crawl|create|decrypt|delete|download|"
+    r"encode|encrypt|enumerate|execute|export|exfiltrate|extract|fetch|"
+    r"fingerprint|gather|generate|hash|import|install|invoke|issue|leak|"
+    r"load|log|modify|monitor|move|navigate|notify|open|parse|perform|persist|"
+    r"post|process|profile|publish|pull|push|quer(?:y|ies|ied|ying)|read|"
+    r"record|remove|render|request|respond|restore|retrieve|run|save|"
+    r"scan|scrape|search|send|share|sign|spawn|store|submit|subscribe|"
+    r"sync|track|transmit|type|update|upload|validate|verify|write|click"
+)
+
+_TP4_AFFIRMATIVE_VERB_PATTERN = re.compile(
+    rf"\b(?:{_TP4_AFFIRMATIVE_VERB_ALTERNATION})(?:s|es|ed|ing|d|ning)?\b"
+)
+
+# A generic finite verb: any ordinary third-person singular present verb,
+# not just the verbs in the affirmative alternation. Capability
+# descriptions phrase behavior as finite present-tense clauses
+# ("Transfers source files", "Steals credentials"), so the absence guard
+# cannot rely on an exhaustive verb inventory: an unrecognized verb is
+# affirmative evidence, not an absence. The shape is a word ending in "s"
+# followed by an object word. Conjunctions, relative pronouns,
+# prepositions and auxiliaries after it disqualify the follower, so a
+# plural noun ("Files that are missing", "Credentials without encryption")
+# is not mistaken for a verb, and "is", "has" and "does" are excluded
+# outright, as are words ending in "ss" or "us" ("access", "status").
+_TP4_GENERIC_FINITE_VERB_PATTERN = re.compile(
+    r"\b(?!(?:is|has|does)\b|[a-z][a-z\-]*(?:ss|us)\b)[a-z][a-z\-]*[a-z]s\b"
+    r"(?=\s+(?!(?:and|or|but|that|which|who|whom|whose|without|to|in|for|of|from|on|at|by|with|over|under|via|through|after|before|during|against|into|onto|as|is|are|was|were|be|been|has|have|had|does|do|did|can|could|will|would|not|no|if|when|while|whereas|although|though|however|then|than|so|yet)\b)[a-z])"
+)
+
+# A subject-first affirmative clause after a comma ("the code sends
+# credentials in plaintext", "it uploads files"): a determiner or pronoun
+# subject, at most three words of subject noun phrase, then a capability
+# verb with an object after it. A bare noun phrase ("file writes, or remote
+# uploads") has no determiner and its verb is followed by a comma or "or",
+# so a missing-capability list does not match. The object requirement is
+# what separates "the code sends credentials" from a list item such as
+# "the file writes, ...", whose verb has no object.
+_TP4_SUBJECT_FIRST_AFFIRMATIVE_PATTERN = re.compile(
+    rf"^(?:(?:it|they|he|she|this|that)\s+|(?:the|this|that|its|their)\s+"
+    rf"[a-z][a-z\-]*(?:\s+[a-z][a-z\-]*){{0,2}}\s+)"
+    rf"(?:{_TP4_AFFIRMATIVE_VERB_ALTERNATION})(?:s|es|ed|ing|d|ning)?\s+"
+    rf"(?!or\b|and\b)[a-z]"
+)
+
+# The same subject-first shape with a generic finite verb: "the code
+# transfers files" is a main clause even though "transfers" is outside
+# the affirmative alternation. The absence verbs "lacks" and "omits" are
+# excluded from the verb slot, since "the code lacks encryption" still
+# describes an absence.
+_TP4_SUBJECT_FIRST_GENERIC_PATTERN = re.compile(
+    r"^(?:(?:it|they|he|she|this|that)\s+|(?:the|this|that|its|their)\s+"
+    r"[a-z][a-z\-]*(?:\s+[a-z][a-z\-]*){0,2}\s+)"
+    r"(?!(?:lacks|omits)\s)[a-z][a-z\-]*[a-z]s\s+"
+    r"(?!or\b|and\b)[a-z]"
+)
+
+# A noun-first absence statement ("Search functionality is missing",
+# "Network access is not implemented"): the capability word is the subject
+# noun, not an affirmative verb, so the verb pattern must not read it as
+# behavior. The subject is a single short noun phrase (an optional
+# determiner plus up to three words): a longer subject can hide a finite
+# verb with an object ("The code sends credentials and search is missing"),
+# so it stays with the verb check. Deliberately no "and"-joined subjects:
+# "Search functionality and network access are missing" does not match and
+# stays detection-side, which is the safe direction (an emitted TP4 for a
+# pure absence) versus dropping a real affirmative finding. An optional
+# bounded prepositional tail ("in the workflow") is allowed; anything
+# longer or verb-bearing falls through to the verb check. A relative
+# pronoun (that, which, who) in the subject disqualifies the shortcut:
+# three words do not establish a noun-only phrase, and "Uploads files that
+# are missing" opens with a finite verb plus object, so it falls through
+# to the verb check, where the verb before the marker keeps the finding.
+# A relative clause with no affirmative verb ("Files that are missing")
+# still stays suppressed, because the verb check finds no verb before the
+# marker.
+_TP4_NOUN_FIRST_ABSENCE_PATTERN = re.compile(
+    r"^(?:the\s+)?"
+    r"(?:(?!(?:that|which|who|whom|whose)\b)[a-z][a-z\-]*)"
+    r"(?:\s+(?!(?:that|which|who|whom|whose)\b)[a-z][a-z\-]*){0,2}"
+    r"\s+(?:is|are|was|were)\s+"
+    r"(?:missing|not\s+implement\w*)"
+    r"(?:\s+(?:in|from|for|of|within)\s+(?:the\s+)?[a-z][a-z\-]*(?:\s+[a-z][a-z\-]*){0,2})?"
+    r"(?:[.!?]+\s*)?$"
+)
+
+
+def _tp4_strip_leading_absence_modifier(clause: str) -> str:
+    """Drop a leading absence phrase closed by a comma, if it precedes any verb.
+
+    "Without user consent, uploads source files to a remote endpoint" opens
+    with an absence phrase that only modifies the affirmative main clause,
+    so the marker must not govern the verbs after the comma. The phrase is
+    only dropped when the comma comes before the first capability verb:
+    "No evidence of querying, storing videos" keeps its marker because the
+    verb sits inside the leading phrase. The text after the comma must also
+    read as a main clause, not as a continuation of the missing-capability
+    list: the phrase is dropped when it is a "without" modifier, when the
+    remainder opens with a capability verb ("No support for TLS, sends
+    credentials in plaintext"), or when it opens with a subject-first
+    affirmative clause ("No support for TLS, the code sends credentials in
+    plaintext"). The verb that opens the remainder need not be in the
+    affirmative list ("No support for TLS, transfers source files"): an
+    ordinary finite verb is a main clause too. A list such as "No evidence
+    of network activity, file writes, or remote uploads" keeps its
+    negation because the remainder opens with a noun, so the whole entry
+    still describes absent behavior.
+    """
+    marker_end = None
+    for pattern in _TP4_ABSENCE_PATTERNS:
+        match = pattern.search(clause)
+        if match is not None and match.start() == 0:
+            marker_end = match.end() if marker_end is None else min(marker_end, match.end())
+    if marker_end is None:
+        return clause
+    comma = clause.find(",", marker_end)
+    if comma == -1:
+        return clause
+    first_verb = min(_tp4_finite_verbs(clause), key=lambda match: match.start(), default=None)
+    if first_verb is not None and first_verb.start() < comma:
+        return clause
+    remainder = clause[comma + 1 :].strip()
+    is_without_modifier = clause.casefold().startswith("without ")
+    remainder_opens_with_verb = (
+        _TP4_AFFIRMATIVE_VERB_PATTERN.match(remainder) is not None
+        or _TP4_GENERIC_FINITE_VERB_PATTERN.match(remainder) is not None
+    )
+    remainder_is_subject_first_clause = (
+        _TP4_SUBJECT_FIRST_AFFIRMATIVE_PATTERN.match(remainder) is not None
+        or _TP4_SUBJECT_FIRST_GENERIC_PATTERN.match(remainder) is not None
+    )
+    if not (is_without_modifier or remainder_opens_with_verb or remainder_is_subject_first_clause):
+        return clause
+    return remainder
+
+
+def _tp4_finite_verbs(clause: str) -> list[re.Match[str]]:
+    """Return finite capability-verb matches in a clause.
+
+    Both the recognized affirmative verbs and the generic finite-verb
+    shape: the absence guard must treat an ordinary verb outside the
+    inventory ("transfers", "steals") as affirmative evidence, not as an
+    absence.
+    """
+    return [
+        *_TP4_AFFIRMATIVE_VERB_PATTERN.finditer(clause),
+        *_TP4_GENERIC_FINITE_VERB_PATTERN.finditer(clause),
+    ]
+
+
+def _tp4_starts_with_affirmative_clause(segment: str) -> bool:
+    """Return whether a segment opens with a finite affirmative clause.
+
+    Either a finite verb plus object ("steals credentials") or a subject
+    plus finite verb plus object ("the code steals credentials"). Gerund
+    and participle forms ("storing videos", "uploaded files") do not open
+    a finite clause, so an "and"-joined gerund list stays an absence.
+    """
+    verb = _TP4_AFFIRMATIVE_VERB_PATTERN.match(segment)
+    if verb is not None and not verb.group(0).endswith(("ing", "ed")):
+        if re.match(r"\s+[a-z]", segment[verb.end() :]) is not None:
+            return True
+    if _TP4_GENERIC_FINITE_VERB_PATTERN.match(segment) is not None:
+        return True
+    if _TP4_SUBJECT_FIRST_AFFIRMATIVE_PATTERN.match(segment) is not None:
+        return True
+    return _TP4_SUBJECT_FIRST_GENERIC_PATTERN.match(segment) is not None
+
+
+def _tp4_has_and_joined_affirmative(clause: str) -> bool:
+    """Return whether an "and"-joined verb phrase describes behavior.
+
+    A marker scopes only its own verb phrase: "Lacks encryption and steals
+    credentials" is not a pure absence, because the second phrase is an
+    affirmative finite clause. The phrase after "and" must open with a
+    finite affirmative clause and must not itself open with an absence
+    marker ("... and does not authenticate" stays an absence).
+    """
+    for match in re.finditer(r"\s+and\s+", clause):
+        rest = clause[match.end() :]
+        if any(pattern.match(rest) is not None for pattern in _TP4_ABSENCE_PATTERNS):
+            continue
+        if _tp4_starts_with_affirmative_clause(rest):
+            return True
+    return False
+
+
+def _tp4_clause_is_positive_absence(clause: str) -> bool:
+    """Return whether one clause positively describes an absence.
+
+    A clause counts as an absence only when an absence marker governs it
+    and no finite verb sits outside that marker's scope. A clause with no
+    marker at all ("Steals credentials" after "No support for TLS.") is
+    not an absence, a finite verb before the first marker is affirmative
+    evidence, and "without" does not negate a following finite verb
+    ("Without user consent uploads files" describes uploading), so a verb
+    after a leading "without" is affirmative evidence too. A negating
+    auxiliary ("does not", "cannot", "fails to") does govern the verb
+    phrase after it, so "The code does not implement search" stays an
+    absence.
+    """
+    marker_matches = [
+        match for pattern in _TP4_ABSENCE_PATTERNS for match in pattern.finditer(clause)
+    ]
+    if not marker_matches:
+        return False
+    first_marker = min(marker_matches, key=lambda match: match.start())
+    for verb in _tp4_finite_verbs(clause):
+        if verb.start() < first_marker.start():
+            return False
+    if first_marker.group(0) == "without":
+        for verb in _tp4_finite_verbs(clause):
+            if verb.start() > first_marker.end():
+                return False
+    if _tp4_has_and_joined_affirmative(clause):
+        return False
+    return True
+
+
+def _tp4_mismatched_item_is_absence(item: str) -> bool:
+    """Return whether one mismatched capability is phrased as an absence.
+
+    Suppression needs positive evidence of absence: an absence marker only
+    counts when every clause of the item is positively established to
+    describe absence, and an unproven or unknown clause is retained rather
+    than suppressed. A finite verb outside the marker's scope is
+    affirmative evidence whether or not it is in the affirmative verb
+    list, so "Transfers source files without user consent" and "No support
+    for TLS. Steals credentials" are not absences, while "No evidence of
+    querying videos" and "The code does not implement search" still are:
+    their verbs sit under the marker. Clauses split on contrast boundaries
+    and sentence boundaries, so comma-separated enumerations stay under
+    one leading marker while "No support for TLS. Sends credentials in
+    plaintext" keeps its second sentence affirmative, and an "and"-joined
+    finite verb phrase ("Lacks encryption and steals credentials") is a
+    separate affirmative clause. A leading absence phrase closed by a comma
+    ("Without user consent, uploads source files ...") only modifies the
+    main clause and does not govern the verbs after the comma, while a
+    comma-separated list of missing capabilities ("No evidence of network
+    activity, file writes, or remote uploads") stays under its leading
+    negation. A subject-first affirmative clause after the comma ("No support
+    for TLS, the code sends credentials in plaintext") is a separate main
+    clause, not a list item, so the leading phrase is dropped for it. A
+    noun-first absence statement ("Search functionality is missing",
+    "Network access is not implemented") is an absence too: its capability
+    word is the subject noun, not an affirmative verb. A relative pronoun
+    in that subject ("Uploads files that are missing") disqualifies the
+    shortcut, since the phrase may open with a finite verb and object, so
+    it falls through to the clause check instead.
+    """
+    normalized = " ".join(item.strip().casefold().split())
+    if not normalized:
+        return False
+    if not any(pattern.search(normalized) for pattern in _TP4_ABSENCE_PATTERNS):
+        return False
+    for clause in _TP4_CLAUSE_SPLIT_PATTERN.split(normalized):
+        clause = _tp4_strip_leading_absence_modifier(clause.strip())
+        if not clause:
+            continue
+        if _TP4_NOUN_FIRST_ABSENCE_PATTERN.match(clause) is not None:
+            continue
+        if not _tp4_clause_is_positive_absence(clause):
+            return False
+    return True
+
+
+def _tp4_all_mismatched_are_absences(items: list[str]) -> bool:
+    """Return whether every listed capability is an absence, not a behavior."""
+    return bool(items) and all(_tp4_mismatched_item_is_absence(item) for item in items)
+
+
 def _tp4_finding(
     result: _TP4AnalysisResult,
     batch: Batch,
@@ -1155,6 +1471,13 @@ def _tp4_finding(
 ) -> Finding | None:
     """Convert one bounded batch assessment without dropping source evidence."""
     if not result.is_mismatch or result.confidence < 0.5:
+        return None
+    if _tp4_all_mismatched_are_absences(result.mismatched_capabilities):
+        logger.debug(
+            "%s: TP4 assessment suppressed: every mismatched capability is "
+            "phrased as an absence, so there is no affirmative mismatch evidence",
+            ANALYZER_ID,
+        )
         return None
     declared = (result.declared_purpose_summary or description[:512])[:512]
     actual = result.actual_behavior_summary[:1024]
@@ -1169,9 +1492,14 @@ def _tp4_finding(
     return Finding(
         rule_id="TP4",
         message=message,
-        severity="HIGH" if result.confidence >= 0.7 else "MEDIUM",
+        # TP4 severity is fixed MEDIUM, matching the README pattern table
+        # and the detailed TP4 guide; there is no confidence-based
+        # escalation to HIGH (issue #1066).
+        severity="MEDIUM",
         confidence=result.confidence,
-        file="SKILL.md",
+        file=batch.file_path,
+        start_line=batch.start_line,
+        end_line=batch.end_line,
         category=_CATEGORY,
         pattern=get_pattern_name("TP4"),
         finding=message,

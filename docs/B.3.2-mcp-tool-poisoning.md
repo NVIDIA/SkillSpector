@@ -209,7 +209,7 @@ be safe, static, representative examples.
 
 | Field       | Value                                                     |
 |-------------|-----------------------------------------------------------|
-| **Severity**   | MEDIUM or HIGH (based on LLM confidence)               |
+| **Severity**   | MEDIUM                                                      |
 | **Confidence** | LLM-determined (0.50 -- 1.00, threshold: 0.50)         |
 | **Tags**       | ASI02, AML.T0080                                       |
 

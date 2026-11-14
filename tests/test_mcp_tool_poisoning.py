@@ -1139,7 +1139,7 @@ class TestTP4DescriptionBehaviorMismatch:
         result = node(state)
         tp4 = [f for f in result["findings"] if f.rule_id == "TP4"]
         assert len(tp4) >= 1
-        assert tp4[0].severity in {"HIGH", "MEDIUM"}
+        assert tp4[0].severity == "MEDIUM"
         assert tp4[0].pattern == "Description-Behavior Mismatch"
         assert tp4[0].finding == tp4[0].message
 
@@ -1179,6 +1179,391 @@ class TestTP4Finding:
         assert finding.evidence["code_path"] == "scripts/tool.py"
         assert finding.evidence["code_start_line"] == 12
         assert finding.evidence["code_end_line"] == 12
+
+
+class TestTP4FindingIssue1066:
+    """TP4 anchors, severity, and absence-only guard (issue #1066)."""
+
+    def _result(self, confidence: float, mismatched: list[str]):
+        return mcp_tool_poisoning._TP4AnalysisResult(
+            is_mismatch=True,
+            confidence=confidence,
+            declared_purpose_summary="Video intelligence briefing skill",
+            actual_behavior_summary="Renders briefing documents",
+            mismatched_capabilities=mismatched,
+            explanation="The chunk does not show the declared video work.",
+        )
+
+    def test_finding_anchors_to_real_file_and_lines(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="references/briefing-authoring.md",
+            content="unzip -q -o out.epub -d _chk",
+            start_line=27,
+            end_line=28,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(0.99, ["EPUB archive processing"]),
+            batch,
+            "Video intelligence briefing skill",
+        )
+
+        assert finding is not None
+        assert finding.file == "references/briefing-authoring.md"
+        assert finding.start_line == 27
+        assert finding.end_line == 28
+        assert finding.evidence["code_path"] == "references/briefing-authoring.md"
+        assert finding.evidence["code_start_line"] == 27
+        assert finding.evidence["code_end_line"] == 28
+
+    def test_finding_severity_is_medium_at_high_confidence(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="SKILL.md",
+            content="python scripts/markdown_pdf.py",
+            start_line=697,
+            end_line=697,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(0.99, ["Markdown-to-PDF export of briefing files"]),
+            batch,
+            "Video intelligence briefing skill",
+        )
+
+        assert finding is not None
+        assert finding.severity == "MEDIUM"
+
+    def test_absence_only_mismatched_capabilities_suppressed(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="SKILL.md",
+            content="pytest tests/evals/test_search_quality.py -v -s",
+            start_line=314,
+            end_line=314,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(
+                0.99,
+                [
+                    "No evidence of querying videos, transcripts, concepts, "
+                    "quotes, corpus status, or profile data",
+                    "No implementation of the described nugget synthesis/save behavior",
+                ],
+            ),
+            batch,
+            "Video corpus search skill",
+        )
+
+        assert finding is None
+
+    def test_mixed_mismatched_capabilities_still_emitted(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="SKILL.md",
+            content="pytest tests/evals/test_search_quality.py -v -s",
+            start_line=314,
+            end_line=314,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(
+                0.99,
+                [
+                    "Runs automated tests/evaluations instead of providing "
+                    "corpus search functionality",
+                    "No evidence of querying videos",
+                ],
+            ),
+            batch,
+            "Video corpus search skill",
+        )
+
+        assert finding is not None
+        assert finding.severity == "MEDIUM"
+
+    def test_affirmative_mismatched_capability_emitted(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(0.9, ["Sends source data to a remote endpoint"]),
+            batch,
+            "A local text utility",
+        )
+
+        assert finding is not None
+
+    def test_subject_first_affirmative_after_comma_emitted(self):
+        # Reviewer case (yashrajp22, 2026-11-11): the comma-separated
+        # remainder is a subject-first affirmative clause, not a
+        # missing-capability list item.
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(
+                0.9,
+                ["No support for TLS, the code sends credentials in plaintext"],
+            ),
+            batch,
+            "A local text utility",
+        )
+
+        assert finding is not None
+
+    def test_noun_first_absence_only_suppressed(self):
+        # Reviewer cases (yashrajp22, 2026-11-11): noun-first absence
+        # statements describe omitted workflow steps, not behavior.
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        for item in (
+            "Search functionality is missing",
+            "Network access is not implemented",
+        ):
+            finding = mcp_tool_poisoning._tp4_finding(
+                self._result(0.9, [item]),
+                batch,
+                "A local text utility",
+            )
+
+            assert finding is None
+
+    def test_affirmative_relative_clause_not_swallowed_by_noun_first_absence(self):
+        # Reviewer case (yashrajp22, 2026-11-12): "Uploads files that are
+        # missing" opens with a finite verb plus object, so the noun-first
+        # absence shortcut must not consume it. The genuine noun-first
+        # absences in test_noun_first_absence_only_suppressed stay
+        # suppressed.
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(0.9, ["Uploads files that are missing"]),
+            batch,
+            "A local text utility",
+        )
+
+        assert finding is not None
+
+    def test_unrecognized_affirmative_verbs_retained(self):
+        # Reviewer cases (rng1995, 2026-11-13): suppression needs positive
+        # evidence of absence, not merely the failure to match the finite
+        # affirmative-verb list. "Transfers" and "steals" are outside the
+        # list, but both items affirmatively describe behavior, so the TP4
+        # finding must be kept. The pure-absence negatives alongside them
+        # stay suppressed.
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        for item in (
+            "Transfers source files without user consent",
+            "No support for TLS. Steals credentials",
+        ):
+            finding = mcp_tool_poisoning._tp4_finding(
+                self._result(0.9, [item]),
+                batch,
+                "A local text utility",
+            )
+
+            assert finding is not None
+
+        for item in (
+            "No evidence of querying videos",
+            "The code does not implement search",
+            "No support for TLS",
+        ):
+            finding = mcp_tool_poisoning._tp4_finding(
+                self._result(0.9, [item]),
+                batch,
+                "A local text utility",
+            )
+
+            assert finding is None
+
+    def test_affirmative_capability_containing_without_emitted(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(
+                0.9,
+                ["Uploads source files to an undeclared endpoint without user consent"],
+            ),
+            batch,
+            "A local text utility",
+        )
+
+        assert finding is not None
+
+    def test_marker_first_affirmative_capability_emitted(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(
+                0.9,
+                ["Without user consent, uploads source files to a remote endpoint"],
+            ),
+            batch,
+            "A local text utility",
+        )
+
+        assert finding is not None
+        assert finding.severity == "MEDIUM"
+
+    def test_comma_separated_list_of_missing_capabilities_suppressed(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(
+                0.9,
+                ["No evidence of network activity, file writes, or remote uploads"],
+            ),
+            batch,
+            "A local text utility",
+        )
+
+        assert finding is None
+
+    def test_affirmative_action_with_negated_clause_emitted(self):
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(
+            self._result(
+                0.9,
+                [
+                    "Uploads source files to an external endpoint but does not log the transfer",
+                    "Sends credentials to a remote host without validating the certificate",
+                ],
+            ),
+            batch,
+            "A local text utility",
+        )
+
+        assert finding is not None
+
+    @pytest.mark.parametrize(
+        "item, expected",
+        [
+            ("No evidence of querying videos", True),
+            ("No implementation of the described behavior", True),
+            ("The code does not implement search", True),
+            ("Lacks any corpus query", True),
+            ("Missing authentication", True),
+            ("Runs automated tests instead of searching", False),
+            ("Sends source data to a remote endpoint", False),
+            ("Markdown-to-PDF export of briefing files", False),
+            (
+                "Uploads source files to an undeclared endpoint without user consent",
+                False,
+            ),
+            ("Uploads files but does not encrypt them", False),
+            ("No support for TLS, but sends credentials in plaintext", False),
+            (
+                "Sends credentials to a remote host without validating the certificate",
+                False,
+            ),
+            (
+                "Without user consent, uploads source files to a remote endpoint",
+                False,
+            ),
+            ("No support for TLS. Sends credentials in plaintext", False),
+            ("Persists credentials without user consent", False),
+            ("No support for TLS", True),
+            ("Without user consent, no encryption is performed", True),
+            ("No evidence of querying, storing videos", True),
+            (
+                "No evidence of network activity, file writes, or remote uploads",
+                True,
+            ),
+            ("No support for TLS, sends credentials in plaintext", False),
+            # Reviewer cases (yashrajp22, 2026-11-11): a subject-first
+            # affirmative clause after the comma is a separate main clause,
+            # not a list item, so the leading absence phrase must not
+            # govern its verb.
+            ("No support for TLS, the code sends credentials in plaintext", False),
+            ("No support for TLS, the tool uploads files to a remote server", False),
+            ("No support for TLS, it sends credentials in plaintext", False),
+            # Reviewer cases (yashrajp22, 2026-11-11): noun-first absence
+            # statements. "search" and "access" are subject nouns here, not
+            # affirmative verbs.
+            ("Search functionality is missing", True),
+            ("Network access is not implemented", True),
+            ("Search functionality is missing from the workflow", True),
+            # Reviewer case (yashrajp22, 2026-11-12): a relative pronoun
+            # in the subject disqualifies the noun-first shortcut, so a
+            # finite verb plus object keeps the item affirmative. A
+            # relative clause with no affirmative verb still describes an
+            # absence.
+            ("Uploads files that are missing", False),
+            ("Uploads files which are missing", False),
+            ("Files that are missing", True),
+            # Affirmative controls for the noun-first shape: a hidden finite
+            # verb in a long subject, and an affirmative clause joined to
+            # the absence statement, both stay affirmative.
+            ("The code sends credentials and search is missing", False),
+            (
+                "Network access is not implemented, the code sends credentials in plaintext",
+                False,
+            ),
+            # Reviewer cases (rng1995, 2026-11-13): suppression needs
+            # positive evidence of absence. An ordinary verb outside the
+            # affirmative list ("transfers", "steals") is affirmative
+            # evidence, a clause with no marker is not an absence, a
+            # "without" adjunct does not negate a following verb, and an
+            # "and"-joined finite verb phrase is a separate clause.
+            ("Transfers source files without user consent", False),
+            ("No support for TLS. Steals credentials", False),
+            ("Lacks encryption and steals credentials", False),
+            ("Without user consent uploads source files", False),
+            ("No support for TLS, transfers source files", False),
+            ("No support for TLS, the code transfers files", False),
+            # Guards: an "and"-joined gerund list and an "and"-joined
+            # negated verb phrase stay absences.
+            ("No evidence of querying and storing videos", True),
+            ("Does not encrypt and does not authenticate", True),
+        ],
+    )
+    def test_absence_phrasing_detection(self, item: str, expected: bool):
+        assert mcp_tool_poisoning._tp4_mismatched_item_is_absence(item) is expected
 
 
 class TestTP4MarkdownFences:
@@ -2195,7 +2580,9 @@ class TestTP4PlaintextRecovery:
         if confidence is not None:
             finding = result.findings[0]
             assert finding.rule_id == "TP4"
-            assert finding.severity == ("HIGH" if confidence >= 0.7 else "MEDIUM")
+            # TP4 severity is MEDIUM at any confidence (README pattern table,
+            # issue #1066); the old confidence-based escalation is removed.
+            assert finding.severity == "MEDIUM"
             assert finding.evidence["assessment_complete"] is False
             assert "llm-format-recovery" in finding.tags
         producers = [
