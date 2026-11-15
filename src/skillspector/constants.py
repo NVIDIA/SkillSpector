@@ -24,6 +24,7 @@ from skillspector.providers import (
     get_metadata_provider,
     get_model_config_provider,
 )
+from skillspector.scan_policy import RISK_THRESHOLD as RISK_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +32,6 @@ logger = logging.getLogger(__name__)
 MAX_INPUT_TOKENS_PCT = 0.75
 # Fallback context length when no metadata API or registry entry is available.
 DEFAULT_CONTEXT_LENGTH = 128_000
-# Risk score threshold above which a scan is treated as unsafe.
-RISK_THRESHOLD = 50
 # Maximum text-file size processed by static analyzers and lightweight
 # format recognizers.
 MAX_FILE_BYTES = 1_000_000
