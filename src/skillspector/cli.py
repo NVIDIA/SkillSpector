@@ -116,6 +116,20 @@ def report(state: SkillspectorState) -> dict[str, object]:
     return build_report(state)
 
 
+def unsupported_control_error(timeout: float | None = 120) -> str | None:
+    """Keep the preflight hook patchable without loading providers for help."""
+    from skillspector.llm_utils import unsupported_control_error as check_controls
+
+    return check_controls(timeout=timeout)
+
+
+def risk_severity_and_recommendation(score: int) -> tuple[str, str]:
+    """Keep recursive verdict policy patchable while deferring report imports."""
+    from skillspector.nodes.report import risk_severity_and_recommendation as assess_score
+
+    return assess_score(score)
+
+
 def _ensure_utf8_streams() -> None:
     """Reconfigure stdout/stderr to UTF-8 so Unicode report output does not crash.
 
@@ -452,8 +466,6 @@ def _exit_on_unsupported_llm_controls(no_llm: bool) -> None:
     """Exit 2 before any analysis when a configured model rejects a requested control."""
     if no_llm:
         return
-    from skillspector.llm_utils import unsupported_control_error
-
     error = unsupported_control_error()
     if error is not None:
         err_console.print(_error_line(error))
@@ -2898,8 +2910,6 @@ def _multi_skill_risk_assessment(
     analysis_incomplete: bool,
 ) -> dict[str, object]:
     """Return bounded aggregate risk evidence independent of child retention."""
-    from skillspector.nodes.report import risk_severity_and_recommendation
-
     severity, recommendation = risk_severity_and_recommendation(max_score)
     if execution_failed:
         recommendation = "DO_NOT_INSTALL"
