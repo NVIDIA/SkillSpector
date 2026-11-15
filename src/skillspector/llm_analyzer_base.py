@@ -846,8 +846,8 @@ def _cli_max_input_bytes() -> int | None:
     return None
 
 
-class PromptSizeLimitError(RuntimeError):
-    """A built prompt is over the configured prompt byte cap and was not sent."""
+class PromptSizeLimitError(LLMInputBudgetError):
+    """A built prompt is over a configured per-request limit and was not sent."""
 
 
 def optional_positive_int_env(name: str) -> int | None:
@@ -1588,6 +1588,8 @@ class LLMAnalyzerBase:
 
     response_schema: type | None = LLMAnalysisResult
     recovery_required_fields: tuple[str, ...] = ()
+    _input_budget_configured = False
+    _max_prompt_bytes: int | None = None
 
     def __init__(
         self,
@@ -1607,7 +1609,9 @@ class LLMAnalyzerBase:
         # batches (and formatting retries) bind the schema as an unforced
         # tool call instead of paying one rejected request per batch.
         self._use_structured_output_fallback = False
-        self._input_budget = cap_input_tokens(get_max_input_tokens(model))
+        model_budget = get_max_input_tokens(model)
+        self._input_budget = cap_input_tokens(model_budget)
+        self._input_budget_configured = self._input_budget < model_budget
         self._max_prompt_bytes = max_prompt_bytes()
         self._request_ordinal = 0
         self._request_ordinal_lock = threading.Lock()
@@ -2035,11 +2039,19 @@ class LLMAnalyzerBase:
         size = len(self._serialized_input(prompt).encode("utf-8", errors="replace"))
         count = self._count_prompt_tokens(prompt, chat_model=chat_model)
         byte_cap = _cli_max_input_bytes()
-        if count > self._input_budget or (byte_cap is not None and size > byte_cap):
+        over_tokens = count > self._input_budget
+        if (over_tokens and not self._input_budget_configured) or (
+            byte_cap is not None and size > byte_cap
+        ):
             raise LLMInputBudgetError(
                 "serialized LLM input exceeds its token or byte budget; "
                 "batch content retained but not submitted"
             )
+        if over_tokens:
+            raise PromptSizeLimitError(
+                f"prompt exceeds the {self._input_budget}-token limit; got {count} tokens"
+            )
+        self._check_prompt_bytes(prompt)
 
     def _record_failed_request(self, exc: BaseException, prompt: str, ordinal: int) -> None:
         # Diagnostics must never replace the original provider exception or report usage.
@@ -2054,7 +2066,7 @@ class LLMAnalyzerBase:
     def _check_prompt_bytes(self, prompt: str) -> None:
         """Fail a request whose prompt exceeds :func:`max_prompt_bytes` before it is sent."""
         cap = self._max_prompt_bytes
-        size = len(prompt.encode("utf-8"))
+        size = len(self._serialized_input(prompt).encode("utf-8", errors="replace"))
         if cap is not None and size > cap:
             raise PromptSizeLimitError(f"prompt exceeds the {cap}-byte limit; got {size} bytes")
 

@@ -2759,6 +2759,8 @@ def test_tp4_token_ceiling_env_is_configurable(monkeypatch):
     assert _tp4_batch_token_ceiling() == 32_000
     monkeypatch.setenv("SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS", "20000")
     assert _tp4_batch_token_ceiling() == 20_000
+    monkeypatch.setenv("SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS", "64000")
+    assert _tp4_batch_token_ceiling() == 32_000
 
 
 def test_tp4_prompts_honor_configured_byte_and_token_ceilings(monkeypatch: pytest.MonkeyPatch):

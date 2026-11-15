@@ -101,13 +101,13 @@ TP4_MAX_FINDINGS = 64
 def _tp4_batch_token_ceiling() -> int:
     """Return TP4's per-request token ceiling before the model budget is applied.
 
-    ``SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS`` overrides the
+    ``SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS`` can lower, never raise, the
     :data:`TP4_MAX_BATCH_INPUT_TOKENS` default.
     """
-    return (
-        optional_positive_int_env("SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS")
-        or TP4_MAX_BATCH_INPUT_TOKENS
-    )
+    configured = optional_positive_int_env("SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS")
+    if configured is None:
+        return TP4_MAX_BATCH_INPUT_TOKENS
+    return min(configured, TP4_MAX_BATCH_INPUT_TOKENS)
 
 
 def _tp4_max_batches_from_environment(value: str | None) -> int:

@@ -4757,7 +4757,7 @@ class TestConfigurableRequestLimits:
 
     @pytest.mark.parametrize("async_mode", [False, True])
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    async def test_oversized_line_is_size_limited_while_other_batches_run(
+    async def test_oversized_line_is_fragmented_under_byte_cap(
         self, monkeypatch: pytest.MonkeyPatch, async_mode: bool
     ) -> None:
         monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
@@ -4782,12 +4782,9 @@ class TestConfigurableRequestLimits:
             else analyzer.run_batches_detailed(batches)
         )
 
-        assert [(f.batch.file_path, f.reason) for f in outcome.failures] == [
-            ("big.py", LedgerReason.SIZE_LIMIT)
-        ]
-        assert outcome.failures[0].error_class == "PromptSizeLimitError"
+        assert outcome.failures == []
         assert {b.file_path for b, _ in outcome.successful} == {"ok.py", "big.py"}
-        assert len(outcome.successful) == len(batches) - 1
+        assert any(b.source_start_column is not None for b in batches)
         assert all(len(prompt.encode("utf-8")) <= 8000 for prompt in submitted)
 
     @pytest.mark.parametrize("async_mode", [False, True])
@@ -4825,3 +4822,54 @@ class TestConfigurableRequestLimits:
         with pytest.raises(PromptSizeLimitError):
             analyzer._invoke_with_failure_diagnostic(runnable, "z" * (MAX_INPUT_BYTES + 1))
         runnable.invoke.assert_not_called()
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize("content", ["x = 1\n" * 400, "x = 1\n"])
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_tiny_token_cap_is_size_limited_without_submission(
+        self, monkeypatch: pytest.MonkeyPatch, async_mode: bool, content: str
+    ) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+        monkeypatch.setenv("SKILLSPECTOR_MAX_BATCH_INPUT_TOKENS", "100")
+        invoke = MagicMock()
+        monkeypatch.setattr("skillspector.llm_analyzer_base._invoke_with_usage", invoke)
+        monkeypatch.setattr("skillspector.llm_analyzer_base._ainvoke_with_usage", invoke)
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        batches = analyzer.get_batches(["a.py"], {"a.py": content})
+        outcome = (
+            run_async(analyzer.arun_batches_detailed(batches))
+            if async_mode
+            else analyzer.run_batches_detailed(batches)
+        )
+
+        invoke.assert_not_called()
+        assert outcome.failures
+        assert {f.reason for f in outcome.failures} == {LedgerReason.SIZE_LIMIT}
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_schema_augmentation_over_byte_cap_is_size_limited(
+        self, monkeypatch: pytest.MonkeyPatch, async_mode: bool
+    ) -> None:
+        from skillspector.llm_utils import structured_output_instructions
+
+        monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        batch = Batch(file_path="a.py", content="x = 1\n", findings=[])
+        raw = len(analyzer.build_prompt(batch).encode("utf-8"))
+        schema = len(structured_output_instructions(LLMAnalysisResult).encode("utf-8"))
+        monkeypatch.setenv("SKILLSPECTOR_MAX_PROMPT_BYTES", str(raw + schema // 2))
+        invoke = MagicMock()
+        monkeypatch.setattr("skillspector.llm_analyzer_base._invoke_with_usage", invoke)
+        monkeypatch.setattr("skillspector.llm_analyzer_base._ainvoke_with_usage", invoke)
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        outcome = (
+            run_async(analyzer.arun_batches_detailed([batch]))
+            if async_mode
+            else analyzer.run_batches_detailed([batch])
+        )
+
+        invoke.assert_not_called()
+        assert [(f.error_class, f.reason) for f in outcome.failures] == [
+            ("PromptSizeLimitError", LedgerReason.SIZE_LIMIT)
+        ]

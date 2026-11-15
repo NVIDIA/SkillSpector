@@ -511,8 +511,9 @@ settings:
 
 Each setting only lowers a limit; the smallest of it, the model's input budget
 and the provider's byte limit applies (`SKILLSPECTOR_MAX_BATCH_INPUT_TOKENS` also
-bounds TP4). Files are split into line-aligned chunks; a line or fixed prompt that
-cannot fit is reported as a size-limit failure, never truncated. The byte limit
+bounds TP4). Files are split into line-aligned chunks and over-long lines into
+column spans; a fixed prompt that cannot fit is reported as a size-limit failure,
+never truncated. The byte limit
 measures prompt text, not the serialized HTTP request. Blank values keep the
 defaults; other values that are not positive integers are ignored with a warning.
 
