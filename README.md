@@ -224,8 +224,11 @@ all matching versions are assessed. The server name remains the report source:
 skillspector scan 'ac.inference.sh/mcp' --mcp-registry --format json --output current.json
 ```
 
-Use `https://registry.modelcontextprotocol.io/v0/servers` as the input to scan
-the full catalog. Local registry captures are also supported.
+Use `https://registry.modelcontextprotocol.io/v0.1/servers` as the input to scan
+the full catalog. Named lookups also use this stable API. The exact legacy URL
+`https://registry.modelcontextprotocol.io/v0/servers` remains supported. Other
+URLs, including URLs with queries or fragments, are rejected. Local registry
+captures are also supported.
 
 Start with raw registry payload captures (`registry-before.json` and
 `registry-after.json`). Save a scan report as `previous.json`, then compare a
