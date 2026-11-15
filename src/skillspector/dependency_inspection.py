@@ -215,12 +215,25 @@ def _collect_artifacts(
                 if not isinstance(manifest, dict):
                     raise DependencyInspectionError("dependency_parse_error")
                 for key in (
+                    "optionalDependencies",
                     "dependencies",
                     "devDependencies",
-                    "optionalDependencies",
                     "peerDependencies",
                 ):
-                    if manifest.get(key, {}) != packages[""].get(key, {}):
+                    declared = manifest.get(key, {})
+                    locked = packages[""].get(key, {})
+                    if not isinstance(declared, dict) or not isinstance(locked, dict):
+                        raise DependencyInspectionError("dependency_parse_error")
+                    if key == "dependencies":
+                        # npm omits ordinary declarations overridden by optional ones.
+                        optional = manifest.get("optionalDependencies", {})
+                        declared = {
+                            name: spec for name, spec in declared.items() if name not in optional
+                        }
+                        locked = {
+                            name: spec for name, spec in locked.items() if name not in optional
+                        }
+                    if declared != locked:
                         raise DependencyInspectionError("dependency_lockfile_mismatch")
             for index, (location, package) in enumerate(packages.items()):
                 if location == "":

@@ -34,6 +34,7 @@ from skillspector.llm_analyzer_base import (
     LLMAnalyzerBase,
     LLMRuntimeLimitError,
     ledger_events_for_batches,
+    llm_call_record_for_outcome,
 )
 from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
@@ -244,7 +245,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             "llm_call_log": [
                 # Formatting warnings describe an unknown assessment; provider
                 # failures still make execution unsuccessful. Coverage is in the ledger.
-                llm_call_record(ANALYZER_ID, ok=not outcome.failures)
+                llm_call_record_for_outcome(ANALYZER_ID, outcome)
             ],
             "inference_usage": analyzer.inference_usage,
         }

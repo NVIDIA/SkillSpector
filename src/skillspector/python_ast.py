@@ -37,9 +37,13 @@ from enum import StrEnum
 from threading import RLock
 from uuid import uuid4
 
+from skillspector.resource_limits import bounded_capacity
+
 # Keep this in sync with the existing static-analyzer size gate.  It lives here
 # so prewarming does not parse files that AST consumers will skip anyway.
-MAX_PYTHON_AST_SOURCE_CHARS = 1_000_000
+MAX_PYTHON_AST_SOURCE_CHARS = bounded_capacity(
+    "SKILLSPECTOR_MAX_PYTHON_AST_SOURCE_CHARS", 1_000_000, 8_000_000
+)
 # AST nodes can be substantially larger than their source.  Limit the total
 # source retained as parsed trees for any one scan; files beyond this budget
 # use the existing on-demand behavior rather than retaining unbounded memory.

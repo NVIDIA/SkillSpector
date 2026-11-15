@@ -128,9 +128,13 @@ async function approveScanInputs(
     if (!isWithin(resolve(ctx.cwd), path.input) && !isWithin(workspace, path.resolved) && path.resolved !== path.input) {
       aliasRequests.push(readRequest(path.field, path.resolved));
     }
-    // Keep the original target path so the CLI can enforce its no-symlink
-    // input policy. YARA directories are canonicalised by the CLI too.
-    prepared[path.field] = path.field === "target" ? path.input : path.resolved;
+    // Resolve only the workspace prefix; keep child symlinks for the CLI's
+    // no-symlink input checks. YARA directories are canonicalised by the CLI too.
+    prepared[path.field] = path.field === "target"
+      ? isWithin(resolve(ctx.cwd), path.input)
+        ? join(workspace, relative(resolve(ctx.cwd), path.input))
+        : path.input
+      : path.resolved;
   }
   await approve(aliasRequests);
   signal?.throwIfAborted();

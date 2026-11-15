@@ -82,8 +82,9 @@ MP1_PATTERNS = [
 ]
 
 # MP2: Context Window Stuffing — filling context to displace content
+_BOUNDED_REPETITION_PATTERN = r"(.{2,20}?)\1{20,}"
 MP2_CONTENT_PATTERNS = [
-    (r"(.{2,20}?)\1{20,}", 0.8),
+    (_BOUNDED_REPETITION_PATTERN, 0.8),
 ]
 MP2_PROSE_PATTERNS = [
     (
@@ -148,7 +149,11 @@ _ADOPTION_PARAGRAPH_BOUNDARY = re.compile(
 MP3_PATTERNS = [
     (_MP3_STATE_ADOPTION_PATTERN, 0.85),
     (
-        r"(?:clear|reset|wipe|erase|delete|purge)\s+(?:your\s+)?(?:memory|context|state|history|conversation)",
+        # The noun must end its word, so "Clear statement" is not a reset. The
+        # lookahead also allows a plural "s", or "conversational"/"contextual"
+        # before another whole memory noun; the matched text still ends at the noun.
+        r"(?:clear|reset|wipe|erase|delete|purge)\s+(?:your\s+)?(?:memory|context|state|history|conversation)"
+        r"(?=s?(?![a-z])|u?al\s+(?:memor(?:y|ies)|contexts?|states?|histor(?:y|ies))(?![a-z]))",
         0.8,
     ),
     (
@@ -857,10 +862,16 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     table_spans = _markdown_table_line_spans(content) if file_type == "markdown" else []
     for pattern, confidence in MP2_PATTERNS:
+        # For each start there are only 19 candidate lengths. A failed candidate
+        # checks at most 20 copies; a success consumes its entire repeated run.
+        # There is no trailing condition to force it to backtrack over that run.
+        # Keep this linear, window-bounded rule on Python's faster native engine.
         matches = (
-            static_runner.iter_paragraph_matches
+            re.finditer
+            if pattern == _BOUNDED_REPETITION_PATTERN
+            else static_runner.iter_paragraph_matches
             if (pattern, confidence) in MP2_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             span = match.group(0)

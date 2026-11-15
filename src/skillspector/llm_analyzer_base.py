@@ -40,10 +40,12 @@ from email.utils import parsedate_to_datetime
 from random import uniform
 from typing import Any, Literal, cast, get_args
 
+import tiktoken
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import BaseMessage
 from langchain_openai.chat_models.base import BaseChatOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator
+from tiktoken import registry as tiktoken_registry
 
 from skillspector.inference_usage import (
     InferenceUsageRecord,
@@ -57,6 +59,7 @@ from skillspector.inspection_ledger import (
     LedgerReason,
     LedgerRecordType,
     analyzer_status_for_events,
+    inspection_work_id,
     ledger_event,
     outcome_for_llm_batch_failure,
 )
@@ -67,8 +70,10 @@ from skillspector.llm_utils import (
     _ainvoke_with_usage,
     _invoke_with_usage,
     bind_structured_output,
+    bind_structured_output_fallback,
     chat_model_provider_name,
     get_chat_model,
+    is_structured_output_rejection,
     new_inference_usage_collector,
     structured_output_instructions,
 )
@@ -83,6 +88,8 @@ from skillspector.response_recovery import (
     recover_payload,
     recovery_field_choices,
 )
+from skillspector.semantic_runtime import STRUCTURED_OUTPUT_UNAVAILABLE_ERROR
+from skillspector.state import LLMCallRecord, llm_call_record
 from skillspector.structured_response import (
     ResponseIssue,
     completed_response_text,
@@ -177,8 +184,90 @@ def _require_structured_response(response: object) -> None:
         )
 
 
+REQUEST_FRAMING_TOKENS = 256
+
+
+def _input_token_counter_key(chat_model: object) -> tuple[object, ...]:
+    """Retain the selected counter for equivalent client configurations."""
+    if not isinstance(chat_model, BaseChatOpenAI):
+        return ("conservative_utf8_bytes",)
+    custom = getattr(chat_model, "custom_get_token_ids", None)
+    if callable(custom):
+        # The selected counter retains this callable, so its identity cannot be
+        # recycled while this key is cached. Do not retain whole HTTP clients.
+        return ("configured_chat_model_tokenizer", id(custom))
+    label = getattr(chat_model, "tiktoken_model_name", None) or getattr(
+        chat_model, "model_name", None
+    )
+    return ("openai_codec", label if isinstance(label, str) else None)
+
+
+def _input_token_counter(chat_model: object) -> tuple[Callable[[str], int], str]:
+    """Use a configured/recognized OpenAI codec; unknown codecs use UTF-8 bytes.
+
+    A model label must not silently inherit another model's tokenizer. Byte
+    length is a conservative bound for text when no verified codec is known.
+    """
+
+    def byte_bound(text: str) -> int:
+        return len(text.encode("utf-8", errors="replace"))
+
+    if not isinstance(chat_model, BaseChatOpenAI):
+        return byte_bound, "conservative_utf8_bytes"
+    custom = getattr(chat_model, "custom_get_token_ids", None)
+    if callable(custom):
+
+        def configured(text: str) -> int:
+            try:
+                count = len(custom(text))
+                return count if count > 0 or not text else byte_bound(text)
+            except Exception:
+                return byte_bound(text)
+
+        return configured, "configured_chat_model_tokenizer"
+    label = getattr(chat_model, "tiktoken_model_name", None) or getattr(
+        chat_model, "model_name", None
+    )
+    if not isinstance(label, str):
+        return byte_bound, "conservative_utf8_bytes"
+    try:
+        # Name lookup is a pure table lookup. Never initialize a codec here:
+        # get_encoding/encoding_for_model can download its vocabulary without a
+        # timeout, outside the shared scan deadline. Use only an existing codec.
+        encoding_name = tiktoken.encoding_name_for_model(label)
+        encoding = tiktoken_registry.ENCODINGS.get(encoding_name)
+    except Exception:
+        return byte_bound, "conservative_utf8_bytes"
+    if encoding is None:
+        return byte_bound, "conservative_utf8_bytes"
+
+    def recognized(text: str) -> int:
+        try:
+            return len(encoding.encode(text, disallowed_special=()))
+        except Exception:
+            return byte_bound(text)
+
+    return recognized, "recognized_tiktoken_codec"
+
+
+class LLMInputBudgetError(RuntimeError):
+    """Retain an unsubmitted batch that cannot fit the serialized input budget."""
+
+
 class LLMRuntimeLimitError(RuntimeError):
     """Signal that no shared scan time remains for an LLM operation."""
+
+
+class LLMStructuredOutputUnavailableError(Exception):
+    """The gateway rejected structured output in both available shapes.
+
+    Raised when a provider answers the ``json_schema`` response format with
+    HTTP 400 and the unforced tool-calling retry is rejected the same way:
+    the gateway cannot serve structured output at all, so the batch has no
+    recovery left. It is a plain :class:`Exception`, not a ``ValueError``,
+    so batch execution records it as a failure instead of treating it as a
+    misconfiguration that aborts the scan.
+    """
 
 
 _RETRYABLE_PROVIDER_ERROR_NAMES = frozenset(
@@ -894,6 +983,10 @@ class Batch:
     start_line: int = 1
     end_line: int | None = None
     findings: list[Finding] = field(default_factory=list)
+    # Zero-based half-open Unicode-character columns; line endings are excluded.
+    source_start_column: int | None = None
+    source_end_column: int | None = None
+    source_line_length: int | None = None
 
     @property
     def is_chunk(self) -> bool:
@@ -904,6 +997,11 @@ class Batch:
         label = f"File: {self.file_path}"
         if self.is_chunk:
             label += f" (lines {self.start_line}\u2013{self.end_line})"
+        if self.source_start_column is not None:
+            label += (
+                f" (partial source line, columns {self.source_start_column + 1}"
+                f"–{self.source_end_column} of {self.source_line_length} characters)"
+            )
         return label
 
 
@@ -933,6 +1031,30 @@ class _RecoveredBatch:
     values: list
     complete: bool
     failure: Exception | None = None
+
+
+def llm_call_record_for_outcome(node_id: str, outcome: BatchExecutionResult) -> LLMCallRecord:
+    """Build the call-log record for one analyzer run from its batch outcome.
+
+    A run whose every batch failed because the gateway rejects structured
+    output carries that as its error, so the report can tell a provider that
+    cannot serve structured output from a provider that was never reached.
+    Partial failures keep the existing error-free record: the provider did
+    serve some assessments, so the failure is a coverage gap, not an
+    unavailable LLM. A successful or recovered batch proves the provider
+    served an assessment, so the unavailable error is reserved for total
+    rejection.
+    """
+    if not outcome.failures:
+        return llm_call_record(node_id, ok=True)
+    if outcome.successful or outcome.recovered:
+        return llm_call_record(node_id, ok=False)
+    if all(
+        failure.reason is LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
+        for failure in outcome.failures
+    ):
+        return llm_call_record(node_id, ok=False, error=STRUCTURED_OUTPUT_UNAVAILABLE_ERROR)
+    return llm_call_record(node_id, ok=False)
 
 
 @dataclass(frozen=True)
@@ -981,11 +1103,205 @@ def _uncovered_intervals(
     return uncovered
 
 
+def _project_line_fragments(
+    successful: list[tuple[Batch, list]],
+    failures: list[BatchFailure],
+    recovered: list[tuple[Batch, list]] | None = None,
+) -> tuple[list[tuple[Batch, list]], list[BatchFailure], list[tuple[Batch, list]]]:
+    """Project a line only after its successful fragments cover every character.
+
+    The public ledger identifies work by line range. Sibling fragments must not
+    masquerade as successful retries of a different part of that same line.
+    Recovered fields retain findings but never contribute successful coverage.
+    """
+    groups = defaultdict(list)
+    whole_successes = []
+    whole_failures = []
+    partial_findings = []
+    for batch, findings in successful:
+        if batch.source_start_column is None:
+            whole_successes.append((batch, findings))
+        else:
+            groups[(batch.file_path, batch.start_line, batch.end_line)].append(
+                (batch, findings, None)
+            )
+    recovered_by_batch = {id(batch): values for batch, values in recovered or ()}
+    for failure in failures:
+        batch = failure.batch
+        if batch.source_start_column is None:
+            whole_failures.append(failure)
+        else:
+            groups[(batch.file_path, batch.start_line, batch.end_line)].append(
+                (batch, recovered_by_batch.get(id(batch), []), failure)
+            )
+    for (path, start, end), fragments in groups.items():
+        lengths = {batch.source_line_length for batch, _, _ in fragments}
+        total = fragments[0][0].source_line_length
+        valid = (
+            start == end
+            and type(total) is int
+            and total > 0
+            and len(lengths) == 1
+            and all(
+                type(batch.source_start_column) is int
+                and type(batch.source_end_column) is int
+                and 0 <= batch.source_start_column < batch.source_end_column <= total
+                for batch, _, _ in fragments
+            )
+        )
+        covered = 0
+        for left, right in sorted(
+            (batch.source_start_column, batch.source_end_column)
+            for batch, _, failure in fragments
+            if failure is None
+        ):
+            if not valid or left > covered:
+                break
+            covered = max(covered, right)
+        findings = [finding for _, values, _ in fragments for finding in values]
+        original_findings = {
+            finding.finding_id: finding for batch, _, _ in fragments for finding in batch.findings
+        }
+        line = Batch(
+            file_path=path,
+            content="",
+            start_line=start,
+            end_line=end,
+            findings=list(original_findings.values()),
+        )
+        if valid and covered == total:
+            whole_successes.append((line, findings))
+            continue
+        if findings:
+            # Successful fragments still contributed real findings, even though
+            # they cannot establish completion of the original source line.
+            partial_findings.append((line, findings))
+        failed = [failure for _, _, failure in fragments if failure is not None]
+        whole_failures.extend(
+            BatchFailure(line, failure.error_class, failure.reason) for failure in failed
+        )
+        if not failed:
+            whole_failures.append(BatchFailure(line, "IncompleteSourceLineFragments"))
+    return whole_successes, whole_failures, partial_findings
+
+
+def _consolidate_fragment_ledger_events(
+    analyzer_id: str, events: list[InspectionLedgerEvent], batches: list[Batch]
+) -> tuple[list[InspectionLedgerEvent], AnalyzerStatusEvent]:
+    """Keep one terminal line row and separate, non-planned failure facts."""
+    fragmented = {
+        (batch.file_path, batch.start_line, batch.end_line)
+        for batch in batches
+        if batch.source_start_column is not None
+    }
+    groups: dict[str, list[InspectionLedgerEvent]] = defaultdict(list)
+    result: list[InspectionLedgerEvent] = []
+    for event in events:
+        if (event["path"], event["start_line"], event["end_line"]) in fragmented:
+            groups[event["work_id"]].append(event)
+        else:
+            result.append(event)
+    severity = {
+        LedgerOutcome.COMPLETED: 0,
+        LedgerOutcome.SKIPPED: 1,
+        LedgerOutcome.PARTIAL: 2,
+        LedgerOutcome.FAILED: 3,
+    }
+    for rows in groups.values():
+        if len(rows) == 1:
+            result.extend(rows)
+            continue
+        # Recovery warnings also carry distinct incomplete-analysis facts.
+        # Preserve them even when another fragment has an operational failure.
+        failures = [row for row in rows if row.get("reason_code") is not None]
+        primary = cast(
+            InspectionLedgerEvent,
+            dict(max(failures or rows, key=lambda row: severity[row["outcome"]])),
+        )
+        primary["input_finding_ids"] = list(
+            dict.fromkeys(finding_id for row in rows for finding_id in row["input_finding_ids"])
+        )
+        primary["emitted_finding_ids"] = list(
+            dict.fromkeys(finding_id for row in rows for finding_id in row["emitted_finding_ids"])
+        )
+        # Producer findings need one partial origin. A separate failure boundary
+        # retains any fatal fact without creating another planned line outcome.
+        if primary["phase"] != "meta" and primary["emitted_finding_ids"]:
+            primary["outcome"] = LedgerOutcome.PARTIAL
+        result.append(primary)
+        primary_fact = (primary["outcome"], primary.get("reason_code"), primary.get("error_class"))
+        facts = {primary_fact}
+        for failure in failures:
+            fact = (failure["outcome"], failure.get("reason_code"), failure.get("error_class"))
+            if fact in facts:
+                continue
+            facts.add(fact)
+            boundary = ledger_event(
+                analyzer_id=analyzer_id,
+                record_type=LedgerRecordType.SCOPE_BOUNDARY,
+                outcome=failure["outcome"],
+                phase=failure["phase"],
+                path=failure["path"],
+                start_line=failure["start_line"],
+                end_line=failure["end_line"],
+                reason=failure.get("reason_code"),
+                error_class=failure.get("error_class"),
+            )
+            # Scope facts are not planned work, and must not collide with the
+            # original line's ID. Keep the real analyzer in public provenance.
+            boundary["work_id"] = inspection_work_id(
+                f"{analyzer_id}:fragment-failure:{fact[0]}:{fact[1]}:{fact[2]}",
+                failure["path"],
+                failure["start_line"],
+                failure["end_line"],
+            )
+            result.append(boundary)
+    status = analyzer_status_for_events(analyzer_id, result)
+    if any(event["outcome"] == LedgerOutcome.FAILED for event in result):
+        status["status"] = "failed"
+    return result, status
+
+
 def ledger_events_for_batches(
     analyzer_id: str,
     outcome: BatchExecutionResult,
 ) -> tuple[list[InspectionLedgerEvent], AnalyzerStatusEvent]:
     """Project detailed LLM batch execution into terminal ledger evidence."""
+    fragment_batches = [batch for batch, _ in outcome.successful if isinstance(batch, Batch)] + [
+        failure.batch
+        for failure in [*outcome.failures, *outcome.warnings]
+        if isinstance(failure.batch, Batch)
+    ]
+    successful, failures, partial_findings = _project_line_fragments(
+        [(batch, findings) for batch, findings in outcome.successful if isinstance(batch, Batch)],
+        [
+            failure
+            for failure in [*outcome.failures, *outcome.warnings]
+            if isinstance(failure.batch, Batch)
+        ],
+        [(batch, findings) for batch, findings in outcome.recovered if isinstance(batch, Batch)],
+    )
+    outcome = BatchExecutionResult(
+        successful=successful,
+        failures=[
+            failure
+            for failure in failures
+            if failure.reason is not LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+        ],
+        recovered=[
+            *(
+                (batch, values)
+                for batch, values in outcome.recovered
+                if isinstance(batch, Batch) and batch.source_start_column is None
+            ),
+            *partial_findings,
+        ],
+        warnings=[
+            failure
+            for failure in failures
+            if failure.reason is LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+        ],
+    )
     events: list[InspectionLedgerEvent] = []
     successful_ranges: dict[str, list[tuple[int | None, int | None]]] = defaultdict(list)
     for batch, findings in outcome.successful:
@@ -1083,7 +1399,7 @@ def ledger_events_for_batches(
                     )
                 )
 
-    return events, analyzer_status_for_events(analyzer_id, events)
+    return _consolidate_fragment_ledger_events(analyzer_id, events, fragment_batches)
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +1430,7 @@ def chunk_file_by_lines(
     overlap_lines: int = CHUNK_OVERLAP_LINES,
     *,
     max_bytes: int | None = None,
+    fits_chunk: Callable[[str, int, int], bool] | None = None,
 ) -> list[tuple[str, int, int]]:
     """Split *content* into line-range chunks that each fit within *max_tokens*.
 
@@ -1121,10 +1438,14 @@ def chunk_file_by_lines(
     are 1-indexed.  Consecutive chunks share *overlap_lines* lines of context so
     findings near chunk boundaries still have surrounding code.
 
+    The token estimate includes numbered line prefixes and rounds cumulative
+    serialized size, rather than rounding each line independently.
+
     When *max_bytes* is set, each chunk must also fit within that many UTF-8
     bytes *after* :func:`number_lines` has prefixed it, which is what a CLI
     provider's input cap measures.  A single line that alone exceeds the budget
-    still becomes its own chunk: content is never dropped or truncated.
+    still becomes its own chunk: content is never dropped or truncated. The
+    invocation guard records an explicit failure instead of submitting it.
     """
     lines = content.splitlines(keepends=True)
     if not lines:
@@ -1138,24 +1459,36 @@ def chunk_file_by_lines(
     start_idx = 0
 
     while start_idx < len(lines):
-        token_count = 0
         byte_count = 0
         end_idx = start_idx
 
         while end_idx < len(lines):
-            line_tokens = estimate_tokens(lines[end_idx])
-            line_bytes = (
-                len(lines[end_idx].encode("utf-8", errors="replace")) + prefix_bytes
-                if max_bytes is not None
-                else 0
-            )
-            over_tokens = token_count + line_tokens > max_tokens
+            line_bytes = len(lines[end_idx].encode("utf-8", errors="replace")) + prefix_bytes
+            # Round the cumulative serialized size, not each short line. Prefixes
+            # and UTF-8 bytes conservatively bound the chars/4 token estimate.
+            over_tokens = (
+                byte_count + line_bytes + CHARS_PER_TOKEN - 1
+            ) // CHARS_PER_TOKEN > max_tokens
             over_bytes = max_bytes is not None and byte_count + line_bytes > max_bytes
             if (over_tokens or over_bytes) and end_idx > start_idx:
                 break
-            token_count += line_tokens
             byte_count += line_bytes
             end_idx += 1
+
+        if fits_chunk is not None and not fits_chunk(
+            "".join(lines[start_idx:end_idx]), start_idx + 1, end_idx
+        ):
+            low, high = start_idx + 1, end_idx
+            best = None
+            while low <= high:
+                middle = (low + high) // 2
+                if fits_chunk("".join(lines[start_idx:middle]), start_idx + 1, middle):
+                    best = middle
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            # An unfit single line stays represented; the call guard refuses it.
+            end_idx = best if best is not None else start_idx + 1
 
         chunk_text = "".join(lines[start_idx:end_idx])
         chunks.append((chunk_text, start_idx + 1, end_idx))  # 1-indexed
@@ -1270,6 +1603,10 @@ class LLMAnalyzerBase:
         self.recovery_rule_ids = recovery_rule_ids
         self._timeout = timeout
         self._dynamic_timeout = callable(timeout)
+        # Set once a gateway rejects the json_schema response format: later
+        # batches (and formatting retries) bind the schema as an unforced
+        # tool call instead of paying one rejected request per batch.
+        self._use_structured_output_fallback = False
         self._input_budget = cap_input_tokens(get_max_input_tokens(model))
         self._max_prompt_bytes = max_prompt_bytes()
         self._request_ordinal = 0
@@ -1282,6 +1619,8 @@ class LLMAnalyzerBase:
             self._require_time_remaining()
             raise
         self._require_time_remaining()
+        self._token_counter, self._token_counter_source = _input_token_counter(self._llm)
+        self._call_token_counters = {_input_token_counter_key(self._llm): self._token_counter}
         # Native SDK retries cannot re-read a workflow-wide deadline between
         # attempts.  A dynamic deadline therefore uses our explicit retry loop,
         # which checks and caps every retry/backoff against remaining time.
@@ -1302,8 +1641,32 @@ class LLMAnalyzerBase:
             chat_model=self._llm,
         )
 
-    def _bind_structured_output(self, llm: object, schema: type) -> object:
-        return bind_structured_output(llm, schema, self.model)
+    def _bind_structured_output(
+        self, llm: object, schema: type, *, preserve_text: str | None = None
+    ) -> object:
+        if self._use_structured_output_fallback:
+            fallback = bind_structured_output_fallback(
+                llm, schema, self.model, preserve_text=preserve_text
+            )
+            if fallback is not None:
+                return fallback
+        return bind_structured_output(llm, schema, self.model, preserve_text=preserve_text)
+
+    def _fallback_structured_output(self, llm: object) -> object | None:
+        """Rebind the response schema as an unforced tool call, once per analyzer.
+
+        Returns ``None`` when the model cannot take the fallback shape, so the
+        caller re-raises the original rejection instead of retrying a binding
+        that cannot help. Sets the instance flag on success: the gateway has
+        shown it rejects ``json_schema``, so later batches bind the fallback
+        directly.
+        """
+        if self.response_schema is None:
+            return None
+        fallback = bind_structured_output_fallback(llm, self.response_schema, self.model)
+        if fallback is not None:
+            self._use_structured_output_fallback = True
+        return fallback
 
     def _remaining_timeout(self) -> float | None:
         if callable(self._timeout):
@@ -1401,14 +1764,14 @@ class LLMAnalyzerBase:
     ) -> list[Batch]:
         """Create one :class:`Batch` per file, splitting oversized files into chunks.
 
-        When a prompt byte cap applies (a CLI provider's cap or
-        ``SKILLSPECTOR_MAX_PROMPT_BYTES``, see :func:`max_prompt_bytes`) every batch
-        must also keep the built prompt under it.  The fixed part of
+        Every batch accounts for the real prompt wrapper, findings and schema
+        as well as line prefixes. When a prompt byte cap applies (a CLI provider's
+        cap or ``SKILLSPECTOR_MAX_PROMPT_BYTES``, see :func:`max_prompt_bytes`) it
+        must also stay under it.  The fixed part of
         the prompt is measured with :meth:`build_prompt` itself, called with
         *prompt_kwargs* (the same keyword arguments later passed to the run), so
         subclass prompt layouts are accounted for rather than estimated.
         """
-        base_overhead = estimate_tokens(self.base_prompt)
         max_input_bytes = max_prompt_bytes()
 
         findings_by_file: dict[str, list[Finding]] = defaultdict(list)
@@ -1418,27 +1781,46 @@ class LLMAnalyzerBase:
 
         batches: list[Batch] = []
         for path in file_paths:
-            content = file_cache.get(path) or "No content available for this file."
+            content = file_cache.get(path)
+            if content is None:
+                content = "No content available for this file."
             file_findings = findings_by_file.get(path, [])
 
-            extra = self._estimate_extra_overhead(file_findings)
-            content_budget = max(self._input_budget - base_overhead - extra, 1024)
-
             last_line = max(len(content.splitlines()), 1)
-            fixed_bytes = 0
+            # Only the irreducible wrapper belongs in the coarse budget. The
+            # range predicate measures findings that actually occur in a chunk.
+            fixed_bytes = self._fixed_prompt_bytes(path, [], last_line, **prompt_kwargs)
+            minimum = Batch(file_path=path, content="", findings=[])
+            if not self._prompt_fits_budget(self.build_prompt(minimum, **prompt_kwargs)):
+                # No line split can shrink a fixed wrapper. Keep all content as
+                # one explicit unsubmitted failure instead of refining every line.
+                retained = Batch(file_path=path, content=content, findings=file_findings)
+                batches.append(retained)
+                logger.warning("Fixed LLM prompt cannot fit input budget; batch content retained")
+                if max_input_bytes is not None and fixed_bytes > max_input_bytes:
+                    logger.warning(
+                        "LLM prompt exceeds the provider input limit; batch content retained"
+                    )
+                continue
+            fixed_tokens = (fixed_bytes + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
+            content_budget = max(self._input_budget - fixed_tokens, 1)
             byte_budget: int | None = None
             if max_input_bytes is not None:
-                fixed_bytes = self._fixed_prompt_bytes(
-                    path, file_findings, last_line, **prompt_kwargs
-                )
                 byte_budget = max_input_bytes - fixed_bytes - PROMPT_BYTE_SAFETY_MARGIN
 
             first_batch = len(batches)
-            content_tokens = estimate_tokens(content)
+            content_tokens = (
+                _numbered_size_bound(content, last_line) + CHARS_PER_TOKEN - 1
+            ) // CHARS_PER_TOKEN
             fits_bytes = byte_budget is None or (
                 _numbered_size_bound(content, last_line) <= byte_budget
             )
-            if content_tokens <= content_budget and fits_bytes:
+            whole = Batch(file_path=path, content=content, findings=file_findings)
+            if (
+                content_tokens <= content_budget
+                and fits_bytes
+                and self._prompt_fits_budget(self.build_prompt(whole, **prompt_kwargs))
+            ):
                 batches.append(
                     Batch(
                         file_path=path,
@@ -1447,24 +1829,53 @@ class LLMAnalyzerBase:
                     )
                 )
             else:
-                chunk_budget = max(int(content_budget), 1024)
+                chunk_budget = content_budget
                 # A non-positive byte budget means the fixed prompt alone is over the
                 # cap; splitting the content further cannot help, and every batch is
                 # reported below and fails closed at the provider.
                 chunk_bytes = byte_budget if byte_budget is not None and byte_budget > 0 else None
-                for chunk_text, s_line, e_line in chunk_file_by_lines(
-                    content, chunk_budget, max_bytes=chunk_bytes
-                ):
-                    chunk_findings = findings_in_range(file_findings, s_line, e_line)
-                    batches.append(
-                        Batch(
-                            file_path=path,
-                            content=chunk_text,
-                            start_line=s_line,
-                            end_line=e_line,
-                            findings=chunk_findings,
+
+                def fits_chunk(
+                    text: str,
+                    start: int,
+                    end: int,
+                    *,
+                    path: str = path,
+                    file_findings: list[Finding] = file_findings,
+                ) -> bool:
+                    return self._prompt_fits_budget(
+                        self.build_prompt(
+                            Batch(
+                                file_path=path,
+                                content=text,
+                                start_line=start,
+                                end_line=end,
+                                findings=findings_in_range(file_findings, start, end),
+                            ),
+                            **prompt_kwargs,
                         )
                     )
+
+                for chunk_text, s_line, e_line in chunk_file_by_lines(
+                    content,
+                    chunk_budget,
+                    max_bytes=chunk_bytes,
+                    fits_chunk=fits_chunk,
+                ):
+                    chunk_findings = findings_in_range(file_findings, s_line, e_line)
+                    batch = Batch(
+                        file_path=path,
+                        content=chunk_text,
+                        start_line=s_line,
+                        end_line=e_line,
+                        findings=chunk_findings,
+                    )
+                    if s_line == e_line and not self._prompt_fits_budget(
+                        self.build_prompt(batch, **prompt_kwargs)
+                    ):
+                        batches.extend(self._fragment_source_line(batch, **prompt_kwargs))
+                    else:
+                        batches.append(batch)
 
             if max_input_bytes is not None:
                 for batch in batches[first_batch:]:
@@ -1479,6 +1890,52 @@ class LLMAnalyzerBase:
                         )
 
         return batches
+
+    def _fragment_source_line(self, batch: Batch, **prompt_kwargs: object) -> list[Batch]:
+        """Retain an oversized physical line as bounded, overlapping source spans."""
+        logical = batch.content.splitlines()
+        if len(logical) != 1 or not logical[0]:
+            return [batch]
+        body = logical[0]
+        ending = batch.content[len(body) :]
+        result = []
+        start = 0
+        while start < len(body):
+            self._require_time_remaining()
+
+            def fragment(end: int, start: int = start) -> Batch:
+                return Batch(
+                    file_path=batch.file_path,
+                    content=body[start:end] + (ending if end == len(body) else ""),
+                    start_line=batch.start_line,
+                    end_line=batch.end_line,
+                    findings=batch.findings,
+                    source_start_column=start,
+                    source_end_column=end,
+                    source_line_length=len(body),
+                )
+
+            low, high, best = start + 1, len(body), None
+            while low <= high:
+                middle = (low + high) // 2
+                candidate = fragment(middle)
+                if self._prompt_fits_budget(self.build_prompt(candidate, **prompt_kwargs)):
+                    best = middle
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if best is None:
+                # Fixed metadata/one character cannot fit. Preserve the entire
+                # remainder for the unchanged invocation guard to fail closed.
+                result.append(fragment(len(body)))
+                break
+            result.append(fragment(best))
+            if best == len(body):
+                break
+            # Keep boundary instructions/calls together without quadratic
+            # request growth under tiny budgets. Every iteration advances.
+            start = best - min(256, (best - start) // 8)
+        return result
 
     def _fixed_prompt_bytes(
         self,
@@ -1532,12 +1989,57 @@ class LLMAnalyzerBase:
         different ``response_schema`` or raw-string mode.
         """
         if isinstance(response, LLMAnalysisResult):
+            if batch.source_start_column is not None and any(
+                finding.start_line != batch.start_line
+                or (finding.end_line is not None and finding.end_line != batch.end_line)
+                for finding in response.findings
+            ):
+                raise _StructuredResponseValidationError
             return [f.to_finding(batch.file_path) for f in response.findings]
         raise NotImplementedError(
             "Override parse_response for custom response_schema or raw-string mode"
         )
 
     # -- Run loop -----------------------------------------------------------
+
+    def _serialized_input(self, prompt: str) -> str:
+        if self.response_schema is not None:
+            return prompt + structured_output_instructions(self.response_schema)
+        return prompt
+
+    def _count_prompt_tokens(self, prompt: str, *, chat_model: object | None = None) -> int:
+        if chat_model is None:
+            counter = self._token_counter
+        else:
+            # Reuse a chosen fallback even if another request later populates
+            # the process-wide codec registry. Equivalent refreshed HTTP clients
+            # share a counter without keeping their connection pools alive.
+            counters = getattr(self, "_call_token_counters", None)
+            if counters is None:
+                counters = self._call_token_counters = {}
+            key = _input_token_counter_key(chat_model)
+            if key not in counters:
+                counters[key] = _input_token_counter(chat_model)[0]
+            counter = counters[key]
+        return counter(self._serialized_input(prompt)) + REQUEST_FRAMING_TOKENS
+
+    def _prompt_fits_budget(self, prompt: str) -> bool:
+        try:
+            self._check_prompt_budget(prompt)
+        except LLMInputBudgetError:
+            return False
+        return True
+
+    def _check_prompt_budget(self, prompt: str, *, chat_model: object | None = None) -> None:
+        """Reject an unfit serialized batch before it reaches a provider."""
+        size = len(self._serialized_input(prompt).encode("utf-8", errors="replace"))
+        count = self._count_prompt_tokens(prompt, chat_model=chat_model)
+        byte_cap = _cli_max_input_bytes()
+        if count > self._input_budget or (byte_cap is not None and size > byte_cap):
+            raise LLMInputBudgetError(
+                "serialized LLM input exceeds its token or byte budget; "
+                "batch content retained but not submitted"
+            )
 
     def _record_failed_request(self, exc: BaseException, prompt: str, ordinal: int) -> None:
         # Diagnostics must never replace the original provider exception or report usage.
@@ -1587,12 +2089,65 @@ class LLMAnalyzerBase:
             len(batch.findings),
         )
         llm, structured_llm = self._model_for_call()
+        self._check_prompt_budget(prompt, chat_model=llm)
+        # Snapshot whether this request started on the fallback binding. The
+        # shared flag only guides future bindings: a concurrent batch may flip
+        # it while this request is in flight, and that must not classify this
+        # request as already having tried the fallback.
+        started_on_fallback = self._use_structured_output_fallback
         if structured_llm:
+            if started_on_fallback:
+                # A gateway that rejected json_schema once rejects it for every
+                # batch: bind the fallback directly instead of paying for
+                # another rejected request.
+                structured_llm = self._bind_structured_output(llm, self.response_schema)  # type: ignore[arg-type]
             try:
                 response = self._invoke_with_failure_diagnostic(structured_llm, prompt)
                 _require_structured_response(response)
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError(getattr(exc, "issue", None)) from exc
+            except Exception as exc:
+                if is_structured_output_rejection(exc) and started_on_fallback:
+                    # This batch already ran on the fallback binding: both
+                    # shapes were rejected, so there is no recovery left.
+                    raise LLMStructuredOutputUnavailableError(
+                        "provider rejected structured output (response_format "
+                        "unsupported; tool-calling fallback also rejected)"
+                    ) from exc
+                if not is_structured_output_rejection(exc):
+                    raise
+                # Refresh the remaining workflow deadline and request timeout
+                # before the fallback call: _model_for_call() ran before the
+                # initial request, so the retry must not reuse that earlier
+                # timeout once the deadline has expired.
+                self._require_time_remaining()
+                llm, _ = self._model_for_call()
+                fallback = self._fallback_structured_output(llm)
+                if fallback is None:
+                    raise
+                logger.warning(
+                    "LLM structured output rejected for %s; retrying with tool calling",
+                    batch.file_label,
+                )
+                try:
+                    response = self._invoke_with_failure_diagnostic(fallback, prompt)
+                    _require_structured_response(response)
+                except (StructuredOutputParseError, ValidationError) as retry_exc:
+                    raise _StructuredResponseValidationError(
+                        getattr(retry_exc, "issue", None)
+                    ) from retry_exc
+                except Exception as retry_exc:
+                    # The fallback runs inside the handler for the initial
+                    # rejection, so Python links that rejection as this
+                    # error's implicit context. Stop the walk there: only
+                    # the fallback request's own failure may report the
+                    # run as structured-output unavailable.
+                    if is_structured_output_rejection(retry_exc, stop_before=exc):
+                        raise LLMStructuredOutputUnavailableError(
+                            "provider rejected structured output (response_format "
+                            "unsupported; tool-calling fallback also rejected)"
+                        ) from retry_exc
+                    raise
         else:
             response = _raw_response_text(self._invoke_with_failure_diagnostic(llm, prompt))
         logger.debug("LLM response for %s", batch.file_label)
@@ -1617,10 +2172,10 @@ class LLMAnalyzerBase:
                 "formatting input exceeds model budget", issue=ResponseIssue.LIMIT
             )
         llm, _ = self._model_for_call()
-        return bind_structured_output(
+        self._check_prompt_budget(prompt, chat_model=llm)
+        return self._bind_structured_output(
             llm,
             schema,
-            self.model,
             preserve_text=source,
         ), prompt
 
@@ -1925,6 +2480,9 @@ class LLMAnalyzerBase:
                 return self._recovered_result(batch, items, False, exc)
             try:
                 llm, _ = self._model_for_call()
+                # Recovery repeats source plus quoted prior answers; measure the
+                # complete prompt against the actual refreshed request client too.
+                self._check_prompt_budget(question.prompt, chat_model=llm)
                 response = self._invoke_with_failure_diagnostic(llm, question.prompt)
                 if (getattr(response, "response_metadata", {}) or {}).get(
                     "completion_source"
@@ -1952,6 +2510,9 @@ class LLMAnalyzerBase:
                 return self._recovered_result(batch, items, False, exc)
             try:
                 llm, _ = self._model_for_call()
+                # Keep the async raw-recovery path under the same serialized
+                # token/byte limits without dropping already recovered findings.
+                self._check_prompt_budget(question.prompt, chat_model=llm)
                 response = await self._ainvoke_with_failure_diagnostic(llm, question.prompt)
                 if (getattr(response, "response_metadata", {}) or {}).get(
                     "completion_source"
@@ -2076,6 +2637,8 @@ class LLMAnalyzerBase:
             except (LLMRuntimeLimitError, PromptSizeLimitError):
                 raise
             except Exception as exc:
+                if isinstance(exc, LLMStructuredOutputUnavailableError):
+                    retry_outcome.reason = LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
                 retryable = _is_retryable_provider_error(exc)
                 if not retryable:
                     self._require_time_remaining()
@@ -2121,12 +2684,65 @@ class LLMAnalyzerBase:
             len(batch.findings),
         )
         llm, structured_llm = self._model_for_call()
+        self._check_prompt_budget(prompt, chat_model=llm)
+        # Snapshot whether this request started on the fallback binding. The
+        # shared flag only guides future bindings: a concurrent batch may flip
+        # it while this request is in flight, and that must not classify this
+        # request as already having tried the fallback.
+        started_on_fallback = self._use_structured_output_fallback
         if structured_llm:
+            if started_on_fallback:
+                # A gateway that rejected json_schema once rejects it for every
+                # batch: bind the fallback directly instead of paying for
+                # another rejected request.
+                structured_llm = self._bind_structured_output(llm, self.response_schema)  # type: ignore[arg-type]
             try:
                 response = await self._ainvoke_with_failure_diagnostic(structured_llm, prompt)
                 _require_structured_response(response)
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError(getattr(exc, "issue", None)) from exc
+            except Exception as exc:
+                if is_structured_output_rejection(exc) and started_on_fallback:
+                    # This batch already ran on the fallback binding: both
+                    # shapes were rejected, so there is no recovery left.
+                    raise LLMStructuredOutputUnavailableError(
+                        "provider rejected structured output (response_format "
+                        "unsupported; tool-calling fallback also rejected)"
+                    ) from exc
+                if not is_structured_output_rejection(exc):
+                    raise
+                # Refresh the remaining workflow deadline and request timeout
+                # before the fallback call: _model_for_call() ran before the
+                # initial request, so the retry must not reuse that earlier
+                # timeout once the deadline has expired.
+                self._require_time_remaining()
+                llm, _ = self._model_for_call()
+                fallback = self._fallback_structured_output(llm)
+                if fallback is None:
+                    raise
+                logger.warning(
+                    "LLM structured output rejected for %s; retrying with tool calling",
+                    batch.file_label,
+                )
+                try:
+                    response = await self._ainvoke_with_failure_diagnostic(fallback, prompt)
+                    _require_structured_response(response)
+                except (StructuredOutputParseError, ValidationError) as retry_exc:
+                    raise _StructuredResponseValidationError(
+                        getattr(retry_exc, "issue", None)
+                    ) from retry_exc
+                except Exception as retry_exc:
+                    # The fallback runs inside the handler for the initial
+                    # rejection, so Python links that rejection as this
+                    # error's implicit context. Stop the walk there: only
+                    # the fallback request's own failure may report the
+                    # run as structured-output unavailable.
+                    if is_structured_output_rejection(retry_exc, stop_before=exc):
+                        raise LLMStructuredOutputUnavailableError(
+                            "provider rejected structured output (response_format "
+                            "unsupported; tool-calling fallback also rejected)"
+                        ) from retry_exc
+                    raise
         else:
             response = _raw_response_text(await self._ainvoke_with_failure_diagnostic(llm, prompt))
         logger.debug("LLM response for %s", batch.file_label)
@@ -2202,6 +2818,8 @@ class LLMAnalyzerBase:
             except (LLMRuntimeLimitError, PromptSizeLimitError):
                 raise
             except Exception as exc:
+                if isinstance(exc, LLMStructuredOutputUnavailableError):
+                    retry_outcome.reason = LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
                 retryable = _is_retryable_provider_error(exc)
                 if not retryable:
                     self._require_time_remaining()
@@ -2329,9 +2947,9 @@ class LLMAnalyzerBase:
     ) -> list[tuple[Batch, list]]:
         """Execute LLM calls for all *batches* concurrently.
 
-        Uses ``asyncio.gather`` with a semaphore to run up to
-        *max_concurrency* LLM requests in parallel.  Both cross-file and
-        cross-chunk batches are parallelized in a single gather call.
+        A bounded worker window submits up to *max_concurrency* batches to
+        the shared request limiter. Cross-file and cross-chunk batches can
+        run together without queuing every batch ahead of later analyzers.
 
         When *max_concurrency* is ``None`` (the default) it is resolved from
         ``SKILLSPECTOR_MAX_LLM_CONCURRENCY`` via :func:`resolve_max_concurrency`,
@@ -2384,10 +3002,13 @@ class LLMAnalyzerBase:
         # An explicit argument keeps its documented meaning and stays local to this call: a caller
         # that passes a number is asking for a fan-out width, not for a share of the budget.
         sem: _GlobalLLMLimiter | asyncio.Semaphore
+        concurrency = resolve_max_concurrency() if max_concurrency is None else max_concurrency
+        if not isinstance(concurrency, int) or concurrency < 1:
+            raise ValueError("max_concurrency must be a positive integer")
         if max_concurrency is None:
-            sem = _shared_limiter(resolve_max_concurrency())
+            sem = _shared_limiter(concurrency)
         else:
-            sem = asyncio.Semaphore(max_concurrency)
+            sem = asyncio.Semaphore(concurrency)
 
         async def _process(
             batch: Batch, retry_outcome: _ProviderRetryOutcome
@@ -2399,10 +3020,18 @@ class LLMAnalyzerBase:
                 )
 
         retry_outcomes = [_ProviderRetryOutcome() for _ in batches]
-        results = await asyncio.gather(
-            *[_process(b, retry) for b, retry in zip(batches, retry_outcomes, strict=True)],
-            return_exceptions=True,
-        )
+        results: list[Any] = [None] * len(batches)
+        pending = iter(range(len(batches)))
+
+        async def _worker() -> None:
+            for index in pending:
+                # Preserve per-batch exceptions while external worker cancellation
+                # still cancels the in-flight request and releases its permit.
+                (results[index],) = await asyncio.gather(
+                    _process(batches[index], retry_outcomes[index]), return_exceptions=True
+                )
+
+        await asyncio.gather(*(_worker() for _ in range(min(concurrency, len(batches)))))
         outcome = BatchExecutionResult()
         for batch, result, retry_outcome in zip(batches, results, retry_outcomes, strict=True):
             if isinstance(result, _RecoveredBatch):
