@@ -4173,6 +4173,12 @@ def _has_shell_command_word_exhaustion(
             if backtick_values
             else {}
         ),
+        # A clipped view cannot prove that a wrapper has no following operands.
+        **(
+            {"json_value_ends": dict(json_value_spans)}
+            if complete_context and json_value_spans
+            else {}
+        ),
     ):
         command_string = command.content
         if command_string is None:
@@ -4324,6 +4330,7 @@ def _shell_command_strings(
     xargs_contexts: tuple[tuple[str, list[bool | None]], ...] = (),
     json_key_starts: frozenset[int] = frozenset(),
     json_value_starts: frozenset[int] = frozenset(),
+    json_value_ends: Mapping[int, int] | None = None,
 ) -> Iterator[_ShellCommandString]:
     """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
     single_sources = (
@@ -4461,6 +4468,11 @@ def _shell_command_strings(
             xargs_override_cache=xargs_override_cache,
             xargs_source=content,
             xargs_parent_contexts=xargs_contexts,
+            **(
+                {"native_word_end": json_value_ends[clause_start] - body_start}
+                if json_value_ends is not None and clause_start in json_value_ends
+                else {}
+            ),
         )
         if nested_substitutions and startup_exposure[0]:
             # Quoted substitutions can launch shells outside this clause walk.
@@ -5226,11 +5238,13 @@ def _command_string_from_clause(
     command_operand_spans: list[tuple[int, int]] | None = None,
     shell_command_only: bool = False,
     require_command_identity: bool = False,
+    native_word_end: int | None = None,
 ) -> tuple[bool, str | None]:
     """Resolve a bounded wrapper chain to an ``eval`` or shell command string."""
     cursor = start
     pending: str | None = None
     wrapper_seen = False
+    native_wrapper_end: int | None = None
     last_word_start = start
     word_start = [start]
     xargs_replacements: set[str] = set()
@@ -5411,6 +5425,19 @@ def _command_string_from_clause(
             # this word selects the command an owned child actually executes.
             return failed(ParserCause.RUNTIME_DEPENDENT, ParserCheck.COMMAND_IDENTITY)
         command = word.casefold().rsplit("/", 1)[-1]
+        if (
+            native_word_end is not None
+            and last_word_start == start
+            and cursor == native_word_end
+            and command in {"sudo", "nice", "xargs", "timeout"}
+            and not any(
+                marker in word
+                for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+            )
+        ):
+            # Remember a complete native name, but still resolve any following
+            # argv operands. Only an empty first operand read can use this end.
+            native_wrapper_end = native_word_end
         if (
             not wrapper_seen
             and content[last_word_start:cursor] == word
@@ -5668,6 +5695,7 @@ def _command_string_from_clause(
             xargs_redirected = False
             xargs_input_mode = False
             for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
+                operand_scan_start = cursor
                 if command == "xargs":
                     horizontal_gap()
                     here_string = re.match(r"(?:[0-9]+)?<<<", content[cursor : cursor + 32])
@@ -5710,6 +5738,7 @@ def _command_string_from_clause(
                     return (
                         (False, None)
                         if _ends_wrapped_clause(content, cursor)
+                        or (native_wrapper_end == operand_scan_start and cursor == len(content))
                         else failed(
                             ParserCause.BOUNDARY_UNRESOLVED, ParserCheck.COMMAND_WORD_BOUNDARY
                         )
@@ -5847,6 +5876,7 @@ def _command_string_from_clause(
         if command == "timeout":
             wrapper_seen = True
             while True:
+                operand_scan_start = cursor
                 option, limited = next_word()
                 if limited:
                     return failed()
@@ -5854,6 +5884,7 @@ def _command_string_from_clause(
                     return (
                         (False, None)
                         if _ends_wrapped_clause(content, cursor)
+                        or (native_wrapper_end == operand_scan_start and cursor == len(content))
                         else failed(
                             ParserCause.BOUNDARY_UNRESOLVED, ParserCheck.COMMAND_WORD_BOUNDARY
                         )

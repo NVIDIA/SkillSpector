@@ -361,11 +361,12 @@ def test_oms_decoded_window_keeps_unicode_fence_source_coordinates(
     source = projection.view.text
     raw_start = static_runner._RAW_WINDOW_OWNED_CHARS - static_runner._WINDOW_OVERLAP_CHARS
     context = static_runner._build_window_source_context(path, source, (0, raw_start))
+    # Reconstructed fences retain the language across scan windows.
     assert (
         static_runner._markdown_context_prefix(
             source, raw_start, len(source), context.fence_states, context.fence_transitions
         )
-        == "~~~\n"
+        == "~~~sh\n"
     )
     decoded = _prepared(source)
     assert decoded is not None
