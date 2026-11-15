@@ -24,6 +24,11 @@ from skillspector.mcp_registry import (
     scan_registry,
 )
 
+OFFICIAL_URLS = (
+    "https://registry.modelcontextprotocol.io/v0.1/servers",
+    "https://registry.modelcontextprotocol.io/v0/servers",
+)
+
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "mcp_registry"
 
 
@@ -140,7 +145,8 @@ def test_contract_isolation_uses_normalized_snapshots() -> None:
     assert all("server" not in server["snapshot"] for server in report["servers"])
 
 
-def test_registry_url_scan_follows_next_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+def test_registry_url_scan_follows_next_cursor(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
     page_one = {
         "servers": [{"server": {"name": "page/one"}}],
         "metadata": {"nextCursor": "cursor-2"},
@@ -154,11 +160,66 @@ def test_registry_url_scan_follows_next_cursor(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr("skillspector.mcp_registry.httpx.get", fake_get)
 
-    report = scan_registry(REGISTRY_URL)
+    report = scan_registry(url)
 
+    assert report["source"] == url
+    assert all(snapshot["source"] == url for snapshot in report["snapshots"])
     assert report["server_count"] == 2
     assert [server["snapshot"]["name"] for server in report["servers"]] == ["page/one", "page/two"]
-    assert calls == [(REGISTRY_URL, None), (REGISTRY_URL, {"cursor": "cursor-2"})]
+    assert calls == [(url, None), (url, {"cursor": "cursor-2"})]
+
+
+def test_registry_defaults_and_named_lookups_use_stable_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_get(url: str, **kwargs: Any) -> _Response:
+        calls.append(url)
+        return _Response(one_server(pinned_server()))
+
+    monkeypatch.setattr(mcp_registry.httpx, "get", fake_get)
+    assert scan_registry()["server_count"] == 1
+    assert scan_registry("safe/example")["server_count"] == 1
+    assert calls == [OFFICIAL_URLS[0], f"{OFFICIAL_URLS[0]}/safe%2Fexample/versions"]
+
+
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda url: url + "/",
+        lambda url: url + "/extra",
+        lambda url: url + "?limit=1",
+        lambda url: url + "?",
+        lambda url: url + "#fragment",
+        lambda url: url + "#",
+        lambda url: url.replace("https:", "http:"),
+        lambda url: url.replace(".io/", ".io:443/"),
+        lambda url: url.replace(".io/", ".io:8443/"),
+        lambda url: url.replace("https://", "https://user@"),
+        lambda url: url.replace(".io/", ".io.evil.invalid/"),
+        lambda url: url.replace(".io/", ".io./"),
+        lambda url: url.replace("/servers", "/%73ervers"),
+        lambda url: url.replace("/servers", "/other/../servers"),
+    ],
+)
+def test_official_registry_url_neighbors_are_rejected_before_http(
+    monkeypatch: pytest.MonkeyPatch, url: str, change: Any
+) -> None:
+    monkeypatch.setattr(mcp_registry.httpx, "get", lambda *a, **kw: pytest.fail("must not fetch"))
+    with pytest.raises(ValueError, match="only the official registry URL is supported"):
+        scan_registry(change(url))
+
+
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+@pytest.mark.parametrize("response", [[], {"servers": {}}, {"servers": [None]}])
+def test_official_registry_urls_preserve_invalid_response_errors(
+    monkeypatch: pytest.MonkeyPatch, url: str, response: Any
+) -> None:
+    monkeypatch.setattr(mcp_registry.httpx, "get", lambda *a, **kw: _Response(response))
+    with pytest.raises(ValueError, match="MCP Registry"):
+        scan_registry(url)
 
 
 def test_untrusted_registry_url_is_rejected() -> None:
@@ -483,7 +544,8 @@ def test_error_on_invalid_repository_shape() -> None:
         )
 
 
-def test_error_on_repeated_next_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+def test_error_on_repeated_next_cursor(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
     page = {"servers": [{"server": {"name": "page/one"}}], "metadata": {"nextCursor": "cursor-1"}}
 
     def fake_get(url: str, *, params: dict[str, str] | None = None, timeout: int) -> _Response:
@@ -492,17 +554,18 @@ def test_error_on_repeated_next_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("skillspector.mcp_registry.httpx.get", fake_get)
 
     with pytest.raises(ValueError, match="repeated pagination cursor"):
-        scan_registry(REGISTRY_URL)
+        scan_registry(url)
 
 
-def test_error_on_http_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+def test_error_on_http_failure(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
     def fake_get(url: str, *, params: dict[str, str] | None = None, timeout: int) -> _Response:
         raise httpx.HTTPError("network down")
 
     monkeypatch.setattr("skillspector.mcp_registry.httpx.get", fake_get)
 
     with pytest.raises(ValueError, match="MCP Registry source failed"):
-        scan_registry(REGISTRY_URL)
+        scan_registry(url)
 
 
 def test_scan_registry_scans_partial_paginated_capture(tmp_path: Path) -> None:

@@ -19,7 +19,8 @@ from urllib.parse import quote
 
 import httpx
 
-REGISTRY_URL = "https://registry.modelcontextprotocol.io/v0/servers"
+REGISTRY_URL = "https://registry.modelcontextprotocol.io/v0.1/servers"
+LEGACY_REGISTRY_URL = "https://registry.modelcontextprotocol.io/v0/servers"
 OFFICIAL_META_KEY = "io.modelcontextprotocol.registry/official"
 MAX_REGISTRY_BYTES = 16 * 1024 * 1024
 MAX_REGISTRY_DEPTH = 64
@@ -410,7 +411,7 @@ def _load_payload(input_path: str) -> dict[str, Any]:
         if Path(input_path).is_file():
             return _load_local_registry(Path(input_path))
         if input_path.startswith(("http://", "https://")):
-            if input_path != REGISTRY_URL:
+            if input_path not in {REGISTRY_URL, LEGACY_REGISTRY_URL}:
                 raise ValueError(
                     f"MCP Registry source failed: {input_path}: only the official registry URL is supported"
                 )
