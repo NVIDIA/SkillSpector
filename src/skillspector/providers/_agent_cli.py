@@ -90,6 +90,7 @@ _RUNTIME_ENV_NAMES = frozenset(
         "USERPROFILE",
         "APPDATA",
         "LOCALAPPDATA",
+        "PROGRAMDATA",
         "SYSTEMROOT",
         "WINDIR",
         "TEMP",
@@ -542,7 +543,10 @@ _OPENCODE_SUPPORTED_VERSIONS_V2 = frozenset(
 # and auth probe refuse to start when this directory configures plugins
 # (see _check_opencode_system_sources). Tests monkeypatch this constant to
 # a temporary directory; production code reads the module global at call
-# time and must never capture it at import.
+# time and must never capture it at import. On Windows the gate instead
+# derives the directory from the child environment passed to OpenCode
+# (see _opencode_system_config_dir), so the inspected path is the path
+# the child actually resolves.
 if sys.platform == "win32":
     _OPENCODE_SYSTEM_CONFIG_DIR = os.path.join(
         os.environ.get("ProgramData", r"C:\ProgramData"), "opencode"
@@ -927,15 +931,42 @@ def _write_opencode_project_config(temp_root: str, agent_name: str) -> None:
         handle.write(_opencode_config_2x(agent_name))
 
 
+def _skip_jsonc_trivia(text: str, index: int) -> int:
+    """Return the index of the next non-trivia character at or after *index*.
+
+    Trivia is whitespace plus ``//`` line comments and ``/* ... */``
+    block comments. An unterminated block comment consumes the rest of
+    the text, so a comma before it is never treated as trailing.
+    """
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char in " \t\r\n":
+            index += 1
+            continue
+        if char == "/" and index + 1 < length and text[index + 1] == "/":
+            while index < length and text[index] != "\n":
+                index += 1
+            continue
+        if char == "/" and index + 1 < length and text[index + 1] == "*":
+            end = text.find("*/", index + 2)
+            if end == -1:
+                return length
+            index = end + 2
+            continue
+        return index
+    return index
+
+
 def _strip_opencode_jsonc_comments(text: str) -> str:
     """Strip JSONC comments and trailing commas, leaving strings intact.
 
     A regex would corrupt string values containing ``//`` or a trailing
     ``,}`` (a URL, for example), so this walks the text once tracking
     string and escape state instead. ``//`` runs to end of line and
-    ``/* ... */`` runs to its close; a comma whose next non-whitespace
-    character is ``}`` or ``]`` is dropped. An unterminated block comment
-    or string is left for ``json.loads`` to reject.
+    ``/* ... */`` runs to its close; a comma whose next non-whitespace,
+    non-comment character is ``}`` or ``]`` is dropped. An unterminated
+    block comment or string is left for ``json.loads`` to reject.
     """
     out: list[str] = []
     index = 0
@@ -970,9 +1001,13 @@ def _strip_opencode_jsonc_comments(text: str) -> str:
             index = end + 2
             continue
         if char == ",":
-            lookahead = index + 1
-            while lookahead < length and text[lookahead] in " \t\r\n":
-                lookahead += 1
+            # A comma is trailing when the next significant character
+            # closes the object or array. Comments are trivia here: in
+            # `{"policies": [], /* note */}` the next non-whitespace
+            # character is `/`, but the comment is stripped later, so
+            # skipping only whitespace would leave `{"policies": [], }`
+            # for json.loads to reject.
+            lookahead = _skip_jsonc_trivia(text, index + 1)
             if lookahead < length and text[lookahead] in "}]":
                 index += 1
                 continue
@@ -998,6 +1033,13 @@ def _load_opencode_system_config(path: str) -> dict[str, Any]:
         raise AgentCLIError(
             f"OpenCode system configuration {path!r} could not be read: {exc}"
         ) from exc
+    except UnicodeDecodeError as exc:
+        # A decode failure is not an OSError, so without this it would
+        # escape the auth check and is_llm_available instead of
+        # returning the normal unavailable-provider result.
+        raise AgentCLIError(
+            f"OpenCode system configuration {path!r} could not be decoded as UTF-8: {exc}"
+        ) from exc
     try:
         config = json.loads(_strip_opencode_jsonc_comments(raw))
     except json.JSONDecodeError as exc:
@@ -1009,7 +1051,25 @@ def _load_opencode_system_config(path: str) -> dict[str, Any]:
     return config
 
 
-def _check_opencode_system_sources() -> None:
+def _opencode_system_config_dir(env: dict[str, str] | None = None) -> str:
+    """Return the platform system directory OpenCode 2.x discovers.
+
+    On Windows the directory is ``<ProgramData>\\opencode`` where
+    ProgramData comes from *env*, the environment passed to the OpenCode
+    child, when given. The gate must inspect the same directory the
+    child resolves: deriving it from the parent environment while the
+    scrubbed child env dropped PROGRAMDATA let the child fall back to
+    ``C:\\ProgramData`` while the gate inspected another drive. On other
+    platforms the directory is fixed, so the module constant is used
+    (tests monkeypatch it); without *env* the constant is used on every
+    platform.
+    """
+    if env is not None and sys.platform == "win32":
+        return os.path.join(env.get("ProgramData", r"C:\ProgramData"), "opencode")
+    return _OPENCODE_SYSTEM_CONFIG_DIR
+
+
+def _check_opencode_system_sources(env: dict[str, str] | None = None) -> None:
     """Fail closed when the platform system directory configures plugins.
 
     2.x only. A system-level ``plugin.use`` allow outranks the project
@@ -1018,8 +1078,9 @@ def _check_opencode_system_sources() -> None:
     project policy alone cannot close the boundary. Before any 2.x
     server starts (the preflight ``debug agents --standalone`` and the
     ``auth list --standalone`` probe), inspect the platform system
-    directory (``_OPENCODE_SYSTEM_CONFIG_DIR``) and refuse when it
-    configures any plugin source:
+    directory (see :func:`_opencode_system_config_dir`; callers pass the
+    child environment so the inspected path is the child's effective
+    path) and refuse when it configures any plugin source:
 
     - a ``policies`` rule with action exactly ``plugin.use`` and an
       effect other than ``deny`` (``allow`` or ``ask`` both outrank the
@@ -1033,7 +1094,7 @@ def _check_opencode_system_sources() -> None:
     config file that cannot be read or parsed, fails closed: an
     unreadable system policy must never be treated as an empty one.
     """
-    system_dir = _OPENCODE_SYSTEM_CONFIG_DIR
+    system_dir = _opencode_system_config_dir(env)
     try:
         entries = os.listdir(system_dir)
     except FileNotFoundError:
@@ -1163,7 +1224,9 @@ def _preflight_opencode_policy(
         # configured system plugin loads into the server before the project
         # policy is read (verified live on real 2.2.7, #1086), so the gate
         # runs before any 2.x server starts, including this preflight.
-        _check_opencode_system_sources()
+        # The child environment is passed so the gate inspects the
+        # directory the child resolves, not the parent's.
+        _check_opencode_system_sources(child_env)
         try:
             _write_opencode_project_config(temp_root, agent_name)
         except OSError as exc:
@@ -1453,8 +1516,10 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
                 # The gate raises AgentCLIError; the auth check reports
                 # availability as a (False, reason) tuple, so convert it
                 # here instead of letting it escape to is_available.
+                # The child environment is passed so the gate inspects
+                # the directory the child resolves, not the parent's.
                 try:
-                    _check_opencode_system_sources()
+                    _check_opencode_system_sources(child_env)
                 except AgentCLIError as exc:
                     return False, str(exc)
                 # Then deliver the project policy into the isolated

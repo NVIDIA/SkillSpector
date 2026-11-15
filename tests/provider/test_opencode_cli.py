@@ -65,12 +65,15 @@ from skillspector.providers._agent_cli import (
     _is_supported_opencode_version_v2,
     _opencode_auth_check,
     _opencode_config_2x,
+    _opencode_system_config_dir,
     _parse_opencode_debug_agents,
     _parse_opencode_output,
     _parse_opencode_version,
     _preflight_opencode_policy,
     _prepare_opencode_env,
     _run_bounded,
+    _scrub_env,
+    _strip_opencode_jsonc_comments,
     get_spec,
     run_agent_cli,
 )
@@ -432,13 +435,20 @@ class TestOpencodeVersionRange:
 
 class TestOpencodeVersionRangeV2:
     @pytest.fixture(autouse=True)
-    def _pin_probe_version_2x(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _pin_probe_version_2x(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         # These tests mock subprocess.run but the Popen-based version
         # probes in _build_opencode_argv and _prepare_opencode_env are
         # real: pin the probe to 2.2.6 so the whole auth check runs in a
         # consistent 2.x world instead of depending on which binary a
         # developer has installed. The mocked run version below agrees.
         monkeypatch.setattr(_agent_cli, "_probe_opencode_version", lambda _binary: (2, 2, 6))
+        # The 2.x auth check runs the system-source gate before the
+        # mocked auth command, so point the gate at an empty temporary
+        # directory: on a developer machine with a configured system
+        # plugin the gate would otherwise refuse before the mock runs.
+        empty_system_dir = tmp_path / "system"
+        empty_system_dir.mkdir()
+        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(empty_system_dir))
 
     def test_supported_v2_versions_are_an_explicit_verified_set(self) -> None:
         assert _OPENCODE_SUPPORTED_VERSIONS_V2 == frozenset({(2, 2, 6), (2, 2, 7)})
@@ -775,6 +785,18 @@ class TestOpencodeDenyAllPolicy:
 
 
 class TestOpencodeDenyAllPolicyV2:
+    @pytest.fixture(autouse=True)
+    def _empty_system_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Every test here runs a 2.x fake binary through the real
+        # preflight, which runs the system-source gate before any server
+        # starts. Point the gate at an empty temporary directory so the
+        # results never depend on the host's real system directory; the
+        # dedicated configured-source cases below override this default
+        # with their own directory.
+        empty_system_dir = tmp_path / "system"
+        empty_system_dir.mkdir()
+        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(empty_system_dir))
+
     @staticmethod
     def _write_fake_opencode_v2(
         binary: Path,
@@ -1079,9 +1101,10 @@ class TestOpencodeDenyAllPolicyV2:
         # outranks the project deny, so auth, preflight and inference
         # must all fail closed before any 2.x server starts. No probe
         # markers at all: the fake binary never runs a command, so no
-        # plugin code could have loaded.
+        # plugin code could have loaded. The autouse fixture already
+        # created this empty directory; the override below points the
+        # gate at the configured one.
         system_dir = tmp_path / "system"
-        system_dir.mkdir()
         self._write_system_plugin_allow(system_dir)
         monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(system_dir))
 
@@ -1119,9 +1142,10 @@ class TestOpencodeDenyAllPolicyV2:
         # A system config that denies plugin.use and only removes plugins
         # configures no plugin source, so the gate passes and the project
         # deny does the blocking: the fake refuses its probe without the
-        # project policy deny, and the run holds.
+        # project policy deny, and the run holds. The autouse fixture
+        # already created this empty directory; the override below points
+        # the gate at the configured one.
         system_dir = tmp_path / "system"
-        system_dir.mkdir()
         (system_dir / "opencode.json").write_text(
             json.dumps(
                 {
@@ -1345,6 +1369,84 @@ class TestOpencodeSystemSources:
         with pytest.raises(AgentCLIError, match="could not be listed"):
             _check_opencode_system_sources()
 
+    def test_jsonc_trailing_comma_before_block_comment_parses(self, _system_dir: Path) -> None:
+        # Review round 4 (#1086): a trailing comma before a block
+        # comment is still trailing once the comment is stripped, so
+        # `{"policies": [], /* note */}` must parse instead of leaving
+        # `{"policies": [], }` for json.loads to reject.
+        (_system_dir / "opencode.jsonc").write_text(
+            '{"policies": [], /* note */}\n',
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_jsonc_trailing_comma_before_line_comment_parses(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.jsonc").write_text(
+            '{\n  "policies": [], // system policy\n}\n',
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_jsonc_comma_before_comment_before_key_is_kept(self) -> None:
+        # The comment-skipping lookahead must not eat a real separator:
+        # a comma before a comment that precedes another key stays, and
+        # a comma before a comment that precedes a closer goes.
+        assert json.loads(
+            _strip_opencode_jsonc_comments(
+                '{"homepage": "https://example.invalid/docs", /* note */ "policies": []}'
+            )
+        ) == {"homepage": "https://example.invalid/docs", "policies": []}
+        assert json.loads(_strip_opencode_jsonc_comments('{"policies": [], /* note */}')) == {
+            "policies": []
+        }
+
+    def test_undecodable_system_config_fails_closed(self, _system_dir: Path) -> None:
+        # Review round 4 (#1086): invalid UTF-8 in a system config must
+        # fail closed as AgentCLIError, not escape the gate (and the auth
+        # check) as UnicodeDecodeError.
+        (_system_dir / "opencode.json").write_bytes(b'{"policies": [\xff\xfe]}')
+        with pytest.raises(AgentCLIError, match="could not be decoded"):
+            _check_opencode_system_sources()
+
+    def test_scrub_env_keeps_programdata(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Review round 4 (#1086): the system-directory gate derives its
+        # path from ProgramData, so the scrubbed child environment must
+        # carry the same value or the child falls back to C:\ProgramData
+        # while the gate inspected another drive.
+        monkeypatch.setenv("ProgramData", r"D:\ProgramData")
+        assert _scrub_env().get("ProgramData") == r"D:\ProgramData"
+
+    def test_system_dir_derives_from_child_env_programdata(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 4 (#1086): on Windows the gate must inspect the
+        # directory from the environment passed to OpenCode, not the
+        # parent's. A system allow under the child's ProgramData is
+        # refused, while the same allow under another drive is not even
+        # inspected.
+        monkeypatch.setattr(sys, "platform", "win32")
+        program_data = tmp_path / "ProgramData"
+        system_dir = program_data / "opencode"
+        system_dir.mkdir(parents=True)
+        (system_dir / "opencode.json").write_text(
+            json.dumps(
+                {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        assert _opencode_system_config_dir({"ProgramData": str(program_data)}) == str(system_dir)
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources({"ProgramData": str(program_data)})
+        _check_opencode_system_sources({"ProgramData": str(tmp_path / "other-drive")})
+
+    def test_system_dir_falls_back_to_default_programdata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No ProgramData in the child environment: the child falls back
+        # to C:\ProgramData, and the gate inspects that same path.
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert _opencode_system_config_dir({}) == os.path.join(r"C:\ProgramData", "opencode")
+
 
 # ---------------------------------------------------------------------------
 # Review round 2 (#1086): version-specific OPENCODE_DISABLE_PROJECT_CONFIG
@@ -1382,6 +1484,18 @@ class TestOpencodeProjectConfigFlagVersionSpecific:
 
 
 class TestOpencodeAuthProbeIsolation:
+    @pytest.fixture(autouse=True)
+    def _empty_system_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The 2.x auth check runs the system-source gate before the
+        # probe starts a server, so point the gate at an empty temporary
+        # directory: on a developer machine with a configured system
+        # plugin the gate would otherwise refuse before the fake binary
+        # runs. The undecodable-config case below overrides this default
+        # with its own directory.
+        empty_system_dir = tmp_path / "system"
+        empty_system_dir.mkdir()
+        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(empty_system_dir))
+
     @staticmethod
     def _write_fake_auth_2x(binary: Path, markers: Path) -> None:
         """Fake modelling the 2.x auth probe boundary.
@@ -1568,8 +1682,38 @@ class TestOpencodeAuthProbeIsolation:
         assert cwd != os.getcwd()
         assert (markers / "env-flag").read_text() == "1"
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_auth_probe_undecodable_system_config_returns_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 4 (#1086): invalid UTF-8 in a system config must
+        # surface as an unavailable-provider result, not escape the auth
+        # check as UnicodeDecodeError.
+        # The autouse fixture already created this empty directory.
+        system_dir = tmp_path / "system"
+        (system_dir / "opencode.json").write_bytes(b'{"policies": [\xff\xfe]}')
+        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(system_dir))
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_auth_2x(binary, markers)
+        ok, reason = _opencode_auth_check(str(binary))
+        assert ok is False
+        assert reason is not None and "could not be decoded" in reason
+        assert list(markers.iterdir()) == []
+
 
 class TestOpencodeAncestorProject:
+    @pytest.fixture(autouse=True)
+    def _empty_system_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The 2.x run here goes through the real preflight, which runs
+        # the system-source gate before any server starts: point the
+        # gate at an empty temporary directory so the result never
+        # depends on the host's real system directory.
+        empty_system_dir = tmp_path / "system"
+        empty_system_dir.mkdir()
+        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(empty_system_dir))
+
     @pytest.fixture()
     def project(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         # A repository containing .opencode, with the run/auth temp dirs
