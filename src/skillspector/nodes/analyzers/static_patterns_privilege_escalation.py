@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: privilege escalation (PE1–PE5). Node and analyze() in one module."""
+"""Static patterns: privilege escalation (PE1–PE6). Node and analyze() in one module."""
 
 from __future__ import annotations
 
@@ -171,6 +171,36 @@ PE5_PATTERNS = [
     (r"/proc/\d+/ns/", 0.85),
     (r"""\bunshare\b['",\s]+--(?:user|mount|pid)""", 0.85),
 ]
+# PE6: symbolic-link creation. A link planted in the workspace redirects later
+# approved file operations to its target, and agent approval prompts may show
+# the link path rather than the destination (SymJack, GhostApproval). Base
+# confidence is deliberately low: build scripts and virtual environments create
+# harmless links. The boosts below fire when the same line names a credential
+# store / agent configuration path, or when the target escapes the workspace.
+PE6_PATTERNS = [
+    (r"\bos\s*\.\s*symlink\s*\(", 0.5),
+    (r"\.symlink_to\s*\(", 0.5),
+    (r"\bos\s*\.\s*link\s*\(", 0.4),
+    (r"\bfs\s*\.\s*(?:symlink|symlinkSync|link|linkSync)\s*\(", 0.5),
+    (r"(?<![\w./-])ln\s+(?:-[a-zA-Z]*s[a-zA-Z]*|--symbolic)\b", 0.5),
+    (r"\bmklink\b", 0.5),
+    (r"\bNew-Item\b[^\n]{0,160}?-ItemType\s+(?:SymbolicLink|Junction|HardLink)\b", 0.5),
+]
+_PE6_SENSITIVE_TARGET = re.compile(
+    r"(?:"
+    r"(?<![\w-])\.(?:ssh|aws|gnupg|kube|docker|azure|npmrc|netrc|git-credentials)(?![\w-])"
+    r"|(?<![\w-])\.env(?:\.[\w-]+)?(?![\w-])"
+    r"|(?<![\w-])\.(?:claude|codex|gemini|cursor|windsurf|augment)(?![\w-])"
+    r"|(?<![\w-])\.?mcp\.json(?![\w-])"
+    r"|copilot-instructions\.md"
+    r"|settings(?:\.local)?\.json"
+    r"|(?:^|/)etc/(?:passwd|shadow|sudoers|hosts|cron)"
+    r")",
+    re.IGNORECASE,
+)
+_PE6_ESCAPING_TARGET = re.compile(
+    r"(?:~[/\\]|\$HOME\b|%USERPROFILE%|expanduser\s*\(|Path\s*\.\s*home\s*\(|\.\./|[\s\"'(,=]/(?:etc|root|home|Users|var|usr)/|[A-Za-z]:\\)"
+)
 
 _READ_ONLY_PASSWD_VOLUME = re.compile(
     r"\b(?:docker|podman)\s+run\b"
@@ -1403,6 +1433,49 @@ def analyze(
                 complete_match=match.group(0),
             )
     findings.extend(pe5_best.values())
+    # Collect best-confidence PE6 finding per line; several patterns can hit one
+    # `ln -s` / `os.symlink` statement.
+    pe6_best: dict[int, AnalyzerFinding] = {}
+    for pattern, base_confidence in PE6_PATTERNS:
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
+            line_num = line_number(match.start())
+            line_start = content.rfind("\n", 0, match.start()) + 1
+            line_end = content.find("\n", match.end())
+            line_text = content[line_start : len(content) if line_end == -1 else line_end]
+            sensitive = _PE6_SENSITIVE_TARGET.search(line_text) is not None
+            escaping = _PE6_ESCAPING_TARGET.search(line_text) is not None
+            confidence = base_confidence
+            if sensitive:
+                confidence = min(0.95, confidence + 0.35)
+                severity = Severity.HIGH
+                message = "Symlink Creation Targeting Credentials or Agent Configuration"
+            elif escaping:
+                confidence = min(0.95, confidence + 0.15)
+                severity = Severity.MEDIUM
+                message = "Symlink Creation Targeting a Path Outside the Workspace"
+            else:
+                severity = Severity.LOW
+                message = "Symlink Creation"
+            context = context_at(match.start())
+            finding_tags = list(tag)
+            if reference_material or _is_documentation_example(context, file_type):
+                finding_tags.extend(["contextual-triage", "likely-benign-context"])
+            if line_num in pe6_best and pe6_best[line_num].confidence >= confidence:
+                continue
+            pe6_best[line_num] = AnalyzerFinding(
+                rule_id="PE6",
+                message=message,
+                severity=severity,
+                location=loc(line_num),
+                confidence=confidence,
+                tags=finding_tags,
+                context=context,
+                matched_text=match.group(0)[:200],
+                complete_match=match.group(0),
+            )
+    findings.extend(pe6_best.values())
     return findings
 
 

@@ -1,5 +1,6 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
+* feat(sc11, pe6): report symbolic links shipped inside a skill bundle (SC11, supply chain: HIGH when the link resolves outside the bundle, dangles, or targets credential/agent-configuration paths; MEDIUM for internal links, whose content is still unscanned) and symlink creation in skill code (PE6: `os.symlink`, `Path.symlink_to`, `ln -s`, `mklink`, `New-Item -ItemType SymbolicLink`, `fs.symlink`; LOW by default, raised when the same line names a credential store or agent configuration path, or a target outside the workspace). Discovery still never follows links; the existing scope-boundary ledger event is unchanged (#1141)
 * fix(deps): bump the locked `langgraph` from 1.2.6 to 1.2.20 (and `langgraph-checkpoint` 4.1.1 to 4.3.1, which it requires) past GHSA-3fx2-cqw9-xr3c; the locked `langgraph-sdk` 0.4.10 was already patched (#1078)
 * fix(pi): accept scans from symlinked workspace roots while preserving the CLI's checks on symlinks below the workspace. Custom YARA rules loaded with `--yara-rules-dir` cannot use `include`; place each rule directly in the selected directory.
 * fix(coverage): account for successfully inspected linked ZIP containers while retaining member failures and archive limits
