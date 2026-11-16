@@ -3987,7 +3987,10 @@ def _scan_shipped_bytecode(
     requested_finding_limit = MAX_SC8_FINDINGS if max_findings is None else max_findings
     finding_limit = max(0, min(requested_finding_limit, MAX_SC8_FINDINGS))
     discovered_entries = 0
-    stack: list[tuple[Path, str, int]] = [(root, "", 0)]
+    # The fourth element marks a links-only subtree: SC8 keeps pruning vendor and
+    # metadata trees for bytecode, but a shipped link hidden under node_modules/
+    # or .git/ is still a shipped link, so SC11 walks them without emitting SC8.
+    stack: list[tuple[Path, str, int, bool]] = [(root, "", 0, False)]
     stop_scan = False
 
     def scope_path(relative_directory: str) -> str:
@@ -4088,8 +4091,12 @@ def _scan_shipped_bytecode(
         resolved = os.path.realpath(link_path)
         inside = resolved == root_resolved or resolved.startswith(root_resolved + os.sep)
         dangling = not os.path.exists(resolved)
-        sensitive = bool(
-            _SC11_SENSITIVE_TARGET.search(target) or _SC11_SENSITIVE_TARGET.search(resolved)
+        # The install location must not make an internal link sensitive: a skill
+        # under ~/.claude/skills/demo with CLAUDE.md -> AGENTS.md is still internal.
+        # So the resolved path only counts when it leaves the skill root; the raw
+        # link text always counts (a dangling "~/.claude/settings.json" is a plan).
+        sensitive = bool(_SC11_SENSITIVE_TARGET.search(target)) or (
+            not inside and bool(_SC11_SENSITIVE_TARGET.search(resolved))
         )
         if len(findings) >= finding_limit:
             add_limitation(
@@ -4132,7 +4139,7 @@ def _scan_shipped_bytecode(
         return True
 
     while stack and not stop_scan:
-        directory, relative_directory, depth = stack.pop()
+        directory, relative_directory, depth, links_only = stack.pop()
         if runtime_exhausted(relative_directory):
             break
         remaining_entries = max(0, MAX_SC8_DISCOVERED_ENTRIES - discovered_entries)
@@ -4171,8 +4178,8 @@ def _scan_shipped_bytecode(
                         directory_overflow = True
                         break
                     try:
-                        is_link = entry.is_symlink()
-                        is_directory = entry.is_dir(follow_symlinks=False)
+                        is_link = entry.is_symlink() or Path(entry.path).is_junction()
+                        is_directory = not is_link and entry.is_dir(follow_symlinks=False)
                         is_file = entry.is_file(follow_symlinks=False)
                         error_class = None
                     except OSError as exc:
@@ -4193,7 +4200,7 @@ def _scan_shipped_bytecode(
         if directory_overflow:
             break
 
-        child_directories: list[tuple[Path, str, int]] = []
+        child_directories: list[tuple[Path, str, int, bool]] = []
         for name, is_directory, is_file, is_link, error_class in sorted(
             entries, key=lambda item: item[0]
         ):
@@ -4216,10 +4223,13 @@ def _scan_shipped_bytecode(
                     break
                 continue
             if is_directory:
-                if name == "__pycache__" and not add_finding(f"{relative_path}/", directory=True):
+                if (
+                    not links_only
+                    and name == "__pycache__"
+                    and not add_finding(f"{relative_path}/", directory=True)
+                ):
                     break
-                if name in _SC8_SKIP_DIRS:
-                    continue
+                child_links_only = links_only or name in _SC8_SKIP_DIRS
                 child_depth = depth + 1
                 if child_depth > max(0, MAX_SC8_TRAVERSAL_DEPTH):
                     add_limitation(
@@ -4231,9 +4241,11 @@ def _scan_shipped_bytecode(
                         )
                     )
                     continue
-                child_directories.append((directory / name, relative_path, child_depth))
+                child_directories.append(
+                    (directory / name, relative_path, child_depth, child_links_only)
+                )
                 continue
-            if is_file and name.lower().endswith(_SC8_BYTECODE_SUFFIXES):
+            if not links_only and is_file and name.lower().endswith(_SC8_BYTECODE_SUFFIXES):
                 if not add_finding(relative_path, directory=False):
                     break
         stack.extend(reversed(child_directories))
