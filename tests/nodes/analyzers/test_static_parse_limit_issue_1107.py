@@ -98,6 +98,55 @@ def test_cronq_idiom_reaches_completed_ledger_outcome() -> None:
     assert "reason_code" not in row
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        pytest.param(
+            """$(printf '%s%s' r 'm -rf /' | cat) """,
+            id="executable-printf-pipeline",
+        ),
+        pytest.param(
+            """$(command printf '%s' x | cat) """,
+            id="executable-wrapper-printf-pipeline",
+        ),
+    ],
+)
+def test_executable_printf_pipeline_keeps_coverage_warning(line: str) -> None:
+    """Review #1109: the exemption is for proven quoted data arguments only.
+
+    An unquoted printf pipeline in command position supplies the command
+    and its arguments through word splitting, so the reconstruction
+    diagnostic must stay: the outer-operand check has nothing left to
+    inspect once the substitution is treated as resolved data.
+    """
+    source = "#!/bin/sh\n" + line.strip() + "\n"
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is True
+
+
+def test_quoted_wrapper_printf_pipeline_still_completes() -> None:
+    """Review #1109: the quoted wrapper case keeps the #1107 exemption."""
+    line = """printf "'%s'" "$(command printf '%s' "$1" | sed 's/a/b/')" """
+    source = "#!/bin/sh\n" + line.strip() + "\n"
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is False
+
+
+def test_operator_scan_honors_runtime_check() -> None:
+    """Review #1109: the operator scan must not bypass cancellation.
+
+    A long quoted argument has no _SHELL_COMMAND_WORD_CHARS cap, so the
+    added full pass over the substitution must invoke the caller's runtime
+    check (cancellation and the analyzer deadline) instead of lambda: None.
+    """
+    long_argument = "'" + "a" * 9000 + "'"
+    inner = "printf '%s' " + long_argument + " | cat"
+
+    def cancelled() -> None:
+        raise RuntimeError("cancelled")
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        tm._printf_invocation_has_following_operator(inner, check_runtime=cancelled)
+
+
 def test_literal_elf_probe_behavior_is_unchanged() -> None:
     """Issue #694: a literal ``$(printf '\\177ELF\\001')`` still resolves."""
     probe = "$(printf '\\177ELF\\001')"
