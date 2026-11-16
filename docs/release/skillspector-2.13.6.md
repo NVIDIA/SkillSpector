@@ -9,6 +9,9 @@ This maintenance release builds on v2.13.5 and corrects incomplete static inspec
 ## Minor updates
 
 - [#807](https://github.com/NVIDIA/SkillSpector/pull/807): Correct both development-guide links to the shared LLM analyzer base source module.
+- [#423](https://github.com/NVIDIA/SkillSpector/pull/423): Document `--min-coverage` thresholds, recursive child coverage, and omitted-skill handling.
+- [#685](https://github.com/NVIDIA/SkillSpector/pull/685): Correct least-privilege remediation guidance to require review of necessary capabilities and host enforcement before approving tools or changing permission declarations.
+- [#816](https://github.com/NVIDIA/SkillSpector/pull/816): Document JSON archive-member provenance and how consumers should interpret virtual component locations.
 
 ## Scope and upgrading
 
