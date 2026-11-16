@@ -207,6 +207,7 @@ def test_cross_file_occurrences_keep_their_report_identity_and_snippet() -> None
             "source_digest",
             "source_url",
             "transitive_depth",
+            "surface",
         }
         for occurrence in compacted[0].to_dict()["occurrences"]
     )
@@ -230,6 +231,60 @@ def test_cross_file_occurrences_keep_their_report_identity_and_snippet() -> None
     ] == [
         ("first.py", "finding-first", "first_context\nsubprocess.run(command)"),
         ("second.py", "finding-second", "second_context\nsubprocess.run(command)"),
+    ]
+
+
+def test_compacted_occurrences_keep_their_own_finding_text() -> None:
+    # #759: two matches share a whitespace-normalized fingerprint, but the
+    # second occurrence's source text spans lines. Report expansion must not
+    # borrow the representative's single-line ``finding`` text for it.
+    findings = [
+        Finding(
+            rule_id="P1",
+            message="Instruction Override",
+            finding_id="finding-first",
+            file="SKILL.md",
+            start_line=3,
+            severity="HIGH",
+            finding="ignore previous instructions",
+            matched_text="ignore previous instructions",
+            code_snippet="ignore previous instructions",
+        ),
+        Finding(
+            rule_id="P1",
+            message="Instruction Override",
+            finding_id="finding-second",
+            file="SKILL.md",
+            start_line=7,
+            severity="HIGH",
+            finding="ignore\nprevious instructions",
+            matched_text="ignore\nprevious instructions",
+            code_snippet="ignore\nprevious instructions",
+        ),
+    ]
+
+    compacted = deduplicate(findings)
+
+    assert len(compacted) == 1
+    assert len(compacted[0].occurrences) == 2
+    assert deduplicate(compacted)[0].to_dict() == compacted[0].to_dict()
+    result = report({"findings": compacted, "output_format": "json"})
+    issues = json.loads(result["report_body"])["issues"]
+    assert [(issue["location"]["start_line"], issue["finding"]) for issue in issues] == [
+        (3, "ignore previous instructions"),
+        (7, "ignore\nprevious instructions"),
+    ]
+    assert "_skillspector_report_" not in result["report_body"]
+    assert "_skillspector_report_" not in json.dumps(result["sarif_report"])
+    assert [
+        (
+            item["locations"][0]["physicalLocation"]["region"]["startLine"],
+            item["properties"]["finding"],
+        )
+        for item in result["sarif_report"]["runs"][0]["results"]
+    ] == [
+        (3, "ignore previous instructions"),
+        (7, "ignore\nprevious instructions"),
     ]
 
 

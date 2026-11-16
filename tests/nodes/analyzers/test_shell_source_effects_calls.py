@@ -59,6 +59,27 @@ def _preserves_joined(caller: str, **kwargs) -> bool:
     return source_effects_preserve(resolver, "scripts/library.sh", len(caller), **kwargs)
 
 
+@pytest.mark.parametrize(
+    "command, preserved",
+    [
+        ("file scripts/library.sh", True),
+        ("file -bi --mime-type scripts/library.sh", True),
+        ("file -- -C", True),
+        ("file -m -C scripts/library.sh", True),
+        ("file -F --compile scripts/library.sh", True),
+        ("file -C -m scripts/library", False),
+        ("file --compile --magic-file=scripts/library", False),
+        ("file scripts/library.sh -C", False),
+        ("file -bC scripts/library.sh", False),
+        ("file --comp scripts/library.sh", False),
+        ("file --magic-file", False),
+        ('file "$unknown"', False),
+    ],
+)
+def test_default_file_effects_require_readonly_mode(command: str, preserved: bool) -> None:
+    assert _preserves(command + "\n", "helper() { printf ready; }\n") is preserved
+
+
 _LIBRARY = """set -euo pipefail
 write_file() { local target="$1"; printf '%s' changed > "$target"; }
 main() { write_file scripts/library.sh; }

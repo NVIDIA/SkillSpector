@@ -57,6 +57,7 @@ from skillspector.nodes.analyzers.whitespace_padding import (
     padding_run_match_fingerprint,
 )
 from skillspector.providers import get_active_provider
+from skillspector.resource_limits import bounded_capacity
 from skillspector.state import (
     AnalyzerNodeResponse,
     LLMCallRecord,
@@ -74,10 +75,16 @@ logger = logging.getLogger(__name__)
 
 _FRAMEWORK_TAGS = ["ASI02", "AML.T0080"]
 TP3_MAX_PARAM_DESC_LENGTH = 500
-TP4_MAX_FILES = 128
-TP4_MAX_TOTAL_CODE_BYTES = 4 * 1024 * 1024
-TP4_MAX_TOTAL_INPUT_BYTES = 4 * 1024 * 1024
-TP4_MAX_FILE_CODE_BYTES = 1024 * 1024
+TP4_MAX_FILES = bounded_capacity("SKILLSPECTOR_TP4_MAX_FILES", 128, 10_000)
+TP4_MAX_TOTAL_CODE_BYTES = bounded_capacity(
+    "SKILLSPECTOR_TP4_MAX_TOTAL_CODE_BYTES", 4 * 1024 * 1024, 64 * 1024 * 1024
+)
+TP4_MAX_TOTAL_INPUT_BYTES = bounded_capacity(
+    "SKILLSPECTOR_TP4_MAX_TOTAL_INPUT_BYTES", 4 * 1024 * 1024, 64 * 1024 * 1024
+)
+TP4_MAX_FILE_CODE_BYTES = bounded_capacity(
+    "SKILLSPECTOR_TP4_MAX_FILE_CODE_BYTES", 1024 * 1024, 16 * 1024 * 1024
+)
 DEFAULT_TP4_MAX_BATCHES = 256
 TP4_MAX_BATCHES_CEILING = 4096
 TP4_MAX_BATCH_INPUT_TOKENS = 32_000
@@ -1073,33 +1080,63 @@ def _bounded_utf8_prefix(text: str, max_bytes: int) -> tuple[str, int, bool]:
     return candidate, len(encoded), len(candidate) < len(text)
 
 
-def _tp4_line_chunks(content: str, max_tokens: int) -> Iterator[_TP4CodeChunk]:
+def _tp4_line_chunks(
+    content: str,
+    max_tokens: int,
+    *,
+    fits_chunk: Callable[[str], bool] | None = None,
+) -> Iterator[_TP4CodeChunk]:
     """Yield bounded line-aligned chunks; oversized single lines fail closed."""
     lines = content.splitlines(keepends=True)
-    current: list[str] = []
-    current_tokens = 0
-    start_line = 1
-    for line_number, line in enumerate(lines, start=1):
-        line_tokens = max(1, (len(line) + 3) // 4)
-        if line_tokens > max_tokens:
-            if current:
+
+    def refine(text: str, start: int, end: int) -> Iterator[_TP4CodeChunk]:
+        if fits_chunk is None or fits_chunk(text):
+            yield _TP4CodeChunk(text, start, end)
+        elif start == end:
+            yield _TP4CodeChunk(None, start, end)
+        else:
+            parts = text.splitlines(keepends=True)
+            middle = len(parts) // 2
+            yield from refine("".join(parts[:middle]), start, start + middle - 1)
+            yield from refine("".join(parts[middle:]), start + middle, end)
+
+    def coarse_chunks() -> Iterator[_TP4CodeChunk]:
+        current: list[str] = []
+        current_tokens = 0
+        start_line = 1
+        for line_number, line in enumerate(lines, start=1):
+            line_tokens = max(1, (len(line) + 3) // 4)
+            if line_tokens > max_tokens:
+                if current:
+                    yield _TP4CodeChunk("".join(current), start_line, line_number - 1)
+                    current = []
+                    current_tokens = 0
+                yield _TP4CodeChunk(None, line_number, line_number, len(line))
+                start_line = line_number + 1
+                continue
+            if current and current_tokens + line_tokens > max_tokens:
                 yield _TP4CodeChunk("".join(current), start_line, line_number - 1)
                 current = []
                 current_tokens = 0
-            yield _TP4CodeChunk(None, line_number, line_number, len(line))
-            start_line = line_number + 1
+                start_line = line_number
+            if not current:
+                start_line = line_number
+            current.append(line)
+            current_tokens += line_tokens
+        if current:
+            yield _TP4CodeChunk("".join(current), start_line, len(lines))
+
+    wrapper_checked = False
+    for chunk in coarse_chunks():
+        if chunk.content is None or fits_chunk is None:
+            yield chunk
             continue
-        if current and current_tokens + line_tokens > max_tokens:
-            yield _TP4CodeChunk("".join(current), start_line, line_number - 1)
-            current = []
-            current_tokens = 0
-            start_line = line_number
-        if not current:
-            start_line = line_number
-        current.append(line)
-        current_tokens += line_tokens
-    if current:
-        yield _TP4CodeChunk("".join(current), start_line, len(lines))
+        if not wrapper_checked:
+            wrapper_checked = True
+            if not fits_chunk(""):
+                yield _TP4CodeChunk(None, chunk.start_line, len(lines))
+                return
+        yield from refine(chunk.content, chunk.start_line, chunk.end_line)
 
 
 def _tp4_partial_event(
@@ -1152,16 +1189,21 @@ def _tp4_finding(
     actual = result.actual_behavior_summary[:1024]
     mismatched = [str(item)[:256] for item in result.mismatched_capabilities[:16]]
     mismatched_text = ", ".join(mismatched)[:2048] if mismatched else "unspecified"
+    message = (
+        f"Description-behavior mismatch: declared purpose is '{declared}' "
+        f"but code also performs: {mismatched_text}."
+    )[:4096]
+    from skillspector.nodes.analyzers.pattern_defaults import get_pattern_name
+
     return Finding(
         rule_id="TP4",
-        message=(
-            f"Description-behavior mismatch: declared purpose is '{declared}' "
-            f"but code also performs: {mismatched_text}."
-        )[:4096],
+        message=message,
         severity="HIGH" if result.confidence >= 0.7 else "MEDIUM",
         confidence=result.confidence,
         file="SKILL.md",
         category=_CATEGORY,
+        pattern=get_pattern_name("TP4"),
+        finding=message,
         tags=list(_FRAMEWORK_TAGS),
         explanation=(result.explanation[:4096] or f"Declared: {declared}. Actual: {actual}."),
         remediation=(
@@ -1184,6 +1226,8 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
     analyzer: _TP4Analyzer | None = None
     attempted = False
     batches: list[Batch] = []
+    planning_candidate: _TP4Candidate | None = None
+    planning_next_line: int | None = None
     try:
         manifest: dict = state.get("manifest") or {}
         description_value = manifest.get("description")
@@ -1279,7 +1323,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                 )
 
         def plan_candidate(candidate: _TP4Candidate) -> None:
-            nonlocal total_prompt_bytes
+            nonlocal analyzer, planning_next_line, total_prompt_bytes
             path = candidate.path
             record_declaration_limit()
             if code_token_budget < TP4_MIN_CODE_TOKENS:
@@ -1297,9 +1341,33 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     )
                 )
                 return
-            for chunk in _tp4_line_chunks(candidate.content, code_token_budget):
-                chunk_start_line = candidate.start_line + chunk.start_line - 1
-                chunk_end_line = min(candidate.end_line, candidate.start_line + chunk.end_line - 1)
+            prompt_prefix = prefix + f"### {candidate.path} ({candidate.language})\n"
+            minimum_prompt_bytes = len((prompt_prefix + _TP4_PROMPT_SUFFIX).encode("utf-8"))
+            if total_prompt_bytes + minimum_prompt_bytes > TP4_MAX_TOTAL_INPUT_BYTES:
+                stop_planning(
+                    LedgerReason.TOTAL_BYTES_LIMIT,
+                    observed_bytes=total_prompt_bytes + minimum_prompt_bytes,
+                    limit_bytes=TP4_MAX_TOTAL_INPUT_BYTES,
+                )
+                add_partial_once(_tp4_partial_event(path, stop_reason, **stop_metrics))
+                return
+
+            def fits_chunk(content: str) -> bool:
+                nonlocal analyzer
+                prompt = prompt_prefix + content + _TP4_PROMPT_SUFFIX
+                if estimate_tokens(prompt) > batch_input_tokens:
+                    return False
+                if analyzer is None:
+                    timeout = (
+                        (lambda: transitive_remaining_seconds(state))
+                        if shared_remaining is not None
+                        else None
+                    )
+                    analyzer = _TP4Analyzer(model, timeout=timeout)
+                batch = Batch(file_path=path, content=prompt)
+                return analyzer._prompt_fits_budget(analyzer.build_prompt(batch))
+
+            def runtime_exhausted() -> bool:
                 dynamic_remaining = transitive_remaining_seconds(state)
                 if dynamic_remaining is not None and dynamic_remaining <= 0:
                     stop_planning(
@@ -1315,7 +1383,20 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                             limit_seconds=max(0.0, shared_remaining or 0.0),
                         )
                     )
+                    return True
+                return False
+
+            if runtime_exhausted():
+                return
+            first_chunk = True
+            for chunk in _tp4_line_chunks(
+                candidate.content, code_token_budget, fits_chunk=fits_chunk
+            ):
+                chunk_start_line = candidate.start_line + chunk.start_line - 1
+                chunk_end_line = min(candidate.end_line, candidate.start_line + chunk.end_line - 1)
+                if not first_chunk and runtime_exhausted():
                     break
+                first_chunk = False
                 if chunk.content is None:
                     add_partial_once(
                         _tp4_partial_event(
@@ -1323,10 +1404,13 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                             LedgerReason.SIZE_LIMIT,
                             start_line=chunk_start_line,
                             end_line=chunk_end_line,
-                            observed_characters=chunk.observed_characters,
-                            limit_characters=code_token_budget * 4,
+                            observed_characters=chunk.observed_characters or None,
+                            limit_characters=(
+                                code_token_budget * 4 if chunk.observed_characters else None
+                            ),
                         )
                     )
+                    planning_next_line = chunk_end_line + 1
                     continue
                 if len(batches) >= TP4_MAX_BATCHES:
                     stop_planning(
@@ -1359,6 +1443,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                             limit_characters=batch_input_tokens * 4,
                         )
                     )
+                    planning_next_line = chunk_end_line + 1
                     continue
                 prompt_bytes = len(prompt.encode("utf-8"))
                 if total_prompt_bytes + prompt_bytes > TP4_MAX_TOTAL_INPUT_BYTES:
@@ -1387,6 +1472,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                         end_line=chunk_end_line,
                     )
                 )
+                planning_next_line = chunk_end_line + 1
 
         source_count = 0
 
@@ -1494,15 +1580,16 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                         break
 
         for candidate in iter_candidates():
+            planning_candidate = candidate
+            planning_next_line = candidate.start_line
             plan_candidate(candidate)
+            planning_candidate = None
+            planning_next_line = None
 
         if not batches:
             return result
 
-        timeout = (
-            (lambda: transitive_remaining_seconds(state)) if shared_remaining is not None else None
-        )
-        analyzer = _TP4Analyzer(model, timeout=timeout)
+        assert analyzer is not None
         attempted = True
         # Fan out like the semantic analyzers do. The shared limiter still honours
         # SKILLSPECTOR_MAX_LLM_CONCURRENCY, and results keep the batch order.
@@ -1631,10 +1718,14 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                 if batch_outcome.failures
                 else "UnexpectedStructuredResponse"
             )
+            refusal_only = not unexpected_response and all(
+                failure.reason is LedgerReason.LLM_RESPONSE_REFUSED
+                for failure in batch_outcome.failures
+            )
             result.record = llm_call_record(
                 ANALYZER_ID,
                 ok=False,
-                error=f"TP4 LLM batch failed: {error_class}",
+                error=None if refusal_only else f"TP4 LLM batch failed: {error_class}",
             )
         else:
             result.record = llm_call_record(ANALYZER_ID, ok=True)
@@ -1662,7 +1753,22 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                         limit_seconds=0.0,
                     )
                 )
-        else:
+        if (
+            planning_candidate is not None
+            and planning_next_line is not None
+            and planning_next_line <= planning_candidate.end_line
+        ):
+            result.ledger.append(
+                _tp4_partial_event(
+                    planning_candidate.path,
+                    LedgerReason.RUNTIME_LIMIT,
+                    start_line=planning_next_line,
+                    end_line=planning_candidate.end_line,
+                    observed_seconds=0.0,
+                    limit_seconds=0.0,
+                )
+            )
+        elif not unfinished:
             result.ledger.append(
                 _tp4_partial_event(
                     "SKILL.md",
@@ -1684,7 +1790,22 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
             for batch in batches
             if (batch.file_path, batch.start_line, batch.end_line) not in terminal_ranges
         ]
-        failure_paths = unfinished or [Batch(file_path="SKILL.md", content="")]
+        failure_paths = list(unfinished)
+        if (
+            planning_candidate is not None
+            and planning_next_line is not None
+            and planning_next_line <= planning_candidate.end_line
+        ):
+            failure_paths.append(
+                Batch(
+                    file_path=planning_candidate.path,
+                    content="",
+                    start_line=planning_next_line,
+                    end_line=planning_candidate.end_line,
+                )
+            )
+        if not failure_paths:
+            failure_paths = [Batch(file_path="SKILL.md", content="")]
         for batch in failure_paths:
             result.ledger.append(
                 ledger_event(

@@ -104,7 +104,7 @@ def test_runtime_aware_static_module_retains_prefix_and_fails_closed(
 
     monkeypatch.setattr(static_runner, "MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT", 30.0)
     monkeypatch.setattr(static_runner.time, "monotonic", lambda: now)
-    monkeypatch.setattr(report_module, "is_llm_available", lambda: (False, "disabled"))
+    monkeypatch.setattr(report_module, "is_llm_available", lambda **_: (False, "disabled"))
     content = "ordinary text"
     state = {
         "components": ["SKILL.md"],

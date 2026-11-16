@@ -145,13 +145,13 @@ class TestPerSlotModelOverrides:
         assert config["meta_analyzer"] == meta_default
 
         # SKILLSPECTOR_MODEL replaces the slot default as well...
-        monkeypatch.setenv("SKILLSPECTOR_MODEL", "claude-opus-4-6")
-        assert constants.build_model_config()["meta_analyzer"] == "claude-opus-4-6"
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "claude-opus-5-5")
+        assert constants.build_model_config()["meta_analyzer"] == "claude-opus-5-5"
 
         # ...and a slot override wins over both.
         monkeypatch.setenv("SKILLSPECTOR_MODEL_META_ANALYZER", meta_default)
         config = constants.build_model_config()
-        assert config["default"] == "claude-opus-4-6"
+        assert config["default"] == "claude-opus-5-5"
         assert config["meta_analyzer"] == meta_default
 
     def test_nv_build_slot_override_does_not_inherit_glm_reasoning(

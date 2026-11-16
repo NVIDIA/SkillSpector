@@ -55,9 +55,12 @@ def test_proven_list_content_margin_owns_inline_delimiters(
         "- Parent:\n  10. Example:\n      `printf 'x' | cat`.\n",
         "1. Parent:\n   10. Example:\n       `printf 'x' | cat`.\n",
         "10. Example:\n   `printf 'x' | cat`.\n",
+        "10. Example:\n    - `printf 'x' | cat`.\n",
     ],
 )
 def test_recognized_nested_and_lazy_list_paragraphs_complete(source: str) -> None:
+    projection = tool._markdown_shell_text(source, lambda: None)
+    assert projection.count("`") == 0
     assert not tool.has_bounded_parse_exhaustion(source, lambda: None, file_type="markdown")
 
 
@@ -71,7 +74,6 @@ def test_recognized_nested_and_lazy_list_paragraphs_complete(source: str) -> Non
         "10. Example:\n    <pre>\n    `printf 'x' | cat`.\n    </pre>\n",
         "10. Example:\n    ```text\n    `printf 'x' | cat`.\n    ```\n",
         "10. Example:\n    > `printf 'x' | cat`.\n",
-        "10. Example:\n    - `printf 'x' | cat`.\n",
     ],
 )
 def test_unproven_or_code_blocks_keep_literal_backticks(source: str) -> None:

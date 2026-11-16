@@ -1,0 +1,454 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Unsafe options belong to the command that actually supplies them."""
+
+import subprocess
+import sys
+
+import pytest
+
+from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+
+COMMANDS = [
+    ("git push -u origin topic", "git push --force-with-lease origin topic"),
+    ("curl https://example.com", "curl --insecure https://example.com"),
+    ("curl https://example.com", "curl -k https://example.com"),
+    ("wget https://example.com", "wget --no-check-certificate https://example.com"),
+    ("chmod u+r file", "chmod a+rwx file"),
+    ("chown user file", "chown a+rwx file"),
+]
+
+
+def tm1(source):
+    return [
+        f for f in tm.analyze(source, "references/commands.md", "markdown") if f.rule_id == "TM1"
+    ]
+
+
+@pytest.mark.parametrize("safe,unsafe", COMMANDS)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_separate_examples_keep_their_own_locations(safe, unsafe, newline):
+    source = newline.join(
+        [
+            "```powershell",
+            "wsl.exe -- " + safe,
+            "```",
+            "",
+            "Explain the option.",
+            "",
+            "```powershell",
+            unsafe,
+            "```",
+            "",
+        ]
+    )
+    findings = tm1(source)
+    assert {f.location.start_line for f in findings} == {8}
+    assert any(f.matched_text.startswith(unsafe.split()[0]) for f in findings)
+    assert all("Explain" not in f.matched_text for f in findings)
+
+
+@pytest.mark.parametrize("safe,unsafe", COMMANDS)
+@pytest.mark.parametrize("separator", ["\n", "; ", " && ", " || ", " | "])
+def test_separate_commands_do_not_share_options(safe, unsafe, separator):
+    findings = [
+        f for f in tm1(safe + separator + unsafe) if f.matched_text.startswith(unsafe.split()[0])
+    ]
+    assert len(findings) == 1
+    assert unsafe.startswith(findings[0].matched_text)
+
+
+@pytest.mark.parametrize("safe,unsafe", COMMANDS)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("continuation", ["\\", "`"])
+def test_supported_continuations_keep_the_unsafe_option(safe, unsafe, newline, continuation):
+    words = unsafe.split()
+    source = words[0] + " " + continuation + newline + " ".join(words[1:])
+    findings = [f for f in tm1(source) if f.matched_text.startswith(words[0])]
+    assert findings
+    assert all(f.location.start_line == 1 for f in findings)
+
+
+@pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_balanced_multiline_argument_and_quoted_option(quote, newline):
+    source = f'git push {quote}first{newline}second{quote} "--force-with-lease" origin topic'
+    findings = tm1(source)
+    assert len(findings) == 1
+    assert findings[0].location.start_line == 1
+
+
+def test_balanced_substitution_can_precede_an_option():
+    assert tm1('git push $(printf "%s"\n topic) --force origin topic')
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_balanced_backtick_argument_keeps_the_option(newline):
+    assert tm1(f'git push `printf "%s"{newline}topic` --force origin topic')
+
+
+@pytest.mark.parametrize("newline", ["", "\n", "\r\n"])
+def test_powershell_escaped_quote_keeps_the_option(newline):
+    assert tm1(f'git push "first`" ;{newline} second" --force origin topic')
+
+
+def test_unclosed_quote_cannot_cross_a_markdown_fence():
+    source = '```sh\ngit push "topic\n```\n\n```sh\ngit push --force origin topic\n```\n'
+    findings = tm1(source)
+    assert [f.location.start_line for f in findings] == [6]
+
+
+@pytest.mark.parametrize(
+    "fence,literal",
+    [
+        ("```", "~~~"),
+        ("~~~", "```"),
+        ("````", "```"),
+        ("~~~~", "~~~"),
+        ("```", "```literal"),
+        ("```", "    ```"),
+    ],
+)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("list_item", [False, True, "nested", "lazy"])
+def test_literal_fence_in_multiline_argument_keeps_the_unsafe_option(
+    fence, literal, newline, quote, list_item
+):
+    source = newline.join(
+        [
+            fence + "sh",
+            "curl --data " + quote + "first",
+            literal,
+            "second" + quote + " --insecure https://example.com",
+            fence,
+            "",
+        ]
+    )
+    if list_item:
+        prefix = (
+            "- examples:" + newline + "  - nested" + newline * 2 + "  Parent content." + newline * 2
+            if list_item == "nested"
+            else "- examples:" + newline + "lazy paragraph continuation" + newline * 2
+            if list_item == "lazy"
+            else "- examples:" + newline * 2
+        )
+        source = prefix + "".join("    " + line for line in source.splitlines(keepends=True))
+    findings = tm1(source)
+    assert len(findings) == 1
+    assert findings[0].location.start_line == (
+        7 if list_item == "nested" else 5 if list_item == "lazy" else 4 if list_item else 2
+    )
+    assert "--insecure" in findings[0].matched_text
+
+
+@pytest.mark.parametrize(
+    "command,option",
+    [("curl https://example.com/a", "--insecure"), ("git push origin topic", "--force")],
+)
+@pytest.mark.parametrize("literal", [";", "&"])
+@pytest.mark.parametrize("escape", ["`", "\\"])
+def test_escaped_separator_keeps_the_unsafe_option(command, option, literal, escape):
+    suffix = "b" if command.startswith("curl") else "suffix"
+    source = f"```powershell\n{command}{escape}{literal}{suffix} {option}\n```\n"
+    findings = tm1(source)
+    assert len(findings) == 1
+    assert findings[0].location.start_line == 2
+    assert option in findings[0].matched_text
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "Run `curl https://example.com`\nExplain --insecure here.",
+        'git push "`printf topic`"\nThe --force option is dangerous.',
+        "curl https://example.com/items/[id\nExplain --insecure here.",
+    ],
+)
+def test_literal_argument_text_does_not_open_a_multiline_command(source):
+    assert not tm1(source)
+
+
+@pytest.mark.parametrize("indent", ["  ", "   ", "    ", "     "])
+@pytest.mark.parametrize(
+    "prefix,expected_line",
+    [
+        ("- examples:\n\n", 8),
+        ("- examples:\n  - nested\n\n  Parent content.\n\n", 11),
+        ("- examples:\nlazy paragraph continuation\n\n", 9),
+    ],
+)
+def test_list_indented_fences_keep_their_command_locations(indent, prefix, expected_line):
+    source = prefix + "\n".join(
+        indent + line
+        for line in [
+            "```sh",
+            'git push "topic',
+            "```",
+            "",
+            "```sh",
+            "git push --force origin topic",
+            "```",
+            "",
+        ]
+    )
+    assert {f.location.start_line for f in tm1(source)} == {expected_line}
+
+
+def test_deeply_nested_list_fences_keep_their_command_locations():
+    source = '- first:\n  - second:\n    - third:\n\n        ```sh\n        git push "topic\n        ```\n\n        ```sh\n        git push --force origin topic\n        ```\n'
+    assert {f.location.start_line for f in tm1(source)} == {10}
+
+
+@pytest.mark.parametrize(
+    "prefix,indent",
+    [("", "    "), ("- examples:\n\nPlain paragraph.\n\n", "    "), ("- examples:\n\n", "      ")],
+)
+def test_indented_code_markers_remain_literal_argument_data(prefix, indent):
+    source = prefix + "\n".join(
+        indent + line
+        for line in ["curl --data 'first", "```", "second' --insecure https://example.com", ""]
+    )
+    findings = tm1(source)
+    assert len(findings) == 1
+    assert findings[0].location.start_line == prefix.count("\n") + 1
+    assert "--insecure" in findings[0].matched_text
+
+
+def test_node_retains_only_the_actual_force_push():
+    source = "```sh\ngit push origin topic\n```\n\n```sh\ngit push --force origin topic\n```\n"
+    findings = tm.node({"components": ["commands.md"], "file_cache": {"commands.md": source}})[
+        "findings"
+    ]
+    assert {f.start_line for f in findings if f.rule_id == "TM1"} == {6}
+
+
+def test_long_quoted_arguments_finish_in_bounded_time():
+    script = """
+from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+import time
+started = time.monotonic()
+source = 'git push ' + ('"' + 'x' * 60000 + '" ') + '--force origin topic'
+assert any(f.rule_id == 'TM1' for f in tm.analyze(source, 'commands.md', 'markdown'))
+source = 'git push ' + ('"x" ' * 30000)
+assert not any(f.rule_id == 'TM1' for f in tm.analyze(source, 'commands.md', 'markdown'))
+assert time.monotonic() - started < 5
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=60)
+
+
+@pytest.mark.parametrize(
+    "command,option",
+    [
+        ("curl --data", "--insecure"),
+        ("curl --data", "-k"),
+        ("git push", "--force"),
+        ("wget --post-data", "--no-check-certificate"),
+        ("chmod", "a+rwx"),
+        ("chown", "a+rwx"),
+    ],
+)
+@pytest.mark.parametrize("delimiter", ["```", "````"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("quote", ["'", '"'])
+def test_complete_inline_span_in_multiline_argument_keeps_the_unsafe_option(
+    command, option, delimiter, newline, quote
+):
+    source = newline.join(
+        [
+            command + " " + quote + "first",
+            delimiter + "note" + delimiter,
+            "second" + quote + " " + option + " https://example.com",
+            "",
+        ]
+    )
+    findings = [
+        finding for finding in tm1(source) if finding.matched_text.startswith(command.split()[0])
+    ]
+    assert len(findings) == 1
+    assert findings[0].location.start_line == 1
+    assert option in findings[0].matched_text
+
+
+def test_escaped_arguments_do_not_skip_runtime_checks():
+    source = "curl " + (r"\x" * 4096) + " --insecure"
+
+    def cancel():
+        raise TimeoutError("deadline expired")
+
+    with pytest.raises(TimeoutError, match="deadline expired"):
+        tm._option_command_end(source, 5, len(source), cancel)
+
+
+@pytest.mark.parametrize(
+    "command,option",
+    [
+        ("curl https://example.com", "--insecure"),
+        ("curl https://example.com", "-k"),
+        ("git push origin topic", "--force"),
+        ("wget https://example.com", "--no-check-certificate"),
+        ("chmod", "a+rwx"),
+        ("chown", "a+rwx"),
+    ],
+)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("split_after_command", [False, True])
+@pytest.mark.parametrize("fence", [None, "yaml", "yml", "", "unknown-host"])
+def test_folded_yaml_keeps_unsafe_options(command, option, newline, split_after_command, fence):
+    first, _, rest = command.partition(" ") if split_after_command else (command, "", "")
+    source = newline.join(
+        ["steps:", "  - run: >", "      " + first, "      " + (rest + " " + option).lstrip(), ""]
+    )
+    if command in {"chmod", "chown"}:
+        source = source.rstrip() + " file" + newline
+    if fence is not None:
+        source = "```" + fence + newline + source + "```" + newline
+    findings = [
+        f
+        for f in tm.analyze(
+            source,
+            "workflow.yaml" if fence is None else "guide.md",
+            "yaml" if fence is None else "markdown",
+        )
+        if f.rule_id == "TM1" and f.matched_text.startswith(command.split()[0])
+    ]
+    assert len(findings) == 1
+    assert findings[0].location.start_line == (3 if fence is None else 4)
+    assert option in findings[0].matched_text
+
+
+@pytest.mark.parametrize("file_type", ["python", "javascript", "json", "", "text"])
+def test_unproven_host_values_keep_conservative_option_matching(file_type):
+    findings = tm.analyze("curl\nhttps://example.com\n--insecure", "commands", file_type)
+    assert any(f.rule_id == "TM1" and "--insecure" in f.matched_text for f in findings)
+
+
+@pytest.mark.parametrize("file_type", ["shell", "powershell"])
+@pytest.mark.parametrize("safe,unsafe", COMMANDS)
+def test_shell_commands_keep_their_own_options(file_type, safe, unsafe):
+    findings = [
+        f
+        for f in tm.analyze(safe + "\n" + unsafe, "commands", file_type)
+        if f.rule_id == "TM1" and f.matched_text.startswith(unsafe.split()[0])
+    ]
+    assert len(findings) == 1
+    assert findings[0].location.start_line == 2
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_dedenting_out_of_a_list_fence_ends_the_command(newline):
+    source = newline.join(
+        ["- example:", "", "  ```sh", '  curl --data "first', "", "Explain --insecure here.", ""]
+    )
+    assert not tm1(source)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("command", ["curl https://example.com", "curl"])
+def test_multiline_inline_code_keeps_folded_options(newline, command):
+    assert tm1(f"Run `{command}{newline}--insecure https://example.com`.")
+
+
+def test_python_fence_keeps_multiline_host_string_options():
+    assert tm1('```python\ncommand = """curl https://example.com\n--insecure"""\n```\n')
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("continuation", ["\\", "`"])
+def test_inline_metadata_preserves_shell_prefix_continuations(newline, continuation):
+    source = newline.join(
+        [
+            "Read `flags`.",
+            "",
+            "```sh",
+            "git" + continuation,
+            " push --force origin topic",
+            "```",
+            "",
+        ]
+    )
+    assert any(f.location.start_line == 4 for f in tm1(source))
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("language", ["cmd", "bat", "batch", "dos"])
+def test_unparsed_batch_fences_keep_caret_continuations(language, newline):
+    source = newline.join(
+        ["```" + language, "curl https://example.com ^", "  --insecure", "```", ""]
+    )
+    assert any(f.location.start_line == 2 for f in tm1(source))
+
+
+@pytest.mark.parametrize("safe,unsafe", COMMANDS)
+@pytest.mark.parametrize("separator", [";", "&", "|", "\n", "\r\n"])
+@pytest.mark.parametrize("context", ["shell", "markdown", "fence"])
+def test_parameter_expansion_separators_keep_unsafe_options(safe, unsafe, separator, context):
+    command, _, arguments = unsafe.partition(" ")
+    if command == "git":
+        command, arguments = "git push", arguments.removeprefix("push ")
+    source = command + " ${body:-first" + separator + "second} " + arguments
+    if context == "fence":
+        source = "```bash\n" + source + "\n```\n"
+    findings = tm.analyze(source, "commands", "shell" if context == "shell" else "markdown")
+    assert any(f.rule_id == "TM1" and command in f.matched_text for f in findings)
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        "${body:-first;second}",
+        "${body:-${fallback:-first;second}}",
+        '"${body:-first;second}"',
+    ],
+)
+def test_parameter_expansion_ends_before_the_outer_command_separator(argument):
+    assert tm1("curl --data " + argument + " --insecure https://example.com")
+    assert not tm1("curl --data " + argument + "\necho --insecure")
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        "$(case x in x) printf https://example.com;; esac)",
+        '"$(printf "%s" "https://example.com/a;b")"',
+        r"$'https://example.com/a\';b'",
+        "<(case x in x) printf data;; esac)",
+    ],
+)
+@pytest.mark.parametrize("context", ["shell", "markdown", "fence"])
+def test_nested_shell_word_separators_keep_unsafe_options(argument, context):
+    source = "curl " + argument + " --insecure https://example.com"
+    if context == "fence":
+        source = "```bash\n" + source + "\n```\n"
+    findings = tm.analyze(source, "commands", "shell" if context == "shell" else "markdown")
+    assert any(f.rule_id == "TM1" for f in findings)
+    assert not tm1("curl " + argument + "\necho --insecure")
+
+
+def test_unproven_nested_parameter_quotes_keep_conservative_matching():
+    assert tm1('curl --data "${body:-"first;second"}" --insecure https://example.com')
+
+
+@pytest.mark.parametrize("language", [None, "powershell", "pwsh", "ps1"])
+@pytest.mark.parametrize("argument", ["@{Accept=1;X=2}", "@{Accept=@{X=1;Y=2};Z=3}"])
+def test_powershell_hashtable_separators_keep_unsafe_options(language, argument):
+    source = "curl --header " + argument + " --insecure https://example.com"
+    control = "curl --header " + argument + "\necho --insecure"
+    if language is not None:
+        source = "```" + language + "\n" + source + "\n```\n"
+        control = "```" + language + "\n" + control + "\n```\n"
+    file_type = "powershell" if language is None else "markdown"
+    assert any(f.rule_id == "TM1" for f in tm.analyze(source, "commands", file_type))
+    assert not any(f.rule_id == "TM1" for f in tm.analyze(control, "commands", file_type))
+
+
+@pytest.mark.parametrize("fenced", [False, True])
+def test_bash_braces_do_not_hide_real_command_separators(fenced):
+    source = "curl --header @{Accept=1;X=2} --insecure https://example.com"
+    if fenced:
+        source = "```bash\n" + source + "\n```\n"
+    assert not any(
+        f.rule_id == "TM1"
+        for f in tm.analyze(source, "commands", "markdown" if fenced else "shell")
+    )

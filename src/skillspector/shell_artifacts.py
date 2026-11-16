@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import posixpath
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from skillspector.shell_sources import ShellSourceValue
 
@@ -367,10 +367,6 @@ class ShellArtifactStore:
         if artifact is None:
             self.invalidate(destination)
             return False
-        previous = self.read(destination)
-        if previous is not None:
-            # Plain cp replaces bytes but preserves an existing file's mode.
-            artifact = replace(artifact, executable=previous.executable)
         return self.write(destination, artifact)
 
     def archive(self, root: str, destination: str, *, member_prefix: str = "") -> bool:

@@ -54,6 +54,7 @@ from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
+from skillspector.cleanup import remove_temp_tree
 from skillspector.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -818,7 +819,7 @@ class InputHandler:
         if self._is_file_url(input_path):
             return self._download_file(input_path), "url"
         normalized_local_path = validate_local_input_path(Path(input_path))
-        if input_path.endswith(".zip"):
+        if input_path.lower().endswith(".zip"):
             return self._extract_zip(normalized_local_path), "zip"
         if input_path.endswith(".md"):
             return self._wrap_single_file(normalized_local_path), "file"
@@ -834,7 +835,7 @@ class InputHandler:
     def cleanup(self) -> None:
         """Clean up temporary files created during resolution."""
         if self._temp_dir and self._temp_dir.exists():
-            shutil.rmtree(self._temp_dir, ignore_errors=True)
+            remove_temp_tree(self._temp_dir)
             self._temp_dir = None
 
     def temp_dir_for_cleanup(self) -> Path | None:
@@ -1361,6 +1362,12 @@ class InputHandler:
             self._terminate_git_process(process)
             shutil.rmtree(clone_dir, ignore_errors=True)
             raise ValueError("Failed to clone repository") from exc
+        except BaseException:
+            # An interrupt or a cancellation while Git is still writing: stop
+            # the child before the tree it writes into is removed.
+            self._terminate_git_process(process)
+            shutil.rmtree(clone_dir, ignore_errors=True)
+            raise
         return clone_dir
 
     @staticmethod
@@ -1444,7 +1451,7 @@ class InputHandler:
             download_path.unlink(missing_ok=True)
             raise
 
-        is_zip = filename.endswith(".zip") or content_type.startswith("application/zip")
+        is_zip = filename.lower().endswith(".zip") or content_type.startswith("application/zip")
         if is_zip:
             zip_path = temp_dir / "download.zip"
             download_path.replace(zip_path)
@@ -1467,7 +1474,7 @@ class InputHandler:
             raise ValueError(f"Failed to download file: {exc}") from exc
         temp_dir = self._get_temp_dir()
         self._record_artifacts(1)
-        if filename.endswith(".zip") or headers.get("content-type", "").startswith(
+        if filename.lower().endswith(".zip") or headers.get("content-type", "").startswith(
             "application/zip"
         ):
             zip_path = temp_dir / "download.zip"

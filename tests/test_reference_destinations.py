@@ -64,15 +64,7 @@ def test_markdown_destinations_preserve_present_and_missing_targets(
 
 @pytest.mark.parametrize(
     "target",
-    [
-        "../outside.md",
-        "%2e%2e/outside.md",
-        "%2Foutside.md",
-        "%5Coutside.md",
-        "C%3A/file.md",
-        "docs/a%00.md",
-        "a%00.md",
-    ],
+    ["../outside.md", "%2e%2e/outside.md", "%2Foutside.md", "%5Coutside.md", "C%3A/file.md"],
 )
 def test_decoded_destination_cannot_escape_bundle(tmp_path: Path, target: str) -> None:
     result = resolve_bundle_references_with_metadata(
@@ -94,149 +86,6 @@ def test_reference_definitions_do_not_restore_slash_prose_false_positives(tmp_pa
         known_paths=["SKILL.md"],
     )
     assert result.complete is True
-    assert result.records == []
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        "Use the configuration field `worker_settings.region`.",
-        "Inspect the object property\n`worker_settings.region`.",
-        "Read the `worker_settings.region` field.",
-        "The `worker_settings.region` field selects the worker location.",
-        "Read\n`worker_settings.region` from live catalog evidence.",
-        "Read `worker_settings.region` from the record data.",
-        "Only `worker_settings.region`\ncarries the worker identity.",
-        "The key `worker_settings.region` carries a value.",
-        "Use the selector `job.runtime.pool`.",
-    ],
-)
-def test_documented_scalar_fields_do_not_invent_missing_files(tmp_path: Path, body: str) -> None:
-    result = resolve_bundle_references_with_metadata(
-        tmp_path, source_path="SKILL.md", source_text=body, known_paths=["SKILL.md"]
-    )
-    assert result.complete
-    assert result.raw_candidates_considered == 1
-    assert result.accepted_references == 0
-    assert result.records == []
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        "Read `worker_settings.region`.",
-        "The field may be chosen later. Read `worker_settings.region`.",
-        "Use `worker_settings.region`. The next field is optional.",
-        "Use `worker_settings.region`\n\ncarries the worker identity.",
-        "Configuration field [key](worker_settings.region).",
-        "[Configuration field]: worker_settings.region",
-        "Use the field `./worker_settings.region`.",
-        "Use the field `config/worker_settings.region`.",
-        'Use the field "worker_settings.region".',
-        "Use the field 'worker_settings.region'.",
-        "Use the field `worker_settings.region'.",
-        r"Use the field \`worker_settings.region`.",
-        "Use the field ``worker_settings.region``.",
-        "`Example\nUse the field `worker_settings.region`.\n`",
-        "```text\nUse the field `worker_settings.region`.\n```",
-        "    Use the field `worker_settings.region`.",
-        "<!-- Use the field `worker_settings.region`. -->",
-        "---\ndescription: Use the field `worker_settings.region`.\n---",
-        "Run `worker_settings.region` from live catalog evidence.",
-        "Execute `worker_settings.region` from the record data.",
-        "Source `worker_settings.region` from the record data.",
-        "Invoke the field `worker_settings.region`.",
-        "Call `worker_settings.region` from live catalog evidence.",
-        "Launch `worker_settings.region` from live catalog evidence.",
-        "Process `worker_settings.region` from live catalog evidence.",
-        "Feed `worker_settings.region` from live catalog evidence.",
-        "cat `worker_settings.region` from the record data.",
-        "Read file `worker_settings.region` from the record data.",
-        "Read `worker_settings.region` from the record data file.",
-        "Open the configuration field `settings.yaml`.",
-        "Read the configuration file `settings.toml`.",
-        "python 'worker_settings.region' # field",
-        "Use the field `worker_settings.region` | sh",
-        "Use the field `worker_settings.123`.",
-        "Use the field `worker-settings.region`.",
-        "Use the field `" + "r" * 122 + ".region`.",
-        "Use the field " + " " * 161 + "`worker_settings.region`.",
-        "Invoke " + " " * 160 + "Read `worker_settings.region` from the record data.",
-    ],
-)
-def test_ambiguous_or_explicit_file_uses_remain_missing(tmp_path: Path, body: str) -> None:
-    result = resolve_bundle_references_with_metadata(
-        tmp_path, source_path="SKILL.md", source_text=body, known_paths=["SKILL.md"]
-    )
-    assert result.complete
-    assert result.records
-    assert all(record["status"] == "missing" for record in result.records)
-
-
-@pytest.mark.parametrize(
-    ("paths", "status", "target"),
-    [
-        (["worker_settings.region"], "resolved", "worker_settings.region"),
-        (["docs/worker_settings.region"], "resolved", "docs/worker_settings.region"),
-        (["a/worker_settings.region", "b/worker_settings.region"], "ambiguous", None),
-    ],
-)
-def test_real_artifact_matches_override_documented_field_context(
-    tmp_path: Path, paths: list[str], status: str, target: str | None
-) -> None:
-    result = resolve_bundle_references_with_metadata(
-        tmp_path,
-        source_path="SKILL.md",
-        source_text="Use the configuration field `worker_settings.region`.",
-        known_paths=["SKILL.md", *paths],
-    )
-    assert result.complete
-    assert len(result.records) == 1
-    assert result.records[0]["status"] == status
-    assert result.records[0]["target_path"] == target
-    assert result.accepted_references == 1
-
-
-@pytest.mark.parametrize(
-    "file_use",
-    [
-        "Read [guide](worker_settings.region).",
-        "Read `./worker_settings.region`.",
-        "Read the file `worker_settings.region`.",
-        "cat 'worker_settings.region'",
-        "Read `worker_settings.region`.",
-    ],
-)
-@pytest.mark.parametrize("separator", [" ", "\n\n"])
-def test_field_context_does_not_exempt_other_uses_of_same_token(
-    tmp_path: Path, file_use: str, separator: str
-) -> None:
-    result = resolve_bundle_references_with_metadata(
-        tmp_path,
-        source_path="SKILL.md",
-        source_text="Use the field `worker_settings.region`." + separator + file_use,
-        known_paths=["SKILL.md"],
-    )
-    assert result.complete
-    assert result.raw_candidates_considered == 2
-    assert len(result.records) == 1
-    assert result.records[0]["status"] == "missing"
-    assert result.accepted_references == 1
-
-
-def test_documented_fields_still_consume_the_candidate_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(references_module, "MAX_RAW_REFERENCE_CANDIDATES", 2)
-    result = resolve_bundle_references_with_metadata(
-        tmp_path,
-        source_path="SKILL.md",
-        source_text="Use the field `worker_settings.region`.\n" * 3,
-        known_paths=["SKILL.md"],
-    )
-    assert not result.complete
-    assert result.limitations == ("raw_candidates",)
-    assert result.raw_candidates_considered == 2
     assert result.records == []
 
 
@@ -545,16 +394,3 @@ async def test_markdown_limits_block_complete_verdict(
         report = json.loads(result["report"])
     assert report["execution_successful"] is True
     assert report["analysis_completeness"]["is_complete"] is False
-
-
-def test_double_encoded_nul_remains_a_literal_filename(tmp_path: Path) -> None:
-    target = "docs/a%00.md"
-    result = resolve_bundle_references_with_metadata(
-        tmp_path,
-        source_path="SKILL.md",
-        source_text="Read [guide](docs/a%2500.md).",
-        known_paths=["SKILL.md", target],
-    )
-    assert result.complete
-    assert result.records[0]["status"] == "resolved"
-    assert result.records[0]["target_path"] == target

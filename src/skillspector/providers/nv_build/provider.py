@@ -24,11 +24,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-
-from langchain_core.language_models.chat_models import BaseChatModel
+from typing import TYPE_CHECKING
 
 from skillspector.providers import registry
-from skillspector.providers.chat_models import create_openai_compatible_chat_model
+
+if TYPE_CHECKING:
+    from langchain_core.language_models.chat_models import BaseChatModel
 
 BUILD_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
@@ -46,6 +47,12 @@ class NvBuildProvider:
     DEFAULT_MODEL = "z-ai/glm-5.3"
     SLOT_DEFAULTS: dict[str, str] = {}
 
+    def prepare_chat_model_imports(self) -> None:
+        """Prepare the OpenAI transport without resolving or creating a client."""
+        from skillspector.providers.chat_models import prepare_openai_chat_model_imports
+
+        prepare_openai_chat_model_imports()
+
     def resolve_credentials(self) -> tuple[str, str | None] | None:
         """Return ``(api_key, base_url)`` from ``NVIDIA_INFERENCE_KEY``."""
         api_key = os.environ.get("NVIDIA_INFERENCE_KEY", "").strip()
@@ -61,6 +68,8 @@ class NvBuildProvider:
         timeout: float | None = 120,
     ) -> BaseChatModel | None:
         """Create ``ChatOpenAI`` for the build.nvidia.com endpoint."""
+        from skillspector.providers.chat_models import create_openai_compatible_chat_model
+
         return create_openai_compatible_chat_model(
             model=model,
             credentials=self.resolve_credentials(),

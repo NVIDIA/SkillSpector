@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+from importlib import import_module
 from urllib.parse import urlparse
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -66,6 +67,12 @@ class ChatOpenAI(_RawToolArguments, _ChatOpenAI):
 
 class AzureChatOpenAI(_RawToolArguments, _AzureChatOpenAI):
     """Native Azure invoke/ainvoke with the same tool response evidence."""
+
+
+def prepare_openai_chat_model_imports() -> None:
+    """Load lazy transport/resource modules before concurrent CPU-heavy analysis."""
+    import_module("httpcore")
+    import_module("openai.resources.chat.completions.completions")
 
 
 class UnsupportedControlError(ValueError):

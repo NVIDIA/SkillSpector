@@ -22,6 +22,7 @@ import concurrent.futures
 import contextlib
 import json
 import threading
+from contextvars import ContextVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -45,6 +46,7 @@ from botocore.exceptions import (
 from botocore.exceptions import (
     ConnectionError as BotocoreConnectionError,
 )
+from google.auth.exceptions import RefreshError
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
@@ -63,6 +65,7 @@ from pydantic import ValidationError
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import (
     API_CONNECTION_MAX_RETRIES,
+    DEFAULT_CLI_MAX_LLM_CONCURRENCY,
     DEFAULT_MAX_LLM_CONCURRENCY,
     OUTPUT_LANGUAGE_MAX_LENGTH,
     PROVIDER_RETRY_AFTER_MAX_SECONDS,
@@ -86,10 +89,16 @@ from skillspector.llm_analyzer_base import (
     findings_in_range,
     ledger_events_for_batches,
     number_lines,
+    numbered_line_overhead_bytes,
     resolve_max_concurrency,
     resolve_output_language,
 )
-from skillspector.llm_utils import AgentCLIChatModel, StructuredOutputParseError, run_async
+from skillspector.llm_utils import (
+    AgentCLIChatModel,
+    StructuredOutputParseError,
+    _StructuredAgentCLIModel,
+    run_async,
+)
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
@@ -97,6 +106,7 @@ from skillspector.nodes.meta_analyzer import (
     MetaAnalyzerResult,
     _format_findings_for_prompt,
 )
+from skillspector.providers._agent_cli import MAX_INPUT_BYTES
 
 # ---------------------------------------------------------------------------
 # estimate_tokens
@@ -129,6 +139,21 @@ class TestResolveMaxConcurrency:
     def test_below_one_clamps_to_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "0")
         assert resolve_max_concurrency() == 1
+
+    def test_cli_provider_unset_uses_cli_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", raising=False)
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        assert resolve_max_concurrency() == DEFAULT_CLI_MAX_LLM_CONCURRENCY
+
+    def test_cli_provider_explicit_value_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "6")
+        assert resolve_max_concurrency() == 6
+
+    def test_unknown_provider_uses_http_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", raising=False)
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "not-a-provider")
+        assert resolve_max_concurrency() == DEFAULT_MAX_LLM_CONCURRENCY
 
 
 class TestOutputLanguage:
@@ -238,6 +263,60 @@ class TestChunkFileByLines:
         chunks = chunk_file_by_lines(content, max_tokens=100)
         assert len(chunks) == 1
         assert chunks[0][1] == 1
+
+    def test_max_bytes_none_is_unchanged(self) -> None:
+        content = "".join(f"x = {i}\n" for i in range(5000))
+        assert chunk_file_by_lines(content, 500) == chunk_file_by_lines(
+            content, 500, max_bytes=None
+        )
+
+    def test_chunks_respect_byte_budget_including_line_prefix(self) -> None:
+        # The token budget alone would fit every line; only the byte budget splits.
+        content = "".join("a" * 40 + "\n" for _ in range(20_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=100_000)
+        assert len(chunks) > 1
+        for text, start, _end in chunks:
+            assert len(number_lines(text, start).encode("utf-8")) <= 100_000
+
+    def test_byte_budget_covers_every_line(self) -> None:
+        content = "".join(f"line {i}\n" for i in range(20_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=50_000)
+        covered: set[int] = set()
+        for _text, start, end in chunks:
+            covered.update(range(start, end + 1))
+        assert covered == set(range(1, 20_001))
+
+    def test_multibyte_lines_counted_in_bytes(self) -> None:
+        # 300 UTF-8 bytes but only 25 estimated tokens per line.
+        content = "".join("漢" * 100 + "\n" for _ in range(5_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=200_000)
+        assert len(chunks) > 1
+        for text, start, _end in chunks:
+            assert len(number_lines(text, start).encode("utf-8")) <= 200_000
+
+    def test_single_oversized_line_is_kept_whole(self) -> None:
+        long_line = "y" * 300_000
+        content = "short\n" + long_line + "\nshort\n"
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=100_000)
+        assert any(long_line in text for text, _start, _end in chunks)
+        covered: set[int] = set()
+        for _text, start, end in chunks:
+            covered.update(range(start, end + 1))
+        assert covered == {1, 2, 3}
+
+    def test_compact_prompts_and_crlf_stay_under_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_COMPACT_PROMPTS", "1")
+        content = "".join("b" * 30 + "\r\n" for _ in range(20_000))
+        chunks = chunk_file_by_lines(content, 10**9, max_bytes=60_000)
+        assert len(chunks) > 1
+        for text, start, _end in chunks:
+            assert len(number_lines(text, start).encode("utf-8")) <= 60_000
+
+    def test_numbered_line_overhead_bytes_matches_widest_prefix(self) -> None:
+        assert numbered_line_overhead_bytes(9) == len("L9: ")
+        assert numbered_line_overhead_bytes(19_239) == len("L19239: ")
 
 
 # ---------------------------------------------------------------------------
@@ -1001,6 +1080,133 @@ class TestMetaAnalyzerResultFindingsValidator:
 
 
 # ---------------------------------------------------------------------------
+# LLMAnalyzerBase.get_batches — CLI provider input byte cap
+# ---------------------------------------------------------------------------
+
+
+class TestCliPromptByteBudget:
+    """CLI providers reject prompts over ``MAX_INPUT_BYTES`` before the CLI starts.
+
+    The token budget alone does not keep a numbered prompt under that cap: with a
+    272k-token context window (input budget 204k tokens), short lines carry a
+    line-number prefix the token estimate ignores, and multi-byte text is larger in
+    bytes than in estimated tokens.
+    """
+
+    MODEL = "nvidia/openai/gpt-oss-120b"
+    LARGE_CONTEXT_INPUT_BUDGET = int(272_000 * 0.75)
+
+    @pytest.fixture
+    def cli_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+
+    @pytest.fixture
+    def http_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+
+    def _analyzer(self) -> LLMAnalyzerBase:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._input_budget = self.LARGE_CONTEXT_INPUT_BUDGET
+        return analyzer
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_provider_batches_fit_max_input_bytes(self, cli_provider: None) -> None:
+        analyzer = self._analyzer()
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        batches = analyzer.get_batches(["big.js"], {"big.js": content})
+        assert len(batches) > 1
+        for batch in batches:
+            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_provider_batches_cover_every_line(self, cli_provider: None) -> None:
+        analyzer = self._analyzer()
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        covered: set[int] = set()
+        for batch in analyzer.get_batches(["big.js"], {"big.js": content}):
+            assert batch.end_line is not None
+            covered.update(range(batch.start_line, batch.end_line + 1))
+        assert covered == set(range(1, 150_001))
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_provider_splits_multibyte_file_under_token_budget(
+        self, cli_provider: None
+    ) -> None:
+        analyzer = self._analyzer()
+        # ~1.2 MB of UTF-8 but only ~100k estimated tokens: fits the token budget whole.
+        content = "".join("漢" * 200 + "\n" for _ in range(2_000))
+        assert estimate_tokens(content) <= self.LARGE_CONTEXT_INPUT_BUDGET
+        batches = analyzer.get_batches(["cjk.md"], {"cjk.md": content})
+        assert len(batches) > 1
+        for batch in batches:
+            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_http_provider_serialized_prompts_fit_and_keep_all_lines(
+        self, http_provider: None
+    ) -> None:
+        analyzer = self._analyzer()
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        covered: set[int] = set()
+        for batch in analyzer.get_batches(["big.js"], {"big.js": content}):
+            prompt = analyzer.build_prompt(batch)
+            if analyzer.response_schema is not None:
+                from skillspector.llm_utils import structured_output_instructions
+
+                prompt += structured_output_instructions(analyzer.response_schema)
+            assert (len(prompt.encode("utf-8")) + 3) // 4 <= analyzer._input_budget
+            assert batch.end_line is not None
+            covered.update(range(batch.start_line, batch.end_line + 1))
+        assert covered == set(range(1, 150_001))
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_payload_with_schema_instructions_fits_without_margin(
+        self, cli_provider: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The CLI transport appends the JSON schema after build_prompt; the budget must
+        # measure it rather than rely on the safety margin to absorb it.
+        monkeypatch.setattr("skillspector.llm_analyzer_base.PROMPT_BYTE_SAFETY_MARGIN", 0)
+        analyzer = self._analyzer()
+        structured = _StructuredAgentCLIModel(MagicMock(), LLMAnalysisResult)
+        content = "".join("z" * 10 + "\n" for _ in range(150_000))
+        for batch in analyzer.get_batches(["big.js"], {"big.js": content}):
+            payload = structured._augment(analyzer.build_prompt(batch))
+            assert len(payload.encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_path_with_unencodable_characters_does_not_raise(self, cli_provider: None) -> None:
+        # A non-UTF-8 file name decoded with surrogateescape; the provider encodes
+        # with errors="replace", so batching must not be stricter than the transport.
+        analyzer = self._analyzer()
+        path = "skill/\udcff.md"
+        batches = analyzer.get_batches([path], {path: "line \udcfe\n"})
+        assert [b.file_path for b in batches] == [path]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_oversized_single_line_is_fragmented_without_truncation(
+        self, cli_provider: None
+    ) -> None:
+        analyzer = self._analyzer()
+        # Fewer estimated tokens than the budget, more bytes than the cap.
+        line = "漢" * (MAX_INPUT_BYTES // 3 + 10)
+        batches = analyzer.get_batches(["min.js"], {"min.js": line + "\n"})
+        assert len(batches) > 1
+        rebuilt = ""
+        covered = 0
+        for batch in batches:
+            start, end = batch.source_start_column, batch.source_end_column
+            assert start is not None and end is not None and start <= covered
+            assert batch.start_line == batch.end_line == 1
+            assert batch.source_line_length == len(line)
+            rebuilt += batch.content[covered - start : end - start]
+            covered = end
+            analyzer._check_prompt_budget(analyzer.build_prompt(batch))
+        assert covered == len(line)
+        assert rebuilt.encode() == line.encode()
+        assert batches[-1].content.endswith("\n")
+
+
+# ---------------------------------------------------------------------------
 # LLMAnalyzerBase.collect_findings
 # ---------------------------------------------------------------------------
 
@@ -1280,6 +1486,50 @@ class TestRunBatches:
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_missing_structured_response_recovers_on_retry(self, sleep: MagicMock) -> None:
+        """A tool-call parser returns None when the reply has no tool call."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[None, LLMAnalysisResult(findings=[])]
+        )
+
+        outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert analyzer._structured_llm.invoke.call_count == 2
+        sleep.assert_called_once_with(0.5)
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_missing_structured_response_isolated_after_three_retries(
+        self, sleep: MagicMock
+    ) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[None, None, None, None, LLMAnalysisResult(findings=[])]
+        )
+        batches = [
+            Batch(file_path="missing.py", content="no tool call"),
+            Batch(file_path="clean.py", content="clean response"),
+        ]
+
+        outcome = analyzer.run_batches_detailed(batches)
+
+        assert [item[0].file_path for item in outcome.successful] == ["clean.py"]
+        assert [
+            (failure.batch.file_path, failure.error_class, failure.reason)
+            for failure in outcome.failures
+        ] == [("missing.py", "ValidationError", LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID)]
+        assert analyzer._structured_llm.invoke.call_count == 5
+        assert sleep.call_args_list == [
+            ((0.5,), {}),
+            ((1.0,), {}),
+            ((2.0,), {}),
+        ]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
     def test_api_connection_error_recovers_with_bounded_backoff(self, sleep: MagicMock) -> None:
         analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
         analyzer._structured_llm.invoke = MagicMock(
@@ -1498,6 +1748,78 @@ class TestRunBatches:
 
 
 class TestDynamicTimeout:
+    def test_model_construction_rechecks_the_shared_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Construction that consumes the budget cannot start an LLM call."""
+        timeout_values = iter([10.0, 0.0])
+
+        class _LLM:
+            def with_structured_output(self, schema: type) -> _LLM:
+                return self
+
+        monkeypatch.setattr(
+            "skillspector.llm_analyzer_base.get_chat_model", lambda **_kwargs: _LLM()
+        )
+
+        with pytest.raises(LLMRuntimeLimitError, match="runtime limit"):
+            LLMAnalyzerBase(
+                base_prompt="test",
+                model="nvidia/openai/gpt-oss-120b",
+                timeout=lambda: next(timeout_values),
+            )
+
+    def test_second_dynamic_model_refresh_failure_keeps_first_batch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A refresh failure is isolated to its batch after an earlier success."""
+
+        class _LLM:
+            def with_structured_output(self, schema: type) -> _LLM:
+                return self
+
+            def invoke(self, prompt: str, **kwargs: object) -> LLMAnalysisResult:
+                return LLMAnalysisResult(
+                    findings=[
+                        LLMFinding(
+                            rule_id="retained",
+                            message="retained finding",
+                            severity="LOW",
+                            start_line=1,
+                        )
+                    ]
+                )
+
+        models: list[object] = [_LLM(), _LLM(), RefreshError("refresh failed")]
+
+        def _get_model(**_kwargs: object) -> _LLM:
+            model = models.pop(0)
+            if isinstance(model, Exception):
+                raise model
+            return model  # type: ignore[return-value]
+
+        monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", _get_model)
+        analyzer = LLMAnalyzerBase(
+            base_prompt="test",
+            model="nvidia/openai/gpt-oss-120b",
+            timeout=lambda: 10.0,
+        )
+
+        outcome = analyzer.run_batches_detailed(
+            [Batch(file_path="first.py", content="ok"), Batch(file_path="second.py", content="bad")]
+        )
+
+        assert [batch.file_path for batch, _ in outcome.successful] == ["first.py"]
+        assert outcome.successful[0][1][0].rule_id == "retained"
+        assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
+            ("second.py", "RefreshError")
+        ]
+        events, _ = ledger_events_for_batches("semantic_test", outcome)
+        assert [(event["path"], event["outcome"]) for event in events] == [
+            ("first.py", "completed"),
+            ("second.py", "failed"),
+        ]
+
     def test_dynamic_deadline_disables_unobservable_native_retries(self) -> None:
         chat_model = ChatOpenAI(model="nvidia/openai/gpt-oss-120b", api_key="sk-test")
         assert chat_model.root_client is not None
@@ -1588,10 +1910,46 @@ class TestDynamicTimeout:
         assert sync_client.timeout == 1.0
         assert _cached_async_httpx_client.cache_info().misses == cache_misses_before
 
+    def test_gemini_reuses_client_until_adc_token_changes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skillspector.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        tokens = iter(["first", "second", "second"])
+        monkeypatch.setattr(
+            provider,
+            "resolve_credentials",
+            lambda *, timeout: (next(tokens), "https://example.invalid"),
+        )
+        monkeypatch.setattr("skillspector.llm_analyzer_base.get_active_provider", lambda: provider)
+        built: list[ChatOpenAI] = []
+
+        def _factory(*, model: str, timeout: float | None = None) -> ChatOpenAI:
+            chat_model = ChatOpenAI(
+                model=model,
+                api_key="first" if not built else "second",
+                timeout=timeout,
+            )
+            built.append(chat_model)
+            return chat_model
+
+        monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", _factory)
+        analyzer = LLMAnalyzerBase(base_prompt="test", model="gemini-test", timeout=lambda: 10.0)
+
+        first, _ = analyzer._model_for_call()
+        second, _ = analyzer._model_for_call()
+        third, _ = analyzer._model_for_call()
+
+        assert first is built[0]
+        assert second is built[1]
+        assert third is second
+        assert len(built) == 2
+
     def test_run_batches_resolves_timeout_per_batch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Dynamic timeout providers are called again before every LLM call."""
         captured_timeouts: list[float | None] = []
-        timeout_values = iter([30.0, 30.0, 20.0, 10.0])
+        timeout_values = iter([30.0, 30.0, 20.0, 20.0, 10.0, 10.0])
 
         class _Structured:
             def invoke(self, prompt: str) -> LLMAnalysisResult:
@@ -1624,7 +1982,7 @@ class TestDynamicTimeout:
     def test_sync_retry_preserves_provider_failure_when_deadline_cannot_fund_backoff(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        timeout_values = iter([5.0, 4.0, 0.1, 0.0])
+        timeout_values = iter([5.0, 5.0, 4.0, 4.0, 0.1, 0.0])
         sleeps: list[float] = []
 
         class _LLM:
@@ -1668,7 +2026,7 @@ class TestDynamicTimeout:
     def test_provider_timeout_at_shared_deadline_preserves_primary_cause(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        timeout_values = iter([5.0, 5.0, 0.1, 0.0])
+        timeout_values = iter([5.0, 5.0, 5.0, 5.0, 0.0])
 
         class _LLM:
             def with_structured_output(self, schema: type) -> _LLM:
@@ -1695,7 +2053,7 @@ class TestDynamicTimeout:
     async def test_async_retry_preserves_provider_failure_when_deadline_cannot_fund_backoff(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        timeout_values = iter([5.0, 4.0, 0.2, 0.0])
+        timeout_values = iter([5.0, 5.0, 4.0, 4.0, 0.2, 0.0])
         sleeps: list[float] = []
 
         class _LLM:
@@ -1870,6 +2228,50 @@ class TestARunBatches:
         assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
             ("malformed.py", "ValidationError")
         ]
+        assert analyzer._structured_llm.ainvoke.call_count == 5
+        assert sleep.await_args_list == [
+            ((0.5,), {}),
+            ((1.0,), {}),
+            ((2.0,), {}),
+        ]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_missing_structured_response_recovers_on_retry(self, sleep: AsyncMock) -> None:
+        """A tool-call parser returns None when the reply has no tool call."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
+            side_effect=[None, LLMAnalysisResult(findings=[])]
+        )
+
+        outcome = await analyzer.arun_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert analyzer._structured_llm.ainvoke.call_count == 2
+        sleep.assert_awaited_once_with(0.5)
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_missing_structured_response_isolated_after_three_retries(
+        self, sleep: AsyncMock
+    ) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
+            side_effect=[None, None, None, None, LLMAnalysisResult(findings=[])]
+        )
+        batches = [
+            Batch(file_path="missing.py", content="no tool call"),
+            Batch(file_path="clean.py", content="clean response"),
+        ]
+
+        outcome = await analyzer.arun_batches_detailed(batches, max_concurrency=1)
+
+        assert [item[0].file_path for item in outcome.successful] == ["clean.py"]
+        assert [
+            (failure.batch.file_path, failure.error_class, failure.reason)
+            for failure in outcome.failures
+        ] == [("missing.py", "ValidationError", LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID)]
         assert analyzer._structured_llm.ainvoke.call_count == 5
         assert sleep.await_args_list == [
             ((0.5,), {}),
@@ -2539,8 +2941,23 @@ class TestLLMAnalysisResult:
         assert finding.start_line == 10
         assert finding.end_line == 12
         assert finding.confidence == 0.95
+        assert finding.category == "Security"
+        assert finding.pattern == "Hardcoded secret"
+        assert finding.finding == "Hardcoded secret"
         assert finding.explanation == "Contains API key"
         assert finding.remediation == "Use env vars"
+
+    def test_to_finding_populates_report_metadata_for_semantic_rules(self) -> None:
+        finding = LLMFinding(
+            rule_id="SSD-3",
+            message="Natural-language credential exfiltration",
+            severity="CRITICAL",
+            start_line=3,
+        ).to_finding("SKILL.md")
+
+        assert finding.category == "Data Exfiltration"
+        assert finding.pattern == "Natural-language credential exfiltration"
+        assert finding.finding == "Natural-language credential exfiltration"
 
     def test_model_dump(self) -> None:
         f = LLMFinding(
@@ -2801,6 +3218,79 @@ class TestLLMMetaAnalyzerGetBatches:
         batches = analyzer.get_batches(["a.py"], file_cache, [])
         assert len(batches) == 1
         assert batches[0].findings == []
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_batches_fit_with_large_metadata_and_findings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        analyzer._input_budget = int(272_000 * 0.75)
+        content = "".join("m" * 40 + "\n" for _ in range(30_000))
+        findings = [self._make_finding("big.js", line=i) for i in range(1, 30_000, 100)]
+        metadata = "d" * 400_000
+        # Exercise the CLI byte cap with an explicit known local counting fixture;
+        # unknown codecs instead use the conservative byte-bound refusal test.
+        import tiktoken
+
+        codec = tiktoken.get_encoding("cl100k_base")
+        analyzer._token_counter = lambda text: len(codec.encode(text, disallowed_special=()))
+        batches = analyzer.get_batches(
+            ["big.js"], {"big.js": content}, findings, metadata_text=metadata
+        )
+        for batch in batches:
+            prompt = analyzer.build_prompt(batch, metadata_text=metadata)
+            assert len(prompt.encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_sc10_redaction_cannot_push_prompt_over_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        analyzer._input_budget = int(272_000 * 0.75)
+        # Each short credential URL grows when redact_text rewrites it.
+        content = "".join("x=http://u:p@h\n" for _ in range(70_000))
+        findings = [self._make_finding("creds.py", line=1, rule_id="SC10")]
+        batches = analyzer.get_batches(["creds.py"], {"creds.py": content}, findings)
+        assert all("u:p@" not in batch.content for batch in batches)
+        for batch in batches:
+            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_sc10_redaction_keeps_lines_and_finding_aligned(self) -> None:
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        lines = [f"line {i}\n" for i in range(1, 11)]
+        lines[4] = "x=http://u:p@h?token=s3cret more\n"
+        content = "".join(lines)
+        cache = {"creds.py": content, "plain.py": "y=http://u:p@h\n"}
+        finding = self._make_finding("creds.py", line=5, rule_id="SC10")
+        batches = analyzer.get_batches(["creds.py", "plain.py"], cache, [finding])
+        creds = next(b for b in batches if b.file_path == "creds.py")
+        redacted = creds.content.splitlines()
+        assert len(redacted) == 10
+        assert redacted[3] == "line 4" and redacted[5] == "line 6"
+        assert "u:p@" not in redacted[4] and "s3cret" not in redacted[4]
+        assert creds.findings == [finding]
+        assert cache["creds.py"] == content  # the caller's cache is not mutated
+        plain = next(b for b in batches if b.file_path == "plain.py")
+        assert plain.content == "y=http://u:p@h\n"  # files without SC10 stay as they are
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_fixed_prompt_over_cap_warns_and_keeps_content(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        content = "".join(f"line {i}\n" for i in range(1, 101))
+        findings = [self._make_finding("a.py", line=1)]
+        metadata = "d" * (MAX_INPUT_BYTES + 10)
+        with caplog.at_level("WARNING"):
+            batches = analyzer.get_batches(
+                ["a.py"], {"a.py": content}, findings, metadata_text=metadata
+            )
+        assert "".join(b.content for b in batches) == content
+        assert "exceeds the provider input limit" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -3618,6 +4108,171 @@ class TestConcurrencyIsGlobal:
         assert peak[0] == 2
 
 
+class TestBoundedBatchAdmission:
+    MODEL = "gpt-4o-mini"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_late_analyzer_progresses_before_an_early_queue_drains(self, monkeypatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "1")
+        limiter = _GlobalLLMLimiter(1)
+        monkeypatch.setattr("skillspector.llm_analyzer_base._shared_limiter", lambda _: limiter)
+        owner = ContextVar("batch_owner", default="")
+        first_started, late_waiting, release = (threading.Event() for _ in range(3))
+        order: list[str] = []
+        lock = threading.Lock()
+        acquire = limiter.acquire
+
+        async def observed_acquire():
+            if owner.get() == "late":
+                late_waiting.set()
+            await acquire()
+
+        monkeypatch.setattr(limiter, "acquire", observed_acquire)
+
+        async def invoke(*_args, **_kwargs):
+            label = owner.get()
+            with lock:
+                order.append(label)
+                first = len(order) == 1
+            if first:
+                first_started.set()
+                assert await asyncio.to_thread(release.wait, 5)
+            await asyncio.sleep(0)
+            return LLMAnalysisResult(findings=[])
+
+        first = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        late = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        first._structured_llm.ainvoke = AsyncMock(side_effect=invoke)
+        late._structured_llm.ainvoke = AsyncMock(side_effect=invoke)
+        batches = [Batch(file_path=f"early-{index}.py", content="print(1)") for index in range(64)]
+
+        def run(label, analyzer, own_batches):
+            token = owner.set(label)
+            try:
+                return run_async(analyzer.arun_batches_detailed(own_batches))
+            finally:
+                owner.reset(token)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            early_future = pool.submit(run, "early", first, batches)
+            try:
+                assert first_started.wait(5)
+                late_future = pool.submit(
+                    run, "late", late, [Batch(file_path="late.py", content="print(2)")]
+                )
+                assert late_waiting.wait(5)
+            finally:
+                release.set()
+            early_result = early_future.result(timeout=10)
+            late_result = late_future.result(timeout=10)
+        assert order.index("late") <= 2
+        assert [batch.file_path for batch, _ in early_result.successful] == [
+            batch.file_path for batch in batches
+        ]
+        assert len(late_result.successful) == 1
+        assert not early_result.failures and not late_result.failures
+
+    @pytest.mark.parametrize("width", [1, 3])
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_cancelled_worker_windows_release_the_global_permits(
+        self, width, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", str(width))
+        limiter = _GlobalLLMLimiter(width)
+        monkeypatch.setattr("skillspector.llm_analyzer_base._shared_limiter", lambda _: limiter)
+        entered, release = asyncio.Event(), asyncio.Event()
+        started = 0
+
+        async def blocked(*_args, **_kwargs):
+            nonlocal started
+            started += 1
+            if started == width:
+                entered.set()
+            await release.wait()
+            return LLMAnalysisResult(findings=[])
+
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(side_effect=blocked)
+        task = asyncio.create_task(
+            analyzer.arun_batches_detailed(
+                [Batch(file_path=f"{index}.py", content="print(1)") for index in range(20)]
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        probe = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        probe._structured_llm.ainvoke = AsyncMock(return_value=LLMAnalysisResult(findings=[]))
+        result = await asyncio.wait_for(
+            probe.arun_batches_detailed([Batch(file_path="probe.py", content="print(2)")]), 5
+        )
+        assert len(result.successful) == 1
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_unstarted_batches_keep_terminal_runtime_outcomes_and_findings(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "1")
+        remaining = [60.0]
+        analyzer = LLMAnalyzerBase(
+            base_prompt="test", model=self.MODEL, timeout=lambda: remaining[0]
+        )
+
+        async def first_response(*_args, **_kwargs):
+            remaining[0] = 0.0
+            return LLMAnalysisResult(
+                findings=[
+                    LLMFinding(
+                        rule_id="SEC-001",
+                        message="Bad",
+                        severity="HIGH",
+                        start_line=1,
+                        confidence=0.9,
+                    )
+                ]
+            )
+
+        analyzer._structured_llm.ainvoke = AsyncMock(side_effect=first_response)
+        monkeypatch.setattr(MOCK_PATCH_TARGET, lambda **_kwargs: analyzer._llm)
+        batches = [Batch(file_path=f"{index}.py", content="print(1)") for index in range(20)]
+        result = await analyzer.arun_batches_detailed(batches)
+        assert len(result.successful) == 1
+        assert result.successful[0][0] is batches[0]
+        assert result.successful[0][1][0].severity == "HIGH"
+        assert [failure.batch for failure in result.failures] == batches[1:]
+        assert all(failure.reason == LedgerReason.RUNTIME_LIMIT for failure in result.failures)
+        analyzer._structured_llm.ainvoke.assert_awaited_once()
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_one_cancelled_batch_does_not_cancel_sibling_results(self, monkeypatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "2")
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        batches = [Batch(file_path=f"{index}.py", content="print(1)") for index in range(4)]
+
+        async def invoke(batch, _prompt, **_kwargs):
+            if batch is batches[1]:
+                raise asyncio.CancelledError
+            await asyncio.sleep(0)
+            return batch, []
+
+        monkeypatch.setattr(analyzer, "_ainvoke_batch_with_retries", invoke)
+        result = await analyzer.arun_batches_detailed(batches)
+        assert [batch for batch, _ in result.successful] == [batches[0], batches[2], batches[3]]
+        assert len(result.failures) == 1
+        assert result.failures[0].batch is batches[1]
+        assert result.failures[0].error_class == "CancelledError"
+
+    @pytest.mark.parametrize("width", [0, -1, 1.5])
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_invalid_worker_width_is_rejected(self, width) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        with pytest.raises(ValueError, match="positive integer"):
+            await analyzer.arun_batches_detailed(
+                [Batch(file_path="a.py", content="print(1)")], max_concurrency=width
+            )
+
+
 class TestConcurrencyIsGlobalAcrossLoops:
     """The same bound, exercised the way the graph actually runs.
 
@@ -3684,17 +4339,44 @@ class TestConcurrencyIsGlobalAcrossLoops:
         monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "3")
         state = {"live": 0, "peak": 0}
         lock = threading.Lock()
+        all_started = threading.Event()
+        release = threading.Event()
         analyzers = [self._counting_analyzer(state, lock) for _ in range(3)]
         batches = [Batch(file_path="a.py", content="a")]
 
+        async def invoke(*_args, **_kwargs):
+            with lock:
+                state["live"] += 1
+                state["peak"] = max(state["peak"], state["live"])
+                if state["live"] == 3:
+                    all_started.set()
+            try:
+                # Hold each request until all three loops have acquired a permit.
+                while not release.is_set():
+                    await asyncio.sleep(0.001)
+            finally:
+                with lock:
+                    state["live"] -= 1
+            return LLMAnalysisResult(findings=[])
+
+        for analyzer in analyzers:
+            analyzer._structured_llm.ainvoke = AsyncMock(side_effect=invoke)
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(analyzers)) as pool:
-            for f in [pool.submit(self._run_like_a_node, a, list(batches)) for a in analyzers]:
-                f.result()
+            futures = [pool.submit(self._run_like_a_node, a, list(batches)) for a in analyzers]
+            try:
+                started = all_started.wait(5)
+            finally:
+                release.set()
+            for future in futures:
+                future.result(timeout=10)
+            assert started, "three nodes could not acquire three permits"
 
         assert state["peak"] == 3, (
             f"peak was {state['peak']} with a limit of 3 across three nodes: the bound has "
             "become a queue"
         )
+        assert state["live"] == 0, "a permit was never released"
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_a_cancelled_waiter_does_not_strand_its_permit(self, monkeypatch) -> None:

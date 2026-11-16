@@ -26,6 +26,7 @@ from skillspector import python_tokens
 from skillspector.artifacts import SecurityTextView
 from skillspector.graph import graph
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.nodes.analyzers import static_patterns_anti_refusal as ar_module
 from skillspector.nodes.analyzers import static_patterns_prompt_injection as pi_module
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_module
 from skillspector.nodes.analyzers import static_runner
@@ -271,9 +272,15 @@ def test_string_ownership_is_proven_lazily_and_once(monkeypatch: pytest.MonkeyPa
 
 # --- One ownership parse per module ----------------------------------------
 
-# The marker pass proves the closing quote after "omit", and the tool-misuse
-# shell parser proves the fence backticks literal: both consumers ask.
-_BOTH_CONSUMERS = _ASSERT_FLAG + 'FENCE = "\\n```\\n"\n' + _UNQUOTED_TAIL
+# The marker pass proves the closing quote after "omit", the tool-misuse shell
+# parser proves the fence backticks literal, and AR2 proves that "no warning"
+# lies in a comment that reports program output: all three consumers ask.
+_ALL_CONSUMERS = (
+    _ASSERT_FLAG
+    + 'FENCE = "\\n```\\n"\n'
+    + "# The server emits no warning when the cache is cold.\n"
+    + _UNQUOTED_TAIL
+)
 
 
 def _count_parses(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -294,25 +301,34 @@ def _literals(content: str, spans: python_tokens.PythonLiteralSpans | None) -> l
     return [content[start:end] for start, end in zip(*spans, strict=True)]
 
 
-def test_marker_pass_and_shell_parser_share_one_parse_per_scan(
+def test_marker_pass_shell_parser_and_ar2_share_one_parse_per_scan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     parses = _count_parses(monkeypatch)
-    requests: list[int] = []
+    requests: list[tuple[str, int]] = []
     real_spans = python_tokens.python_literal_spans
 
-    def requested(content: str, check_runtime: Callable[[], None]):
-        requests.append(len(content))
-        return real_spans(content, check_runtime)
+    def requested_by(consumer: str):
+        def requested(content: str, check_runtime: Callable[[], None]):
+            requests.append((consumer, len(content)))
+            return real_spans(content, check_runtime)
 
-    monkeypatch.setattr(python_tokens, "python_literal_spans", requested)
-    monkeypatch.setattr(tm_module, "_python_literal_spans", requested)
+        return requested
 
-    result = _ledger("scripts/check.py", _BOTH_CONSUMERS, tm_module, pi_module)
+    monkeypatch.setattr(python_tokens, "python_literal_spans", requested_by("marker"))
+    monkeypatch.setattr(tm_module, "_python_literal_spans", requested_by("tool-misuse"))
+    monkeypatch.setattr(ar_module, "python_literal_spans", requested_by("anti-refusal"))
 
+    result = _ledger("scripts/check.py", _ALL_CONSUMERS, tm_module, pi_module, ar_module)
+
+    assert result["findings"] == []
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
-    assert requests == [len(_BOTH_CONSUMERS)] * 2
-    assert [len(content) for content in parses] == [len(_BOTH_CONSUMERS)]
+    assert sorted(requests) == [
+        ("anti-refusal", len(_ALL_CONSUMERS)),
+        ("marker", len(_ALL_CONSUMERS)),
+        ("tool-misuse", len(_ALL_CONSUMERS)),
+    ]
+    assert [len(content) for content in parses] == [len(_ALL_CONSUMERS)]
 
 
 def test_memo_reuses_proven_and_unproven_results(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -384,15 +400,17 @@ def test_parse_interrupted_by_the_runtime_check_is_not_memoized(
 def test_concurrent_sources_each_get_their_own_spans() -> None:
     # Analyzer nodes run on worker threads. More sources than memo entries
     # keep entries being replaced while other threads look them up.
+    cache_size = python_tokens._PYTHON_LITERAL_SPANS_CACHE_SIZE
+    proven_count = cache_size + 2
     sources = [
         "".join(f'value_{index} = "{worker}-{index}"  # w{worker}\n' for index in range(worker + 1))
-        for worker in range(6)
+        for worker in range(proven_count)
     ] + ['broken = "x" + $(\n']
     expected = {
         source: python_tokens._python_literal_spans_uncached(source, lambda: None)
         for source in sources
     }
-    assert [spans is None for spans in expected.values()] == [False] * 6 + [True]
+    assert [spans is None for spans in expected.values()] == [False] * proven_count + [True]
     barrier = threading.Barrier(8)
     correct: list[bool] = []
 
@@ -411,8 +429,8 @@ def test_concurrent_sources_each_get_their_own_spans() -> None:
         thread.join()
 
     assert correct == [True] * 480
-    cache_size = python_tokens._PYTHON_LITERAL_SPANS_CACHE_SIZE
-    assert len(python_tokens._PYTHON_LITERAL_SPANS_CACHE) <= cache_size
+    # More distinct sources than entries were stored, so eviction left it full.
+    assert len(python_tokens._PYTHON_LITERAL_SPANS_CACHE) == cache_size
 
 
 # --- Readings that stay fail-closed ----------------------------------------
@@ -421,6 +439,21 @@ def test_concurrent_sources_each_get_their_own_spans() -> None:
 @pytest.mark.parametrize("path", ["notes.md", "notes.txt"])
 def test_other_file_types_keep_the_lexical_reading(path: str) -> None:
     _assert_partial_marker_text(_ledger(path, _ASSERT_FLAG + _LITERAL_TAIL))
+
+
+def test_shell_does_not_borrow_python_ownership(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden(*args, **kwargs):
+        raise AssertionError("A shell path cannot borrow Python string proof")
+
+    monkeypatch.setattr(static_runner, "PythonStringClosers", forbidden)
+    # Shell now has its own complete-source lexical proof. It independently
+    # owns this closing quote; this does not use Python syntax validation.
+    result = _ledger("scripts/check.sh", _ASSERT_FLAG + _LITERAL_TAIL)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    # An unresolved shell suffix withholds that whole-source proof as before.
+    _assert_partial_marker_text(
+        _ledger("scripts/check.sh", _ASSERT_FLAG + _LITERAL_TAIL + "echo $(unclosed\n")
+    )
 
 
 @pytest.mark.parametrize(
@@ -469,21 +502,21 @@ _GLUED_INVALID_PYTHON = (
     [
         pytest.param("SKILL.md", _GLUED, id="prose"),
         pytest.param("notes.txt", _GLUED, id="text"),
+        pytest.param("SKILL.md", _GLUED_INVALID_PYTHON, id="prose-section-sign"),
+        pytest.param("scripts/check.py", _GLUED_INVALID_PYTHON, id="invalid-python"),
     ],
 )
 def test_glued_marker_outside_proven_python_still_fails_closed(path: str, content: str) -> None:
+    if path.endswith(".py"):
+        # Tool misuse parses Python for TM1 reconciliation, so the
+        # higher-precedence syntax error names its partial event. A lexical-only
+        # analyzer still reports the unproven marker reading.
+        _assert_partial_marker_text(_ledger(path, content, ar_module))
+        event = _ledger(path, content)["inspection_ledger"][0]
+        assert event["outcome"] is LedgerOutcome.PARTIAL
+        assert event["reason_code"] is LedgerReason.SYNTAX_ERROR
+        return
     _assert_partial_marker_text(_ledger(path, content))
-
-
-def test_invalid_python_never_receives_marker_ownership() -> None:
-    # The selected 2.13 release does not include unrelated section-sign marker
-    # hardening from main. Its existing syntax-error accounting still prevents
-    # malformed Python from borrowing host ownership.
-    result = _ledger("scripts/check.py", _GLUED_INVALID_PYTHON)
-    assert result["findings"] == []
-    event = result["inspection_ledger"][0]
-    assert event["outcome"] is LedgerOutcome.PARTIAL
-    assert event["reason_code"] is LedgerReason.SYNTAX_ERROR
 
 
 def test_glued_bare_string_statements_in_a_proven_module_are_complete() -> None:

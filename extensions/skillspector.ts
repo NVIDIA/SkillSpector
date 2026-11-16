@@ -16,7 +16,7 @@ const scanSchema = Type.Object({
   output: Type.Optional(Type.String({ description: "Optional report output path within the current workspace." })),
   noLlm: Type.Optional(Type.Boolean({ description: "Skip LLM analysis. Defaults to true." })),
   provider: Type.Optional(
-    StringEnum(["openai", "anthropic", "anthropic_proxy", "nv_build", "nv_inference"] as const, {
+    StringEnum(["openai", "anthropic", "anthropic_proxy", "nv_build", "nv_inference", "gemini"] as const, {
       description: "Optional SkillSpector LLM provider when noLlm is false.",
     }),
   ),
@@ -128,9 +128,13 @@ async function approveScanInputs(
     if (!isWithin(resolve(ctx.cwd), path.input) && !isWithin(workspace, path.resolved) && path.resolved !== path.input) {
       aliasRequests.push(readRequest(path.field, path.resolved));
     }
-    // Keep the original target path so the CLI can enforce its no-symlink
-    // input policy. YARA directories are canonicalised by the CLI too.
-    prepared[path.field] = path.field === "target" ? path.input : path.resolved;
+    // Resolve only the workspace prefix; keep child symlinks for the CLI's
+    // no-symlink input checks. YARA directories are canonicalised by the CLI too.
+    prepared[path.field] = path.field === "target"
+      ? isWithin(resolve(ctx.cwd), path.input)
+        ? join(workspace, relative(resolve(ctx.cwd), path.input))
+        : path.input
+      : path.resolved;
   }
   await approve(aliasRequests);
   signal?.throwIfAborted();
@@ -216,7 +220,8 @@ export default function (pi: ExtensionAPI) {
           cwd: ctx.cwd,
           env,
           signal,
-          timeout: 120000,
+          // Match the CLI's 600s workflow budget plus startup/report headroom.
+          timeout: (params.noLlm ?? true) ? 120000 : 630000,
         });
 
         const stdout = truncateText(redactSecrets(result.stdout ?? ""));

@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -738,6 +739,132 @@ def test_source_local_only_preserves_excluded_executable_coverage(
     )
 
 
+@pytest.mark.parametrize("client_dir", [".agents", ".claude"])
+@pytest.mark.parametrize("use_llm", [True, False])
+def test_conventional_skill_scripts_are_not_concealed(
+    tmp_path: Path, client_dir: str, use_llm: bool
+) -> None:
+    skill_root = tmp_path / client_dir / "skills" / "hello"
+    (skill_root / "scripts").mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# Hello\n", encoding="utf-8")
+    (skill_root / "scripts" / "hello.py").write_text('print("hello")\n', encoding="utf-8")
+    hidden_script = skill_root / "scripts" / ".hidden.py"
+    hidden_script.write_text('print("hidden")\n', encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path), "use_llm": use_llm})
+
+    metadata = {item["path"]: item for item in result["component_metadata"]}
+    visible_path = f"{client_dir}/skills/hello/scripts/hello.py"
+    hidden_path = f"{client_dir}/skills/hello/scripts/.hidden.py"
+    assert metadata[visible_path]["concealed_executable"] is False
+    assert metadata[visible_path]["hidden_skill_script_llm_review_withheld"] is True
+    assert metadata[hidden_path]["concealed_executable"] is True
+    findings = _analyze_concealed_executables(result["component_metadata"])
+    assert visible_path not in {finding.file for finding in findings}
+    assert hidden_path in {finding.file for finding in findings}
+    coverage = [
+        event
+        for event in result["inspection_ledger"]
+        if event["path"] == visible_path
+        and event.get("reason_code") == LedgerReason.HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY
+    ]
+    if use_llm:
+        assert len(coverage) == 1
+        assert coverage[0]["outcome"] == LedgerOutcome.SKIPPED
+        assert "not sent to an external LLM" in coverage[0]["message"]
+    else:
+        assert coverage == []
+
+
+def test_conventional_skill_script_with_compatible_env_shebang_is_not_concealed(
+    tmp_path: Path,
+) -> None:
+    skill_root = tmp_path / ".claude" / "skills" / "demo"
+    script = skill_root / "scripts" / "run.py"
+    script.parent.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    script.write_bytes(b"#!/usr/bin/env python3\nprint(1)\n")
+
+    result = build_context({"skill_path": str(tmp_path), "use_llm": False})
+
+    metadata = next(
+        item
+        for item in result["component_metadata"]
+        if item["path"] == ".claude/skills/demo/scripts/run.py"
+    )
+    assert metadata["concealed_executable"] is False
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "payload", "manifest", "source_local_only"),
+    [
+        (".claude/skills/demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", False, False),
+        (
+            ".claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env python3\nprint(1)\n",
+            "symlink",
+            False,
+        ),
+        (".claude/skills/demo/scripts/tool.py", b"\x7fELF" + b"\0" * 20, True, False),
+        (".claude/skills/demo/scripts/tool.py", b"MZ" + b"\0" * 20, True, False),
+        (".claude/skills/demo/scripts/run", b"#!/bin/sh\ntrue\n", True, False),
+        (".claude/skills/demo/scripts/run.bat", b"@echo off\r\n", True, False),
+        (
+            ".claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env -Sbash\ntrue\n",
+            True,
+            False,
+        ),
+        (
+            ".claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env --split-string=bash\ntrue\n",
+            True,
+            False,
+        ),
+        (".claude/skills/.demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", True, False),
+        (
+            ".claude/skills/demo/scripts/.cache/run.py",
+            b"#!/usr/bin/env python3\nprint(1)\n",
+            True,
+            False,
+        ),
+        (".github/skills/demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", True, False),
+        (
+            "project/.claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env python3\nprint(1)\n",
+            True,
+            False,
+        ),
+        (".claude/skills/demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", True, True),
+        (".claude/skills/demo/scripts/run.py", b"#!/bin/bash\nprint(1)\n", True, False),
+    ],
+)
+def test_skill_script_exemption_fails_closed(
+    tmp_path: Path,
+    relative_path: str,
+    payload: bytes,
+    manifest: bool | str,
+    source_local_only: bool,
+) -> None:
+    target = tmp_path / relative_path
+    target.parent.mkdir(parents=True)
+    target.write_bytes(payload)
+    skill_root = target.parents[1]
+    skill_root.mkdir(parents=True, exist_ok=True)
+    if manifest is True:
+        (skill_root / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    elif manifest == "symlink":
+        external = tmp_path / "outside.md"
+        external.write_text("# Demo\n", encoding="utf-8")
+        (skill_root / "SKILL.md").symlink_to(external)
+
+    result = build_context({"skill_path": str(tmp_path), "source_local_only": source_local_only})
+    metadata = next(item for item in result["component_metadata"] if item["path"] == relative_path)
+    assert metadata["concealed_executable"] is True
+    findings = _analyze_concealed_executables(result["component_metadata"])
+    assert relative_path in {finding.file for finding in findings}
+
+
 def test_build_context_model_config_uses_bound_provider(tmp_path: Path) -> None:
     class _BoundProvider:
         DEFAULT_MODEL = "bound-default"
@@ -783,6 +910,106 @@ def test_build_context_model_config_matches_openai_fallback(
     result = build_context({"skill_path": str(tmp_path)})
 
     assert result["model_config"]["default"] == OpenAIProvider.DEFAULT_MODEL
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_build_context_prepares_transport_only_for_enabled_ai(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports",
+        lambda: calls.append("prepare"),
+    )
+
+    result = build_context({"skill_path": str(tmp_path), "use_llm": enabled})
+
+    assert calls == (["prepare"] if enabled else [])
+    assert result["file_cache"]["SKILL.md"] == "# Example\n"
+    assert bool(result["model_config"]) is enabled
+
+
+def test_build_context_skips_transport_preparation_after_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    budget = WorkflowResourceBudget(max_seconds=0.0)
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports",
+        lambda: pytest.fail("Expired work must not prepare a transport"),
+    )
+
+    result = build_context({"skill_path": str(tmp_path), "workflow_resource_budget": budget})
+
+    assert result["workflow_resource_budget"] is budget
+    assert any(
+        event["reason_code"] == LedgerReason.RUNTIME_LIMIT for event in result["inspection_ledger"]
+    )
+
+
+def test_build_context_transport_preparation_keeps_shared_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    budget = WorkflowResourceBudget(max_seconds=30.0)
+    observed_starts: list[float] = []
+    caplog.set_level(logging.DEBUG, logger="skillspector.nodes.build_context")
+
+    def expire_during_preparation() -> None:
+        assert budget.started_at is not None
+        observed_starts.append(budget.started_at)
+        budget.started_at = monotonic() - budget.max_seconds - 1
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports", expire_during_preparation
+    )
+    result = build_context({"skill_path": str(tmp_path), "workflow_resource_budget": budget})
+
+    assert len(observed_starts) == 1
+    assert result["workflow_resource_budget"] is budget
+    assert budget.remaining_seconds() == 0
+    assert budget.started_at < observed_starts[0]
+    assert result["file_cache"]["SKILL.md"] == "# Example\n"
+    assert "Workflow deadline reached while preparing AI transport imports" in caplog.text
+
+
+def test_build_context_transport_import_failure_preserves_normal_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    caplog.set_level(logging.DEBUG, logger="skillspector.nodes.build_context")
+
+    def failed_preparation() -> None:
+        raise ImportError("private-error-detail")
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports", failed_preparation
+    )
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["model_config"]
+    assert result["file_cache"]["SKILL.md"] == "# Example\n"
+    assert not any(
+        event["reason_code"] == LedgerReason.RUNTIME_LIMIT for event in result["inspection_ledger"]
+    )
+    assert "Could not prepare AI transport imports (ImportError)" in caplog.text
+    assert "private-error-detail" not in caplog.text
+
+
+def test_build_context_transport_preparation_preserves_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+
+    def cancelled_preparation() -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports", cancelled_preparation
+    )
+    with pytest.raises(KeyboardInterrupt):
+        build_context({"skill_path": str(tmp_path)})
 
 
 def test_build_context_inspects_unverified_root_oms_signature(

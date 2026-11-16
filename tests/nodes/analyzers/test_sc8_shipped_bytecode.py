@@ -345,7 +345,7 @@ def test_sc8_walk_ignores_time_spent_waiting_for_other_analyzers(
     tmp_path: Path, monkeypatch
 ) -> None:
     # Concurrent analyzers hold the GIL, so each step of the walk can wait a
-    # long time while doing almost no work of its own.
+    # long time while doing almost no work of its own (SKILLEVAL-17).
     _nested_clean_tree(tmp_path)
     monkeypatch.setattr(supply_chain, "time", _FakeClock(wall_step=1.0, cpu_step=0.0))
 

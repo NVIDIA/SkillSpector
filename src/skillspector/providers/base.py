@@ -29,9 +29,10 @@ without an explicit ``runtime_checkable`` decorator).
 
 from __future__ import annotations
 
-from typing import ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
-from langchain_core.language_models.chat_models import BaseChatModel
+if TYPE_CHECKING:
+    from langchain_core.language_models.chat_models import BaseChatModel
 
 
 class ModelMetadataProvider(Protocol):

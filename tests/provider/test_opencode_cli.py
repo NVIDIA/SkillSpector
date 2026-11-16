@@ -32,11 +32,13 @@ Security invariants verified:
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import sys
 import textwrap
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -53,13 +55,16 @@ from skillspector.providers import (
 from skillspector.providers._agent_cli import (
     _OPENCODE_AGENT_PREFIX,
     _OPENCODE_DENY_ALL,
-    _OPENCODE_SUPPORTED_VERSION,
+    _OPENCODE_SUPPORTED_VERSIONS,
     AgentCLIError,
     _build_opencode_argv,
+    _is_supported_opencode_version,
     _opencode_auth_check,
     _parse_opencode_output,
+    _parse_opencode_version,
     _prepare_opencode_env,
     _run_bounded,
+    get_spec,
     run_agent_cli,
 )
 from skillspector.providers.opencode_cli import OpencodeCLIProvider
@@ -73,7 +78,7 @@ _AUTH_LIST_OK = (
 _AUTH_LIST_EMPTY = b"0 credentials\n0 environment variables\n"
 _AUTH_LIST_SINGULAR = b"1 credential\n1 environment variable\n"
 _AUTH_LIST_UNPARSEABLE = b"authentication status unknown\n"
-_VERSION_OK = f"{_OPENCODE_SUPPORTED_VERSION}\n".encode()
+_VERSION_OK = b"1.18.33\n"
 
 
 def _ok_result(stdout: bytes = _AUTH_LIST_OK) -> SimpleNamespace:
@@ -261,7 +266,7 @@ class TestOpencodeAuthCheck:
         mock_run.return_value = _ok_result(b"1.18.99\n")
         ok, reason = _opencode_auth_check(OPENCODE_BINARY)
         assert ok is False
-        assert _OPENCODE_SUPPORTED_VERSION in (reason or "")
+        assert "1.18.31" in (reason or "") and "1.18.34" in (reason or "")
         mock_run.assert_called_once()
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
@@ -291,6 +296,79 @@ class TestOpencodeAuthCheck:
         assert "auth login" in (reason or "")
 
 
+class TestOpencodeVersionRange:
+    def test_supported_versions_are_an_explicit_verified_set(self) -> None:
+        assert _OPENCODE_SUPPORTED_VERSIONS == frozenset(
+            {
+                (1, 18, 31),
+                (1, 18, 32),
+                (1, 18, 33),
+                (1, 18, 34),
+                (1, 18, 35),
+                (1, 19, 0),
+                (1, 19, 1),
+                (1, 19, 2),
+                (1, 19, 3),
+                (1, 19, 4),
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "version",
+        [
+            "1.18.31",
+            "1.18.32",
+            "1.18.33",
+            "1.18.34",
+            "1.18.35",
+            "1.19.0",
+            "1.19.1",
+            "1.19.2",
+            "1.19.3",
+            "1.19.4",
+        ],
+    )
+    def test_parse_supported_versions_compare_in_range(self, version: str) -> None:
+        parsed = _parse_opencode_version(f"{version}\n".encode())
+        assert parsed is not None
+        assert _is_supported_opencode_version(parsed)
+
+    @pytest.mark.parametrize(
+        "raw", [b"1.18.30\n", b"1.18.36\n", b"1.19.5\n", b"1.18.34-1\n", b"garbage\n", b"\n"]
+    )
+    def test_parse_unsupported_versions_rejected(self, raw: bytes) -> None:
+        parsed = _parse_opencode_version(raw)
+        assert not _is_supported_opencode_version(parsed)
+
+    @pytest.mark.parametrize(
+        "version",
+        [
+            "1.18.31",
+            "1.18.32",
+            "1.18.34",
+            "1.18.35",
+            "1.19.0",
+            "1.19.1",
+            "1.19.2",
+            "1.19.3",
+            "1.19.4",
+        ],
+    )
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_accepts_range_versions(self, mock_run: MagicMock, version: str) -> None:
+        mock_run.side_effect = [_ok_result(f"{version}\n".encode()), _ok_result()]
+        assert _opencode_auth_check(OPENCODE_BINARY) == (True, None)
+
+    @pytest.mark.parametrize("version", ["1.18.30", "1.18.36", "1.19.5"])
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_rejects_out_of_range_versions(self, mock_run: MagicMock, version: str) -> None:
+        mock_run.return_value = _ok_result(f"{version}\n".encode())
+        ok, reason = _opencode_auth_check(OPENCODE_BINARY)
+        assert ok is False
+        assert "1.18.31" in (reason or "") and "1.19.4" in (reason or "")
+        mock_run.assert_called_once()
+
+
 class TestOpencodeDenyAllPolicy:
     def test_policy_overrides_hostile_ambient_configuration(self, tmp_path: Path) -> None:
         base = {
@@ -299,6 +377,8 @@ class TestOpencodeDenyAllPolicy:
             "OPENCODE_CONFIG_CONTENT": '{"permission":"allow","share":"auto"}',
             "OPENCODE_PERMISSION": '{"*":"allow"}',
             "OPENCODE_EXPERIMENTAL": "1",
+            # An ambient value must not switch the OAuth login plugins back off (#809).
+            "OPENCODE_DISABLE_DEFAULT_PLUGINS": "1",
         }
 
         argv = _build_opencode_argv(OPENCODE_BINARY, "", 0)
@@ -314,7 +394,10 @@ class TestOpencodeDenyAllPolicy:
         assert config["autoshare"] is False
         assert env["OPENCODE_AUTO_SHARE"] == "0"
         assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
-        assert env["OPENCODE_DISABLE_DEFAULT_PLUGINS"] == "1"
+        # Internal plugins carry the OAuth logins (ChatGPT, Copilot, ...) and
+        # register no tools; disabling them breaks the user's login (#809).
+        # External plugins stay off through OPENCODE_PURE below.
+        assert "OPENCODE_DISABLE_DEFAULT_PLUGINS" not in env
         assert env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] == "1"
         assert env["OPENCODE_DISABLE_CLAUDE_CODE"] == "1"
         assert env["OPENCODE_PURE"] == "1"
@@ -328,7 +411,7 @@ class TestOpencodeDenyAllPolicy:
         markers: Path,
         *,
         managed: dict | None = None,
-        version: str = _OPENCODE_SUPPORTED_VERSION,
+        version: str = "1.18.34",
     ) -> None:
         """Write a host simulator with real version/config/run boundaries."""
         binary.write_text(
@@ -427,8 +510,23 @@ class TestOpencodeDenyAllPolicy:
         self._write_fake_opencode(binary, markers, version="1.18.99")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
-        with pytest.raises(AgentCLIError, match=f"only for version {_OPENCODE_SUPPORTED_VERSION}"):
+        with pytest.raises(AgentCLIError, match="only for versions 1.18.31"):
             run_agent_cli("opencode", "try a newer runtime", model="")
+        assert list(markers.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    @pytest.mark.parametrize("version", ["1.18.30", "1.18.36", "1.19.5"])
+    def test_preflight_rejects_boundary_versions_before_inference(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode(binary, markers, version=version)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        with pytest.raises(AgentCLIError, match="only for versions 1.18.31"):
+            run_agent_cli("opencode", "try a boundary runtime", model="")
         assert list(markers.iterdir()) == []
 
 
@@ -437,7 +535,7 @@ class TestOpencodeDenyAllPolicy:
 # ---------------------------------------------------------------------------
 
 
-# Real opencode 1.18.31 envelope shapes (Step-0 probe:
+# Real opencode 1.18.33 envelope shapes (Step-0 probe:
 # `opencode run "say hi" --format json` in an empty dir; verbatim raw saved
 # to Temp scratch only). Top-level `type` is one of step_start / text /
 # step_finish; the reply text lives at part.text of `text` events.
@@ -478,7 +576,7 @@ class TestParseOpencodeOutput:
 
     def test_skips_non_json_noise_lines(self) -> None:
         # Banner/TUI noise must never leak into the extracted output.
-        raw = f"opencode v1.18.31\n{_TEXT_EVENT}\nattaching session...\n"
+        raw = f"opencode v1.18.33\n{_TEXT_EVENT}\nattaching session...\n"
         assert _parse_opencode_output(raw) == "hi"
 
     def test_empty_stdout_raises(self) -> None:
@@ -543,3 +641,63 @@ class TestOpencodeCLIProviderWiring:
 
     def test_has_cli_capability(self) -> None:
         assert has_cli_capability(OpencodeCLIProvider())
+
+
+# ---------------------------------------------------------------------------
+# Zen free-tier refusal mapping
+# ---------------------------------------------------------------------------
+
+# Verbatim envelope shape from a Zen 403 (free tier refused
+# under the deny-all isolation; any permission deny trips it).
+_ZEN_REFUSAL_ENVELOPE = (
+    '{"type":"error","timestamp":1789784969134,"sessionID":"ses_probe",'
+    '"error":{"name":"APIError","data":{"message":"Error from provider '
+    "(Console): OpenCode's free tier can only be used from within OpenCode\","
+    '"statusCode":403,"responseBody":"{\\"type\\":\\"error\\",\\"error\\":'
+    '{\\"type\\":\\"FreeTierError\\"}"}}}}}'
+)
+
+
+class _FakePopen:
+    """Minimal Popen stand-in for _run_bounded (cross-platform, no subprocess)."""
+
+    def __init__(self, stdout: bytes, returncode: int) -> None:
+        self.stdin: io.BytesIO | None = io.BytesIO()
+        self.stdout: io.BytesIO | None = io.BytesIO(stdout)
+        self.stderr: io.BytesIO | None = io.BytesIO(b"")
+        self._returncode = returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self._returncode
+
+    def kill(self) -> None:
+        pass
+
+
+class TestZenFreeTierRefusal:
+    def _run_with_fake_host(
+        self, monkeypatch: pytest.MonkeyPatch, stdout: bytes, returncode: int
+    ) -> str:
+        spec = replace(get_spec("opencode"), preflight=None)
+        monkeypatch.setattr(_agent_cli, "get_spec", lambda _name: spec)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: "/usr/bin/opencode")
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            lambda *args, **kwargs: _FakePopen(stdout, returncode),
+        )
+        return run_agent_cli("opencode", "probe", model="opencode/nemotron-3-ultra-free")
+
+    def test_free_tier_refusal_raises_actionable_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Zen FreeTierError envelope must fail closed with guidance — never
+        the opaque exit-code message, and never a silent sandbox weakening."""
+        with pytest.raises(AgentCLIError, match="free tier can only be used"):
+            self._run_with_fake_host(monkeypatch, _ZEN_REFUSAL_ENVELOPE.encode(), 1)
+
+    def test_plain_nonzero_exit_keeps_generic_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(AgentCLIError, match="exited with code 1"):
+            self._run_with_fake_host(monkeypatch, b"boom", 1)

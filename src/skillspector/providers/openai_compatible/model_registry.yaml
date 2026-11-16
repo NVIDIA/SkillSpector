@@ -8,6 +8,7 @@
 #     "<model-label>":
 #       context_length: <int>          # total context window in tokens (required)
 #       max_output_tokens: <int>       # model's max output cap (optional)
+#       tool_choice: auto              # when the endpoint ignores a forced tool_choice (optional)
 
 models:
   # Groq
@@ -41,3 +42,9 @@ models:
   "deepseek-ai/DeepSeek-V3":
     context_length: 65536
     max_output_tokens: 8192
+
+  # iFlytek Astron Token Plan (https://maas-token-api.cn-huabei-1.xf-yun.com/v2).
+  # The endpoint ignores response_format and a forced tool_choice.
+  "spark-x2.5":
+    context_length: 262144
+    tool_choice: auto

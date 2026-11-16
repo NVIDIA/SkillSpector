@@ -28,7 +28,10 @@ from pathlib import Path
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from skillspector.providers import registry
-from skillspector.providers.chat_models import create_openai_compatible_chat_model
+from skillspector.providers.chat_models import (
+    create_openai_compatible_chat_model,
+    prepare_openai_chat_model_imports,
+)
 from skillspector.providers.structured_output import forced_tool_choice_supported
 
 # Documented for completeness — ChatOpenAI defaults here when base_url=None.
@@ -49,6 +52,10 @@ class OpenAIProvider:
 
     DEFAULT_MODEL = "gpt-6.1-sol"
     SLOT_DEFAULTS: dict[str, str] = {}
+
+    def prepare_chat_model_imports(self) -> None:
+        """Prepare the OpenAI transport without resolving or creating a client."""
+        prepare_openai_chat_model_imports()
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
         """Return ``(api_key, base_url)`` from ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL``."""

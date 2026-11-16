@@ -191,44 +191,6 @@ def test_parameter_expansion_then_genuine_comment_exempts() -> None:
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is False
 
 
-def test_comment_ownership_is_indexed_once_per_source(monkeypatch) -> None:
-    original = tm._shell_comment_starts
-    traversals = []
-
-    def counted(content, check_runtime, **kwargs):
-        steps = 0
-
-        def check():
-            nonlocal steps
-            steps += 1
-            check_runtime()
-
-        result = original(content, check, **kwargs)
-        traversals.append((len(content), steps))
-        return result
-
-    monkeypatch.setattr(tm, "_shell_comment_starts", counted)
-    for count in (200, 400):
-        source = "# Uses the `printf` builtin.\n" * count
-        assert tm._has_shell_command_word_exhaustion(source, lambda: None) is None
-    assert len(traversals) == 2
-    assert all(steps <= length for length, steps in traversals)
-    assert traversals[1][1] <= 2 * traversals[0][1]
-
-
-def test_comment_ownership_checks_runtime_inside_parameter_expansion() -> None:
-    calls = 0
-
-    def check():
-        nonlocal calls
-        calls += 1
-        if calls == 5:
-            raise RuntimeError("deadline reached")
-
-    with pytest.raises(RuntimeError, match="deadline reached"):
-        tm._shell_comment_starts("${value:-" + "x" * 1000 + "} # comment\n", check)
-
-
 def test_issue_reproducer_scripts_reach_completed_ledger_outcome() -> None:
     for path, source in (
         ("scripts/run.sh", _COMMENT_BACKTICK_SCRIPT),

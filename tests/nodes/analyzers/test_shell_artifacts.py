@@ -555,7 +555,12 @@ def _inspect_producer(program=_PRODUCER, *, modes=("one",)):
     producer = ShellProducer(
         store, context, tm._next_shell_invocation_word, lambda: None, helper_output
     )
-    return producer.inspect(("/tmp/result/package.tgz",), {}, ("/tmp/result/package.tgz",)), store
+    return (
+        producer.inspect(
+            ("/tmp/result/package.tgz",), {}, ("/tmp/result/package.tgz",), initial_cwd="."
+        ),
+        store,
+    )
 
 
 def test_finite_producer_preserves_setup_copy_and_archive_member_prefixes() -> None:
@@ -1163,43 +1168,81 @@ def test_unknown_sibling_bytes_do_not_remove_an_independent_path_ownership_proof
     assert not store.owns("/tmp/work/log/child")
 
 
-@pytest.mark.parametrize("source_mode", [True, False, None])
-@pytest.mark.parametrize("destination_mode", [True, False, None])
-def test_copy_replaces_bytes_without_replacing_existing_mode(source_mode, destination_mode) -> None:
+@pytest.mark.parametrize("source_mode", [False, True, None])
+@pytest.mark.parametrize("destination_mode", [False, True, None])
+def test_producer_plain_copy_retains_existing_destination_mode(
+    source_mode: bool | None, destination_mode: bool | None
+) -> None:
     store = ShellArtifactStore(lambda: None)
-    source = ShellArtifact(_program("rm -rf /\n").value, executable=source_mode)
-    destination = ShellArtifact(_program("printf ready\n").value, executable=destination_mode)
-    assert store.write("source.sh", source)
-    assert store.write("destination.sh", destination)
-    assert store.copy("source.sh", "destination.sh")
-    copied = store.read("destination.sh")
-    assert copied is not None
-    assert copied.value == source.value
-    assert copied.executable is destination_mode
-    assert store.copy("source.sh", "new.sh")
-    assert store.read("new.sh").executable is source_mode
-
-
-@pytest.mark.parametrize(
-    "invocation,expected",
-    [
-        ("printf '100%% ready'", "100% ready"),
-        ("printf '%%%%'", "%%"),
-        ("printf '%%%s' ready", "%ready"),
-        ("printf '%s' '%%'", "%%"),
-        (r"printf '\\'", "\\"),
-        ("printf 'trailing%'", None),
-        ("printf '%q' ready", None),
-        ("printf '%n' name >/dev/null", None),
-        ("printf '%b' ready >/dev/null", None),
-        (r"printf '\a' >/dev/null", None),
-    ],
-)
-def test_helper_output_validates_complete_format_tokens(invocation, expected) -> None:
-    output = reconstruct_helper_output(
-        invocation + "\n", (), {}, frozenset(), tm._next_shell_invocation_word, lambda: None
+    assert store.create_empty_directory("/tmp/copies")
+    source = ShellArtifact(_program().value, executable=source_mode)
+    assert store.write("/tmp/copies/source", source)
+    assert store.write(
+        "/tmp/copies/destination",
+        ShellArtifact(_program("printf old\n").value, executable=destination_mode),
     )
-    if expected is None:
-        assert output is None
+    assert ShellArtifactEffects(store, lambda: None).copy_file(
+        ("cp", "/tmp/copies/source", "/tmp/copies/destination")
+    )
+    result = store.read("/tmp/copies/destination")
+    assert result is not None and result.value == source.value
+    assert result.executable is destination_mode
+
+
+@pytest.mark.parametrize("source_mode", [False, True, None])
+@pytest.mark.parametrize("known_new", [False, True])
+def test_producer_plain_copy_inherits_mode_only_for_proven_new_destination(
+    source_mode: bool | None, known_new: bool
+) -> None:
+    store = ShellArtifactStore(lambda: None)
+    assert store.create_empty_directory("/tmp/copies")
+    source = ShellArtifact(_program().value, executable=source_mode)
+    assert store.write("/tmp/copies/source", source)
+    destination = "/tmp/copies/new" if known_new else "/runtime/unknown"
+    assert store.exists(destination) is (False if known_new else None)
+    assert ShellArtifactEffects(store, lambda: None).copy_file(
+        ("cp", "/tmp/copies/source", destination)
+    )
+    result = store.read(destination)
+    assert result is not None and result.value == source.value
+    assert result.executable is (source_mode if known_new else None)
+    assert store.copy("/tmp/copies/source", "/tmp/copies/generic")
+    assert store.read("/tmp/copies/generic") == source
+
+
+@pytest.mark.parametrize("initial_cwd", [None, ".", "/tmp/work"])
+@pytest.mark.parametrize("relative_destination", [False, True])
+def test_producer_relative_copy_uses_actual_cwd_for_both_operands(
+    initial_cwd: str | None, relative_destination: bool
+) -> None:
+    destination = "scripts/result.sh" if relative_destination else "$1"
+    program = f'set -euo pipefail\ncp scripts/setup.sh "{destination}"\n'
+    uploaded = _program("printf uploaded\n")
+    generated = _program("printf generated\n")
+    store = ShellArtifactStore(lambda: None)
+    assert store.create_empty_directory("/tmp/work")
+    assert store.write("scripts/setup.sh", uploaded)
+    assert store.write("scripts/result.sh", uploaded)
+    assert store.write("/tmp/work/scripts/setup.sh", generated)
+    output = "/tmp/work/scripts/result.sh"
+    producer = ShellProducer(
+        store,
+        ShellSourceContext(
+            "producer.sh",
+            {
+                "producer.sh": program,
+                "scripts/setup.sh": uploaded.value.text,
+                "scripts/result.sh": uploaded.value.text,
+            },
+        ),
+        tm._next_shell_invocation_word,
+        lambda: None,
+        None,
+    )
+    result = producer.inspect((output,), {}, (output,), initial_cwd=initial_cwd)
+    if initial_cwd is None or initial_cwd == "." and relative_destination:
+        assert result is None
     else:
-        assert output == ((ShellHelperOutput(text=expected),),)
+        assert result is not None
+        assert store.read(output) == (uploaded if initial_cwd == "." else generated)
+        assert store.read("scripts/result.sh") == uploaded
