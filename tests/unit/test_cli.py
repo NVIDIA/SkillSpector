@@ -8621,3 +8621,18 @@ def test_scan_report_saved_message_shows_bracketed_path_literally(tmp_path: Path
     )
     assert "out[b].json" in "".join(result.output.split())
     assert report.exists()
+
+
+def test_recursive_risk_assessment_uses_cli_verdict_hook() -> None:
+    from skillspector import cli
+
+    with patch("skillspector.cli.risk_severity_and_recommendation", return_value=("LOW", "SAFE")):
+        result = cli._multi_skill_risk_assessment(
+            25, execution_failed=False, analysis_incomplete=True
+        )
+
+    assert result == {
+        "max_risk_score": 25,
+        "severity": "LOW",
+        "recommendation": "CAUTION",
+    }
