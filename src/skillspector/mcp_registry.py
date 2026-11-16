@@ -379,7 +379,9 @@ def _load_local_registry(path: Path) -> dict[str, Any]:
         raw = source_file.read(MAX_REGISTRY_BYTES + 1)
     if len(raw) > MAX_REGISTRY_BYTES:
         raise ValueError(f"input exceeds {MAX_REGISTRY_BYTES} bytes")
-    text = raw.decode("utf-8")
+    # Local captures and comparison reports may carry a UTF-8 signature.
+    # Count it in the raw byte budget, then strip only that leading signature.
+    text = raw.decode("utf-8-sig")
     # The JSON decoder owns syntax validation; only bound nesting here, while
     # ignoring delimiters in strings, before its recursive parser runs.
     depth = 0
