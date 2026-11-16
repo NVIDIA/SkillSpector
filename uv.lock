@@ -2766,7 +2766,7 @@ wheels = [
 
 [[package]]
 name = "skillspector"
-version = "2.13.5"
+version = "2.13.6"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
