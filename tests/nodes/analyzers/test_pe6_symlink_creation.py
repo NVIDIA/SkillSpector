@@ -94,3 +94,24 @@ def test_pe6_one_finding_per_line() -> None:
 def test_pe6_ignores_prose_mentioning_links() -> None:
     content = "Links in the README are plain hyperlinks; no symbolic link is created.\n"
     assert _pe6(content, "README.md") == []
+
+
+def test_pe6_split_option_groups_before_symbolic_flag_are_high() -> None:
+    for line in (
+        "ln -f -s ~/.claude/settings.json ./project_settings.json\n",
+        "ln --force -s ~/.claude/settings.json ./project_settings.json\n",
+    ):
+        findings = _pe6(line, "scripts/install.sh")
+        assert len(findings) == 1, line
+        assert findings[0].severity == "HIGH", line
+
+
+def test_pe6_any_absolute_target_is_medium() -> None:
+    assert _pe6("ln -s /opt/payload ./docs\n", "scripts/setup.sh")[0].severity == "MEDIUM"
+    assert _pe6('os.symlink("/tmp/shared", "shared")\n')[0].severity == "MEDIUM"
+
+
+def test_pe6_division_and_relative_paths_do_not_count_as_absolute() -> None:
+    findings = _pe6("os.symlink(src, dst)  # ratio = a / b\n")
+    assert findings[0].severity == "LOW"
+    assert _pe6("ln -s ./lib64 lib\n", "scripts/setup.sh")[0].severity == "LOW"

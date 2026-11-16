@@ -120,3 +120,56 @@ def test_sc11_does_not_descend_through_directory_links(tmp_path: Path) -> None:
 def test_sc11_clean_tree_has_no_findings(tmp_path: Path) -> None:
     (tmp_path / "SKILL.md").write_text("# demo\n", encoding="utf-8")
     assert _sc11(tmp_path) == []
+
+
+def test_sc11_internal_link_stays_medium_when_skill_lives_under_dot_claude(tmp_path: Path) -> None:
+    skill = tmp_path / ".claude" / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# demo\n", encoding="utf-8")
+    (skill / "AGENTS.md").write_text("# agents\n", encoding="utf-8")
+    _link("AGENTS.md", skill / "CLAUDE.md")
+
+    findings = _sc11(skill)
+
+    assert len(findings) == 1
+    assert findings[0].severity == "MEDIUM"
+
+
+def test_sc11_reports_links_under_sc8_skip_dirs_without_sc8(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    skill = tmp_path / "skill"
+    vendor = skill / "node_modules" / "pkg"
+    vendor.mkdir(parents=True)
+    (vendor / "__pycache__").mkdir()
+    (vendor / "__pycache__" / "x.pyc").write_bytes(b"\x00")
+    _link(outside, vendor / "helpdocs")
+
+    findings = supply_chain._analyze_shipped_bytecode(str(skill))
+
+    sc11 = [f for f in findings if f.rule_id == "SC11"]
+    assert [f.file for f in sc11] == ["node_modules/pkg/helpdocs"]
+    assert sc11[0].severity == "HIGH"
+    assert not any(f.rule_id == "SC8" for f in findings)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions exist only on Windows")
+def test_sc11_reports_windows_junction_and_does_not_descend(tmp_path: Path) -> None:
+    import subprocess
+
+    outside = tmp_path / "outside" / "__pycache__"
+    outside.mkdir(parents=True)
+    (outside / "evil.pyc").write_bytes(b"\x00")
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    junction = skill / "vendor"
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(tmp_path / "outside")],
+        check=True,
+        capture_output=True,
+    )
+
+    findings = supply_chain._analyze_shipped_bytecode(str(skill))
+
+    assert {f.rule_id for f in findings} == {"SC11"}
+    assert findings[0].file == "vendor"

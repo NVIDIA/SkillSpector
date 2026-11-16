@@ -182,7 +182,11 @@ PE6_PATTERNS = [
     (r"\.symlink_to\s*\(", 0.5),
     (r"\bos\s*\.\s*link\s*\(", 0.4),
     (r"\bfs\s*\.\s*(?:symlink|symlinkSync|link|linkSync)\s*\(", 0.5),
-    (r"(?<![\w./-])ln\s+(?:-[a-zA-Z]*s[a-zA-Z]*|--symbolic)\b", 0.5),
+    # Option groups may precede the symbolic flag: `ln -f -s`, `ln --force -s`.
+    (
+        r"(?<![\w./-])ln\s+(?:(?:-[a-rt-zA-Z]+|--[a-z-]+)\s+)*(?:-[a-zA-Z]*s[a-zA-Z]*|--symbolic)\b",
+        0.5,
+    ),
     (r"\bmklink\b", 0.5),
     (r"\bNew-Item\b[^\n]{0,160}?-ItemType\s+(?:SymbolicLink|Junction|HardLink)\b", 0.5),
 ]
@@ -198,8 +202,12 @@ _PE6_SENSITIVE_TARGET = re.compile(
     r")",
     re.IGNORECASE,
 )
+# An absolute POSIX path is recognised when it starts a shell argument or a string
+# literal (preceded by whitespace, a quote, `(`, `,` or `=`) and has at least one
+# directory component, which keeps `a / b` divisions and `./rel` paths out.
 _PE6_ESCAPING_TARGET = re.compile(
-    r"(?:~[/\\]|\$HOME\b|%USERPROFILE%|expanduser\s*\(|Path\s*\.\s*home\s*\(|\.\./|[\s\"'(,=]/(?:etc|root|home|Users|var|usr)/|[A-Za-z]:\\)"
+    r"(?:~[/\\]|\$HOME\b|%USERPROFILE%|expanduser\s*\(|Path\s*\.\s*home\s*\(|\.\./"
+    r"|(?:^|[\s\"'(,=])/[A-Za-z0-9_.-]+/|[A-Za-z]:\\)"
 )
 
 _READ_ONLY_PASSWD_VOLUME = re.compile(
