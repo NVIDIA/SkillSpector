@@ -6,6 +6,11 @@ This maintenance release builds on v2.13.5 and corrects incomplete static inspec
 
 - [#1123](https://github.com/NVIDIA/SkillSpector/pull/1123): Complete JSON values such as `{"name":"nice"}` and `{"keywords":["sudo"]}` no longer produce a false `static_parse_limit` / `command_word_boundary` diagnostic. Validated JSON value boundaries establish when a bare wrapper name has no operands. Command arguments, runtime-selected wrappers, consumed options, clipped inputs, and unresolved shell fragments retain their existing checks and incomplete-inspection diagnostics.
 
+## Minor updates
+
+- [#807](https://github.com/NVIDIA/SkillSpector/pull/807): Correct both development-guide links to the shared LLM analyzer base source module.
+- Retain the Stage 2 analysis documentation clarification from [#684](https://github.com/NVIDIA/SkillSpector/pull/684) and temporary-folder cleanup fixes from [#567](https://github.com/NVIDIA/SkillSpector/pull/567), [#568](https://github.com/NVIDIA/SkillSpector/pull/568), and [#666](https://github.com/NVIDIA/SkillSpector/pull/666), all already included in v2.13.5.
+
 ## Previously released fixes retained
 
 The v2.13.5 baseline already includes [#1087](https://github.com/NVIDIA/SkillSpector/pull/1087), grounding semantic intent findings in observed operations and declaration mismatches rather than domain labels alone. It also includes the requested fixes or equivalent backports from [#742](https://github.com/NVIDIA/SkillSpector/pull/742), [#773](https://github.com/NVIDIA/SkillSpector/pull/773), [#814](https://github.com/NVIDIA/SkillSpector/pull/814), [#963](https://github.com/NVIDIA/SkillSpector/pull/963), [#967](https://github.com/NVIDIA/SkillSpector/pull/967), [#855](https://github.com/NVIDIA/SkillSpector/pull/855), [#851](https://github.com/NVIDIA/SkillSpector/pull/851), [#899](https://github.com/NVIDIA/SkillSpector/pull/899), [#955](https://github.com/NVIDIA/SkillSpector/pull/955), [#965](https://github.com/NVIDIA/SkillSpector/pull/965), [#969](https://github.com/NVIDIA/SkillSpector/pull/969), [#752](https://github.com/NVIDIA/SkillSpector/pull/752), and [#662](https://github.com/NVIDIA/SkillSpector/pull/662).
