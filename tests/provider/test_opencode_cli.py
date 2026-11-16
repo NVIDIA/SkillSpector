@@ -35,6 +35,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -65,6 +66,7 @@ from skillspector.providers._agent_cli import (
     _is_supported_opencode_version_v2,
     _opencode_auth_check,
     _opencode_config_2x,
+    _opencode_managed_preference_paths,
     _opencode_system_config_dir,
     _parse_opencode_debug_agents,
     _parse_opencode_output,
@@ -446,9 +448,16 @@ class TestOpencodeVersionRangeV2:
         # mocked auth command, so point the gate at an empty temporary
         # directory: on a developer machine with a configured system
         # plugin the gate would otherwise refuse before the mock runs.
+        # The effective lookup is _opencode_system_config_dir, not the
+        # module constant: on Windows the helper derives the directory
+        # from the child environment passed to the gate, so patching the
+        # constant alone would still leave the auth check reading the
+        # host directory (review round 5, #1086).
         empty_system_dir = tmp_path / "system"
         empty_system_dir.mkdir()
-        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(empty_system_dir))
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(empty_system_dir)
+        )
 
     def test_supported_v2_versions_are_an_explicit_verified_set(self) -> None:
         assert _OPENCODE_SUPPORTED_VERSIONS_V2 == frozenset({(2, 2, 6), (2, 2, 7)})
@@ -792,10 +801,15 @@ class TestOpencodeDenyAllPolicyV2:
         # starts. Point the gate at an empty temporary directory so the
         # results never depend on the host's real system directory; the
         # dedicated configured-source cases below override this default
-        # with their own directory.
+        # with their own directory. The effective lookup is
+        # _opencode_system_config_dir: on Windows it derives from the
+        # child environment, so patching the module constant alone would
+        # not isolate the preflight (review round 5, #1086).
         empty_system_dir = tmp_path / "system"
         empty_system_dir.mkdir()
-        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(empty_system_dir))
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(empty_system_dir)
+        )
 
     @staticmethod
     def _write_fake_opencode_v2(
@@ -1106,7 +1120,9 @@ class TestOpencodeDenyAllPolicyV2:
         # gate at the configured one.
         system_dir = tmp_path / "system"
         self._write_system_plugin_allow(system_dir)
-        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(system_dir))
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(system_dir)
+        )
 
         # Preflight: the gate fires before `debug agents --standalone`.
         binary = tmp_path / "opencode"
@@ -1155,7 +1171,9 @@ class TestOpencodeDenyAllPolicyV2:
             ),
             encoding="utf-8",
         )
-        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(system_dir))
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(system_dir)
+        )
         binary = tmp_path / "opencode"
         markers = tmp_path / "outside"
         markers.mkdir()
@@ -1187,13 +1205,17 @@ class TestOpencodeDenyAllPolicyV2:
         self._write_fake_opencode_v2(binary, markers)
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
-        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(tmp_path / "absent"))
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(tmp_path / "absent")
+        )
         response = run_agent_cli("opencode", "use every host tool", model="")
         assert response.startswith("policy held:")
 
         empty_dir = tmp_path / "empty-system"
         empty_dir.mkdir()
-        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(empty_dir))
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(empty_dir)
+        )
         response = run_agent_cli("opencode", "use every host tool", model="")
         assert response.startswith("policy held:")
 
@@ -1202,17 +1224,20 @@ class TestOpencodeDenyAllPolicyV2:
 # Review round 3 (#1086): pre-start system-source gate for OpenCode 2.x.
 # A system-level plugin.use allow outranks the project deny (verified live
 # on real 2.2.7), so the 2.x preflight and auth probe refuse to start when
-# the platform system directory configures plugins. The gate reads the
-# module constant, so tests point it at a temporary directory.
+# the platform system directory configures plugins. The gate resolves the
+# directory through _opencode_system_config_dir, so the direct tests below
+# point the module constant at a temporary directory while the end-to-end
+# fixtures patch the helper.
 # ---------------------------------------------------------------------------
 
 
 class TestOpencodeSystemSources:
     """Direct unit tests for the 2.x pre-start system-source gate.
 
-    The gate reads the module constant ``_OPENCODE_SYSTEM_CONFIG_DIR``,
-    so these tests point it at a temporary directory. The end-to-end
-    fake-binary coverage lives in TestOpencodeDenyAllPolicyV2.
+    These tests call the gate without a child environment, so the helper
+    returns the module constant ``_OPENCODE_SYSTEM_CONFIG_DIR`` and these
+    tests point it at a temporary directory. The end-to-end fake-binary
+    coverage lives in TestOpencodeDenyAllPolicyV2.
     """
 
     @pytest.fixture(autouse=True)
@@ -1447,6 +1472,199 @@ class TestOpencodeSystemSources:
         monkeypatch.setattr(sys, "platform", "win32")
         assert _opencode_system_config_dir({}) == os.path.join(r"C:\ProgramData", "opencode")
 
+    def test_system_dir_lookup_is_case_insensitive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 5 (#1086): Python exposes PROGRAMDATA, but the
+        # scrubbed child environment is a plain dict, so asking for
+        # "ProgramData" missed it and the gate fell back to C: while
+        # OpenCode read D:. A system allow under the child's uppercase
+        # key must be refused.
+        monkeypatch.setattr(sys, "platform", "win32")
+        program_data = tmp_path / "ProgramData"
+        system_dir = program_data / "opencode"
+        system_dir.mkdir(parents=True)
+        (system_dir / "opencode.json").write_text(
+            json.dumps(
+                {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        assert _opencode_system_config_dir({"PROGRAMDATA": str(program_data)}) == str(system_dir)
+        assert _opencode_system_config_dir({"programdata": str(program_data)}) == str(system_dir)
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources({"PROGRAMDATA": str(program_data)})
+        _check_opencode_system_sources({"PROGRAMDATA": str(tmp_path / "other-drive")})
+
+    def test_system_dir_empty_programdata_falls_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Review round 5 (#1086): match OpenCode's `env.ProgramData ||
+        # "C:\\ProgramData"` (pinned discovery.ts): an empty value falls
+        # back to C:\ProgramData, it is not used as the directory.
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert _opencode_system_config_dir({"ProgramData": ""}) == os.path.join(
+            r"C:\ProgramData", "opencode"
+        )
+        assert _opencode_system_config_dir({"PROGRAMDATA": ""}) == os.path.join(
+            r"C:\ProgramData", "opencode"
+        )
+
+    def test_effective_lookup_is_the_helper_not_the_constant(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 5 (#1086): passing child_env makes the helper
+        # derive the directory from the child environment on Windows,
+        # bypassing _OPENCODE_SYSTEM_CONFIG_DIR, so patching the constant
+        # alone leaves the auth fixtures reading the host directory. The
+        # effective lookup is _opencode_system_config_dir: patching it
+        # isolates the gate even when the child env names a configured
+        # host directory.
+        monkeypatch.setattr(sys, "platform", "win32")
+        program_data = tmp_path / "ProgramData"
+        system_dir = program_data / "opencode"
+        system_dir.mkdir(parents=True)
+        (system_dir / "opencode.json").write_text(
+            json.dumps(
+                {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources({"PROGRAMDATA": str(program_data)})
+        empty_system_dir = tmp_path / "isolated-system"
+        empty_system_dir.mkdir()
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(empty_system_dir)
+        )
+        _check_opencode_system_sources({"PROGRAMDATA": str(program_data)})
+
+    @staticmethod
+    def _write_mdm_plist(path: Path, config: dict[str, object]) -> None:
+        with open(path, "wb") as handle:
+            plistlib.dump(config, handle)
+
+    def test_mdm_plist_allow_raises(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Review round 5 (#1086): an MDM plugin.use allow outranks the
+        # project deny exactly like a system-directory allow, so the gate
+        # must refuse when the macOS managed-preference plist allows it.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        plist = tmp_path / "ai.opencode.managed.plist"
+        self._write_mdm_plist(
+            plist,
+            {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]},
+        )
+        monkeypatch.setattr(_agent_cli, "_opencode_managed_preference_paths", lambda: [str(plist)])
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_mdm_plist_plugin_entry_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 5 (#1086): a plugin listed in the MDM plist is a
+        # managed plugin source, so the gate must refuse it too.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        plist = tmp_path / "ai.opencode.managed.plist"
+        self._write_mdm_plist(plist, {"plugins": ["some-plugin"]})
+        monkeypatch.setattr(_agent_cli, "_opencode_managed_preference_paths", lambda: [str(plist)])
+        with pytest.raises(AgentCLIError, match="lists plugin"):
+            _check_opencode_system_sources()
+
+    def test_mdm_plist_deny_passes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Review round 5 (#1086): an MDM plist that only denies plugin.use
+        # configures no plugin source, so the gate passes.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        plist = tmp_path / "ai.opencode.managed.plist"
+        self._write_mdm_plist(
+            plist,
+            {"policies": [{"action": "plugin.use", "resource": "*", "effect": "deny"}]},
+        )
+        monkeypatch.setattr(_agent_cli, "_opencode_managed_preference_paths", lambda: [str(plist)])
+        _check_opencode_system_sources()
+
+    def test_mdm_plist_absent_passes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Review round 5 (#1086): no MDM plist deployed means no managed
+        # preference source, so the gate passes.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(
+            _agent_cli,
+            "_opencode_managed_preference_paths",
+            lambda: [str(tmp_path / "absent.plist")],
+        )
+        _check_opencode_system_sources()
+
+    def test_mdm_plist_unparseable_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 5 (#1086): a present plist that cannot be parsed
+        # must fail closed, never be treated as an empty one.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        plist = tmp_path / "ai.opencode.managed.plist"
+        plist.write_bytes(b"not a plist")
+        monkeypatch.setattr(_agent_cli, "_opencode_managed_preference_paths", lambda: [str(plist)])
+        with pytest.raises(AgentCLIError, match="could not be parsed"):
+            _check_opencode_system_sources()
+
+    def test_mdm_plist_first_present_wins(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 5 (#1086): only the first plist present loads
+        # (pinned discovery.ts), so a per-user deny plist wins over a
+        # machine-wide allow plist.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        user_plist = tmp_path / "user.plist"
+        machine_plist = tmp_path / "machine.plist"
+        self._write_mdm_plist(
+            user_plist,
+            {"policies": [{"action": "plugin.use", "resource": "*", "effect": "deny"}]},
+        )
+        self._write_mdm_plist(
+            machine_plist,
+            {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]},
+        )
+        monkeypatch.setattr(
+            _agent_cli,
+            "_opencode_managed_preference_paths",
+            lambda: [str(user_plist), str(machine_plist)],
+        )
+        _check_opencode_system_sources()
+
+    def test_mdm_plist_ignored_off_darwin(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 5 (#1086): OpenCode loads managed preferences on
+        # macOS only, so the plist check is skipped elsewhere even when a
+        # plist path is configured.
+        plist = tmp_path / "ai.opencode.managed.plist"
+        self._write_mdm_plist(
+            plist,
+            {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]},
+        )
+        monkeypatch.setattr(_agent_cli, "_opencode_managed_preference_paths", lambda: [str(plist)])
+        _check_opencode_system_sources()
+
+    def test_mdm_plist_checked_when_system_dir_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 5 (#1086): a missing system directory must not skip
+        # the MDM check: the plist is a separate managed source.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(tmp_path / "absent"))
+        plist = tmp_path / "ai.opencode.managed.plist"
+        self._write_mdm_plist(
+            plist,
+            {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]},
+        )
+        monkeypatch.setattr(_agent_cli, "_opencode_managed_preference_paths", lambda: [str(plist)])
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_managed_preference_paths(self) -> None:
+        # Review round 5 (#1086): the per-user MDM plist comes first,
+        # then the machine-wide one (pinned discovery.ts preferencePaths).
+        assert _opencode_managed_preference_paths("someuser") == [
+            "/Library/Managed Preferences/someuser/ai.opencode.managed.plist",
+            "/Library/Managed Preferences/ai.opencode.managed.plist",
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Review round 2 (#1086): version-specific OPENCODE_DISABLE_PROJECT_CONFIG
@@ -1491,10 +1709,15 @@ class TestOpencodeAuthProbeIsolation:
         # directory: on a developer machine with a configured system
         # plugin the gate would otherwise refuse before the fake binary
         # runs. The undecodable-config case below overrides this default
-        # with its own directory.
+        # with its own directory. The effective lookup is
+        # _opencode_system_config_dir: on Windows it derives from the
+        # child environment, so patching the module constant alone would
+        # not isolate the probe (review round 5, #1086).
         empty_system_dir = tmp_path / "system"
         empty_system_dir.mkdir()
-        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(empty_system_dir))
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(empty_system_dir)
+        )
 
     @staticmethod
     def _write_fake_auth_2x(binary: Path, markers: Path) -> None:
@@ -1692,7 +1915,9 @@ class TestOpencodeAuthProbeIsolation:
         # The autouse fixture already created this empty directory.
         system_dir = tmp_path / "system"
         (system_dir / "opencode.json").write_bytes(b'{"policies": [\xff\xfe]}')
-        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(system_dir))
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(system_dir)
+        )
         binary = tmp_path / "opencode"
         markers = tmp_path / "outside"
         markers.mkdir()
@@ -1709,10 +1934,15 @@ class TestOpencodeAncestorProject:
         # The 2.x run here goes through the real preflight, which runs
         # the system-source gate before any server starts: point the
         # gate at an empty temporary directory so the result never
-        # depends on the host's real system directory.
+        # depends on the host's real system directory. The effective
+        # lookup is _opencode_system_config_dir: on Windows it derives
+        # from the child environment, so patching the module constant
+        # alone would not isolate the preflight (review round 5, #1086).
         empty_system_dir = tmp_path / "system"
         empty_system_dir.mkdir()
-        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(empty_system_dir))
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(empty_system_dir)
+        )
 
     @pytest.fixture()
     def project(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:

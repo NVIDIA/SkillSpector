@@ -47,8 +47,10 @@ compatibility, but Codex inference is disabled before a subprocess is started.
 
 from __future__ import annotations
 
+import getpass
 import json
 import os
+import plistlib
 import re
 import secrets
 import shutil
@@ -60,6 +62,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+from xml.parsers.expat import ExpatError
 
 from skillspector.logging_config import get_logger
 
@@ -541,9 +544,15 @@ _OPENCODE_SUPPORTED_VERSIONS_V2 = frozenset(
 # outranks the project deny, and a plugin listed or installed here loads
 # into the server before the project policy is read, so the 2.x preflight
 # and auth probe refuse to start when this directory configures plugins
-# (see _check_opencode_system_sources). Tests monkeypatch this constant to
-# a temporary directory; production code reads the module global at call
-# time and must never capture it at import. On Windows the gate instead
+# (see _check_opencode_system_sources). The same gate also inspects the
+# macOS MDM managed-preference plist, the other managed source in the
+# pinned discovery.ts, because its policies outrank the project deny too.
+# Tests monkeypatch this constant to a temporary directory for the direct
+# gate tests; tests that drive the preflight or auth probe patch
+# _opencode_system_config_dir instead, because on Windows that helper
+# derives the directory from the child environment and the constant
+# alone does not isolate it. Production code reads the module global at
+# call time and must never capture it at import. On Windows the gate
 # derives the directory from the child environment passed to OpenCode
 # (see _opencode_system_config_dir), so the inspected path is the path
 # the child actually resolves.
@@ -1054,47 +1063,143 @@ def _load_opencode_system_config(path: str) -> dict[str, Any]:
 def _opencode_system_config_dir(env: dict[str, str] | None = None) -> str:
     """Return the platform system directory OpenCode 2.x discovers.
 
-    On Windows the directory is ``<ProgramData>\\opencode`` where
+    This is the single effective lookup for the system-source gate: the
+    gate never reads ``_OPENCODE_SYSTEM_CONFIG_DIR`` directly. On
+    Windows the directory is ``<ProgramData>\\opencode`` where
     ProgramData comes from *env*, the environment passed to the OpenCode
     child, when given. The gate must inspect the same directory the
     child resolves: deriving it from the parent environment while the
     scrubbed child env dropped PROGRAMDATA let the child fall back to
-    ``C:\\ProgramData`` while the gate inspected another drive. On other
-    platforms the directory is fixed, so the module constant is used
-    (tests monkeypatch it); without *env* the constant is used on every
-    platform.
+    ``C:\\ProgramData`` while the gate inspected another drive. The
+    lookup is case-insensitive because the scrubbed child env is a
+    plain dict while Python exposes the variable as ``PROGRAMDATA``,
+    and an empty value falls back to ``C:\\ProgramData``, matching
+    OpenCode's ``env.ProgramData || "C:\\\\ProgramData"`` (pinned
+    discovery.ts). On other platforms the directory is fixed, so the
+    module constant is used (tests monkeypatch it); without *env* the
+    constant is used on every platform.
     """
     if env is not None and sys.platform == "win32":
-        return os.path.join(env.get("ProgramData", r"C:\ProgramData"), "opencode")
+        program_data = None
+        for key, value in env.items():
+            if key.upper() == "PROGRAMDATA":
+                program_data = value
+                break
+        if not program_data:
+            program_data = r"C:\ProgramData"
+        return os.path.join(program_data, "opencode")
     return _OPENCODE_SYSTEM_CONFIG_DIR
 
 
-def _check_opencode_system_sources(env: dict[str, str] | None = None) -> None:
+def _refuse_opencode_managed_config(config: dict[str, Any], path: str, description: str) -> None:
+    """Raise AgentCLIError when a managed config document configures plugins.
+
+    *config* is the parsed document, *path* its source file (used in the
+    error message), *description* the source kind (``"system
+    configuration"`` for a system-directory file, ``"managed
+    preferences"`` for the macOS MDM plist). Shared by both managed
+    sources because both outrank the project deny the same way: a
+    ``plugin.use`` allow, or any listed plugin, must refuse the start.
+    """
+    policies = config.get("policies", [])
+    if not isinstance(policies, list):
+        raise AgentCLIError(f"OpenCode {description} {path!r} has a non-list 'policies' value")
+    for rule in policies:
+        if not isinstance(rule, dict):
+            raise AgentCLIError(f"OpenCode {description} {path!r} has a malformed policy rule")
+        if rule.get("action") == "plugin.use" and rule.get("effect") != "deny":
+            raise AgentCLIError(
+                f"OpenCode {description} "
+                f"{path!r} allows 'plugin.use' (effect "
+                f"{str(rule.get('effect'))!r}): a managed allow outranks "
+                "the project deny, so refusing to start a 2.x server"
+            )
+    for key in ("plugin", "plugins"):
+        if key not in config:
+            continue
+        listed = config[key]
+        if isinstance(listed, str):
+            listed = [listed]
+        elif isinstance(listed, dict):
+            listed = list(listed)
+        elif not isinstance(listed, list):
+            raise AgentCLIError(f"OpenCode {description} {path!r} has a malformed {key!r} value")
+        for entry in listed:
+            if isinstance(entry, str) and (not entry or entry.startswith("-")):
+                continue
+            raise AgentCLIError(
+                f"OpenCode {description} "
+                f"{path!r} lists plugin {entry!r}: refusing to start "
+                "a 2.x server with a configured managed plugin"
+            )
+
+
+def _opencode_managed_preference_paths(username: str | None = None) -> list[str]:
+    """macOS MDM managed-preference plists, most specific first.
+
+    Pinned OpenCode 2.2.6/2.2.7 ``discovery.ts`` ``preferencePaths``: the
+    per-user plist wins over the machine-wide one, and only the first
+    plist present loads. *username* defaults to the current user (with
+    the same ``"user"`` fallback OpenCode uses when it cannot be read).
+    """
+    if username is None:
+        try:
+            username = getpass.getuser()
+        except (KeyError, OSError):
+            username = "user"
+    base = "/Library/Managed Preferences"
+    return [
+        os.path.join(base, username, "ai.opencode.managed.plist"),
+        os.path.join(base, "ai.opencode.managed.plist"),
+    ]
+
+
+def _check_opencode_managed_preferences() -> None:
+    """Fail closed when a macOS MDM managed-preference plist configures plugins.
+
+    2.x only, darwin only. Managed policies load first and evaluate
+    first (pinned ``config.ts``), so an MDM ``plugin.use`` allow or a
+    plugin listed in the plist outranks the project deny exactly like a
+    system-directory allow does. OpenCode 2.2.6/2.2.7 offers no flag or
+    environment variable to suppress managed sources: the server
+    bootstrap never passes ``options.system``, so there is no supported
+    way to turn them off before startup. The boundary is therefore
+    enforced by refusal: when the plist configures a plugin source, the
+    2.x server is not started. A missing plist passes; a present plist
+    that cannot be read or parsed fails closed.
+    """
+    if sys.platform != "darwin":
+        return
+    for path in _opencode_managed_preference_paths():
+        if not os.path.isfile(path):
+            continue
+        # Only the first plist present loads, matching discovery.ts.
+        try:
+            with open(path, "rb") as handle:
+                config = plistlib.load(handle)
+        except OSError as exc:
+            raise AgentCLIError(
+                f"OpenCode managed preferences {path!r} could not be read: {exc}"
+            ) from exc
+        except (ValueError, ExpatError) as exc:
+            raise AgentCLIError(
+                f"OpenCode managed preferences {path!r} could not be parsed: {exc}"
+            ) from exc
+        if not isinstance(config, dict):
+            raise AgentCLIError(f"OpenCode managed preferences {path!r} is not a dictionary")
+        _refuse_opencode_managed_config(config, path, "managed preferences")
+        return
+
+
+def _check_opencode_system_directory(system_dir: str) -> None:
     """Fail closed when the platform system directory configures plugins.
 
-    2.x only. A system-level ``plugin.use`` allow outranks the project
-    deny (verified live on real 2.2.7: a configured system plugin runs
-    during startup while the agent permission check passes), so the
-    project policy alone cannot close the boundary. Before any 2.x
-    server starts (the preflight ``debug agents --standalone`` and the
-    ``auth list --standalone`` probe), inspect the platform system
-    directory (see :func:`_opencode_system_config_dir`; callers pass the
-    child environment so the inspected path is the child's effective
-    path) and refuse when it configures any plugin source:
-
-    - a ``policies`` rule with action exactly ``plugin.use`` and an
-      effect other than ``deny`` (``allow`` or ``ask`` both outrank the
-      project deny);
-    - any plugin listed in ``plugin`` or ``plugins`` (add operations
-      only: a ``-name`` removal entry configures no plugin);
-    - any entry under ``<system dir>/plugin`` or ``<system dir>/plugins``.
-
-    A missing system directory means no machine-wide source exists and
-    the check passes. A directory that cannot be listed, or a system
-    config file that cannot be read or parsed, fails closed: an
-    unreadable system policy must never be treated as an empty one.
+    Split out of :func:`_check_opencode_system_sources` so a missing
+    system directory does not skip the MDM preference check. A missing
+    directory means no machine-wide source exists and this part passes.
+    A directory that cannot be listed, or a system config file that
+    cannot be read or parsed, fails closed.
     """
-    system_dir = _opencode_system_config_dir(env)
     try:
         entries = os.listdir(system_dir)
     except FileNotFoundError:
@@ -1108,43 +1213,7 @@ def _check_opencode_system_sources(env: dict[str, str] | None = None) -> None:
             continue
         path = os.path.join(system_dir, filename)
         config = _load_opencode_system_config(path)
-        policies = config.get("policies", [])
-        if not isinstance(policies, list):
-            raise AgentCLIError(
-                f"OpenCode system configuration {path!r} has a non-list 'policies' value"
-            )
-        for rule in policies:
-            if not isinstance(rule, dict):
-                raise AgentCLIError(
-                    f"OpenCode system configuration {path!r} has a malformed policy rule"
-                )
-            if rule.get("action") == "plugin.use" and rule.get("effect") != "deny":
-                raise AgentCLIError(
-                    "OpenCode system configuration "
-                    f"{path!r} allows 'plugin.use' (effect "
-                    f"{str(rule.get('effect'))!r}): a system allow outranks "
-                    "the project deny, so refusing to start a 2.x server"
-                )
-        for key in ("plugin", "plugins"):
-            if key not in config:
-                continue
-            listed = config[key]
-            if isinstance(listed, str):
-                listed = [listed]
-            elif isinstance(listed, dict):
-                listed = list(listed)
-            elif not isinstance(listed, list):
-                raise AgentCLIError(
-                    f"OpenCode system configuration {path!r} has a malformed {key!r} value"
-                )
-            for entry in listed:
-                if isinstance(entry, str) and (not entry or entry.startswith("-")):
-                    continue
-                raise AgentCLIError(
-                    "OpenCode system configuration "
-                    f"{path!r} lists plugin {entry!r}: refusing to start "
-                    "a 2.x server with a configured system plugin"
-                )
+        _refuse_opencode_managed_config(config, path, "system configuration")
     for subdir in ("plugin", "plugins"):
         if subdir not in entries:
             continue
@@ -1163,6 +1232,41 @@ def _check_opencode_system_sources(env: dict[str, str] | None = None) -> None:
                 f"{plugin_dir!r} is not empty: refusing to start a 2.x "
                 "server with a configured system plugin"
             )
+
+
+def _check_opencode_system_sources(env: dict[str, str] | None = None) -> None:
+    """Fail closed when a managed OpenCode source configures plugins.
+
+    2.x only. A managed ``plugin.use`` allow outranks the project deny
+    (verified live on real 2.2.7: a configured system plugin runs during
+    startup while the agent permission check passes), so the project
+    policy alone cannot close the boundary. Before any 2.x server starts
+    (the preflight ``debug agents --standalone`` and the ``auth list
+    --standalone`` probe), inspect both managed sources and refuse when
+    either configures any plugin source:
+
+    - the platform system directory (see
+      :func:`_opencode_system_config_dir`; callers pass the child
+      environment so the inspected path is the child's effective path);
+    - on macOS, the MDM managed-preference plist (see
+      :func:`_check_opencode_managed_preferences`).
+
+    Each source refuses on:
+
+    - a ``policies`` rule with action exactly ``plugin.use`` and an
+      effect other than ``deny`` (``allow`` or ``ask`` both outrank the
+      project deny);
+    - any plugin listed in ``plugin`` or ``plugins`` (add operations
+      only: a ``-name`` removal entry configures no plugin);
+    - any entry under ``<system dir>/plugin`` or ``<system dir>/plugins``.
+
+    A missing source means no machine-wide plugin exists there and that
+    part passes. A source that cannot be listed, read, or parsed fails
+    closed: an unreadable managed policy must never be treated as an
+    empty one.
+    """
+    _check_opencode_system_directory(_opencode_system_config_dir(env))
+    _check_opencode_managed_preferences()
 
 
 def _preflight_opencode_policy(
