@@ -741,3 +741,21 @@ class TestScanPreflightControls:
 
         check.assert_not_called()
         assert "SKILLSPECTOR_TEMPERATURE" not in result.output
+
+    def test_scan_preflight_uses_cli_control_hook(self, tmp_path: Path) -> None:
+        (tmp_path / "SKILL.md").write_text("---\nname: demo\n---\nHello.\n", encoding="utf-8")
+        output = tmp_path / "report.json"
+        with (
+            patch(
+                "skillspector.cli.unsupported_control_error", return_value="control hook rejected"
+            ),
+            patch("skillspector.cli.graph.invoke", side_effect=AssertionError("analysis started")),
+        ):
+            result = CliRunner().invoke(
+                app, ["scan", str(tmp_path), "--format", "json", "--output", str(output)]
+            )
+
+        assert result.exit_code == 2
+        assert result.stdout == ""
+        assert "Error: control hook rejected" in result.stderr
+        assert not output.exists()
