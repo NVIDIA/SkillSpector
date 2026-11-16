@@ -21,6 +21,9 @@ SC5: Abandoned dependencies — flags known-abandoned or archived packages.
 SC6: Typosquatting — flags package names similar to popular packages.
 SC7: Untrusted container image — flags image signature / registry-verification bypass.
 SC8: Shipped Python bytecode — flags __pycache__/ and *.pyc/*.pyo that discovery skips.
+SC11: Shipped symlink/junction — flags links that discovery refuses to follow, so the
+      linked content is unscanned and an approved file operation on the link path can
+      reach a target outside the bundle (SymJack / GhostApproval, CWE-59 + CWE-451).
 SC9: Concealed executable artifact — flags executables nested in document or hidden artifacts.
 SC10: Dependency source redirection — flags noncanonical package registries and indexes.
 TR1–TR3: Trigger analysis — flags overly broad, shadowing, or baiting triggers.
@@ -3913,6 +3916,22 @@ MAX_SC8_ANALYSIS_SECONDS = 5.0
 MAX_SC8_FINDINGS = 10_000
 MAX_SC8_LIMITATIONS = 256
 
+# SC11: symlink / junction shipped inside the bundle. The walker above already
+# refuses to follow links; SC11 turns that silent skip into a finding. Targets
+# that name credential stores or agent configuration are what the published
+# symlink-hijack chains (SymJack, GhostApproval) write through.
+_SC11_SENSITIVE_TARGET = re.compile(
+    r"(?:"
+    r"(?<![\w-])\.(?:ssh|aws|gnupg|kube|docker|azure|config/gcloud|npmrc|netrc|git-credentials)(?![\w-])"
+    r"|(?<![\w-])\.env(?:\.[\w-]+)?(?![\w-])"
+    r"|(?<![\w-])\.(?:claude|codex|gemini|cursor|windsurf|augment)(?![\w-])"
+    r"|(?<![\w-])\.?mcp\.json(?![\w-])"
+    r"|copilot-instructions\.md"
+    r"|(?:^|/)etc/(?:passwd|shadow|sudoers|hosts)"
+    r")",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class _SupplementalLimitation:
@@ -4050,6 +4069,68 @@ def _scan_shipped_bytecode(
         findings.append(analyzer_finding_to_finding(analyzer_finding))
         return True
 
+    root_resolved = os.path.realpath(root)
+
+    def add_symlink_finding(relative_path: str, link_path: Path) -> bool:
+        """Emit SC11 for a link entry. Never follows the link for reads."""
+        nonlocal stop_scan
+        try:
+            target = os.readlink(link_path)
+        except OSError as exc:
+            add_limitation(
+                _SupplementalLimitation(
+                    path=relative_path,
+                    reason=LedgerReason.STAT_ERROR,
+                    error_class=type(exc).__name__,
+                )
+            )
+            return True
+        resolved = os.path.realpath(link_path)
+        inside = resolved == root_resolved or resolved.startswith(root_resolved + os.sep)
+        dangling = not os.path.exists(resolved)
+        sensitive = bool(
+            _SC11_SENSITIVE_TARGET.search(target) or _SC11_SENSITIVE_TARGET.search(resolved)
+        )
+        if len(findings) >= finding_limit:
+            add_limitation(
+                _SupplementalLimitation(
+                    path=relative_path,
+                    reason=LedgerReason.OUTPUT_LIMIT,
+                    observed_findings=len(findings) + 1,
+                    limit_findings=finding_limit,
+                )
+            )
+            stop_scan = True
+            return False
+        if sensitive:
+            severity, confidence = Severity.HIGH, 0.95
+            why = "link target names a credential store or agent configuration path"
+        elif not inside:
+            severity, confidence = Severity.HIGH, 0.9
+            why = "link resolves outside the skill bundle"
+        elif dangling:
+            severity, confidence = Severity.HIGH, 0.85
+            why = "link is dangling; it can be retargeted after install"
+        else:
+            severity, confidence = Severity.MEDIUM, 0.7
+            why = "link stays inside the bundle, but the linked content is not scanned"
+        analyzer_finding = AnalyzerFinding(
+            rule_id="SC11",
+            message=f"Skill ships a symbolic link ({why})",
+            severity=severity,
+            location=Location(file=relative_path, start_line=1),
+            confidence=confidence,
+            tags=[PatternCategory.SUPPLY_CHAIN.value],
+            matched_text=f"{relative_path} -> {target}"[:200],
+            context=(
+                "Discovery does not follow links, so linked content is unscanned. "
+                "Agent approval prompts may show the link path rather than its "
+                f"destination; an approved operation on this path reaches {resolved}."
+            ),
+        )
+        findings.append(analyzer_finding_to_finding(analyzer_finding))
+        return True
+
     while stack and not stop_scan:
         directory, relative_directory, depth = stack.pop()
         if runtime_exhausted(relative_directory):
@@ -4131,6 +4212,8 @@ def _scan_shipped_bytecode(
                 )
                 continue
             if is_link:
+                if not add_symlink_finding(relative_path, directory / name):
+                    break
                 continue
             if is_directory:
                 if name == "__pycache__" and not add_finding(f"{relative_path}/", directory=True):
@@ -4159,7 +4242,7 @@ def _scan_shipped_bytecode(
 
 
 def _analyze_shipped_bytecode(skill_path: str) -> list[Finding]:
-    """Emit SC8 when a skill ships __pycache__ dirs or .pyc/.pyo files.
+    """Emit SC8 (bytecode) and SC11 (shipped symlink) from one bounded walk.
 
     ``build_context`` keeps bytecode out of content analysis and
     ``static_runner`` treats ``.pyc`` as binary. Presence alone is a HIGH
