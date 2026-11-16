@@ -76,10 +76,11 @@ def _is_p9_skipped_path(file_path: str) -> bool:
 _FR_E = r"(?:e[̀́̂̈]?|[éèêë])"
 _FR_A = r"(?:à?|à)"
 _FR_O = r"(?:ô?|ô)"
+_FR_U = r"(?:u\u0302?|û)"
 _FR_APOS = r"['’]?"
 _FR_USER = rf"(?:l{_FR_APOS}|les\s+)?utilisateurs?"
 _FR_RULES = rf"(?:r{_FR_E}gles?|consignes?|directives?|instructions?)"
-_FR_SAFETY = rf"(?:s{_FR_E}curit{_FR_E}|s{_FR_E}ret{_FR_E})"
+_FR_SAFETY = rf"(?:s{_FR_E}curit{_FR_E}|s{_FR_U}ret{_FR_E})"
 _FR_DET = r"(?:(?:toutes\s+)?(?:les|tes|vos)\s+|toutes\s+)?"
 _FR_PREVIOUS = rf"(?:pr{_FR_E}c{_FR_E}dentes?|ant{_FR_E}rieures?|initiales?|d{_FR_APOS}origine)"
 _FR_SEND = (
@@ -138,7 +139,7 @@ P1_PATTERNS = [
         0.95,
     ),
     (
-        rf"(?:active|activez)\s+(?:le\s+)?mode\s+"
+        rf"\b(?:active|activez)\s+(?:le\s+)?mode\s+"
         rf"(?:d{_FR_E}veloppeur|d{_FR_E}bogage|debug|admin(?:istrateur)?|root)",
         0.7,
     ),
@@ -305,7 +306,7 @@ P3_PATTERNS_FR = [
 P4_PATTERNS_FR = [
     (
         rf"(?:recommande|recommandez|privil{_FR_E}gie|privil{_FR_E}giez|sugg{_FR_E}re|sugg{_FR_E}rez"
-        rf"|choisis|choisissez|utilise|utilisez)\s+toujours\s+(?:\w+\s+){{0,3}}"
+        rf"|choisis|choisissez|utilise|utilisez)\s+toujours\s+(?:[\w\u0300-\u036f]+\s+){{0,3}}"
         rf"(?:plut{_FR_O}t\s+que|au\s+lieu\s+de|{_FR_A}\s+la\s+place\s+de)",
         0.7,
     ),
