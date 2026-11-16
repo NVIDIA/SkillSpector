@@ -1438,8 +1438,13 @@ class TestOpencodeSystemSources:
         # path from ProgramData, so the scrubbed child environment must
         # carry the same value or the child falls back to C:\ProgramData
         # while the gate inspected another drive.
+        # Review round 6 (#1086): on Windows the key may come back as
+        # PROGRAMDATA, so match it case-insensitively instead of asking
+        # the plain dictionary for one exact casing.
         monkeypatch.setenv("ProgramData", r"D:\ProgramData")
-        assert _scrub_env().get("ProgramData") == r"D:\ProgramData"
+        scrubbed = _scrub_env()
+        kept = [value for key, value in scrubbed.items() if key.upper() == "PROGRAMDATA"]
+        assert kept == [r"D:\ProgramData"]
 
     def test_system_dir_derives_from_child_env_programdata(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1552,7 +1557,9 @@ class TestOpencodeSystemSources:
             plist,
             {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]},
         )
-        monkeypatch.setattr(_agent_cli, "_opencode_managed_preference_paths", lambda: [str(plist)])
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_managed_preference_paths", lambda env=None: [str(plist)]
+        )
         with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
             _check_opencode_system_sources()
 
@@ -1564,7 +1571,9 @@ class TestOpencodeSystemSources:
         monkeypatch.setattr(sys, "platform", "darwin")
         plist = tmp_path / "ai.opencode.managed.plist"
         self._write_mdm_plist(plist, {"plugins": ["some-plugin"]})
-        monkeypatch.setattr(_agent_cli, "_opencode_managed_preference_paths", lambda: [str(plist)])
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_managed_preference_paths", lambda env=None: [str(plist)]
+        )
         with pytest.raises(AgentCLIError, match="lists plugin"):
             _check_opencode_system_sources()
 
@@ -1577,7 +1586,9 @@ class TestOpencodeSystemSources:
             plist,
             {"policies": [{"action": "plugin.use", "resource": "*", "effect": "deny"}]},
         )
-        monkeypatch.setattr(_agent_cli, "_opencode_managed_preference_paths", lambda: [str(plist)])
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_managed_preference_paths", lambda env=None: [str(plist)]
+        )
         _check_opencode_system_sources()
 
     def test_mdm_plist_absent_passes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1587,7 +1598,7 @@ class TestOpencodeSystemSources:
         monkeypatch.setattr(
             _agent_cli,
             "_opencode_managed_preference_paths",
-            lambda: [str(tmp_path / "absent.plist")],
+            lambda env=None: [str(tmp_path / "absent.plist")],
         )
         _check_opencode_system_sources()
 
@@ -1599,7 +1610,9 @@ class TestOpencodeSystemSources:
         monkeypatch.setattr(sys, "platform", "darwin")
         plist = tmp_path / "ai.opencode.managed.plist"
         plist.write_bytes(b"not a plist")
-        monkeypatch.setattr(_agent_cli, "_opencode_managed_preference_paths", lambda: [str(plist)])
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_managed_preference_paths", lambda env=None: [str(plist)]
+        )
         with pytest.raises(AgentCLIError, match="could not be parsed"):
             _check_opencode_system_sources()
 
@@ -1623,7 +1636,7 @@ class TestOpencodeSystemSources:
         monkeypatch.setattr(
             _agent_cli,
             "_opencode_managed_preference_paths",
-            lambda: [str(user_plist), str(machine_plist)],
+            lambda env=None: [str(user_plist), str(machine_plist)],
         )
         _check_opencode_system_sources()
 
@@ -1633,12 +1646,19 @@ class TestOpencodeSystemSources:
         # Review round 5 (#1086): OpenCode loads managed preferences on
         # macOS only, so the plist check is skipped elsewhere even when a
         # plist path is configured.
+        # Review round 6 (#1086): set the platform explicitly. On macOS
+        # sys.platform stays darwin, the gate reads the allow-policy
+        # plist created above and raises, so the test would fail instead
+        # of exercising the off-Darwin branch.
+        monkeypatch.setattr(sys, "platform", "linux")
         plist = tmp_path / "ai.opencode.managed.plist"
         self._write_mdm_plist(
             plist,
             {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]},
         )
-        monkeypatch.setattr(_agent_cli, "_opencode_managed_preference_paths", lambda: [str(plist)])
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_managed_preference_paths", lambda env=None: [str(plist)]
+        )
         _check_opencode_system_sources()
 
     def test_mdm_plist_checked_when_system_dir_missing(
@@ -1653,17 +1673,96 @@ class TestOpencodeSystemSources:
             plist,
             {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]},
         )
-        monkeypatch.setattr(_agent_cli, "_opencode_managed_preference_paths", lambda: [str(plist)])
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_managed_preference_paths", lambda env=None: [str(plist)]
+        )
         with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
             _check_opencode_system_sources()
 
     def test_managed_preference_paths(self) -> None:
         # Review round 5 (#1086): the per-user MDM plist comes first,
         # then the machine-wide one (pinned discovery.ts preferencePaths).
+        # Review round 6 (#1086): build the expectations with
+        # os.path.join, like the helper does. On Windows the helper
+        # inserts backslashes, so fixed POSIX strings never match.
         assert _opencode_managed_preference_paths("someuser") == [
-            "/Library/Managed Preferences/someuser/ai.opencode.managed.plist",
-            "/Library/Managed Preferences/ai.opencode.managed.plist",
+            os.path.join(
+                "/Library/Managed Preferences",
+                "someuser",
+                "ai.opencode.managed.plist",
+            ),
+            os.path.join("/Library/Managed Preferences", "ai.opencode.managed.plist"),
         ]
+
+    def test_managed_preference_paths_use_child_env_user(self) -> None:
+        # Review round 6 (#1086): Bun resolves os.userInfo().username
+        # from USER, while getpass.getuser() prefers LOGNAME, so with
+        # LOGNAME alice and USER bob the guard must check Bob's plist,
+        # the one the OpenCode child loads, not Alice's.
+        assert _opencode_managed_preference_paths(env={"USER": "bob", "LOGNAME": "alice"}) == [
+            os.path.join("/Library/Managed Preferences", "bob", "ai.opencode.managed.plist"),
+            os.path.join("/Library/Managed Preferences", "ai.opencode.managed.plist"),
+        ]
+
+    def test_managed_preference_paths_ambiguous_identity_refuses(self) -> None:
+        # Review round 6 (#1086): without a usable USER in the child
+        # environment the child's effective identity cannot be
+        # established, so the gate refuses startup instead of guessing
+        # a user and possibly checking the wrong plist.
+        with pytest.raises(AgentCLIError, match="no usable USER"):
+            _opencode_managed_preference_paths(env={"LOGNAME": "alice"})
+        with pytest.raises(AgentCLIError, match="no usable USER"):
+            _opencode_managed_preference_paths(env={})
+        with pytest.raises(AgentCLIError, match="no usable USER"):
+            _opencode_managed_preference_paths(env={"USER": ""})
+        with pytest.raises(AgentCLIError, match="no usable USER"):
+            _opencode_managed_preference_paths(env={"USER": "   "})
+
+    def test_mdm_plist_checked_for_child_user_not_logname(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 6 (#1086): end to end, the gate reads the plist
+        # of the user named by the child environment, not LOGNAME. With
+        # LOGNAME alice and USER bob, Bob's allow refuses, while Alice's
+        # allow alone passes because OpenCode never loads her plist.
+        # The /Library paths do not exist on this host, so stand in
+        # isfile/open for exactly the two per-user plist paths.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        allow = io.BytesIO()
+        plistlib.dump(
+            {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]},
+            allow,
+        )
+        allow_bytes = allow.getvalue()
+        bob_path = os.path.join("/Library/Managed Preferences", "bob", "ai.opencode.managed.plist")
+        alice_path = os.path.join(
+            "/Library/Managed Preferences", "alice", "ai.opencode.managed.plist"
+        )
+        present: set[str] = set()
+        real_isfile = os.path.isfile
+        real_open = open
+
+        def fake_isfile(path: str) -> bool:
+            if path in (bob_path, alice_path):
+                return path in present
+            return real_isfile(path)
+
+        def fake_open(path: str, *args: object, **kwargs: object) -> object:
+            if path in (bob_path, alice_path):
+                return io.BytesIO(allow_bytes)
+            return real_open(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os.path, "isfile", fake_isfile)
+        monkeypatch.setattr("builtins.open", fake_open)
+        child_env = {"USER": "bob", "LOGNAME": "alice"}
+        present.add(bob_path)
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources(child_env)
+        present.clear()
+        present.add(alice_path)
+        _check_opencode_system_sources(child_env)
+        with pytest.raises(AgentCLIError, match="no usable USER"):
+            _check_opencode_system_sources({"LOGNAME": "alice"})
 
 
 # ---------------------------------------------------------------------------

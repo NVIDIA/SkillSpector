@@ -47,7 +47,6 @@ compatibility, but Codex inference is disabled before a subprocess is started.
 
 from __future__ import annotations
 
-import getpass
 import json
 import os
 import plistlib
@@ -1134,19 +1133,38 @@ def _refuse_opencode_managed_config(config: dict[str, Any], path: str, descripti
             )
 
 
-def _opencode_managed_preference_paths(username: str | None = None) -> list[str]:
+def _opencode_managed_preference_paths(
+    username: str | None = None, env: dict[str, str] | None = None
+) -> list[str]:
     """macOS MDM managed-preference plists, most specific first.
 
     Pinned OpenCode 2.2.6/2.2.7 ``discovery.ts`` ``preferencePaths``: the
     per-user plist wins over the machine-wide one, and only the first
-    plist present loads. *username* defaults to the current user (with
-    the same ``"user"`` fallback OpenCode uses when it cannot be read).
+    plist present loads. The username is the one the OpenCode child
+    itself resolves: pinned ``discovery.ts`` reads
+    ``os.userInfo().username``, and the bundled Bun 1.4.4 runtime
+    resolves that from the ``USER`` variable of the child environment
+    (``node_os.rs`` ``user_info``), never ``LOGNAME``. Python
+    ``getpass.getuser()`` prefers ``LOGNAME``, so with ``LOGNAME=alice``
+    and ``USER=bob`` it checked Alice's plist while OpenCode loaded
+    Bob's. *username*, when given, is used verbatim (explicit override,
+    used by tests). Otherwise the username comes from *env*, the
+    environment passed to the child (``os.environ`` when *env* is None,
+    matching what the scrubbed child environment carries), and a
+    missing or blank ``USER`` refuses startup: without it the child's
+    effective identity cannot be established, and guessing would risk
+    checking the wrong user's plist.
     """
     if username is None:
-        try:
-            username = getpass.getuser()
-        except (KeyError, OSError):
-            username = "user"
+        source = env if env is not None else os.environ
+        username = source.get("USER")
+        if not username or not username.strip():
+            raise AgentCLIError(
+                "OpenCode managed preferences cannot be checked: the child "
+                "environment has no usable USER value, so the username the "
+                "OpenCode child would resolve cannot be established; "
+                "refusing to start a 2.x server"
+            )
     base = "/Library/Managed Preferences"
     return [
         os.path.join(base, username, "ai.opencode.managed.plist"),
@@ -1154,7 +1172,7 @@ def _opencode_managed_preference_paths(username: str | None = None) -> list[str]
     ]
 
 
-def _check_opencode_managed_preferences() -> None:
+def _check_opencode_managed_preferences(env: dict[str, str] | None = None) -> None:
     """Fail closed when a macOS MDM managed-preference plist configures plugins.
 
     2.x only, darwin only. Managed policies load first and evaluate
@@ -1166,11 +1184,15 @@ def _check_opencode_managed_preferences() -> None:
     way to turn them off before startup. The boundary is therefore
     enforced by refusal: when the plist configures a plugin source, the
     2.x server is not started. A missing plist passes; a present plist
-    that cannot be read or parsed fails closed.
+    that cannot be read or parsed fails closed. The plist checked is
+    the one for the username the child resolves (``USER`` from *env*,
+    the environment passed to the child; see
+    :func:`_opencode_managed_preference_paths`), never the parent's
+    ``LOGNAME`` user.
     """
     if sys.platform != "darwin":
         return
-    for path in _opencode_managed_preference_paths():
+    for path in _opencode_managed_preference_paths(env=env):
         if not os.path.isfile(path):
             continue
         # Only the first plist present loads, matching discovery.ts.
@@ -1249,7 +1271,8 @@ def _check_opencode_system_sources(env: dict[str, str] | None = None) -> None:
       :func:`_opencode_system_config_dir`; callers pass the child
       environment so the inspected path is the child's effective path);
     - on macOS, the MDM managed-preference plist (see
-      :func:`_check_opencode_managed_preferences`).
+      :func:`_check_opencode_managed_preferences`), resolved for the
+      username the child environment names via ``USER``.
 
     Each source refuses on:
 
@@ -1266,7 +1289,7 @@ def _check_opencode_system_sources(env: dict[str, str] | None = None) -> None:
     empty one.
     """
     _check_opencode_system_directory(_opencode_system_config_dir(env))
-    _check_opencode_managed_preferences()
+    _check_opencode_managed_preferences(env)
 
 
 def _preflight_opencode_policy(
