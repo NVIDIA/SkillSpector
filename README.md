@@ -38,19 +38,24 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 
 > **Open-source software notice:** This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.
 
-Create and activate a virtual environment first (all `make` targets assume the venv is active). Use **uv** or **pip**; the Makefile uses `uv` if available, otherwise `pip`.
+Use **Python 3.12 or 3.13** for installation with prebuilt YARA wheels on supported
+platforms. The examples below select 3.13 explicitly; see the
+[Python installation notes](#python-installation-notes) for newer interpreters.
+For source installs, create and activate a virtual environment first (all `make`
+targets assume the venv is active). Use **uv** or **pip**; the Makefile uses `uv`
+if available, otherwise `pip`.
 
 **Quick install with uv (CLI-only):**
 
 ```bash
-uv tool install git+https://github.com/NVIDIA/skillspector.git
+uv tool install --python 3.13 git+https://github.com/NVIDIA/skillspector.git
 # Update later: uv tool update skillspector
 ```
 
 If you plan to run `skillspector mcp`, install the MCP extra at install time:
 
 ```bash
-uv tool install 'skillspector[mcp] @ git+https://github.com/NVIDIA/skillspector.git'
+uv tool install --python 3.13 'skillspector[mcp] @ git+https://github.com/NVIDIA/skillspector.git'
 ```
 
 **From source:**
@@ -61,8 +66,8 @@ git clone https://github.com/NVIDIA/skillspector.git
 cd skillspector
 
 # Create and activate virtual environment
-uv venv .venv && source .venv/bin/activate
-# or: python3 -m venv .venv && source .venv/bin/activate
+uv venv --python 3.13 .venv && source .venv/bin/activate
+# or: python3.13 -m venv .venv && source .venv/bin/activate
 
 # Install for production use
 make install
@@ -70,6 +75,29 @@ make install
 
 To contribute, follow the [Development setup](#setup) for a supported Python
 interpreter and development dependencies.
+
+### Python installation notes
+
+The package declares Python `>=3.12,<3.16` in [pyproject.toml](pyproject.toml).
+That range does not guarantee prebuilt wheels for every dependency and platform.
+[yara-python 4.5.4 on PyPI](https://pypi.org/project/yara-python/4.5.4/#files)
+provides CPython 3.12/3.13 wheels, but no CPython 3.14/3.15 wheels. Installing it
+on those newer interpreters requires a native source build with a C toolchain
+and Python development headers. Such builds can fail with OpenSSL 4 headers;
+[issue #1008](https://github.com/NVIDIA/SkillSpector/issues/1008) tracks that
+installation problem and upstream wheel availability.
+
+If installation fails while compiling YARA, select Python 3.12 or 3.13 explicitly
+using the commands above. For a new CLI-only installation with `pipx`, first
+install Python 3.13 and make `python3.13` available on PATH, then run:
+
+```bash
+pipx install --python python3.13 git+https://github.com/NVIDIA/skillspector.git
+```
+
+The upstream [wheel-build update](https://github.com/VirusTotal/yara-python/pull/281)
+is separate from publishing a new release to PyPI. Check the published files
+before choosing a newer interpreter; a source build may still be required.
 
 ### Docker (no Python required)
 
@@ -509,7 +537,7 @@ out-of-band audit step.
 
 ```bash
 # Install, or reinstall if you already used the CLI-only path
-uv tool install --force 'skillspector[mcp] @ git+https://github.com/NVIDIA/skillspector.git'
+uv tool install --python 3.13 --force 'skillspector[mcp] @ git+https://github.com/NVIDIA/skillspector.git'
 
 # FastMCP stdio transport for local CLI agents
 skillspector mcp
