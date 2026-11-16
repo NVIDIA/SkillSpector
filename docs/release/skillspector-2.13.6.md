@@ -9,13 +9,6 @@ This maintenance release builds on v2.13.5 and corrects incomplete static inspec
 ## Minor updates
 
 - [#807](https://github.com/NVIDIA/SkillSpector/pull/807): Correct both development-guide links to the shared LLM analyzer base source module.
-- Retain the Stage 2 analysis documentation clarification from [#684](https://github.com/NVIDIA/SkillSpector/pull/684) and temporary-folder cleanup fixes from [#567](https://github.com/NVIDIA/SkillSpector/pull/567), [#568](https://github.com/NVIDIA/SkillSpector/pull/568), and [#666](https://github.com/NVIDIA/SkillSpector/pull/666), all already included in v2.13.5.
-
-## Previously released fixes retained
-
-The v2.13.5 baseline already includes [#1087](https://github.com/NVIDIA/SkillSpector/pull/1087), grounding semantic intent findings in observed operations and declaration mismatches rather than domain labels alone. It also includes the requested fixes or equivalent backports from [#742](https://github.com/NVIDIA/SkillSpector/pull/742), [#773](https://github.com/NVIDIA/SkillSpector/pull/773), [#814](https://github.com/NVIDIA/SkillSpector/pull/814), [#963](https://github.com/NVIDIA/SkillSpector/pull/963), [#967](https://github.com/NVIDIA/SkillSpector/pull/967), [#855](https://github.com/NVIDIA/SkillSpector/pull/855), [#851](https://github.com/NVIDIA/SkillSpector/pull/851), [#899](https://github.com/NVIDIA/SkillSpector/pull/899), [#955](https://github.com/NVIDIA/SkillSpector/pull/955), [#965](https://github.com/NVIDIA/SkillSpector/pull/965), [#969](https://github.com/NVIDIA/SkillSpector/pull/969), [#752](https://github.com/NVIDIA/SkillSpector/pull/752), and [#662](https://github.com/NVIDIA/SkillSpector/pull/662).
-
-The baseline retains the bounded multiline `printf` correction required with #814 and the actual formatting patch from the [#981](https://github.com/NVIDIA/SkillSpector/pull/981) PR head. The existing Bedrock Sonnet 4.6 profile identifier and output cap requested from [#806](https://github.com/NVIDIA/SkillSpector/pull/806) are also already present.
 
 ## Scope and upgrading
 
