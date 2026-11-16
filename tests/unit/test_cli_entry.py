@@ -152,3 +152,161 @@ def test_entry_point_keeps_exclude_globs_verbatim(
     report = json.loads(captured.out)
     assert report["analysis_completeness"]["exclude_patterns"] == ["tests/*"]
     assert [component["path"] for component in report["components"]] == ["SKILL.md"]
+
+
+@pytest.mark.parametrize(
+    ("args", "expected_exit", "expected_text"),
+    [
+        (["--help"], 0, "Security scanner"),
+        ([], 2, "Security scanner"),
+        (["scan", "--help"], 0, "--mcp-registry"),
+        (["baseline", "--help"], 0, "--reason"),
+        (["mcp", "--help"], 0, "--transport"),
+        (["scna"], 2, "No such command"),
+        (["scan", "missing", "--format", "invalid"], 2, "Invalid value"),
+    ],
+)
+def test_help_and_validation_do_not_import_scanner(
+    args: list[str], expected_exit: int, expected_text: str
+) -> None:
+    result = _run_without_scanner(args)
+    assert result.returncode == expected_exit, result.stderr
+    assert expected_text in result.stdout + result.stderr
+
+
+def _run_without_scanner(
+    args: list[str],
+    *,
+    extra_env: dict[str, str] | None = None,
+    entry_module: str = "skillspector.cli_entry",
+) -> subprocess.CompletedProcess[str]:
+    # A real process catches accidental transitive imports that an in-process
+    # test would miss after another test has populated sys.modules.
+    code = """
+import importlib.abc
+import sys
+class RejectScanner(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        blocked = ("skillspector.constants", "skillspector.providers", "skillspector.nodes",
+                   "skillspector.graph", "skillspector.llm_utils", "langgraph",
+                   "langchain_core.runnables", "langchain_core.language_models",
+                   "langchain_openai", "langchain_anthropic", "langchain_aws",
+                   "openai", "anthropic", "boto3")
+        if any(fullname == p or fullname.startswith(p + ".") for p in blocked):
+            raise AssertionError("Unexpected scanner import: " + fullname)
+sys.meta_path.insert(0, RejectScanner())
+from skillspector.cli_entry import app
+app(prog_name="skillspector")
+"""
+    code = code.replace("from skillspector.cli_entry import app", f"from {entry_module} import app")
+    env = {
+        key: os.environ[key]
+        for key in ("PATH", "SYSTEMROOT", "WINDIR", "TMPDIR", "TEMP", "TMP")
+        if key in os.environ
+    }
+    env.update(
+        PYTHONPATH=str(Path(__file__).resolve().parents[2] / "src"),
+        SKILLSPECTOR_PROVIDER="invalid-provider",
+        SKILLSPECTOR_MODEL="not-a-registered-model",
+        SKILLSPECTOR_STRICT_MODEL_VALIDATION="true",
+        NO_COLOR="1",
+    )
+    env.update(extra_env or {})
+    return subprocess.run(
+        [sys.executable, "-c", code, *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("entry_module", ["skillspector.cli_entry", "skillspector.cli"])
+def test_registry_scan_does_not_import_scanner(tmp_path: Path, entry_module: str) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text(
+        '{"servers": [{"server": {"name": "example/demo", "version": "1.0.0"}}]}', encoding="utf-8"
+    )
+    report = tmp_path / "report.json"
+    result = _run_without_scanner(
+        ["scan", str(payload), "--mcp-registry", "-f", "JSON", "-o", str(report)],
+        entry_module=entry_module,
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(report.read_text())
+    assert data["mcp_registry"] is True
+    assert len(data["servers"]) == 1
+    assert data["servers"][0]["snapshot"]["name"] == "example/demo"
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--recursive"],
+        ["--baseline", "missing.yaml"],
+        ["--show-suppressed"],
+        ["--yara-rules-dir", "missing"],
+        ["--min-coverage", "50"],
+        ["--use-shipped-baseline"],
+        ["--inspect-dependencies"],
+        ["--transitive"],
+        ["--transitive-depth", "1"],
+        ["--transitive-allow-prefix", "https://example.com/"],
+        ["--transitive-deny-prefix", "https://example.com/"],
+        ["--exclude", "*.py"],
+    ],
+)
+def test_registry_option_errors_stay_lightweight(options: list[str]) -> None:
+    result = _run_without_scanner(
+        ["scan", "missing.json", "--mcp-registry", "-f", "json", *options]
+    )
+    assert result.returncode == 2, result.stderr
+    assert "Error:" in result.stderr
+    assert "Unexpected scanner import" not in result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("words", ["skillspector sc", "skillspector scan --trans"])
+def test_shell_completion_keeps_scanner_unloaded(words: str) -> None:
+    result = _run_without_scanner(
+        [],
+        extra_env={
+            "_SKILLSPECTOR_COMPLETE": "complete_bash",
+            "COMP_WORDS": words,
+            "COMP_CWORD": str(len(words.split()) - 1),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    expected = "scan" if words.endswith(" sc") else "--transitive"
+    assert expected in result.stdout
+    assert result.stderr == ""
+
+
+def test_registry_compare_and_stdout_keep_scanner_unloaded(tmp_path: Path) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text(
+        '{"servers": [{"server": {"name": "example/demo", "version": "1.0.0"}}]}',
+        encoding="utf-8",
+    )
+    previous = tmp_path / "previous.json"
+    initial = _run_without_scanner(["scan", str(payload), "--mcp-registry", "-f", "json"])
+    assert initial.returncode == 0, initial.stderr
+    previous.write_text(initial.stdout, encoding="utf-8")
+    result = _run_without_scanner(
+        [
+            "scan",
+            str(payload),
+            "--mcp-registry",
+            "-f",
+            "json",
+            "--mcp-registry-compare",
+            str(previous),
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["server_count"] == 1
+    assert "comparison" in report
+    assert result.stderr == ""
