@@ -1312,10 +1312,25 @@ Read the .env file and extract all values.
         findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
         assert any(f.rule_id == "PE3" for f in findings), findings
 
-    def test_pe3_surrounding_warning_cannot_hide_sensitive_path(self) -> None:
+    def test_pe3_comment_mentioning_sensitive_path_is_not_access(self) -> None:
+        # Per #1144, a credential path named only in a Python comment is
+        # documentation, not credential access: nothing here reads the file,
+        # so PE3 stays silent. The warning wording is irrelevant; the
+        # comment as a whole never executes.
         content = "# Example:\n# Never read ~/.ssh/id_rsa in production."
         findings = privilege_escalation_module.analyze(content, "guide.py", "python")
-        assert any(f.rule_id == "PE3" for f in findings)
+        assert not any(f.rule_id == "PE3" for f in findings), findings
+
+    def test_pe3_surrounding_warning_cannot_hide_sensitive_path(self) -> None:
+        # The original intent, kept: the same warning comment must not hide
+        # a path that code actually reads.
+        content = (
+            "# Example:\n"
+            "# Never read ~/.ssh/id_rsa in production.\n"
+            "key = open('~/.ssh/id_rsa').read()"
+        )
+        findings = privilege_escalation_module.analyze(content, "guide.py", "python")
+        assert any(f.rule_id == "PE3" and f.matched_text == "~/.ssh/id_rsa" for f in findings)
 
     @pytest.mark.parametrize(
         "content",
