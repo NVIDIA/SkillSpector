@@ -37,6 +37,13 @@ skillspector scan ./my-skill/ --baseline .skillspector-baseline.yaml --show-supp
 | `skillspector baseline <path> [-o FILE] [--no-llm] [--reason TEXT]` | Scan and write a baseline that fingerprint-suppresses every current finding. Default output: `.skillspector-baseline.yaml`. |
 | `skillspector scan <path> --baseline FILE` (`-b`) | Suppress findings matching the baseline before scoring/reporting. |
 | `skillspector scan <path> --baseline FILE --show-suppressed` | Also list the suppressed findings (they still don't affect the score). |
+| `skillspector scan <directory-or-local-zip> --use-shipped-baseline` | Apply the canonical `.skillspector-baseline.yaml` at the skill root after reviewing the author's suppressions. An explicit `--baseline` takes precedence. |
+
+For a local ZIP, discovery uses the safely extracted skill root, including a
+single wrapper directory. Without opt-in, an archived baseline is not loaded.
+An opted-in malformed baseline fails the scan. The option applies only to the
+requested root, not baselines supplied by transitive references, and does not
+enable shipped-baseline discovery for remote URLs.
 
 A missing, malformed, or unsupported baseline file exits with code 2.
 Generation also exits with code 2 without creating or replacing the output when

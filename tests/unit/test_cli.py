@@ -843,11 +843,12 @@ def test_recursive_output_rejects_child_primary_aliases(
     scan_skill.assert_not_called()
 
 
-def test_cli_baseline_preserves_local_input_with_remote_like_name(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("name", ["git@notes.md", " notes.md "])
+def test_cli_baseline_preserves_local_input_with_literal_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    source = Path("git@notes.md")
+    source = Path(name)
     original = "---\nname: protected\ndescription: Say hello.\n---\n# Hello\n"
     source.write_text(original)
     with patch("skillspector.cli.graph.invoke") as invoke:
@@ -1749,6 +1750,112 @@ def test_cli_keyring_access_can_be_suppressed_by_baseline(tmp_path: Path) -> Non
     assert any(issue["id"] == "PE3" for issue in payload["suppressed"])
 
 
+@pytest.mark.parametrize("format", ["json", "sarif"])
+@pytest.mark.parametrize("shipped", [False, True])
+@pytest.mark.parametrize("alias", ["same-path", "relative-path", "symlink", "hard-link"])
+def test_cli_scan_preserves_consumed_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, format: str, shipped: bool, alias: str
+) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: protected\n---\n# Hello\n")
+    baseline = skill / ".skillspector-baseline.yaml"
+    original = b"version: 2\nrules:\n  - id: P1\n    reason: Reviewed\n"
+    baseline.write_bytes(original)
+    output = baseline
+    monkeypatch.chdir(tmp_path)
+    if alias == "relative-path":
+        output = baseline.relative_to(tmp_path)
+    elif alias in {"symlink", "hard-link"}:
+        output = tmp_path / "report.json"
+        try:
+            if alias == "symlink":
+                output.symlink_to(baseline)
+            else:
+                os.link(baseline, output)
+        except OSError:
+            pytest.skip(f"{alias} is not supported on this filesystem")
+    scan = MagicMock(return_value={"report_body": "{}", "risk_score": 0})
+    monkeypatch.setattr(cli, "_scan_skill", scan)
+    options = ["--use-shipped-baseline"] if shipped else ["--baseline", str(baseline)]
+
+    result = runner.invoke(
+        app,
+        ["scan", str(skill), "--no-llm", "--format", format, "-o", str(output), *options],
+    )
+
+    assert result.exit_code == 2
+    assert "--output points to the input file" in result.output
+    assert baseline.read_bytes() == original
+    assert output.read_bytes() == original
+    scan.assert_not_called()
+
+
+@pytest.mark.parametrize("format", ["json", "sarif"])
+@pytest.mark.parametrize("shipped", [False, True])
+@pytest.mark.parametrize(
+    "alias", ["missing-parent", "nested-missing-parent", "file-parent", "symlink-parent"]
+)
+def test_cli_scan_preserves_baseline_at_normalized_report_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, format: str, shipped: bool, alias: str
+) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: protected\n---\n# Hello\n")
+    baseline = skill / ".skillspector-baseline.yaml"
+    original = b"version: 2\nrules:\n  - id: P1\n    reason: Reviewed\n"
+    baseline.write_bytes(original)
+    output = skill / "missing" / ".." / baseline.name
+    if alias == "nested-missing-parent":
+        output = skill / "missing" / "nested" / ".." / ".." / baseline.name
+    elif alias == "file-parent":
+        (skill / "not-a-directory").write_text("Keep this file")
+        output = skill / "not-a-directory" / ".." / baseline.name
+    elif alias == "symlink-parent":
+        target = tmp_path / "elsewhere" / "child"
+        target.mkdir(parents=True)
+        try:
+            (skill / "linked").symlink_to(target, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+        output = skill / "linked" / ".." / baseline.name
+    scan = MagicMock(return_value={"report_body": "{}", "risk_score": 0})
+    monkeypatch.setattr(cli, "_scan_skill", scan)
+    options = ["--use-shipped-baseline"] if shipped else ["--baseline", str(baseline)]
+
+    result = runner.invoke(
+        app,
+        ["scan", str(skill), "--no-llm", "--format", format, "-o", str(output), *options],
+    )
+
+    assert result.exit_code == 2
+    # The multi-report branch normalizes all writer destinations before preflight,
+    # so even a file/.. alias reports the baseline collision rather than ENOTDIR.
+    assert "--output points to the input file" in result.output
+    assert baseline.read_bytes() == original
+    assert not (skill / "missing").exists()
+    scan.assert_not_called()
+
+
+def test_validate_report_destination_keeps_original_symlink_parent_check(tmp_path: Path) -> None:
+    """Lexical normalization must not replace the original same-file check."""
+    source = tmp_path / "original" / "SKILL.md"
+    source.parent.mkdir()
+    source.write_text("Keep this source")
+    (source.parent / "child").mkdir()
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    try:
+        (output_root / "linked").symlink_to(source.parent / "child", target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+    output = output_root / "linked" / ".." / source.name
+
+    with pytest.raises(ValueError, match="--output points to the input file"):
+        cli_module._validate_report_destination(source, output)
+    assert source.read_text() == "Keep this source"
+
+
 def test_cli_keyring_access_is_kept_in_json_and_sarif(tmp_path: Path) -> None:
     skill = tmp_path / "skill"
     skill.mkdir()
@@ -1795,6 +1902,14 @@ def test_cli_as3_self_reference_fixture_preserves_only_peer_path(tmp_path: Path)
         for issue in payload["issues"]
         if issue["id"] == "AS3"
     ] == [("README.md", "skills/peer-skill/SKILL.md")]
+
+
+def test_cli_shell_env_harvest_fixture_is_flagged() -> None:
+    fixture = Path(__file__).parents[1] / "fixtures" / "e2_shell_env_harvest"
+    result = runner.invoke(app, ["scan", str(fixture), "--format", "json", "--no-llm"])
+    assert result.exit_code in {0, 1}, result.output
+    payload = json.loads(result.output)
+    assert any(issue["id"] == "E2" for issue in payload["issues"])
 
 
 def test_cli_scan_nonexistent_exits_2() -> None:
@@ -4126,6 +4241,95 @@ def test_cli_shipped_baseline_opt_in(tmp_path: Path, extra: list[str]) -> None:
     assert suppressed[0]["suppressed"] is True
     assert "suppression_reason" in suppressed[0]
     assert "Applying author-shipped baseline" in result.stderr
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("format", ["json", "sarif"])
+@pytest.mark.parametrize("extra", [[], ["--transitive", "--transitive-depth", "0"]])
+def test_cli_zip_shipped_baseline_opt_in(
+    tmp_path: Path, wrapped: bool, format: str, extra: list[str]
+) -> None:
+    """Load the extracted root baseline before analysis and preserve report audit trails."""
+    skill_dir = _make_skill_dir(tmp_path)
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        for path in skill_dir.iterdir():
+            bundle.write(path, f"skill/{path.name}" if wrapped else path.name)
+    result = runner.invoke(
+        app,
+        ["scan", str(archive), "--no-llm", "--format", format, "--use-shipped-baseline", *extra],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert "Applying author-shipped baseline" in result.stderr
+    if format == "json":
+        assert data["issues"] == []
+        assert data["suppressed_count"] >= 1
+        assert data["analysis_completeness"]["is_complete"] is True
+        exclusions = data["analysis_completeness"]["scope_exclusions"]
+        assert any(event["reason_code"] == "baseline_file" for event in exclusions)
+    else:
+        validate_sarif_report(data)
+        results = data["runs"][0]["results"]
+        assert results and all(finding.get("suppressions") for finding in results)
+
+
+@pytest.mark.parametrize("mode", ["default", "opt-in", "explicit", "missing-explicit"])
+def test_cli_zip_malformed_shipped_baseline_trust(tmp_path: Path, mode: str) -> None:
+    """Only author opt-in reads the shipped file; an explicit baseline takes precedence."""
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("SKILL.md", _SKILL_MD)
+        bundle.writestr(".skillspector-baseline.yaml", "version: 2\nrules: [{}]\n")
+    args = [] if mode == "default" else ["--use-shipped-baseline"]
+    if "explicit" in mode:
+        explicit = tmp_path / "explicit.yaml"
+        if mode == "explicit":
+            explicit.write_text(_SHIPPED_BASELINE_YAML)
+        args += ["--baseline", str(explicit)]
+    result = runner.invoke(app, ["scan", str(archive), "--no-llm", "--format", "json", *args])
+    assert (
+        result.exit_code == {"default": 1, "opt-in": 2, "explicit": 0, "missing-explicit": 2}[mode]
+    )
+    if mode == "default":
+        assert json.loads(result.stdout)["suppressed_count"] == 0
+    elif mode == "explicit":
+        assert json.loads(result.stdout)["suppressed_count"] >= 1
+        assert "Applying author-shipped baseline" not in result.stderr
+
+
+@pytest.mark.parametrize("failure", [OSError, KeyboardInterrupt])
+def test_cli_zip_baseline_notice_failure_cleans_extraction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: type[BaseException]
+) -> None:
+    """A failed post-graph notice must not strand a temporary tree before result handoff."""
+    from skillspector.input_handler import InputHandler
+
+    archive = tmp_path / "skill.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("SKILL.md", _SKILL_MD)
+        bundle.writestr(".skillspector-baseline.yaml", _SHIPPED_BASELINE_YAML)
+    created: list[Path] = []
+    original = InputHandler._get_temp_dir
+    noticed: list[bool] = []
+
+    def track(handler: InputHandler) -> Path:
+        path = original(handler)
+        created.append(path)
+        return path
+
+    def fail_notice(*_args: object) -> None:
+        noticed.append(True)
+        raise failure("notice failed")
+
+    monkeypatch.setattr(InputHandler, "_get_temp_dir", track)
+    monkeypatch.setattr(cli, "_shipped_baseline_notice", fail_notice)
+    result = runner.invoke(
+        app, ["scan", str(archive), "--no-llm", "--format", "json", "--use-shipped-baseline"]
+    )
+    assert noticed == [True]
+    assert result.exit_code != 0
+    assert created and all(not path.exists() for path in created)
 
 
 def test_cli_shipped_baseline_discovered_equals_explicit(tmp_path: Path) -> None:
@@ -7977,6 +8181,96 @@ def test_report_output_rejects_symlinks_and_cleans_failed_replace(tmp_path, monk
     assert not list(tmp_path.glob(".skillspector-output-*"))
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+@pytest.mark.parametrize("existing", [False, True])
+def test_report_output_restricts_access_before_writing(tmp_path, monkeypatch, existing):
+    from skillspector import file_output
+
+    output = tmp_path / "report.json"
+    if existing:
+        output.write_text("previous", encoding="utf-8")
+    original_restrict = file_output.restrict_temporary_access
+    target_sizes = []
+
+    def restrict_empty_file(descriptor, *, output_kind):
+        target_sizes.append(os.fstat(descriptor).st_size)
+        original_restrict(descriptor, output_kind=output_kind)
+
+    monkeypatch.setattr(file_output, "restrict_temporary_access", restrict_empty_file)
+    file_output.write_text_no_follow(output, "private report")
+
+    assert target_sizes == [0]
+    assert output.read_text(encoding="utf-8") == "private report"
+    assert output.stat().st_mode & 0o777 == 0o600
+    assert not list(tmp_path.glob(".skillspector-output-*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+@pytest.mark.parametrize("existing", [False, True])
+def test_report_output_preserves_destination_when_acl_removal_fails(
+    tmp_path, monkeypatch, existing
+):
+    import ctypes
+    import errno
+
+    from skillspector import file_output
+
+    output = tmp_path / "report.json"
+    if existing:
+        output.write_text("previous", encoding="utf-8")
+    target_sizes = []
+
+    def fail_set_acl(descriptor, acl, acl_type):
+        target_sizes.append(os.fstat(descriptor).st_size)
+        ctypes.set_errno(errno.EACCES)
+        return -1
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda *args, **kwargs: SimpleNamespace(
+            acl_init=lambda count: 1, acl_set_fd_np=fail_set_acl, acl_free=lambda acl: 0
+        ),
+    )
+    with pytest.raises(ValueError, match="clear inherited report ACLs"):
+        file_output.write_text_no_follow(output, "private report")
+
+    assert target_sizes == [0]
+    if existing:
+        assert output.read_text(encoding="utf-8") == "previous"
+    else:
+        assert not output.exists()
+    assert not list(tmp_path.glob(".skillspector-output-*"))
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS inherited ACLs")
+@pytest.mark.parametrize("mode", [None, 0o600, 0o200])
+def test_report_output_clears_inherited_macos_acl(tmp_path, mode):
+    import subprocess
+
+    from skillspector import file_output
+
+    output = tmp_path / "report.json"
+    if mode is not None:
+        output.write_text("previous", encoding="utf-8")
+        output.chmod(mode)
+    subprocess.run(
+        ["/bin/chmod", "+a", "everyone allow read,file_inherit", str(tmp_path)],
+        check=True,
+        capture_output=True,
+    )
+
+    file_output.write_text_no_follow(output, "private report")
+
+    acl_listing = subprocess.run(
+        ["/bin/ls", "-le", str(output)], check=True, capture_output=True, text=True
+    ).stdout
+    assert "everyone" not in acl_listing
+    assert output.stat().st_mode & 0o777 == 0o600
+    assert output.read_text(encoding="utf-8") == "private report"
+
+
 def test_report_output_unsupported_platform_keeps_stdout(tmp_path, monkeypatch):
     from skillspector import file_output
 
@@ -8326,3 +8620,18 @@ def test_scan_report_saved_message_shows_bracketed_path_literally(tmp_path: Path
     )
     assert "out[b].json" in "".join(result.output.split())
     assert report.exists()
+
+
+def test_recursive_risk_assessment_uses_cli_verdict_hook() -> None:
+    from skillspector import cli
+
+    with patch("skillspector.cli.risk_severity_and_recommendation", return_value=("LOW", "SAFE")):
+        result = cli._multi_skill_risk_assessment(
+            25, execution_failed=False, analysis_incomplete=True
+        )
+
+    assert result == {
+        "max_risk_score": 25,
+        "severity": "LOW",
+        "recommendation": "CAUTION",
+    }

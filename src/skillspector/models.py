@@ -117,6 +117,20 @@ def observe_analyzer_findings(
         _analyzer_finding_observer.reset(token)
 
 
+@contextmanager
+def map_analyzer_findings(mapper: Callable[[AnalyzerFinding], None]) -> Iterator[None]:
+    """Map derived findings before an enclosing resource guard observes them."""
+    parent = _analyzer_finding_observer.get()
+
+    def observe(finding: AnalyzerFinding) -> None:
+        mapper(finding)
+        if parent is not None:
+            parent(finding)
+
+    with observe_analyzer_findings(observe):
+        yield
+
+
 _finding_id_factory: ContextVar[Callable[[], str] | None] = ContextVar(
     "skillspector_finding_id_factory", default=None
 )

@@ -15,11 +15,20 @@ from typing import Final, NotRequired, cast
 
 from typing_extensions import TypedDict
 
+from skillspector.resource_limits import bounded_capacity
+
 logger = logging.getLogger(__name__)
 
-MAX_INSPECTION_LEDGER_EVENTS: Final = 10_000
+# Every artifact produces separate work rows for multiple analyzers.
+MAX_INSPECTION_LEDGER_EVENTS: Final = bounded_capacity(
+    "SKILLSPECTOR_MAX_INSPECTION_LEDGER_EVENTS", 100_000, 1_000_000
+)
 MAX_FINDING_OUTPUT_RECORDS: Final = 10_000
 MAX_EFFECTIVE_FINDINGS: Final = MAX_FINDING_OUTPUT_RECORDS
+UNSUPPORTED_PROSE_COMMAND_PATTERN: Final = "unsupported_prose_command_pattern"
+UNSUPPORTED_PROSE_COMMAND_NOTICE: Final = (
+    "This command pattern is not allowed for inspection; put the command in a code block."
+)
 RESOURCE_MEASUREMENT_UNITS: Final = (
     "characters",
     "bytes",
@@ -80,6 +89,7 @@ class LedgerReason(StrEnum):
     SYNTAX_ERROR = "syntax_error"
     LLM_BATCH_FAILED = "llm_batch_failed"
     LLM_STRUCTURED_RESPONSE_INVALID = "llm_structured_response_invalid"
+    LLM_STRUCTURED_OUTPUT_REJECTED = "llm_structured_output_rejected"
     LLM_RESPONSE_REFUSED = "llm_response_refused"
     LLM_RESPONSE_TRUNCATED = "llm_response_truncated"
     LLM_RESPONSE_INCOMPLETE = "llm_response_incomplete"
@@ -150,6 +160,7 @@ class LedgerReason(StrEnum):
     OUTPUT_LIMIT = "output_limit"
     TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
+    JSON_QUOTE_OWNERSHIP_LIMIT = "json_quote_ownership_limit"
     PYTHON_SOURCE_AMBIGUOUS = "python_source_ambiguous"
     PYTHON_SOURCE_DECODE_ERROR = "python_source_decode_error"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
@@ -427,6 +438,10 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
         "LLM response could not be validated after bounded recovery."
     ),
+    LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED: (
+        "Provider rejected structured output (response_format unsupported; "
+        "tool-calling fallback also rejected)."
+    ),
     LedgerReason.LLM_RESPONSE_REFUSED: "The model declined to complete this assessment.",
     LedgerReason.LLM_RESPONSE_TRUNCATED: "The model's answer was cut short by its output limit.",
     LedgerReason.LLM_RESPONSE_INCOMPLETE: "The model did not finish this assessment.",
@@ -555,6 +570,12 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.PYTHON_SOURCE_DECODE_ERROR: (
         "Python source bytes could not be decoded under their declared encoding."
     ),
+    LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT: (
+        "JSON quote ownership was not validated because a candidate source span exceeds "
+        "the character limit. JSON validity remains unverified; other instruction uncertainty "
+        "may remain. Split the document into smaller complete JSON values without dropping "
+        "required content, then rescan. Increasing the scan timeout does not raise this limit."
+    ),
     LedgerReason.OBFUSCATED_INSTRUCTION_TEXT: (
         "Obfuscated instruction text could not be fully evaluated by the deterministic layer."
     ),
@@ -636,6 +657,7 @@ class ParserCheck(StrEnum):
     COMMAND_STRING_DEPTH = "command_string_depth"
     COMMAND_STRING_RUNTIME = "command_string_runtime"
     COMMAND_STRING_EFFECTS = "command_string_effects"
+    JSON_STRING_DECODING = "json_string_decoding"
     STARTUP_PROOF_CHARACTERS = "startup_proof_characters"
     BRACE_CHARACTERS = "brace_characters"
     BRACE_ALTERNATIVES = "brace_alternatives"
@@ -778,6 +800,8 @@ class InspectionLedgerEvent(ResourceMeasurements):
     message: NotRequired[str]
     error_class: NotRequired[str]
     stage: NotRequired[str]
+    source_start_offset: NotRequired[int]
+    source_end_offset: NotRequired[int]
     parser_diagnostic: NotRequired[ParserDiagnostic]
 
 
@@ -807,6 +831,8 @@ class InspectionLedgerException(ResourceMeasurements):
     error_class: NotRequired[str]
     analyzers: NotRequired[list[str]]
     fatal: NotRequired[bool]
+    source_start_offset: NotRequired[int]
+    source_end_offset: NotRequired[int]
     scope: NotRequired[str]
     source_identity: NotRequired[str]
     parser_diagnostic: NotRequired[ParserDiagnostic]
@@ -836,6 +862,55 @@ class AnalysisCompleteness(TypedDict):
     dependency_inspection: NotRequired[dict[str, object]]
     policy_accepted: NotRequired[bool]
     warnings: NotRequired[list[dict[str, object]]]
+    notices: NotRequired[list[dict[str, object]]]
+
+
+def bounded_inspection_notices(rows: object) -> list[dict[str, object]]:
+    """Keep documentation notices separate from inspection gaps and findings."""
+    if not isinstance(rows, list) or MAX_FINDING_OUTPUT_RECORDS <= 0:
+        return []
+    notices: dict[tuple[str, int, int], dict[str, object]] = {}
+    for row in rows[:MAX_INSPECTION_LEDGER_EVENTS]:
+        if (
+            not isinstance(row, Mapping)
+            or row.get("reason_code") != UNSUPPORTED_PROSE_COMMAND_PATTERN
+        ):
+            continue
+        path = row.get("path")
+        if not isinstance(path, str):
+            continue
+        try:
+            path = _normalize_relative_path(path)
+        except ValueError:
+            continue
+        start, end = row.get("source_start_offset"), row.get("source_end_offset")
+        first, last = row.get("start_line"), row.get("end_line")
+        if not (
+            type(start) is int
+            and type(end) is int
+            and 0 <= start < end < (1 << 63)
+            and type(first) is int
+            and type(last) is int
+            and 1 <= first <= last < (1 << 63)
+        ):
+            continue
+        key = (path, start, end)
+        notices.setdefault(
+            key,
+            {
+                "reason_code": UNSUPPORTED_PROSE_COMMAND_PATTERN,
+                "message": UNSUPPORTED_PROSE_COMMAND_NOTICE,
+                "phase": "documentation",
+                "path": path,
+                "start_line": first,
+                "end_line": last,
+                "source_start_offset": start,
+                "source_end_offset": end,
+            },
+        )
+        if len(notices) >= MAX_FINDING_OUTPUT_RECORDS:
+            break
+    return list(notices.values())
 
 
 def _normalize_relative_path(path: str, *, scope_boundary: bool = False) -> str:
@@ -1170,6 +1245,31 @@ def _exception_from_event(
     parser_diagnostic = sanitize_parser_diagnostic(event.get("parser_diagnostic"))
     if parser_diagnostic is not None:
         exception["parser_diagnostic"] = parser_diagnostic
+    if exception["reason_code"] is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT:
+        # Copy only consistent numeric evidence, never an arbitrary message or
+        # source payload from graph state. Keep distinct spans distinct when
+        # the public projection groups contributing analyzers below.
+        start = event.get("source_start_offset")
+        end = event.get("source_end_offset")
+        observed = event.get("observed_characters")
+        limit = event.get("limit_characters")
+        if (
+            type(start) is int
+            and type(end) is int
+            and type(observed) is int
+            and type(limit) is int
+            and 0 <= start < end <= (1 << 63) - 1
+            and observed == end - start
+            and observed > limit > 0
+        ):
+            exception["source_start_offset"] = start
+            exception["source_end_offset"] = end
+            exception["observed_characters"] = observed
+            exception["limit_characters"] = limit
+            exception["message"] += (
+                f" Observed source character span [{start}, {end}) "
+                f"({observed} characters; limit {limit})."
+            )
     return exception
 
 
@@ -1640,6 +1740,9 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_before_filtering": len(findings_by_id),
         "findings_after_filtering": len(validated_effective),
     }
+    notices = bounded_inspection_notices(state.get("inspection_notices"))
+    if notices:
+        completeness["notices"] = notices
     patterns = state.get("exclude_patterns", [])
     dependency_inspection = state.get("dependency_inspection")
     if isinstance(dependency_inspection, dict):

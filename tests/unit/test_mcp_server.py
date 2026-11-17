@@ -1005,10 +1005,64 @@ async def test_run_scan_disables_llm_for_unavailable_bound_provider(
     assert result["scan_mode"] == "static-only"
 
 
-async def test_run_scan_rejects_invalid_format(tmp_path: Path) -> None:
+@pytest.mark.parametrize("include_report", [True, False])
+async def test_run_scan_rejects_invalid_format(tmp_path: Path, include_report: bool) -> None:
     """An unsupported output_format is rejected before any scan runs."""
     with pytest.raises(ValueError):
-        await run_scan(str(tmp_path), output_format="xml")
+        await run_scan(str(tmp_path), output_format="xml", include_report=include_report)
+
+
+@pytest.mark.parametrize("output_format", sorted(mcp_server.VALID_FORMATS))
+@pytest.mark.parametrize("status", ["complete", "partial", "failed"])
+@pytest.mark.parametrize("has_findings", [True, False])
+async def test_compact_response_preserves_verdict_and_scan_contract(
+    monkeypatch: pytest.MonkeyPatch, output_format: str, status: str, has_findings: bool
+) -> None:
+    """Projection must not change policy, completeness, findings, or graph inputs."""
+    finding = Finding(
+        rule_id="TEST-1",
+        severity="HIGH",
+        category="test",
+        message="Repeated issue",
+        file="SKILL.md",
+        start_line=3,
+        occurrences=[{"file": "SKILL.md", "start_line": 3}, {"file": "SKILL.md", "start_line": 5}],
+    )
+    state = {
+        "risk_score": 70 if has_findings else 0,
+        "risk_severity": "HIGH",
+        "risk_recommendation": "CAUTION",
+        "execution_successful": status != "failed",
+        "analysis_completeness": {"status": status, "is_complete": status == "complete"},
+        "filtered_findings": [finding] if has_findings else [],
+        "report_body": "Rendered full report",
+    }
+    invoke = AsyncMock(return_value=state)
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", invoke)
+    default = await run_scan("fixture", use_llm=False, output_format=output_format)
+    explicit = await run_scan(
+        "fixture", use_llm=False, output_format=output_format, include_report=True
+    )
+    compact = await run_scan(
+        "fixture", use_llm=False, output_format=output_format, include_report=False
+    )
+    assert default == explicit
+    assert default.pop("report") == "Rendered full report"
+    assert compact == default
+    assert compact["findings"] == ([finding.to_dict()] if has_findings else [])
+    assert compact["safe_to_install"] is (not has_findings and status == "complete")
+    # Each call deliberately owns a fresh cleanup tracker. Compare the graph
+    # contract without comparing those separate callback instances by identity.
+    calls = invoke.call_args_list
+    assert calls[0].args == calls[1].args == calls[2].args
+    configs = []
+    for call in calls:
+        config = dict(call.kwargs["config"])
+        callbacks = config.pop("callbacks")
+        assert len(callbacks) == 1
+        assert isinstance(callbacks[0], mcp_server.TempDirTracker)
+        configs.append(config)
+    assert configs[0] == configs[1] == configs[2]
 
 
 async def test_mcp_blocks_install_when_execution_failed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1419,6 +1473,31 @@ async def test_build_server_registers_scan_skill() -> None:
     server = mcp_server.build_server()
     tools = await server.list_tools()
     assert "scan_skill" in {tool.name for tool in tools}
+    schema = next(tool.inputSchema for tool in tools if tool.name == "scan_skill")
+    assert schema["properties"]["include_report"]["type"] == "boolean"
+    assert schema["properties"]["include_report"]["default"] is True
+    assert "include_report" not in schema.get("required", [])
+
+
+@pytest.mark.parametrize("include_report", [None, True, False])
+async def test_scan_skill_forwards_report_option(
+    monkeypatch: pytest.MonkeyPatch, include_report: bool | None
+) -> None:
+    pytest.importorskip("mcp")
+    scan = AsyncMock(return_value={"safe_to_install": False})
+    monkeypatch.setattr(mcp_server, "run_scan", scan)
+    arguments = {"target": "https://example.com/skill.zip", "use_llm": False}
+    if include_report is not None:
+        arguments["include_report"] = include_report
+    server = mcp_server.build_server()
+    await server.call_tool("scan_skill", arguments)
+    scan.assert_awaited_once_with(
+        arguments["target"],
+        use_llm=False,
+        output_format="json",
+        include_report=True if include_report is None else include_report,
+        allow_local_targets=False,
+    )
 
 
 async def test_build_server_disables_local_targets_by_default(

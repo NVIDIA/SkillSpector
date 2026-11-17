@@ -436,9 +436,24 @@ def test_concurrent_sources_each_get_their_own_spans() -> None:
 # --- Readings that stay fail-closed ----------------------------------------
 
 
-@pytest.mark.parametrize("path", ["notes.md", "notes.txt", "scripts/check.sh"])
+@pytest.mark.parametrize("path", ["notes.md", "notes.txt"])
 def test_other_file_types_keep_the_lexical_reading(path: str) -> None:
     _assert_partial_marker_text(_ledger(path, _ASSERT_FLAG + _LITERAL_TAIL))
+
+
+def test_shell_does_not_borrow_python_ownership(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden(*args, **kwargs):
+        raise AssertionError("A shell path cannot borrow Python string proof")
+
+    monkeypatch.setattr(static_runner, "PythonStringClosers", forbidden)
+    # Shell now has its own complete-source lexical proof. It independently
+    # owns this closing quote; this does not use Python syntax validation.
+    result = _ledger("scripts/check.sh", _ASSERT_FLAG + _LITERAL_TAIL)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    # An unresolved shell suffix withholds that whole-source proof as before.
+    _assert_partial_marker_text(
+        _ledger("scripts/check.sh", _ASSERT_FLAG + _LITERAL_TAIL + "echo $(unclosed\n")
+    )
 
 
 @pytest.mark.parametrize(

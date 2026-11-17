@@ -1150,10 +1150,14 @@ def test_completed_ambiguous_response_remains_partial_even_when_recovery_says_ze
 
 
 def test_formatting_rechecks_the_input_allowance(http_model):
-    requests = http_model([('{"findings": [],}', "stop")])
+    def reduce_input_allowance(_request_number):
+        analyzer._input_budget = 1
+
+    requests = http_model([('{"findings": [],}', "stop")], after_response=reduce_input_allowance)
     analyzer = make_analyzer("discovery")
-    analyzer._input_budget = 1
     outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="x")])
+    assert not outcome.successful
+    assert len(outcome.failures) == 1
     assert outcome.failures[0].reason == LedgerReason.LLM_RESPONSE_LIMIT
     assert len(requests) == 1
 

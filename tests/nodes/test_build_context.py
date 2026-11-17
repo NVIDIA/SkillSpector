@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -909,6 +910,106 @@ def test_build_context_model_config_matches_openai_fallback(
     result = build_context({"skill_path": str(tmp_path)})
 
     assert result["model_config"]["default"] == OpenAIProvider.DEFAULT_MODEL
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_build_context_prepares_transport_only_for_enabled_ai(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports",
+        lambda: calls.append("prepare"),
+    )
+
+    result = build_context({"skill_path": str(tmp_path), "use_llm": enabled})
+
+    assert calls == (["prepare"] if enabled else [])
+    assert result["file_cache"]["SKILL.md"] == "# Example\n"
+    assert bool(result["model_config"]) is enabled
+
+
+def test_build_context_skips_transport_preparation_after_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    budget = WorkflowResourceBudget(max_seconds=0.0)
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports",
+        lambda: pytest.fail("Expired work must not prepare a transport"),
+    )
+
+    result = build_context({"skill_path": str(tmp_path), "workflow_resource_budget": budget})
+
+    assert result["workflow_resource_budget"] is budget
+    assert any(
+        event["reason_code"] == LedgerReason.RUNTIME_LIMIT for event in result["inspection_ledger"]
+    )
+
+
+def test_build_context_transport_preparation_keeps_shared_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    budget = WorkflowResourceBudget(max_seconds=30.0)
+    observed_starts: list[float] = []
+    caplog.set_level(logging.DEBUG, logger="skillspector.nodes.build_context")
+
+    def expire_during_preparation() -> None:
+        assert budget.started_at is not None
+        observed_starts.append(budget.started_at)
+        budget.started_at = monotonic() - budget.max_seconds - 1
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports", expire_during_preparation
+    )
+    result = build_context({"skill_path": str(tmp_path), "workflow_resource_budget": budget})
+
+    assert len(observed_starts) == 1
+    assert result["workflow_resource_budget"] is budget
+    assert budget.remaining_seconds() == 0
+    assert budget.started_at < observed_starts[0]
+    assert result["file_cache"]["SKILL.md"] == "# Example\n"
+    assert "Workflow deadline reached while preparing AI transport imports" in caplog.text
+
+
+def test_build_context_transport_import_failure_preserves_normal_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    caplog.set_level(logging.DEBUG, logger="skillspector.nodes.build_context")
+
+    def failed_preparation() -> None:
+        raise ImportError("private-error-detail")
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports", failed_preparation
+    )
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["model_config"]
+    assert result["file_cache"]["SKILL.md"] == "# Example\n"
+    assert not any(
+        event["reason_code"] == LedgerReason.RUNTIME_LIMIT for event in result["inspection_ledger"]
+    )
+    assert "Could not prepare AI transport imports (ImportError)" in caplog.text
+    assert "private-error-detail" not in caplog.text
+
+
+def test_build_context_transport_preparation_preserves_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+
+    def cancelled_preparation() -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context.prepare_chat_model_imports", cancelled_preparation
+    )
+    with pytest.raises(KeyboardInterrupt):
+        build_context({"skill_path": str(tmp_path)})
 
 
 def test_build_context_inspects_unverified_root_oms_signature(

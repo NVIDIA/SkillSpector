@@ -139,6 +139,10 @@ class OsvQueryBudget:
     limitations: list[OsvQueryLimitation] | None = None
     limitation_generation: int = 0
     last_limitation: OsvQueryLimitation | None = None
+    # Call-scoped reachability for this budget's own query_batch() calls, so
+    # concurrent scans (same process, different budgets) can't overwrite each
+    # other's reachability outcome. See was_osv_reachable().
+    query_ok: bool | None = None
 
     @classmethod
     def create(cls, timeout_seconds: float | None = None) -> OsvQueryBudget:
@@ -661,8 +665,10 @@ def query_batch(
             ),
         )
 
-    provider_failed = False
     successful_batches = 0
+    # This call's own outcome. Never derived from _last_query_ok, which other
+    # scans in the same process can overwrite at any time.
+    query_ok = False
     try:
         with httpx.Client(timeout=max(0.001, active_budget.remaining_seconds())) as client:
             for start in range(0, len(uncached_queries), active_budget.max_queries_per_batch):
@@ -784,16 +790,15 @@ def query_batch(
                     if active_budget.limitation_generation == package_generation:
                         _put_cache(_cache_key(name, version, ecosystem), vuln_details)
 
-        _last_query_ok = successful_batches > 0
+        query_ok = successful_batches > 0
     except _OsvLimitReachedError:
         # The exact limit is already recorded on the result.  Keep completed
         # prefix results and let static fallback cover the remainder.
-        _last_query_ok = successful_batches > 0
+        query_ok = successful_batches > 0
     except httpx.TimeoutException:
         logger.warning("OSV.dev API request timed out, falling back to static data")
         active_budget.note_runtime_limit()
-        provider_failed = True
-        _last_query_ok = False
+        query_ok = False
     except (
         httpx.InvalidURL,
         httpx.HTTPError,
@@ -809,11 +814,10 @@ def query_batch(
                 error_class=type(exc).__name__,
             )
         )
-        provider_failed = True
-        _last_query_ok = False
+        query_ok = False
 
-    if not provider_failed and _last_query_ok:
-        _last_query_ok = True
+    active_budget.query_ok = query_ok
+    _last_query_ok = query_ok  # legacy fallback only; written, never read here
     return QueryBatchResults(
         all_results,
         limitations=_limitations_since(
@@ -849,10 +853,22 @@ def is_available() -> bool:
         return False
 
 
-def was_osv_reachable() -> bool:
-    """Return True if the last query_batch() call succeeded.
+def was_osv_reachable(budget: OsvQueryBudget | None = None) -> bool:
+    """Return True unless the provider lookup for this scan failed.
+
+    With a ``budget`` the answer is call-scoped: it reflects only the
+    ``query_batch()`` calls made with that budget, so concurrent scans in one
+    process cannot affect each other.  A budget whose calls never reached the
+    provider (nothing to look up, everything cached, or a budget limit hit
+    first) has no failed lookup, so it reports True.
+
+    Without a budget it falls back to the module-level flag of the most recent
+    call, which is shared across scans and therefore only reliable when a
+    single scan runs at a time.
 
     Callers can use this to decide whether to surface a fallback warning
     when query_batch returns empty results.
     """
+    if budget is not None:
+        return budget.query_ok is not False
     return _last_query_ok

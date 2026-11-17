@@ -40,7 +40,7 @@ def osv_packages(monkeypatch):
         )
 
     monkeypatch.setattr(supply_chain, "query_batch", query)
-    monkeypatch.setattr(supply_chain, "was_osv_reachable", lambda: True)
+    monkeypatch.setattr(supply_chain, "was_osv_reachable", lambda budget=None: True)
     return seen
 
 

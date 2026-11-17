@@ -989,6 +989,130 @@ def test_resolved_partial_reference_produces_one_canonically_counted_ae1() -> No
     assert completeness["is_complete"] is False
 
 
+def _budget_limited_state() -> dict:
+    """State mimicking issue #982: TP4 batch cap plus static runtime cap.
+
+    Reference dispositions stay at their resolution-time value because
+    analyzer-time limits land after build_context syncs them, so the
+    budget branch must not depend on disposition equality.
+    """
+    targets = [
+        ("references/active-campaign/README.md", "semantic", "mcp_tool_poisoning"),
+        ("references/acuity-scheduling/README.md", "semantic", "mcp_tool_poisoning"),
+        ("references/snapchat/README.md", "static", "static_patterns_tool_misuse"),
+    ]
+    events = []
+    for index, (target, phase, analyzer_id) in enumerate(targets):
+        if index < 2:
+            events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase=phase,
+                    analyzer_id=analyzer_id,
+                    path=target,
+                    reason=LedgerReason.OUTPUT_LIMIT,
+                    observed_records=257,
+                    limit_records=256,
+                )
+            )
+        else:
+            events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase=phase,
+                    analyzer_id=analyzer_id,
+                    path=target,
+                    reason=LedgerReason.RUNTIME_LIMIT,
+                    observed_seconds=5.01,
+                    limit_seconds=5.0,
+                )
+            )
+    events.append(
+        ledger_event(
+            outcome=LedgerOutcome.COMPLETED,
+            phase="static",
+            analyzer_id="static_patterns_tool_misuse",
+            path="references/active-campaign/README.md",
+        )
+    )
+    return {
+        "components": ["SKILL.md", *[target for target, _, _ in targets]],
+        "findings": [],
+        "effective_finding_ids": [],
+        "artifact_inventory": [
+            {"path": target, "disposition": "analyzed", "content_kind": "text"}
+            for target, _, _ in targets
+        ],
+        "artifact_references": [
+            {
+                "source_path": "SKILL.md",
+                "line": 10 + index,
+                "column": 1,
+                "evidence": f"See [{target}]({target}).",
+                "target_path": target,
+                "status": "resolved",
+                "disposition": "analyzed",
+            }
+            for index, (target, _, _) in enumerate(targets)
+        ],
+        "inspection_ledger": events,
+        "analyzer_status_events": [],
+    }
+
+
+def test_budget_only_references_produce_no_ae1_but_stay_partial() -> None:
+    result = finalize_inspection_ledger(_budget_limited_state())
+
+    assert result["findings"] == []
+    completeness = result["analysis_completeness"]
+    assert completeness["status"] == "partial"
+    assert completeness["is_complete"] is False
+    assert {
+        (event.get("path"), event.get("reason_code")) for event in completeness["ledger_exceptions"]
+    } == {
+        ("references/active-campaign/README.md", LedgerReason.OUTPUT_LIMIT),
+        ("references/acuity-scheduling/README.md", LedgerReason.OUTPUT_LIMIT),
+        ("references/snapchat/README.md", LedgerReason.RUNTIME_LIMIT),
+    }
+
+
+def test_mixed_budget_and_artifact_limitation_keeps_high_ae1() -> None:
+    state = _budget_limited_state()
+    state["inspection_ledger"] = [
+        event for event in state["inspection_ledger"] if event.get("outcome") != "completed"
+    ] + [
+        ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            analyzer_id="static_patterns_tool_misuse",
+            path="references/active-campaign/README.md",
+            reason=LedgerReason.STATIC_PARSE_LIMIT,
+        ),
+    ]
+    result = finalize_inspection_ledger(state)
+
+    ae1 = [finding for finding in result["findings"] if finding.rule_id == "AE1"]
+    assert len(ae1) == 1
+    assert ae1[0].severity == "HIGH"
+    assert ae1[0].confidence == 1.0
+    assert ae1[0].matched_text == "references/active-campaign/README.md"
+
+
+def test_budget_only_with_failed_inventory_keeps_ae1() -> None:
+    state = _budget_limited_state()
+    state["artifact_inventory"] = [
+        {**item, "disposition": "failed"}
+        if item["path"] == "references/snapchat/README.md"
+        else item
+        for item in state["artifact_inventory"]
+    ]
+    result = finalize_inspection_ledger(state)
+
+    ae1 = [finding for finding in result["findings"] if finding.rule_id == "AE1"]
+    assert [finding.matched_text for finding in ae1] == ["references/snapchat/README.md"]
+    assert ae1[0].severity == "HIGH"
+
+
 def test_finalization_coverage_finding_does_not_require_meta_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

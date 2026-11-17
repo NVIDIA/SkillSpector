@@ -26,6 +26,7 @@ Selection happens via the ``SKILLSPECTOR_PROVIDER`` env var:
     anthropic         → AnthropicProvider            (api.anthropic.com)
     anthropic_proxy   → AnthropicProxyProvider       (Vertex-style raw-predict proxy)
     bedrock           → BedrockProvider              (AWS Bedrock Runtime, SigV4)
+    minimax           → MiniMaxProvider              (global or China regional endpoint)
     nv_build          → NvBuildProvider              (build.nvidia.com)
     ollama            → OllamaProvider               (local Ollama instance)
     azure_openai      → AzureOpenAIProvider          (Azure OpenAI Service)
@@ -134,6 +135,10 @@ def _select_active_provider() -> LLMProvider:
         from .bedrock import BedrockProvider
 
         return BedrockProvider()
+    if name == "minimax":
+        from .minimax import MiniMaxProvider
+
+        return MiniMaxProvider()
     if name == "ollama":
         from .ollama import OllamaProvider
 
@@ -184,7 +189,7 @@ def _select_active_provider() -> LLMProvider:
 
     raise UnknownProviderError(
         f"Unknown SKILLSPECTOR_PROVIDER: {name!r}. "
-        "Expected one of: openai, anthropic, anthropic_proxy, bedrock, nv_build, "
+        "Expected one of: openai, anthropic, anthropic_proxy, bedrock, minimax, nv_build, "
         "ollama, azure_openai, openai_compatible, gemini, "
         "claude_cli, codex_cli, gemini_cli, opencode_cli, antigravity_cli (or unset)."
     )
@@ -234,7 +239,7 @@ def resolve_chat_model_credentials() -> tuple[str, str | None] | None:
     return _openai_fallback_provider().resolve_credentials()
 
 
-def get_model_config_provider() -> ModelMetadataProvider:
+def get_model_config_provider() -> LLMProvider:
     """Return the provider whose model defaults match graph chat-model routing.
 
     Explicit bindings, CLI providers, Bedrock's native AWS credential path,
@@ -262,6 +267,14 @@ def get_model_config_provider() -> ModelMetadataProvider:
     if fallback.resolve_credentials() is not None:
         return fallback
     return provider
+
+
+def prepare_chat_model_imports() -> None:
+    """Prepare only an opted-in, configured transport without creating a client."""
+    provider = get_model_config_provider()
+    prepare = getattr(provider, "prepare_chat_model_imports", None)
+    if callable(prepare) and provider.resolve_credentials() is not None:
+        prepare()
 
 
 def create_chat_model_with_provider(
@@ -335,6 +348,7 @@ __all__ = [
     "create_chat_model_with_provider",
     "get_active_provider",
     "get_model_config_provider",
+    "prepare_chat_model_imports",
     "get_metadata_provider",
     "has_cli_capability",
     "has_provider_binding",

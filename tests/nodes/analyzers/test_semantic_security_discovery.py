@@ -314,7 +314,8 @@ class TestSemanticSecurityDiscoveryBatching:
 
         with patch(
             "skillspector.llm_analyzer_base.get_max_input_tokens",
-            return_value=50,
+            # Leave room for the fixed prompt/schema; only source needs splitting.
+            return_value=8192,
         ):
             with patch.object(
                 LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, return_value=[]

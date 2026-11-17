@@ -79,10 +79,20 @@ _scan_python_ast_cache_key: ContextVar[str | None] = ContextVar(
     "system_prompt_leakage_python_ast_cache_key", default=None
 )
 
+# "complete" and "entire" are ordinary adjectives in documentation ("show complete
+# instructions for installing"), so unlike "full" they need "your" or "system" too.
+_P6_TARGET_QUALIFIERS = (
+    r"(?:(?:your\s+)?(?:full\s+)?(?:system\s+)?"
+    r"|your\s+(?:complete|entire)\s+(?:system\s+)?"
+    r"|(?:complete|entire)\s+system\s+)"
+)
+
 # P6: Direct Prompt Extraction — instructions that directly reveal system prompts
 P6_PATTERNS = [
     (
-        r"(?:print|output|show|display|reveal|expose|return|echo)\s+(?:your\s+)?(?:full\s+)?(?:system\s+)?(?:prompts?|instructions?|rules?|guidelines?|directives?)",
+        r"(?:print|output|show|display|reveal|expose|return|echo)\s+"
+        + _P6_TARGET_QUALIFIERS
+        + r"(?:prompts?|instructions?|rules?|guidelines?|directives?)",
         0.85,
     ),
     (
@@ -106,7 +116,9 @@ P6_PATTERNS = [
         0.85,
     ),
     (
-        r"(?:first|before\s+anything)\s+(?:output|print|show|display)\s+(?:your\s+)?(?:full\s+)?(?:system\s+)?(?:prompts?|instructions?)",
+        r"(?:first|before\s+anything)\s+(?:output|print|show|display)\s+"
+        + _P6_TARGET_QUALIFIERS
+        + r"(?:prompts?|instructions?)",
         0.85,
     ),
     (
@@ -120,7 +132,7 @@ _P6_TERMINAL_TARGET_PATTERNS = frozenset(
     pattern for index, (pattern, _) in enumerate(P6_PATTERNS) if index not in (2, 4)
 )
 _P6_QUALIFIED_TARGET = re.compile(
-    r"\b(?:your(?:\s+full)?(?:\s+system)?|system|internal|hidden|secret)\s+"
+    r"\b(?:your(?:\s+(?:full|complete|entire))?(?:\s+system)?|system|internal|hidden|secret)\s+"
     r"(?:prompts?|instructions?|rules?|guidelines?|directives?|config(?:uration)?s?)\Z",
     re.IGNORECASE,
 )
