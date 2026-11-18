@@ -339,7 +339,13 @@ class ShellSourceResolver:
         pending_owners: list[tuple[int, bool]] = []
         conditional = False
 
+        leading_input_redirect = False
+
         def finish(end: int, follows_operator: bool = False) -> None:
+            nonlocal leading_input_redirect
+            if leading_input_redirect and words:
+                self.input_redirect_commands.add(words[0][1])
+            leading_input_redirect = False
             if words or redirects:
                 if len(self.commands) + len(self.child_commands) >= 8192:
                     self.valid = False
@@ -447,6 +453,8 @@ class ShellSourceResolver:
                 cursor += 1
                 continue
             if character in "<>":
+                if character == "<" and not words:
+                    leading_input_redirect = True
                 if self.content.startswith("<<", cursor) and not self.content.startswith(
                     "<<<", cursor
                 ):
@@ -848,6 +856,38 @@ class ShellSourceResolver:
         self.resolving.remove(key)
         self.values[key] = result
         return result
+
+    def literal_command_binding(self, index: int, start: int, end: int) -> bool:
+        """Recognize an immediately preceding plain assignment used by sh/bash -c."""
+        raw = self.content
+        use = re.fullmatch(
+            r'"[^"$`\\\r\n]*\$(?:([A-Za-z_]\w*+)|\{([A-Za-z_]\w*+)\})[^"$`\\\r\n]*"',
+            raw[start:end],
+            re.ASCII,
+        )
+        if not use or not index:
+            return False
+        command = self.commands[index]
+        assignment = self.commands[index - 1]
+        if (
+            re.fullmatch(r"(?:/bin/)?(?:sh|bash)[ \t]+-c[ \t]+", raw[command.start : start]) is None
+            or assignment.start not in self.definite_commands
+            or len(assignment.words) != 1
+            or assignment.redirects
+            or assignment.start in self.input_redirect_commands
+            or assignment.start in self.heredoc_counts
+        ):
+            return False
+        name = use[1] or use[2]
+        _, left, right = assignment.words[0]
+        if (
+            not raw.startswith(name + "=", left)
+            or re.fullmatch(r"[ \t]*(?:;|\n)[ \t\n]*", raw[right : command.start]) is None
+        ):
+            return False
+        # Resolve the RHS a second time with all expansions disabled. This
+        # excludes runtime values, pseudo-paths, and command substitutions.
+        return self.word(left + len(name) + 1, right, literal_only=True) is not None
 
     def generated_files(self) -> Iterator[GeneratedShellFile]:
         """Expose exact bytes from unconditional literal cat-to-file heredocs."""
