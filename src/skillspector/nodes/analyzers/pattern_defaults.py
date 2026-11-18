@@ -101,6 +101,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "SC8": "Skill ships Python bytecode (__pycache__/ or .pyc/.pyo). Discovery skips these paths, so malicious bytecode can score SAFE while decoy sources look clean.",
     "SC9": "Executable content is concealed inside a document container or hidden/disguised artifact, where extension-based review can miss it.",
     "SC10": "Package-manager configuration redirects dependency resolution away from a canonical default, adds another source, or uses an unresolved destination.",
+    "SC11": "Skill ships a symbolic link or junction. Discovery never follows links, so the linked content is unscanned; a link that resolves outside the bundle or targets credential/agent-config paths lets an approved file operation on the skill path reach that target while the agent's prompt shows only the link path (SymJack / GhostApproval, CWE-59 + CWE-451).",
     # Trigger Abuse
     "TR1": "Skill uses overly broad trigger patterns that match common words or phrases, causing it to activate in unintended contexts and potentially shadow other skills.",
     "TR2": "Skill trigger shadows a common built-in command or another skill's trigger, potentially intercepting requests meant for trusted functionality.",
@@ -203,6 +204,7 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "SC8": PatternCategory.SUPPLY_CHAIN.value,
     "SC9": PatternCategory.SUPPLY_CHAIN.value,
     "SC10": PatternCategory.SUPPLY_CHAIN.value,
+    "SC11": PatternCategory.SUPPLY_CHAIN.value,
     "TR1": PatternCategory.TRIGGER_ABUSE.value,
     "TR2": PatternCategory.TRIGGER_ABUSE.value,
     "TR3": PatternCategory.TRIGGER_ABUSE.value,
@@ -304,6 +306,7 @@ PATTERN_NAMES: dict[str, str] = {
     "SC8": "Shipped Python Bytecode",
     "SC9": "Concealed Executable Artifact",
     "SC10": "Dependency Source Redirection",
+    "SC11": "Shipped Symbolic Link",
     "TR1": "Overly Broad Trigger",
     "TR2": "Shadow Command Trigger",
     "TR3": "Keyword Baiting Trigger",
@@ -414,6 +417,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "SC8": "Do not ship __pycache__/ or .pyc/.pyo in skills. Delete bytecode before packaging; if presence is intentional for a lab fixture, quarantine it outside the skill install path.",
     "SC9": "Keep executable files explicit and directly reviewable. Review the artifact provenance and why executable content is packaged inside a document, hidden file, or disguised container.",
     "SC10": "Review the destination and configuration scope as a dependency trust-boundary change, and keep the intended package source explicit and reviewable.",
+    "SC11": "Do not ship symbolic links or junctions in skills; replace them with real files. Never link to paths outside the bundle or to credential/agent-configuration locations. If a link is unavoidable for a lab fixture, document it and keep it inside the bundle.",
     # Trigger Abuse
     "TR1": "Use specific, narrow trigger patterns that match only the skill's intended use case. Avoid single-word or common-phrase triggers.",
     "TR2": "Choose triggers that do not conflict with built-in commands or other skills. Prefix with a unique namespace if necessary.",
