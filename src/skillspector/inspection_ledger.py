@@ -666,6 +666,7 @@ class ParserCheck(StrEnum):
     BRACE_ROUNDS = "brace_rounds"
     BRACE_SYNTAX = "brace_syntax"
     JAVASCRIPT_SYNTAX = "javascript_syntax"
+    GENERATED_HTML_MARKUP = "generated_html_markup"
     MARKDOWN_LITERAL_OWNERSHIP = "markdown_literal_ownership"
     HEREDOC_HEADER = "heredoc_header"
     HEREDOC_COUNT = "heredoc_count"

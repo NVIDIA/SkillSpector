@@ -1494,6 +1494,224 @@ _SHELL_EXECUTION_CALLS = frozenset(
 _SHELL_EXECUTION_MODULES = frozenset({"child_process", "execa", "shelljs", "zx"})
 
 
+def browser_markup_witness(
+    source: str, position: int, check_runtime: Callable[[], None]
+) -> tuple[int, int] | None:
+    """Find a dynamic markup sink when the diagnosed field is plain DOM text."""
+    program = parse_javascript_source(source, check_runtime)
+    if program is None:
+        return None
+    text_write = markup = None
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return None
+        if node.type in {"identifier", "property_identifier"}:
+            name = program.text(node)
+            if name in {
+                "eval",
+                "Function",
+                "Reflect",
+                "defineProperty",
+                "setPrototypeOf",
+                "prototype",
+                "__proto__",
+                "globalThis",
+            }:
+                return None
+            if name == "document" and (
+                node.parent is None
+                or node.parent.type != "member_expression"
+                or node.parent.child_by_field_name("object") != node
+            ):
+                return None
+            if name == "createElement":
+                member = node.parent
+                if (
+                    member is None
+                    or member.parent is None
+                    or member.parent.type != "call_expression"
+                    or member.parent.child_by_field_name("function") != member
+                ):
+                    return None
+        if node.type != "assignment_expression":
+            continue
+        target = node.child_by_field_name("left")
+        value = node.child_by_field_name("right")
+        if (
+            target is None
+            or target.type != "member_expression"
+            or value is None
+            or value.type != "template_string"
+        ):
+            continue
+        fields = [part for part in value.named_children if part.type == "template_substitution"]
+        property_name = _callable_member(program, target)
+        if property_name == "innerHTML" and fields and markup is None:
+            markup = program.span(node)
+        if property_name == "textContent" and any(
+            program.span(part)[0] == position for part in fields
+        ):
+            # A command within the interpolation remains independently relevant.
+            field = next(part for part in fields if program.span(part)[0] == position)
+            pending = list(field.named_children)
+            while pending:
+                check_runtime()
+                expression = pending.pop()
+                if expression.type not in {
+                    "identifier",
+                    "member_expression",
+                    "property_identifier",
+                    "number",
+                }:
+                    return None
+                pending.extend(expression.named_children)
+            text_write = target
+    if markup is None or text_write is None:
+        return None
+    receiver = text_write.child_by_field_name("object")
+    if receiver is None or receiver.type != "identifier":
+        return None
+    scope = text_write.parent
+    while scope is not None and scope.type not in {"statement_block", "program"}:
+        check_runtime()
+        scope = scope.parent
+    if scope is None:
+        return None
+    for statement in scope.named_children:
+        check_runtime()
+        if statement.end_byte > text_write.start_byte:
+            break
+        if statement.type != "lexical_declaration" or statement.children[0].type != "const":
+            continue
+        for binding in statement.named_children:
+            bound, value = binding.child_by_field_name("name"), binding.child_by_field_name("value")
+            if (
+                bound is None
+                or bound.type != "identifier"
+                or program.text(bound) != program.text(receiver)
+                or value is None
+                or value.type != "call_expression"
+            ):
+                continue
+            method = value.child_by_field_name("function")
+            args = value.child_by_field_name("arguments")
+            if (
+                method is not None
+                and method.type == "member_expression"
+                and (doc := method.child_by_field_name("object")) is not None
+                and doc.type == "identifier"
+                and program.text(doc) == "document"
+                and _callable_member(program, method) == "createElement"
+                and args is not None
+                and len(args.named_children) == 1
+                and (tag := args.named_children[0]).type == "string"
+                and program.text(tag)[1:-1]
+                in {"div", "label", "li", "option", "p", "pre", "span", "td"}
+            ):
+                return markup
+    return None
+
+
+def _only_thrown_messages(
+    program: JavaScriptProgram, templates: list[Node], check_runtime: Callable[[], None]
+) -> bool:
+    """Recognize plain diagnostic arguments thrown directly by the native Error.
+
+    Limit the proof to independent data reads. A caught, intercepted, constructed,
+    or otherwise consumed message must still go through ordinary inspection.
+    """
+    constructors: set[int] = set()
+    for template in templates:
+        check_runtime()
+        arguments = template.parent
+        call = None if arguments is None else arguments.parent
+        if (
+            arguments is None
+            or arguments.type != "arguments"
+            or arguments.named_children != [template]
+            or call is None
+            or call.type != "new_expression"
+            or (constructor := call.child_by_field_name("constructor")) is None
+            or constructor.type != "identifier"
+            or program.text(constructor) != "Error"
+            or call.parent is None
+            or call.parent.type != "throw_statement"
+        ):
+            return False
+        constructors.add(constructor.id)
+        pending = list(template.named_children)
+        while pending:
+            check_runtime()
+            component = pending.pop()
+            if component.type not in {
+                "string_fragment",
+                "template_substitution",
+                "identifier",
+                "number",
+                "member_expression",
+                "property_identifier",
+                "subscript_expression",
+            }:
+                return False
+            pending.extend(component.named_children)
+    for node in program.nodes:
+        check_runtime()
+        if node.type in {"catch_clause", "with_statement", "this", "import", "escape_sequence"}:
+            return False
+        if node.type in {"call_expression", "new_expression"}:
+            callee = node.child_by_field_name("function") or node.child_by_field_name("constructor")
+            if callee is not None and (
+                (
+                    callee.type == "identifier"
+                    and program.text(callee).casefold() in _SHELL_EXECUTION_CALLS
+                )
+                or (_callable_member(program, callee) or "").casefold() in _SHELL_EXECUTION_CALLS
+            ):
+                return False
+        if node.type not in {
+            "identifier",
+            "property_identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+            "string",
+        }:
+            continue
+        name = program.text(node).strip("\"'")
+        if (
+            (name == "Error" and node.id not in constructors)
+            or "\\" in name
+            or name
+            in {
+                "globalThis",
+                "global",
+                "self",
+                "window",
+                "process",
+                "Reflect",
+                "eval",
+                "Function",
+                "prototype",
+                "__proto__",
+                "constructor",
+                "require",
+                "defineProperty",
+                "defineProperties",
+                "setPrototypeOf",
+                "catch",
+                "then",
+                "onerror",
+                "addEventListener",
+                "prepareStackTrace",
+                "message",
+                "stack",
+            }
+            or _is_shell_execution_module(name)
+        ):
+            return False
+    return bool(constructors)
+
+
 def javascript_template_spans(
     content: str,
     check_runtime: Callable[[], None],
@@ -1538,7 +1756,7 @@ def javascript_template_spans(
     )
     if not checked_execution:
         execution_node = _has_shell_execution_call(program, check_runtime)
-    if execution_node is not None:
+    if execution_node is not None and not _only_thrown_messages(program, templates, check_runtime):
         for node in templates:
             check_runtime()
             start, end = program.span(node)
@@ -1905,7 +2123,8 @@ def _ordinary_native_calls(
                 if not (
                     owner is not None
                     and owner.type == "member_expression"
-                    and program.text(owner.child_by_field_name("object")) == "Object"
+                    and (object_node := owner.child_by_field_name("object")) is not None
+                    and program.text(object_node) == "Object"
                     and method is not None
                     and method.type == "member_expression"
                     and _callable_member(program, method) == "hasOwnProperty"
@@ -1930,8 +2149,8 @@ def _ordinary_native_calls(
                 and call is not None
                 and call.type == "call_expression"
                 and call.child_by_field_name("function") == member
-                and call.child_by_field_name("arguments") is not None
-                and call.child_by_field_name("arguments").type != "template_string"
+                and (arguments := call.child_by_field_name("arguments")) is not None
+                and arguments.type != "template_string"
             ):
                 if _callable_member(program, member) == "exec":
                     regex_calls.append(member)
@@ -2027,8 +2246,8 @@ def _ordinary_native_calls(
                 and call is not None
                 and call.type == "call_expression"
                 and call.child_by_field_name("function") == member
-                and call.child_by_field_name("arguments") is not None
-                and call.child_by_field_name("arguments").type != "template_string"
+                and (arguments := call.child_by_field_name("arguments")) is not None
+                and arguments.type != "template_string"
             ):
                 intrinsic_override = True
                 break
@@ -2483,8 +2702,8 @@ def _numeric_local_identifiers(
                 or call is None
                 or call.type != "call_expression"
                 or call.child_by_field_name("function") != reference
-                or call.child_by_field_name("arguments") is None
-                or call.child_by_field_name("arguments").type == "template_string"
+                or (arguments := call.child_by_field_name("arguments")) is None
+                or arguments.type == "template_string"
             ):
                 break
             identifiers.add(reference.id)

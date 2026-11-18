@@ -1361,3 +1361,22 @@ def test_array_accumulators_only_own_exact_non_callable_bindings():
     ):
         candidate = source.replace("run = null; return", replacement + "; return")
         assert javascript_template_spans(candidate, lambda: None) is None
+
+
+def test_uncaught_native_error_only_owns_direct_scalar_messages():
+    source = (
+        "function f(items, i) { group.run.push(i); throw new Error(`bad item ${items[i].name}`); }"
+    )
+    assert javascript_template_spans(source, lambda: None)
+    for candidate in (
+        "let Error = receiver; " + source,
+        "try { f(a, b); } catch (e) { use(e); }" + source,
+        "globalThis.Error = handler; " + source,
+        "process.on('uncaughtException', handler); " + source,
+        source + " send(`value ${x}`);",
+        source.replace("items[i].name", "run(cmd)"),
+        source.replace("throw new Error", "return new Error"),
+        source + " import {exec} from 'node:child_process';",
+        source + " tool.exec(other);",
+    ):
+        assert javascript_template_spans(candidate, lambda: None) is None

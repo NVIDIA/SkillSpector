@@ -70,6 +70,7 @@ from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_string_constants import python_constant_string_fields
 from skillspector.python_tokens import (
     PythonLiteralSpans,
+    generated_script_markup_span,
     python_browser_template_shell_text,
     python_string_value_bounds_allowed,
 )
@@ -12436,6 +12437,20 @@ def _has_bounded_parse_exhaustion(
         **json_word_roles,
     )
     if diagnostic is not None:
+        if (
+            file_type == "python"
+            and complete_context
+            and diagnostic.unchecked_scope == ParserUncheckedScope.COMMAND_WORD
+            and content.startswith("${", diagnostic.start)
+        ):
+            markup = generated_script_markup_span(content, diagnostic.start, check_runtime)
+            if markup is not None:
+                return StaticParserDiagnostic(
+                    ParserCause.RUNTIME_DEPENDENT,
+                    ParserCheck.GENERATED_HTML_MARKUP,
+                    *markup,
+                    ParserUncheckedScope.EXPRESSION,
+                )
         return diagnostic
     json_starts = [start for start, _ in json_operand_spans]
     native_backtick_starts = sorted(native_backtick_bounds)
