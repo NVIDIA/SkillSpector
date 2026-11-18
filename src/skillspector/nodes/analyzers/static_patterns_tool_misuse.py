@@ -9353,6 +9353,12 @@ _MARKDOWN_EXAMPLE_CELL = re.compile(
 )
 
 
+_WAVEFORM_AXIS = re.compile(r"^[ \t]*\|(?:[ \t]+\|){2,}[ \t]*\r?$", re.M)
+_WAVEFORM_ROW = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*[ \t]+(?P<signal>[_`|]+)[ \t]*\r?$", re.M)
+_DIRECTORY_TREE_NOTE = re.compile(
+    r'^[ \t│]*(?:├──|└──) +[A-Za-z0-9_./<>-]+[ \t]+# (?P<note>[A-Za-z0-9 ,._<>\[\]…—`:"-]{1,256})\r?$',
+    re.M,
+)
 _CONSOLE_PATH_ERROR = re.compile(
     r"^[a-zA-Z][a-zA-Z0-9_.-]*: (?:error|fatal): [a-zA-Z][a-zA-Z ]{1,80} "
     r"(?P<open>`)/[a-zA-Z0-9_./-]+(?P<close>')[.!]?[ \t]*\r?$",
@@ -9376,6 +9382,21 @@ _MARKDOWN_RECORD_MESSAGE = re.compile(
     r'(?P<open>")(?=[A-Za-z]+ +)[A-Za-z][A-Za-z ,.;-]{1,120}(?P<close>")(?=[ .;,!?]|$)',
     re.I,
 )
+
+
+_OBJECT_FIELD = r"(?:[a-zA-Z_][a-zA-Z0-9_]*|<[a-zA-Z_][a-zA-Z0-9_]*>)"
+_OBJECT_MEMBER = rf'"{_OBJECT_FIELD}" *: *(?:"{_OBJECT_FIELD}"|<[a-zA-Z_][a-zA-Z0-9_]*>)'
+_OBJECT_TEMPLATE = re.compile(rf"\{{ *{_OBJECT_MEMBER}(?: *, *{_OBJECT_MEMBER})* *\}}")
+
+
+def _documented_clause_start(content: str, start: int, end: int) -> bool:
+    return (
+        end - start <= 32
+        and re.fullmatch(r"(?:command|builtin) +\(", content[start:end]) is not None
+        and re.search(r"\bno line starts with[ \t\r\n]+`$", content[max(0, start - 60) : start])
+        is not None
+        and re.match(r"`[.](?:\s|$)", content[end : end + 4]) is not None
+    )
 
 
 def _documented_expansion_placeholder(content: str, start: int, end: int) -> bool:
@@ -9406,7 +9427,13 @@ def _markdown_syntax_example(content: str, start: int, end: int) -> bool:
     """Identify a literal Markdown code span demonstrated inside a longer delimiter."""
     if end - start > 80 or content[start - 2 : start] != "``" or content[end : end + 2] != "``":
         return False
-    match = re.fullmatch(r" `([A-Za-z][A-Za-z0-9_-]*)` ", content[start:end])
+    body = content[start:end]
+    if re.fullmatch(r" `{3,6}[A-Za-z][A-Za-z0-9_-]* ", body):
+        return bool(
+            re.search(r"(?:^|\n)[ \t]*[-*+] +$", content[max(0, start - 30) : start - 2])
+            and re.match(r" +(?:blocks|fences) +(?:→|are|denote)\s", content[end + 2 : end + 52])
+        )
+    match = re.fullmatch(r" `([A-Za-z][A-Za-z0-9_-]*)` ", body)
     if match is None:
         return False
     # A rendered equivalent or a list of inline markup forms establishes the
@@ -9526,8 +9553,23 @@ def _markdown_shell_text(
                 inline_regions.append((end, close_start))
             output[start:end] = " " * (end - start)
             output[close_start:close_end] = " " * (close_end - close_start)
+            if _documented_clause_start(content, end, close_start):
+                output[close_start - 1] = " "
+            if (
+                content.startswith("{", end)
+                and close_start - end <= 512
+                and re.search(r"\b(?:as|example:) +`$", content[max(0, end - 20) : end])
+                and _OBJECT_TEMPLATE.fullmatch(content, end, close_start)
+            ):
+                # These rigid data templates have identifier keys and values
+                # only. Braces and matching quotes carry no shell state.
+                for mark in range(end, close_start):
+                    if content[mark] in '"{}<>':
+                        output[mark] = " "
             if _markdown_syntax_example(content, end, close_start):
-                output[end + 1] = output[close_start - 2] = " "
+                for mark in range(end, close_start):
+                    if content[mark] == "`":
+                        output[mark] = " "
             if inline_code_ranges is not None:
                 inline_code_ranges.append((end, close_start))
             if (
@@ -9601,6 +9643,7 @@ def _markdown_shell_text(
     paragraph_list_indent = 0
     list_content_indents: list[int] = []
     table_columns: int | None = None
+    regex_columns: set[int] = set()
     table_minimum_indent = 0
     table_delimiter_line = -1
     offset = 0
@@ -9749,7 +9792,20 @@ def _markdown_shell_text(
                 ):
                     powershell_blocks.append((fence_body_start, offset))
                 closed_fences.append((fence_body_start, offset))
-                if complete_context and nested_markdown and fence[3] in {"markdown", "md"}:
+                checklist = (
+                    complete_context
+                    and not fence[3]
+                    and content.startswith("[ ] ", fence_body_start)
+                    and all(
+                        line.startswith(("[ ] ", "[x] ", "[X] "))
+                        for line in content[fence_body_start:offset].splitlines()
+                    )
+                )
+                if (
+                    complete_context
+                    and nested_markdown
+                    and (checklist or fence[3] in {"markdown", "md"})
+                ):
                     # Only project delimiter pairs that the child Markdown
                     # document actually owns. A second nested fence remains
                     # literal, and all command strings in the outer source
@@ -9767,10 +9823,14 @@ def _markdown_shell_text(
                         start, end = fence_body_start + inner_start, fence_body_start + inner_end
                         if inline_code_ranges is not None:
                             inline_code_ranges.append((start, end))
-                        if inner_end - inner_start > 128 or not re.fullmatch(
-                            r"(?:[A-Za-z][A-Za-z0-9_./: (),!…\[\]-]*|<[A-Za-z][A-Za-z0-9_.: ,/-]*>|(?:[A-Za-z][\w.-]*-)?<[A-Za-z][\w-]*>(?:-[A-Za-z][\w.-]*)?)",
+                        if inner_end - inner_start > 128:
+                            continue
+                        label = re.sub(
+                            r"<[A-Za-z][A-Za-z0-9_.: ,/-]*>",
+                            "FIELD",
                             section[inner_start:inner_end],
-                        ):
+                        )
+                        if not re.fullmatch(r"[—A-Za-z0-9][A-Za-z0-9_./: (),!…—\[\]-]*", label):
                             continue
                         # Restrict this projection to single delimiters. Other
                         # widths may themselves demonstrate inline markup.
@@ -9782,6 +9842,22 @@ def _markdown_shell_text(
                 if complete_context and fence[3] in {"", "text", "plaintext", "console"}:
                     # A complete, tool-prefixed error line quotes the path
                     # printed by the program, including traditional GNU quotes.
+                    if _WAVEFORM_AXIS.search(content, fence_body_start, offset):
+                        for waveform in _WAVEFORM_ROW.finditer(content, fence_body_start, offset):
+                            check_runtime()
+                            signal = waveform["signal"]
+                            if "_" in signal and "``" in signal and signal.count("|") >= 2:
+                                lo, hi = waveform.span("signal")
+                                output[lo:hi] = signal.replace("`", "_")
+                    for row in _DIRECTORY_TREE_NOTE.finditer(content, fence_body_start, offset):
+                        check_runtime()
+                        for token in re.finditer(
+                            r'"<[A-Za-z_][a-zA-Z0-9_]*>"|`[A-Za-z_][a-zA-Z0-9_]*`', row["note"]
+                        ):
+                            pos = row.start("note") + token.start()
+                            for ch in range(len(token[0])):
+                                if token[0][ch] in '"<>`':
+                                    output[pos + ch] = " "
                     for message in _CONSOLE_PATH_ERROR.finditer(content, fence_body_start, offset):
                         check_runtime()
                         output[message.start("open")] = output[message.start("close")] = " "
@@ -9968,6 +10044,18 @@ def _markdown_shell_text(
                         # a header only after the next row proves that role.
                         separator = False
                         table_columns = columns
+                        regex_columns = {
+                            i
+                            for i, (lo, hi) in enumerate(
+                                _markdown_table_cells(stripped, prefix, check_runtime)
+                            )
+                            if hi - lo <= 100
+                            and re.fullmatch(
+                                r"(?:signature|pattern|regular expression) +\((?:grep +-E|ERE)\)",
+                                stripped[lo:hi].strip(),
+                                re.I,
+                            )
+                        }
                         table_minimum_indent = minimum_indent
                         table_delimiter_line = line_index + 1
                 if table_columns is not None:
@@ -10015,6 +10103,16 @@ def _markdown_shell_text(
                             for match in backtick_runs.finditer(stripped, cell_start, cell_end):
                                 check_runtime()
                                 runs.append((offset + match.start(), offset + match.end()))
+                            if complete_context and cell_index in regex_columns:
+                                # A double quote inside the POSIX bracket class
+                                # [^"] is a literal member, not a shell quote.
+                                for (_, begin), (finish, _) in complete_inline_code_pairs(
+                                    content, runs
+                                ):
+                                    pattern = content[begin:finish]
+                                    if len(pattern) <= 512 and not re.search(r"[$`;&|<>]", pattern):
+                                        for atom in re.finditer(r'\[\^"\]', pattern):
+                                            output[begin + atom.start() + 2] = "_"
                             mask_inline_delimiters()
                         if not cells:
                             table_columns = None
@@ -12229,8 +12327,10 @@ def _markdown_owned_commands_diagnostic(
         return diagnostic
     for start, end in ranges:
         check_runtime()
-        if _markdown_syntax_example(content, start, end) or _documented_expansion_placeholder(
-            content, start, end
+        if (
+            _documented_clause_start(content, start, end)
+            or _markdown_syntax_example(content, start, end)
+            or _documented_expansion_placeholder(content, start, end)
         ):
             continue
         diagnostic = _owned_inline_command_diagnostic(

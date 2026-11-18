@@ -922,3 +922,49 @@ def test_documentation_can_quote_a_path_in_console_output():
     assert " /tmp/output " in tm._markdown_shell_text(closed, lambda: None)
     for source in ["```console\n" + message, as_shell, closed.replace("/tmp/output", "$TARGET")]:
         assert "`" in tm._markdown_shell_text(source, lambda: None)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "- `` ```chart `` blocks → native charts.\n",
+        "No line starts with\n`command (`.\n".lower(),
+        'The output is wrapped as `{"<key>": "<value>", "result": <code>}`.\n',
+        "```\n[ ] Uses `core`, not `extension`.\n[ ] Data types match.\n```\n",
+        '| Signature (grep -E) | Name |\n|---|---|\n| `Value="[^"]+"` | Example |\n',
+    ],
+)
+def test_native_reference_examples_preserve_other_executable_scopes(content):
+    assert tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown") is None
+    assert tm.bounded_parse_diagnostic(
+        content + '\n```sh\neval "$CMD"\n```\n', lambda: None, file_type="markdown"
+    )
+
+
+def test_regular_expression_quotes_are_owned_only_by_the_proved_column():
+    source = '| Command | Pattern (grep -E) |\n|---|---|\n| `Value="[^"]+"` | `Value="[^"]+"` |\n'
+    projected = tm._markdown_shell_text(source, lambda: None)
+    assert projected.splitlines()[-1].count('[^"]') == 1
+    assert source.index('[^"]') == projected.index('[^"]')
+
+
+def test_directory_tree_keeps_unproved_command_and_incomplete_fence():
+    source = (
+        '```text\n├── record.json  # ["<name>", …] — output\n└── runner # `sh -c "$payload"`\n```\n'
+    )
+    projected = tm._markdown_shell_text(source, lambda: None)
+    assert '"<name>"' not in projected
+    assert '`sh -c "$payload"`' in projected
+    assert '"<name>"' in tm._markdown_shell_text(source[:-4], lambda: None)
+
+
+def test_timing_diagram_requires_axis_and_plain_signal_row():
+    row = "clock     ___|```|___|````|\n"
+    axis = "          |   |   |   |\n"
+
+    def projection(body: str) -> str:
+        return tm._markdown_shell_text("```text\n" + body + "```\n", lambda: None)
+
+    assert "`" not in projection(axis + row)
+    assert row in projection(row)
+    assert row.rstrip() + "$CMD" in projection(axis + row.rstrip() + "$CMD\n")

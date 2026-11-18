@@ -146,16 +146,22 @@ def _quoted_list_spans(content: str) -> QuotedListSpans | None:
                         # Parameter expansion, braces with alternatives, and
                         # dynamic executable words keep the existing fallback.
                         with_names = _TEMPLATE_WORD.sub("NAME", body) if "{" in body else body
-                        if _LITERAL_CODE.fullmatch(with_names) is None and not (
-                            _NAMED_PATH.fullmatch(body)
-                            and (
-                                re.search(
-                                    r"\b(?:(?:over|under|inside|in|at) +|Read +[0-9]+ +— +)$",
-                                    block.content[max(0, begin - 20) : begin],
-                                )
-                                or re.match(
-                                    r" is the (?:canonical |primary )?(?:source|path)\b",
-                                    block.content[finish : finish + 40],
+                        if (
+                            _LITERAL_CODE.fullmatch(with_names) is None
+                            and not re.fullmatch(
+                                r"#pragma +[a-zA-Z_][a-zA-Z0-9_]*(?: +[a-zA-Z0-9_]+){0,8}", body
+                            )
+                            and not (
+                                _NAMED_PATH.fullmatch(body)
+                                and (
+                                    re.search(
+                                        r"\b(?:(?:over|under|inside|in|at) +|Read +[0-9]+ +— +)$",
+                                        block.content[max(0, begin - 20) : begin],
+                                    )
+                                    or re.match(
+                                        r" is the (?:canonical |primary )?(?:source|path)\b",
+                                        block.content[finish : finish + 40],
+                                    )
                                 )
                             )
                         ):
