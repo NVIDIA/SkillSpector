@@ -69,6 +69,30 @@ E1_CODE_PATTERNS = [
     _E1_CURL_UPLOAD_PATTERN,
     _E1_WGET_UPLOAD_PATTERN,
     (r"https?://(?:api\.|data\.|collect\.|telemetry\.|analytics\.)[\w.-]+/", 0.5),
+    # Ruby HTTP clients.
+    (r"Net::HTTP\s*\.\s*post(?:_form)?\b", 0.6),
+    (r"Net::HTTP::(?:Post|Put|Patch)\s*\.\s*new\b", 0.6),
+    (r"\b(?:HTTParty|RestClient|Faraday)\s*\.\s*(?:post|put|patch)\b", 0.6),
+    # Go net/http. Go exports are capitalized, so the method names stay
+    # case-sensitive and JavaScript ``http.post(...)`` is not matched here.
+    (
+        r"\b(?:http\.(?-i:Post|PostForm)\s*\(|\w+\.(?-i:Post|PostForm)\s*\(\s*[\"`]https?://)",
+        0.6,
+    ),
+    # ``NewRequestWithContext`` takes a context first: a name, a selector such
+    # as ``r.Context()``, or a call such as ``context.Background()`` /
+    # ``context.WithTimeout(ctx, d)`` (one level of nested parentheses).
+    (
+        r"\bhttp\.(?-i:NewRequest)\s*\(\s*"
+        r"(?:http\.(?-i:MethodPost|MethodPut|MethodPatch)\b|[\"`](?-i:POST|PUT|PATCH)[\"`])",
+        0.6,
+    ),
+    (
+        r"\bhttp\.(?-i:NewRequestWithContext)\s*\(\s*"
+        r"[\w.]+(?:\s*\((?:[^()]|\([^()]*\))*\))?\s*,\s*"
+        r"(?:http\.(?-i:MethodPost|MethodPut|MethodPatch)\b|[\"`](?-i:POST|PUT|PATCH)[\"`])",
+        0.6,
+    ),
 ]
 E1_PROSE_PATTERNS = [
     (
