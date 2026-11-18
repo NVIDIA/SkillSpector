@@ -25,6 +25,7 @@ Framework: ASI02.
 from __future__ import annotations
 
 import ast
+import codecs
 import heapq
 import re
 import shlex
@@ -32,6 +33,7 @@ import sys
 import time
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from itertools import pairwise
@@ -84,6 +86,8 @@ from skillspector.python_tokens import (
     generated_script_markup_span,
     html_template_contains_script,
     python_browser_template_shell_text,
+    python_fstring_literal_spans,
+    python_literal_field_text,
     python_string_value_bounds_allowed,
     python_text_assignment_script,
 )
@@ -261,7 +265,15 @@ _PYTHON_FORMAT_NAME_RE = re.compile(r"\.format\([ \t]*([A-Za-z_][A-Za-z0-9_]*)[ 
 # Python operators that can still extend or rewrite a string value.
 _PYTHON_STRING_EXTENSION_OPERATORS = frozenset({"+", "%", ".", "*", "["})
 # One brace opens an f-string replacement field; a doubled brace is literal.
-_PYTHON_REPLACEMENT_FIELD_RE = re.compile(r"\{\{|(\{)")
+# A literal prefix keeps its internal hyphens inside the same argument.
+# Exclude shell expansions and escapes, whose prefix can disappear.
+_PLAIN_HYPHENATED_WORD_RE = re.compile(
+    r"(?<![A-Za-z0-9_.$/\\])[A-Za-z0-9_./]++(?:-[A-Za-z0-9_./]++)+"
+)
+_PYTHON_OPERAND_SYNTAX_RE = re.compile(
+    r"""\\(?:N\{[a-zA-Z0-9 -]+\}|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}"""
+    r"""|[0-7]{1,3}|[abfnrtv\\'"]|\r?\n)|\{\{|\}\}|(\{)"""
+)
 _PRINTF_FORMAT_CONVERSION_RE = re.compile(r"%[-+ #0-9.*']*[A-Za-z%]")
 _SHELL_ROOT_TARGET_ESCAPE_RE = re.compile(
     r"\\(?:[/~*?]|x(?:2[fF]|7[eE]|2[aA]|3[fF])|"
@@ -809,6 +821,8 @@ class _ShellToken:
     has_quoted_content: bool
     brace_expansion: bool
     leading_tilde_unquoted: bool
+    unresolved_brace: bool
+    python_field: bool = False
 
 
 @dataclass(frozen=True)
@@ -4950,6 +4964,8 @@ def _has_shell_command_word_exhaustion(
                 check_runtime,
                 powershell_strings=powershell_strings,
                 quoted_printf_allowed=quoted_printf_allowed,
+                # Raw Python has not yet resolved replacement fields or concatenation.
+                unresolved_braces=None if file_type == "python" else frozenset(),
                 **(
                     {"source_end": boundary}
                     if value_span is not None
@@ -4963,7 +4979,10 @@ def _has_shell_command_word_exhaustion(
             if parsed.dynamic and may_have_destructive_outer_operands
             else None
         )
-        if operand_diagnostic is not None:
+        # Adjacent Python literals can contribute fields and operands that
+        # belong to a single command even when each raw source word is benign.
+        verify_python_value = parsed.dynamic and python_source is not None
+        if operand_diagnostic is not None or verify_python_value:
             comment = python_source.comment(start) if python_source is not None else None
             while perl_header is not None and start >= perl_header.end():
                 perl_header = _PERL_HEADER_LINE_RE.match(content, perl_header.end())
@@ -4980,28 +4999,81 @@ def _has_shell_command_word_exhaustion(
                 # concatenated with it. A value that code can still extend,
                 # for example with ``%`` or ``.format``, stays partial.
                 value_source_range: list[int] = []
+                projection = _PythonOperandProjection()
                 value = (
-                    python_source.string_value(start, parsed.end, source_range=value_source_range)
+                    python_source.string_value(
+                        start,
+                        parsed.end,
+                        source_range=value_source_range,
+                        projection=projection,
+                    )
                     if python_source is not None
                     else None
                 )
-                if value is None:
+                if value is None or (projection.open_tail and operand_diagnostic is not None):
+                    if operand_diagnostic is None:
+                        continue
                     if python_source is not None:
                         runtime_field = python_source.runtime_format_argument(start, parsed.end)
                         if runtime_field is not None:
                             return runtime_field
                     return operand_diagnostic
+                # A successful raw check already covers the unchanged body of a
+                # single literal. Additional candidates must come from Python
+                # actually decoding, interpolating or joining operand text.
+                if operand_diagnostic is None and (
+                    not projection.changed or not _may_have_destructive_outer_operands(value[0])
+                ):
+                    continue
                 value_diagnostic = _has_runtime_command_operand_exhaustion(
-                    *value, check_runtime, quoted_printf_allowed=quoted_printf_allowed
+                    *value,
+                    check_runtime,
+                    quoted_printf_allowed=quoted_printf_allowed,
+                    unresolved_braces=projection.unknown_fields,
                 )
+                if value_diagnostic is None and projection.field_ranges:
+                    text, start_in_value, end_in_value = value
+                    typed_words, holes = projection.argument_holes(text)
+                    value_diagnostic = _has_runtime_command_operand_exhaustion(
+                        typed_words,
+                        start_in_value,
+                        end_in_value,
+                        check_runtime,
+                        quoted_printf_allowed=quoted_printf_allowed,
+                        python_fields=holes,
+                    )
+                if (
+                    value_diagnostic is not None
+                    and value_diagnostic.check is ParserCheck.COMMAND_ARGUMENT_BOUNDARY
+                    and value_diagnostic.full_input_checked
+                    and projection.complete
+                    and not projection.open_tail
+                    and not projection.unknown_fields
+                ):
+                    # An unclosed quote can hide following option words. Fixed
+                    # hyphens in filenames such as "guide-first/review-map"
+                    # cannot introduce an option, even across joined literals.
+                    potential_options = _PLAIN_HYPHENATED_WORD_RE.sub(
+                        lambda match: match[0].replace("-", "_"), value[0]
+                    )
+                    if not _may_have_destructive_outer_operands(potential_options):
+                        continue
                 if value_diagnostic is not None:
+                    if projection.open_tail:
+                        return StaticParserDiagnostic(
+                            ParserCause.BOUNDARY_UNRESOLVED,
+                            ParserCheck.COMMAND_ARGUMENT_BOUNDARY,
+                            *value_source_range,
+                            ParserUncheckedScope.COMMAND_ARGUMENTS,
+                            location_precision="enclosing_expression",
+                        )
                     return value_diagnostic.enclosed(*value_source_range)
                 continue
             # A native comment is prose that no shell receives, so a command
             # named in it can take operands only from the same comment, never
             # from later host code. Recheck that comment as standalone shell
             # text.
-            if comment not in complete_comments:
+            if operand_diagnostic is not None and comment not in complete_comments:
                 diagnostic = _has_shell_command_word_exhaustion(
                     content[comment[0] : comment[1]],
                     check_runtime,
@@ -5137,6 +5209,8 @@ def _has_runtime_command_operand_exhaustion(
     powershell_strings: Mapping[int, PowerShellString] | None = None,
     quoted_printf_allowed: bool = True,
     source_end: int | None = None,
+    unresolved_braces: AbstractSet[int] | None = frozenset(),
+    python_fields: AbstractSet[int] = frozenset(),
 ) -> StaticParserDiagnostic | None:
     """Return whether a runtime-selected command's operands are undecidable."""
     diagnostics: list[StaticParserDiagnostic] = []
@@ -5149,6 +5223,12 @@ def _has_runtime_command_operand_exhaustion(
         quoted_printf_allowed=quoted_printf_allowed,
         diagnostics=diagnostics,
         **({"source_end": source_end} if source_end is not None else {}),
+        **({"python_fields": python_fields} if python_fields else {}),
+        **(
+            {"unresolved_braces": unresolved_braces}
+            if unresolved_braces is None or unresolved_braces
+            else {}
+        ),
     )
     if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
         # Earlier prose (for example "row-first") cannot supply this
@@ -7339,12 +7419,39 @@ def _powershell_shell_text(
     return "".join(output)
 
 
+@dataclass
+class _PythonOperandProjection:
+    complete: bool = False
+    changed: bool = False
+    open_tail: bool = False
+    unknown_fields: set[int] = field(default_factory=set)
+    field_ranges: dict[int, int] = field(default_factory=dict)
+
+    def argument_holes(self, text: str) -> tuple[str, set[int]]:
+        """Keep a typed hole for each field, including fields inside shell quotes."""
+        pieces: list[str] = []
+        holes: set[int] = set()
+        cursor = projected = 0
+        for left, right in self.field_ranges.items():
+            pieces.extend((text[cursor:left], "\x00"))
+            projected += left - cursor
+            holes.add(projected)
+            projected += 1
+            cursor = right
+        pieces.append(text[cursor:])
+        return "".join(pieces), holes
+
+
 def _python_literal_operands(
     content: str,
     token: tuple[int, int],
     start: int,
     end: int,
     constant_fields: tuple[tuple[int, int, str], ...] = (),
+    projection: _PythonOperandProjection | None = None,
+    projected_start: int = 0,
+    literal_runs: PythonLiteralSpans | None = None,
+    field_ends: Mapping[int, int] | None = None,
 ) -> str:
     """Return string literal body text from ``start`` that a shell reads as operands.
 
@@ -7353,15 +7460,79 @@ def _python_literal_operands(
     """
     text = content[start:end]
     body_start = _python_string_body(content, *token)[0]
-    if not {"f", "t"} & set(content[token[0] : body_start].lower()):
+    prefix = content[token[0] : body_start].lower()
+    formatted = "f" in prefix or "t" in prefix
+    if not formatted and ("r" in prefix or "\\" not in text):
         return text
 
-    def unknown_fields(value: str) -> str:
-        return _PYTHON_REPLACEMENT_FIELD_RE.sub(
-            lambda field: field[0] if field[1] is None else " -rf {", value
-        )
-
     pieces: list[str] = []
+
+    def append_fields(begin: int, stop: int) -> None:
+        nonlocal projected_start
+        cursor = begin
+        while match := _PYTHON_OPERAND_SYNTAX_RE.search(content, cursor, stop):
+            pieces.append(content[cursor : match.start()])
+            projected_start += match.start() - cursor
+            rendered = match[0]
+            cursor = match.end()
+            if rendered.startswith("\\"):
+                index = bisect_right(literal_runs[0], match.start()) - 1 if literal_runs else -1
+                literal_escape = not formatted or (
+                    literal_runs is not None and index >= 0 and cursor <= literal_runs[1][index]
+                )
+                unicode_in_bytes = "b" in prefix and rendered[1] in "NuU"
+                if literal_escape and "r" not in prefix and not unicode_in_bytes:
+                    if rendered in ("\\\n", "\\\r\n"):
+                        rendered = ""
+                    elif rendered[1] in "01234567":
+                        ordinal = int(rendered[1:], 8)
+                        rendered = chr(ordinal % 256 if "b" in prefix else ordinal)
+                    else:
+                        # Only compiler-recognized ASCII escape spellings reach
+                        # the codec. Unrecognized escapes retain their bytes.
+                        rendered = codecs.decode(rendered.encode("ascii"), "unicode_escape")
+                elif rendered.startswith("\\N{"):
+                    # In a raw f-string the name is a real Python field.
+                    cursor = match.start() + 2
+                    rendered = content[match.start() : cursor]
+            elif formatted and match[1] is not None:
+                field_end = (field_ends or {}).get(match.start(), cursor)
+                complete_field = match.end() < field_end <= stop
+                if complete_field:
+                    cursor = field_end
+                fixed_value = (
+                    python_literal_field_text(
+                        content[match.start() : cursor],
+                        raw="r" in prefix,
+                        limit=_ROOT_GLOB_COMMAND_CHARS,
+                    )
+                    if complete_field
+                    else None
+                )
+                if fixed_value is None:
+                    rendered = " -rf " + content[match.start() : cursor]
+                    if projection is not None:
+                        projection.unknown_fields.add(projected_start + len(" -rf "))
+                        if complete_field:
+                            projection.field_ranges[projected_start] = projected_start + len(
+                                rendered
+                            )
+                else:
+                    rendered = fixed_value
+            elif formatted and literal_runs is not None:
+                index = bisect_right(literal_runs[0], match.start()) - 1
+                if index >= 0 and match.end() <= literal_runs[1][index]:
+                    rendered = rendered[0]
+                else:
+                    # A replacement's closing brace can precede a doubled
+                    # literal closer. Reconsider the second brace in its own run.
+                    cursor = match.start() + 1
+                    rendered = content[match.start() : cursor]
+            pieces.append(rendered)
+            projected_start += len(rendered)
+        pieces.append(content[cursor:stop])
+        projected_start += stop - cursor
+
     cursor = start
     index = bisect_left(constant_fields, start, key=lambda field: field[0])
     while index < len(constant_fields):
@@ -7369,11 +7540,12 @@ def _python_literal_operands(
         if field_start >= end:
             break
         if field_end <= end:
-            pieces.append(unknown_fields(content[cursor:field_start]))
+            append_fields(cursor, field_start)
             pieces.append(value)
+            projected_start += len(value)
             cursor = field_end
         index += 1
-    pieces.append(unknown_fields(content[cursor:end]))
+    append_fields(cursor, end)
     return "".join(pieces)
 
 
@@ -7402,6 +7574,8 @@ class _PythonSourceOwnership:
         self._python_import_check = python_import_check
         self._python_stdlib_check = python_stdlib_check
         self._constant_fields: tuple[tuple[int, int, str], ...] | None = None
+        self._literal_runs: dict[tuple[int, int], PythonLiteralSpans | None] = {}
+        self._field_ends: dict[int, int] = {}
         self._content = content
         self._check_runtime = check_runtime
         self._spans: PythonLiteralSpans | None = None
@@ -7454,7 +7628,12 @@ class _PythonSourceOwnership:
         return not start <= position < end
 
     def string_value(
-        self, start: int, end: int, *, source_range: list[int] | None = None
+        self,
+        start: int,
+        end: int,
+        *,
+        source_range: list[int] | None = None,
+        projection: _PythonOperandProjection | None = None,
     ) -> tuple[str, int, int] | None:
         """Return the proven string value that holds a shell word, and its span.
 
@@ -7497,12 +7676,40 @@ class _PythonSourceOwnership:
             origin -= 1
         # The operand tokenizer reads at most this much after the word.
         limit = word_end + _ROOT_GLOB_COMMAND_CHARS + 1
-        pieces = [
-            content[origin:word_end],
-            _python_literal_operands(
-                content, owner, word_end, min(body_end, limit), self._constant_fields
-            ),
-        ]
+        pieces = [content[origin:word_end]]
+        projected_end = word_end - origin
+
+        def append_literal(token: tuple[int, int], begin: int, stop: int) -> None:
+            nonlocal projected_end
+            # Collapse doubled braces only in proven Python literal text. Inside
+            # replacement expressions (and across token boundaries) they may
+            # instead be Python syntax.
+            token_body = _python_string_body(content, *token)[0]
+            if (
+                token not in self._literal_runs
+                and "f" in content[token[0] : token_body].lower()
+                and any(marker in content[begin:stop] for marker in ("{", "}", "\\"))
+            ):
+                self._literal_runs[token] = python_fstring_literal_spans(
+                    content, *token, self._check_runtime, owners=spans, field_ends=self._field_ends
+                )
+            part = _python_literal_operands(
+                content,
+                token,
+                begin,
+                stop,
+                self._constant_fields or (),
+                projection,
+                projected_end,
+                self._literal_runs.get(token),
+                self._field_ends,
+            )
+            if projection is not None and (token != owner or part != content[begin:stop]):
+                projection.changed = True
+            pieces.append(part)
+            projected_end += len(part)
+
+        append_literal(owner, word_end, min(body_end, limit))
         remaining = limit - body_end
         starts, ends = spans
         index = bisect_right(starts, start) - 1
@@ -7534,11 +7741,7 @@ class _PythonSourceOwnership:
                 if source_range is not None:
                     source_range[1] = literal[1]
                 literal_start, literal_end = _python_string_body(content, *literal)
-                pieces.append(
-                    _python_literal_operands(
-                        content, literal, literal_start, literal_end, self._constant_fields
-                    )
-                )
+                append_literal(literal, literal_start, literal_end)
                 remaining -= literal_end - literal_start
                 continue
             # A parenthesized value, as in ``("$TOOL ") + "-rf /"``, can
@@ -7547,8 +7750,12 @@ class _PythonSourceOwnership:
                 cursor = next_token(cursor + 1)
                 operator = content[cursor : cursor + 1]
             if operator in _PYTHON_STRING_EXTENSION_OPERATORS:
-                return None
+                if projection is None:
+                    return None
+                projection.open_tail = True
             break
+        if projection is not None:
+            projection.complete = remaining > 0
         if remaining <= 0 and self._constant_fields:
             # Constant replacement can shorten the projected text. Reaching
             # the source bound cannot prove that later operands are absent.
@@ -8067,6 +8274,8 @@ def _bounded_shell_tokens(
     quoted_printf_allowed: bool = True,
     diagnostics: list[StaticParserDiagnostic] | None = None,
     source_end: int | None = None,
+    unresolved_braces: AbstractSet[int] | None = frozenset(),
+    python_fields: AbstractSet[int] = frozenset(),
 ) -> tuple[tuple[_ShellToken, ...], int, bool]:
     """Return argument words from one security-view-bounded shell command."""
     runtime_check = check_runtime or (lambda: None)
@@ -8079,6 +8288,8 @@ def _bounded_shell_tokens(
     current_can_collapse_to_root_glob = True
     current_has_quoted_content = False
     current_unquoted_brace_open = False
+    current_unresolved_brace = False
+    current_python_field = False
     current_unquoted_brace_close = False
     current_unquoted_brace_comma = False
     current_leading_tilde_unquoted = False
@@ -8160,7 +8371,7 @@ def _bounded_shell_tokens(
         nonlocal current_has_unquoted_star
         nonlocal current_can_collapse_to_root_glob
         nonlocal current_has_quoted_content
-        nonlocal current_unquoted_brace_open
+        nonlocal current_unquoted_brace_open, current_unresolved_brace
         nonlocal current_unquoted_brace_close
         nonlocal current_unquoted_brace_comma
         nonlocal source_word_has_content
@@ -8174,6 +8385,8 @@ def _bounded_shell_tokens(
         )
         current_has_quoted_content = current_has_quoted_content or quoted
         if unquoted_brace_syntax:
+            if piece == "{" and (unresolved_braces is None or cursor in unresolved_braces):
+                current_unresolved_brace = True
             current_unquoted_brace_open = current_unquoted_brace_open or "{" in piece
             current_unquoted_brace_close = current_unquoted_brace_close or "}" in piece
             current_unquoted_brace_comma = current_unquoted_brace_comma or "," in piece
@@ -8187,8 +8400,8 @@ def _bounded_shell_tokens(
         nonlocal word_started
         nonlocal current_has_unquoted_star
         nonlocal current_can_collapse_to_root_glob
-        nonlocal current_has_quoted_content
-        nonlocal current_unquoted_brace_open
+        nonlocal current_has_quoted_content, current_python_field
+        nonlocal current_unquoted_brace_open, current_unresolved_brace
         nonlocal current_unquoted_brace_close
         nonlocal current_unquoted_brace_comma
         nonlocal current_leading_tilde_unquoted
@@ -8204,6 +8417,8 @@ def _bounded_shell_tokens(
                         and current_unquoted_brace_close
                         and current_unquoted_brace_comma,
                         current_leading_tilde_unquoted,
+                        current_unresolved_brace,
+                        current_python_field,
                     )
                 )
             current.clear()
@@ -8213,6 +8428,8 @@ def _bounded_shell_tokens(
             current_can_collapse_to_root_glob = True
             current_has_quoted_content = False
             current_unquoted_brace_open = False
+            current_unresolved_brace = False
+            current_python_field = False
             current_unquoted_brace_close = False
             current_unquoted_brace_comma = False
             current_leading_tilde_unquoted = False
@@ -8220,6 +8437,13 @@ def _bounded_shell_tokens(
     while cursor < limit:
         if (cursor - body_start) % 256 == 0:
             runtime_check()
+        if cursor in python_fields:
+            append_piece(
+                "\x00", unquoted=quote is None, quoted=quote is not None, dynamic_can_be_empty=True
+            )
+            current_python_field = True
+            cursor += 1
+            continue
         character = content[cursor]
         native_string = powershell_strings.get(cursor) if powershell_strings is not None else None
         if quote is None and native_string is not None:
@@ -8730,6 +8954,22 @@ def _static_brace_expansions(
     return tuple(expanded)
 
 
+def _python_field_can_form_option(pattern: str, option: str) -> bool:
+    """Match a specific long option against the known pieces of one argument."""
+    first, *middle, last = pattern.split("\x00")
+    if not option.startswith(first) or not option.endswith(last):
+        return False
+    limit = len(option) - len(last)
+    cursor = len(first)
+    for piece in middle:
+        if piece:
+            index = option.find(piece, cursor, limit)
+            if index < 0:
+                return False
+            cursor = index + len(piece)
+    return cursor <= limit
+
+
 def _has_recursive_force_options(tokens: tuple[_ShellToken, ...]) -> bool:
     """Interpret options using GNU/BSD ``rm`` syntax.
 
@@ -8741,8 +8981,20 @@ def _has_recursive_force_options(tokens: tuple[_ShellToken, ...]) -> bool:
         options_end = next(index for index, token in enumerate(tokens) if token.text == "--")
     except StopIteration:
         options_end = len(tokens)
+    rm_short_options = frozenset("fIiPRrWdvx")
     option_words: list[str] = []
-    for token in tokens[:options_end]:
+    possible_recursive: set[int] = set()
+    possible_force: set[int] = set()
+    for index, token in enumerate(tokens[:options_end]):
+        if token.python_field:
+            pattern = token.text
+            fixed = pattern.removeprefix("-").replace("\x00", "")
+            if pattern.startswith(("-", "\x00")) and set(fixed) <= rm_short_options:
+                return True  # This single argument could be one valid recursive-force cluster.
+            if _python_field_can_form_option(pattern, "--recursive"):
+                possible_recursive.add(index)
+            if _python_field_can_form_option(pattern, "--force"):
+                possible_force.add(index)
         if token.brace_expansion:
             expanded = _static_brace_expansions(token.text)
             if expanded is not None:
@@ -8752,7 +9004,6 @@ def _has_recursive_force_options(tokens: tuple[_ShellToken, ...]) -> bool:
     # A one-dash word is an rm option cluster only when every character is a
     # supported short option. For example, ``-force`` is not ``-f`` + ``-r``:
     # rm rejects its unsupported ``o``, ``c`` and ``e`` options before acting.
-    rm_short_options = frozenset("fIiPRrWdvx")
     short_options = [
         word[1:]
         for word in option_words
@@ -8762,7 +9013,14 @@ def _has_recursive_force_options(tokens: tuple[_ShellToken, ...]) -> bool:
         "r" in option or "R" in option for option in short_options
     )
     force = "--force" in option_words or any("f" in option for option in short_options)
-    return recursive and force
+    if recursive:
+        return force or bool(possible_force)
+    if force:
+        return bool(possible_recursive)
+    # One long option can supply either flag, never both at once.
+    return bool(
+        possible_recursive and possible_force and len(possible_recursive | possible_force) > 1
+    )
 
 
 def _has_destructive_root_glob(tokens: tuple[_ShellToken, ...]) -> bool:
@@ -8806,6 +9064,17 @@ def _brace_expansion_diagnostic(
 ) -> StaticParserDiagnostic | None:
     for token in tokens:
         if token.brace_expansion:
+            if token.unresolved_brace:
+                # A host field supplies operand bytes before the shell sees the
+                # word. Its value is neither a literal brace nor a Bash alternative.
+                return StaticParserDiagnostic(
+                    ParserCause.UNSUPPORTED_SYNTAX,
+                    ParserCheck.BRACE_SYNTAX,
+                    start,
+                    max(start + 1, end),
+                    ParserUncheckedScope.COMMAND_ARGUMENTS,
+                    location_precision="enclosing_expression",
+                )
             diagnostics: list[StaticParserDiagnostic] = []
             if _static_brace_expansions(token.text, diagnostics) is None:
                 return diagnostics[0].enclosed(start, max(start + 1, end))
