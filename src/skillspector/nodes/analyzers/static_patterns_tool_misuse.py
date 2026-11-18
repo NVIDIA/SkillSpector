@@ -90,7 +90,7 @@ from skillspector.python_tokens import python_literal_spans as _python_literal_s
 from skillspector.python_tokens import python_string_body as _python_string_body
 from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.semgrep_tokens import semgrep_rule_scalar_roles
-from skillspector.shell_helper_argv import reconstruct_helper_commands
+from skillspector.shell_helper_argv import is_managed_shell_variable, reconstruct_helper_commands
 from skillspector.shell_sources import (
     SAFE_PATH_MARKER,
     ShellSourceContext,
@@ -3797,7 +3797,7 @@ def _quoted_printf_data_text(
 # unknown value symbolic: assigning it never establishes what a future
 # interpreter, array expansion or executable consumer will do with it.
 _QUOTED_PRINTF_ENCODE = re.compile(
-    r"""\$\(printf[ \t]+'%q'[ \t]+"(?P<value>\$(?:[A-Za-z_][A-Za-z0-9_]*"""
+    r"""\$\(printf[ \t]+(?:--[ \t]+)?(?:'%q'|"%q"|%q)[ \t]+"(?P<value>\$(?:[A-Za-z_][A-Za-z0-9_]*"""
     r"""|\{[A-Za-z_][A-Za-z0-9_]*(?:\[[0-9]{1,5}\])?\})(?:/[A-Za-z0-9_./-]+)?)"\)"""
 )
 _QUOTED_ASSIGNMENT = re.compile(
@@ -3815,25 +3815,29 @@ _PRINTF_DISPLAY_WORD = (
     r"""(?:[A-Za-z0-9_./:%+,-]++|'[A-Za-z0-9_ ./:%+,\\-]*'|"""
     rf""""(?:[A-Za-z0-9_ ./:%+,@*-]|\\[nrt]|{_PRINTF_DISPLAY_PARAMETER})*")"""
 )
+_PRINTF_NAME_OPERATION = r"(?:export|unset)(?:[ \t]+[A-Za-z_][A-Za-z0-9_]*)+"
 _PRINTF_DISPLAY_RECORD = re.compile(
     rf"(?:[A-Za-z_]\w*\+?=(?:{_PRINTF_DISPLAY_WORD}|\((?:{_PRINTF_DISPLAY_WORD})?\))"
     rf"|(?:declare|typeset|local)[ \t]+-a[ \t]+[A-Za-z_]\w*"
-    rf"|echo(?:[ \t]+{_PRINTF_DISPLAY_WORD})*"
+    rf"|{_PRINTF_NAME_OPERATION}|echo(?:[ \t]+{_PRINTF_DISPLAY_WORD})*"
     rf"""|printf[ \t]+(?P<q>['"])(?!-)(?:[A-Za-z0-9_ ./,:-]|%%|%s|\\[nrt])++(?P=q)(?:[ \t]+{_PRINTF_DISPLAY_WORD})*)"""
 )
 
 
-def _standalone_printf_output(content: str, check_runtime: Callable[[], None]) -> bool:
-    for line in content.splitlines():
+def _last_open_printf_statement(content: str, check_runtime: Callable[[], None]) -> int:
+    """Locate the last statement outside the simple, non-capturing display grammar."""
+    start = len(content)
+    for physical in reversed(content.splitlines(keepends=True)):
         check_runtime()
-        line = line.strip(" \t")
+        start -= len(physical)
+        line = physical.strip(" \t\r\n")
         if not line or line.startswith("#"):
             continue
         if len(line) > _ROOT_GLOB_COMMAND_CHARS or not _PRINTF_DISPLAY_RECORD.fullmatch(
             _QUOTED_PRINTF_ENCODE.sub("value", line)
         ):
-            return False
-    return True
+            return start
+    return -1
 
 
 def _printf_storage_uses(
@@ -3843,12 +3847,19 @@ def _printf_storage_uses(
     check_runtime: Callable[[], None],
     budget: list[int],
     seen: set[str],
-    output_builtins_bound: bool,
+    last_open_statement: int,
+    name_operations_bound: bool,
+    assignment_starts: set[int],
+    pending: list[StaticParserDiagnostic],
 ) -> bool:
-    """Follow transparent scalar copies. Keep file, pipe and executable uses live."""
+    """Follow plain writes and copies; retain any unproven consumer at its operand."""
     # Bash consumes command text and startup paths from these variables even
     # when the script contains no explicit parameter expansion of the name.
-    if name in {"PROMPT_COMMAND", "BASH_ENV", "ENV", "PS0", "PS1", "PS2", "PS3", "PS4"}:
+    if (
+        is_managed_shell_variable(name)
+        or name.startswith(("LD_", "DYLD_"))
+        or name in {"PROMPT_COMMAND", "PS0", "PS1", "PS2", "PS3", "PS4"}
+    ):
         return False
     if name in seen:
         return True
@@ -3861,6 +3872,10 @@ def _printf_storage_uses(
     identifier = re.compile(
         r"(?P<expansion>\$\{?)" + re.escape(name) + r"\b|\b" + re.escape(name) + r"\b"
     )
+    entry_pending = len(pending)
+    environment_use = None
+    environment_end = -1
+    uncertain_binding = None
     for occurrence in identifier.finditer(content):
         check_runtime()
         pos = occurrence.start()
@@ -3881,6 +3896,41 @@ def _printf_storage_uses(
                 continue
             if ordinary_declaration and not tail.strip():
                 continue
+            if pos in assignment_starts and _PRINTF_DISPLAY_RECORD.fullmatch(name + tail):
+                continue
+            if re.fullmatch(_PRINTF_NAME_OPERATION, line.strip(" \t")):
+                # These builtins take names, not commands. An export can
+                # expose a value to subsequent processes; unset discards it.
+                verb_start = begin + len(line) - len(line.lstrip(" \t"))
+                verb = line.strip(" \t").split()[0]
+                if not name_operations_bound:
+                    uncertain_binding = (verb_start, verb_start + len(verb))
+                if verb == "export" and stop < last_open_statement:
+                    if environment_use is None or not content[environment_end:begin].strip():
+                        environment_use = (pos, occurrence.end())
+                        environment_end = stop
+                elif (
+                    verb == "unset"
+                    and name_operations_bound
+                    and environment_use
+                    and not content[environment_end:begin].strip()
+                ):
+                    environment_use = None
+                continue
+            integer = re.fullmatch(
+                r"(?:local|declare|typeset)(?:[ \t]+-[a-zA-Z]+)*[ \t]+-[a-zA-Z]*i[a-zA-Z]*", prefix
+            )
+            pending.append(
+                StaticParserDiagnostic(
+                    ParserCause.RUNTIME_DEPENDENT,
+                    ParserCheck.SHELL_ARITHMETIC
+                    if integer
+                    else ParserCheck.GENERATED_TEXT_DESTINATION,
+                    pos,
+                    occurrence.end(),
+                    ParserUncheckedScope.EXPRESSION,
+                )
+            )
             return False
         close = quote_limits.get(pos)
         if close is None:
@@ -3895,7 +3945,10 @@ def _printf_storage_uses(
                 check_runtime,
                 budget,
                 seen,
-                output_builtins_bound,
+                last_open_statement,
+                name_operations_bound,
+                assignment_starts,
+                pending,
             ):
                 return False
             continue
@@ -3920,13 +3973,53 @@ def _printf_storage_uses(
                 ParserCheck.COMMAND_IDENTITY,
                 ParserCheck.COMMAND_STRING_RUNTIME,
             }:
-                continue
+                pending.append(known.shifted(begin))
+                return True
         command = re.match(r"[ \t]*([A-Za-z_][A-Za-z_0-9.-]*)[ \t]+", line)
-        if command is None or close >= stop or line[close - begin + 1 :].strip():
+        if command is None or close >= stop:
             return False
-        cmd = command[1]
-        if not output_builtins_bound or cmd not in {"printf", "echo"}:
+        if (
+            last_open_statement < 0
+            and command[1] in {"printf", "echo"}
+            and not line[close - begin + 1 :].strip()
+        ):
+            continue
+        # The conversion is understood, but the value is passed to an
+        # unverified command, capturing stream, or redirection. Report that
+        # operand; its consumer may use the bytes as data, a path, or code.
+        span = re.match(_PRINTF_DISPLAY_PARAMETER, content[pos:close])
+        if span is None:
             return False
+        pending.append(
+            StaticParserDiagnostic(
+                ParserCause.RUNTIME_DEPENDENT,
+                ParserCheck.GENERATED_TEXT_DESTINATION,
+                pos,
+                pos + span.end(),
+                ParserUncheckedScope.COMMAND_ARGUMENTS,
+            )
+        )
+        return True
+    if len(pending) == entry_pending and (uncertain_binding or environment_use):
+        if uncertain_binding:
+            pending.append(
+                StaticParserDiagnostic(
+                    ParserCause.RUNTIME_DEPENDENT,
+                    ParserCheck.COMMAND_IDENTITY,
+                    *uncertain_binding,
+                    ParserUncheckedScope.COMMAND_WORD,
+                )
+            )
+        else:
+            assert environment_use is not None
+            pending.append(
+                StaticParserDiagnostic(
+                    ParserCause.RUNTIME_DEPENDENT,
+                    ParserCheck.GENERATED_TEXT_DESTINATION,
+                    *environment_use,
+                    ParserUncheckedScope.COMMAND_ARGUMENTS,
+                )
+            )
     return True
 
 
@@ -3949,11 +4042,14 @@ def _quoted_printf_assignments(
     quote_limits: dict[int, int],
     check_runtime: Callable[[], None],
     execution: list[StaticParserDiagnostic],
+    consumers: list[StaticParserDiagnostic],
 ) -> str:
     """Retain one symbolic data operand inside an ordinary scalar/array assignment."""
-    if not quote_limits or "'%q'" not in content:
+    if not quote_limits or "%q" not in content:
         return projected
     assigned: dict[str, int] = {}
+    binding_spans: dict[str, tuple[int, int]] = {}
+    printf_starts: dict[str, int] = {}
     substitutions: list[tuple[int, int, str]] = []
     for match in _QUOTED_PRINTF_ENCODE.finditer(content):
         check_runtime()
@@ -3989,6 +4085,8 @@ def _quoted_printf_assignments(
         if re.search(r"(?:^|[ \t])(?:bash|sh|zsh|ksh)[ \t]+-c(?:[ \t]|$)", prefix):
             continue
         assigned[assignment["name"]] = tail_end
+        binding_spans.setdefault(assignment["name"], assignment.span("name"))
+        printf_starts.setdefault(assignment["name"], start + 2)
         # One parameter expansion remains one unknown double-quoted scalar.
         # Keep all offsets and all later command consumers unchanged.
         substitutions.append((start, end, assignment["name"]))
@@ -3996,8 +4094,13 @@ def _quoted_printf_assignments(
         return projected
     # Verify the actual consumer when a stored scalar reaches an interpreter.
     # A plain scalar may be lexically complete even when its use as code isn't.
+    assignment_starts: set[int] = set()
     for pos in _nonempty_shell_clause_starts(content, check_runtime, shell_substitutions=True):
         prefix = content[pos : pos + 256]
+        if _SHELL_ASSIGNMENT_PREFIX_RE.match(prefix):
+            if len(assignment_starts) >= 1024:
+                return projected
+            assignment_starts.add(pos)
         if re.match(
             r"(?:function[ \t]+printf\b|printf[ \t]*\(|"
             r"(?:(?:command|builtin)[ \t]+)?(?:alias[ \t]+printf=|enable[ \t]+-n[ \t]+printf\b))",
@@ -4042,14 +4145,50 @@ def _quoted_printf_assignments(
     if execution:
         return projected
     budget = [16 * len(content)]
-    output_builtins_bound = _standalone_printf_output(content, check_runtime)
-    safe_storage = {
-        name
-        for name in assigned
-        if _printf_storage_uses(
-            content, name, quote_limits, check_runtime, budget, set(), output_builtins_bound
+    last_open_statement = _last_open_printf_statement(content, check_runtime)
+    name_operations_bound = last_open_statement < 0 or not _shell_redefines_primitives(
+        content, check_runtime, frozenset({"printf", "export", "unset"}), shell_substitutions=True
+    )
+    safe_storage = set()
+    for name in assigned:
+        pending: list[StaticParserDiagnostic] = []
+        traced = _printf_storage_uses(
+            content,
+            name,
+            quote_limits,
+            check_runtime,
+            budget,
+            set(),
+            last_open_statement,
+            name_operations_bound,
+            assignment_starts,
+            pending,
         )
-    }
+        if not traced and not pending:
+            # Preserve a limitation even if another shell parser can tokenize
+            # the scalar without understanding this variable's binding.
+            consumers.append(
+                StaticParserDiagnostic(
+                    ParserCause.RUNTIME_DEPENDENT,
+                    ParserCheck.GENERATED_TEXT_DESTINATION,
+                    *binding_spans[name],
+                    ParserUncheckedScope.EXPRESSION,
+                )
+            )
+            continue
+        if not pending and not name_operations_bound:
+            lo = printf_starts[name]
+            pending.append(
+                StaticParserDiagnostic(
+                    ParserCause.RUNTIME_DEPENDENT,
+                    ParserCheck.COMMAND_IDENTITY,
+                    lo,
+                    lo + len("printf"),
+                    ParserUncheckedScope.COMMAND_WORD,
+                )
+            )
+        safe_storage.add(name)
+        consumers.extend(pending)
     if not safe_storage:
         return projected
     changed = list(projected)
@@ -14099,6 +14238,7 @@ def _has_bounded_parse_exhaustion(
     )
     quote_limits = None
     printf_execution: list[StaticParserDiagnostic] = []
+    printf_consumers: list[StaticParserDiagnostic] = []
     if file_type == "shell" and complete_context:
         # A closing delimiter in proven shell source cannot open a new
         # command word. Nested substitutions retain their own lexical walk,
@@ -14109,7 +14249,12 @@ def _has_bounded_parse_exhaustion(
         )
         shell_word_content = _quoted_printf_data_text(content, quote_limits, check_runtime)
         shell_word_content = _quoted_printf_assignments(
-            content, shell_word_content, quote_limits, check_runtime, printf_execution
+            content,
+            shell_word_content,
+            quote_limits,
+            check_runtime,
+            printf_execution,
+            printf_consumers,
         )
         if bash_quote_limits:
             quote_limits = bash_quote_limits | quote_limits
@@ -14194,6 +14339,11 @@ def _has_bounded_parse_exhaustion(
         ),
         **json_word_roles,
     )
+    if printf_consumers:
+        diagnostic = min(
+            [*printf_consumers, *([diagnostic] if diagnostic is not None else [])],
+            key=lambda detail: detail.start,
+        )
     if diagnostic is not None:
         if (
             file_type == "python"
