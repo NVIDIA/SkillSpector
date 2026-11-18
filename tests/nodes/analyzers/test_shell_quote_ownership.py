@@ -197,12 +197,18 @@ def test_separate_shell_example_keeps_xargs_binding_uncertain(binding) -> None:
 
 
 @pytest.mark.parametrize("command", ["env VALUE=<value> tool", "sudo <command> --list"])
-def test_unresolved_wrapper_points_to_the_ambiguous_operator(command) -> None:
+def test_unresolved_wrapper_points_to_the_ambiguous_operand(command: str) -> None:
     source = f"Example\n\n```sh\n{command}\n```\n"
     diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
-    assert diagnostic is not None
-    assert diagnostic.check is tm.ParserCheck.COMMAND_WORD_BOUNDARY
-    assert (diagnostic.start, diagnostic.end) == (source.index("<"), source.index("<") + 1)
+    check, span = tm.ParserCheck.COMMAND_WORD_BOUNDARY, "<"
+    if command.startswith("sudo ") and "DOCUMENTED_COMMAND_OPERAND" in tm.ParserCheck.__members__:
+        check, span = tm.ParserCheck["DOCUMENTED_COMMAND_OPERAND"], "<command>"
+    assert diagnostic is not None and diagnostic.check is check
+    assert diagnostic.cause is tm.ParserCause.BOUNDARY_UNRESOLVED
+    assert (diagnostic.start, diagnostic.end) == (
+        source.index(span),
+        source.index(span) + len(span),
+    )
 
 
 @pytest.mark.parametrize("operator", ["<<<", "<<< "])
@@ -2171,7 +2177,6 @@ def test_integer_format_proof_rejects_expanding_or_composite_words(scalar: str) 
         "$(printf '%08X' $i) /dev/unit",
         "sudo readreg /dev/unit $(printf '%n' dest)",
         'sudo readreg /dev/unit "$(printf "$fmt" $i)"',
-        'sudo readreg /dev/unit "$(printf %x $((external)))"',
         'sudo sh -c "$(printf %u $i)"',
         "sudo readreg /dev/unit >$(printf %u $i)",
     ],
@@ -2180,6 +2185,21 @@ def test_formatted_data_proof_preserves_runtime_command_diagnostics(command: str
     body = f"for i in 0 1; do {command}; done\n"
     diagnostic = tm.bounded_parse_diagnostic(body, lambda: None, file_type="shell")
     assert diagnostic is not None and diagnostic.check is tm.ParserCheck.PRINTF_FORMAT
+
+
+def test_numeric_argv_locates_the_unresolved_format_or_runtime_arithmetic() -> None:
+    operand = "$(printf %x $((external)))"
+    source = f'for i in 0 1; do sudo readreg /dev/unit "{operand}"; done\n'
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell")
+    check, cause, span = tm.ParserCheck.PRINTF_FORMAT, tm.ParserCause.UNSUPPORTED_SYNTAX, operand
+    if "SHELL_ARITHMETIC" in tm.ParserCheck.__members__:
+        check = tm.ParserCheck["SHELL_ARITHMETIC"]
+        cause, span = tm.ParserCause.RUNTIME_DEPENDENT, "$((external))"
+    assert diagnostic is not None and diagnostic.check is check and diagnostic.cause is cause
+    assert (diagnostic.start, diagnostic.end) == (
+        source.index(span),
+        source.index(span) + len(span),
+    )
 
 
 _FORWARD = 'invoke() { bash -c "$1"; }\n'
