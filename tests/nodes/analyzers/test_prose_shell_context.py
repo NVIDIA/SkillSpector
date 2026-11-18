@@ -635,6 +635,101 @@ def test_complete_inline_code_before_prose_apostrophe_does_not_span_later_fence(
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
+@pytest.mark.parametrize(
+    "guide",
+    [
+        "Press backtick\n(`` ` ``) to open the console.",
+        "The `` `define FLAG_* `` list is here.",
+        "Document the `` `ifdef `` branches.",
+        "Read the `` `celldefine ``\n  models.",
+    ],
+)
+def test_double_delimited_markdown_labels_are_complete(guide: str) -> None:
+    assert tm.bounded_parse_diagnostic(guide, lambda: None, file_type="markdown") is None
+
+
+@pytest.mark.parametrize(
+    "guide",
+    [
+        "Run `` `define FLAG `` now.",
+        "Read the `` `define $FLAG `` directive.",
+        "Read the `` `define FLAG; cmd `` directive.",
+        "Read the ``` `ifdef ``` branches.",
+        "sh -c `` `ifdef `` branches",
+        "`sh -c` `` `ifdef `` branches",
+        "eval `` `ifdef `` branches",
+        "echo `` `ifdef `` branches",
+        "```sh\n`ifdef FLAG\n```",
+    ],
+)
+def test_unproven_code_spans_and_executable_operands_stay_partial(guide: str) -> None:
+    diagnostic = tm.bounded_parse_diagnostic(guide, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.check == "expansion_boundary"
+
+
+@pytest.mark.parametrize("command", ["$CMD -rf /", "rm -rf /"])
+def test_label_preserves_an_adjacent_shell_command(command: str) -> None:
+    guide = "The `` `ifdef `` branches.\n\n" + f"`{command}`"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": guide}}, [tm]
+    )
+    if command == "rm -rf /":
+        assert any(finding.rule_id == "TM1" for finding in result["findings"])
+    else:
+        assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+_TREE = "```text\nroot/\n|-- one/\n|   `-- a.txt  # leaf\n`-- two/\n    `-- b.txt\n```\n"
+
+
+def test_complete_text_tree_owns_only_its_elbow_markers() -> None:
+    previous_view = tm._markdown_shell_text(_TREE, lambda: None, word_apostrophes=True)
+    view = tm._markdown_shell_text(
+        _TREE, lambda: None, word_apostrophes=True, directory_tree_markers=True
+    )
+    assert view == previous_view.replace("`--", " --")
+    assert tm.bounded_parse_diagnostic(_TREE, lambda: None, file_type="markdown") is None
+
+
+@pytest.mark.parametrize(
+    "guide",
+    [
+        _TREE.replace("text", "sh"),
+        _TREE.replace("text", "text title=tree"),
+        _TREE.removesuffix("```\n"),
+        _TREE.replace("|   `--", "    `--"),
+        _TREE.replace("one/", "one"),
+        _TREE.replace("two/", "two/ $(cmd)"),
+        _TREE.replace("`-- a.txt", "|-- a.txt"),
+        _TREE.replace("  # leaf", " # note " + " " * 4096 + "$CMD"),
+        _TREE.replace("|-- one/", "|-- one/\n  printf example"),
+        'sh -c "\n' + _TREE + '"',
+        "echo $(printf hi\n" + _TREE + ")\n",
+        "sh -c \\\n" + _TREE,
+        "cat <<EOF\n" + _TREE + "EOF\n",
+    ],
+)
+def test_unproven_tree_keeps_all_legacy_substitution_markers(guide: str) -> None:
+    previous_view = tm._markdown_shell_text(guide, lambda: None, word_apostrophes=True)
+    view = tm._markdown_shell_text(
+        guide, lambda: None, word_apostrophes=True, directory_tree_markers=True
+    )
+    assert view == previous_view
+
+
+@pytest.mark.parametrize("command", ["$CMD -rf /", "rm -rf /"])
+def test_directory_tree_preserves_subsequent_command(command: str) -> None:
+    guide = _TREE + "\n" + f"`{command}`"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": guide}}, [tm]
+    )
+    if command == "rm -rf /":
+        assert any(finding.rule_id == "TM1" for finding in result["findings"])
+    else:
+        assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
 def test_complete_inline_code_does_not_hide_runtime_selected_command() -> None:
     content = "Run `$($CMD) -rf /`; then read the reference's notes.\n"
 
