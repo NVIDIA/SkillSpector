@@ -331,7 +331,13 @@ class ShellSourceResolver:
         pending_owners: list[tuple[int, bool]] = []
         conditional = False
 
+        leading_input_redirect = False
+
         def finish(end: int, follows_operator: bool = False) -> None:
+            nonlocal leading_input_redirect
+            if leading_input_redirect and words:
+                self.input_redirect_commands.add(words[0][1])
+            leading_input_redirect = False
             if words or redirects:
                 if len(self.commands) + len(self.child_commands) >= 8192:
                     self.valid = False
@@ -439,6 +445,8 @@ class ShellSourceResolver:
                 cursor += 1
                 continue
             if character in "<>":
+                if character == "<" and not words:
+                    leading_input_redirect = True
                 if self.content.startswith("<<", cursor) and not self.content.startswith(
                     "<<<", cursor
                 ):
