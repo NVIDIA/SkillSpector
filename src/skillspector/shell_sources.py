@@ -86,6 +86,14 @@ def _canonical_path(path: str, *, allow_parent: bool = False) -> str | None:
     return "/".join(parts) or ("." if allow_parent else None)
 
 
+def bundled_script_sibling(path: str, suffix: str) -> str | None:
+    """Resolve a strict relative filename against a captured script location."""
+    if _canonical_path(path) != path or _canonical_path(suffix) != suffix:
+        return None
+    parent = path.rpartition("/")[0]
+    return f"{parent}/{suffix}" if parent else suffix
+
+
 class ShellSourceResolver:
     """Resolve ordered source bindings without executing shell or reading files.
 
