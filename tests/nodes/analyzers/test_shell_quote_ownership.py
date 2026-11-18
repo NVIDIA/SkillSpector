@@ -2559,3 +2559,32 @@ def test_unresolved_earlier_eval_keeps_its_own_diagnostic(tmp_path: Path) -> Non
     row = next(r for r in tm.node(state)["inspection_ledger"] if r["path"] == "main.sh")
     d = row["parser_diagnostic"]
     assert source[d["source_start_offset"] : d["source_end_offset"]].strip() == '"$EARLIER"'
+
+
+@pytest.mark.parametrize("order", ["before", "after"])
+def test_conditional_library_can_change_other_sourced_bindings(order: str) -> None:
+    directory, fixed, _ = _SOURCE_RELATIVE.rsplit("\n", 2)
+    relative = "source ./extras.sh"
+    statements = [relative, fixed] if order == "before" else [fixed, relative]
+    source = "\n".join([directory, *statements, 'route "$REQUEST" shell'])
+    sources = {
+        "main.sh": source,
+        "actions.sh": _SOURCED_EVAL_LIB,
+        "extras.sh": "other() { :; }",
+    }
+    diagnostic = tm.sourced_callable_diagnostic("main.sh", source, sources, lambda: None)
+    assert diagnostic and diagnostic.check == tm.ParserCheck.COMMAND_IDENTITY
+    assert source[diagnostic.start : diagnostic.end] == "route"
+
+
+def test_conditional_source_cannot_resurrect_a_superseded_evaluator() -> None:
+    source = (
+        _SOURCE_RELATIVE + 'source ./extras.sh\nsource "$base/replace.sh"\nroute "$REQUEST" shell'
+    )
+    sources = {
+        "main.sh": source,
+        "actions.sh": _SOURCED_EVAL_LIB,
+        "extras.sh": "other() { :; }",
+        "replace.sh": 'route() { printf "%s" "$1"; }',
+    }
+    assert tm.sourced_callable_diagnostic("main.sh", source, sources, lambda: None) is None

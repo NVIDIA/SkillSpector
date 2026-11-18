@@ -1016,7 +1016,8 @@ def sourced_eval_argument(
         return None
     directories: set[bytes] = set()
     assigned: set[bytes] = set()
-    definitions: dict[bytes, tuple[str, Node, bool]] = {}
+    definitions: dict[bytes, tuple[str, Node]] = {}
+    all_sources_script_relative = True
     loaded: set[str] = set()
     for node in root.children:
         check_runtime()
@@ -1080,6 +1081,9 @@ def sourced_eval_argument(
             if imported is None or imported.child_count > 512:
                 return None
             loaded.add(source_path)
+            # A working-directory-relative source may replace any binding in the
+            # current shell, including an earlier helper or the next include root.
+            all_sources_script_relative = all_sources_script_relative and script_relative
             for item in imported.children:
                 check_runtime()
                 if item.type in {"comment", ";"}:
@@ -1097,7 +1101,7 @@ def sourced_eval_argument(
                     b"local",
                 }:
                     return None
-                definitions[symbol.text] = (source_path, body, script_relative)
+                definitions[symbol.text] = (source_path, body)
             continue
         if (
             name not in definitions
@@ -1105,7 +1109,7 @@ def sourced_eval_argument(
             or not all(_single_argv_slot(arg) for arg in args)
         ):
             return None
-        source_path, body, script_relative = definitions[name]
+        source_path, body = definitions[name]
         reached = _forwarded_eval(body, args, check_runtime)
         if reached is not None:
             slot, sink = reached
@@ -1115,7 +1119,7 @@ def sourced_eval_argument(
                 if var and (var[1] or var[2]) not in assigned:
                     raw = caller.encode()
                     source_raw = sources[source_path].encode()
-                    witness = argument if script_relative else node.named_children[0]
+                    witness = argument if all_sources_script_relative else node.named_children[0]
                     return SourcedEval(
                         (
                             len(raw[: witness.start_byte].decode()),
@@ -1126,7 +1130,7 @@ def sourced_eval_argument(
                             len(source_raw[: sink.start_byte].decode()),
                             len(source_raw[: sink.end_byte].decode()),
                         ),
-                        script_relative,
+                        all_sources_script_relative,
                     )
         # An intervening function may change the current shell's bindings.
         return None
