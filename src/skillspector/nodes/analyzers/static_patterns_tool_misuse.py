@@ -7348,6 +7348,18 @@ class _PythonSourceOwnership:
                 and not isinstance(node.ctx, ast.Load)
             ):
                 return None
+
+        def rebound(name: str, definition: ast.AST | None = None) -> bool:
+            return any(
+                node is not definition
+                and (
+                    _binds_generated_receiver(node, name)
+                    or isinstance(node, ast.arg)
+                    and node.arg == name
+                )
+                for node in nodes
+            )
+
         literal = next(
             (
                 node
@@ -7361,6 +7373,12 @@ class _PythonSourceOwnership:
         if isinstance(carrier, ast.Return) and isinstance(
             producer := parents.get(carrier), ast.FunctionDef
         ):
+            if (
+                parents.get(producer) is not parsed.tree
+                or producer.decorator_list
+                or rebound(producer.name, producer)
+            ):
+                return None
             arguments = [
                 node
                 for node in nodes
@@ -7422,12 +7440,36 @@ class _PythonSourceOwnership:
                 or not isinstance(binding.value.func, ast.Name)
             ):
                 return None
-            functions = [
-                fn
+            classes = [
+                cls
                 for cls in parsed.tree.body
                 if isinstance(cls, ast.ClassDef) and cls.name == binding.value.func.id
-                for fn in cls.body
-                if isinstance(fn, ast.FunctionDef) and fn.name == target.attr
+            ]
+            if len(classes) != 1:
+                return None
+            cls = classes[0]
+            if (
+                cls.bases
+                or cls.keywords
+                or cls.decorator_list
+                or rebound(cls.name, cls)
+                or any(
+                    isinstance(member, ast.FunctionDef)
+                    and member.name in {"__new__", "__getattr__", "__getattribute__"}
+                    for member in cls.body
+                )
+                or any(
+                    isinstance(node, ast.Attribute)
+                    and node.attr == target.attr
+                    and not isinstance(node.ctx, ast.Load)
+                    for node in nodes
+                )
+            ):
+                return None
+            functions = [
+                member
+                for member in cls.body
+                if isinstance(member, ast.FunctionDef) and member.name == target.attr
             ]
             index = 1 + call.args.index(arguments[0])
         else:
@@ -7435,10 +7477,14 @@ class _PythonSourceOwnership:
         if len(functions) != 1 or functions[0].decorator_list:
             return None
         wrapper = functions[0]
+        if isinstance(target, ast.Name) and rebound(wrapper.name, wrapper):
+            return None
         formals = [*wrapper.args.posonlyargs, *wrapper.args.args]
         if index >= len(formals):
             return None
-        witness = _ssh_script_argument(wrapper, formals[index].arg, self._check_runtime)
+        witness = _ssh_script_argument(
+            wrapper, formals[index].arg, parsed.tree, rebound, self._check_runtime
+        )
         if witness is None or (span := _node_character_span(parsed, witness)) is None:
             return None
         return StaticParserDiagnostic(
@@ -11490,10 +11536,50 @@ def prepare_source_analysis(
 
 
 def _ssh_script_argument(
-    wrapper: ast.FunctionDef, script: str, check_runtime: Callable[[], None]
+    wrapper: ast.FunctionDef,
+    script: str,
+    module: ast.Module,
+    rebound: Callable[[str, ast.AST | None], bool],
+    check_runtime: Callable[[], None],
 ) -> ast.AST | None:
     """Identify an unresolved SSH option or remote argv in a direct subprocess call."""
+
+    def options_end_before_host(prefix: list[ast.expr]) -> bool:
+        if len(prefix) > 64 or sum(isinstance(arg, ast.Starred) for arg in prefix) > 1:
+            return False
+        words = []
+        for arg in prefix:
+            check_runtime()
+            if isinstance(arg, ast.Starred) and isinstance(arg.value, ast.Name):
+                # Only an unmodified module tuple can supply a static option list.
+                assignments = [
+                    node
+                    for node in module.body
+                    if isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == arg.value.id
+                    and isinstance(node.value, ast.Tuple)
+                ]
+                if len(assignments) != 1 or rebound(arg.value.id, assignments[0].targets[0]):
+                    return False
+                items = assignments[0].value.elts
+            else:
+                items = [arg]
+            for item in items:
+                if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+                    return False
+                if len(words) >= 64:
+                    return False
+                words.append(item.value)
+        return len(words) % 2 == 0 and all(
+            flag in {"-o", "-p", "-i", "-F"} and value and not value.startswith("-")
+            for flag, value in zip(words[::2], words[1::2], strict=True)
+        )
+
     nodes = list(ast.walk(wrapper))
+    if any(_binds_generated_receiver(node, script) for node in nodes):
+        return None
     for call in nodes:
         check_runtime()
         if (
@@ -11523,6 +11609,14 @@ def _ssh_script_argument(
                 len(assignments) != 1
                 or assignments[0].lineno >= call.lineno
                 or any(
+                    isinstance(node, ast.Name)
+                    and node.id == argv.id
+                    and node is not argv
+                    and node is not assignments[0].targets[0]
+                    and node.lineno <= call.lineno
+                    for node in nodes
+                )
+                or any(
                     isinstance(node, ast.Attribute)
                     and isinstance(node.value, ast.Name)
                     and node.value.id == argv.id
@@ -11550,16 +11644,9 @@ def _ssh_script_argument(
         ):
             # Without an option terminator, a caller-supplied host may change
             # SSH option parsing before the remote command is reached.
-            options = [arg.value if isinstance(arg, ast.Constant) else None for arg in args[:-2]]
             # The ordered option vector must actually leave SSH expecting its
             # destination, with no positional operand or '--' ahead of it.
-            if len(options) % 2 == 0 and all(
-                flag in {"-o", "-p", "-i", "-F"}
-                and isinstance(value, str)
-                and value
-                and not value.startswith("-")
-                for flag, value in zip(options[::2], options[1::2], strict=True)
-            ):
+            if options_end_before_host(args[:-2]):
                 return args[-2]
         if any(
             kw.arg == "input" and isinstance(kw.value, ast.Name) and kw.value.id == script
@@ -11579,6 +11666,11 @@ def _ssh_script_argument(
                 and mapping.args[0].id == "str"
                 and isinstance(mapping.args[1], ast.Name)
                 and mapping.args[1].id in _parameter_names(wrapper.args)
+                and not rebound("map", None)
+                and not rebound("str", None)
+                and len(args) >= 5
+                and isinstance(args[-5], (ast.Attribute, ast.Name, ast.Constant))
+                and options_end_before_host(args[:-5])
                 and [arg.value if isinstance(arg, ast.Constant) else None for arg in args[-4:-1]]
                 in (["bash", "-s", "--"], ["sh", "-s", "--"])
             ):

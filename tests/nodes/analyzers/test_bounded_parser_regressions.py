@@ -1113,7 +1113,12 @@ def test_remote_filter_identifies_unterminated_ssh_destination() -> None:
         ("return subprocess.run(args)", "return print(args)"),
         ("subprocess.run(args)", "subprocess.run(args, shell=True)"),
         ("subprocess.run(args)", "subprocess.run(args, executable='replacement')"),
+        ("    return subprocess.run(args)", "    change(args)\n    return subprocess.run(args)"),
+        ("    args = ['ssh'", "    program = replaced()\n    args = ['ssh'"),
         ("    return subprocess.run(args)", "    args.clear()\n    return subprocess.run(args)"),
+        ("def scan(config):", "send = other\ndef scan(config):"),
+        ("def scan(config):", "def scan(config, send):"),
+        ("def build():", "@replaced\ndef build():"),
         ("def build():", "subprocess = Other()\ndef build():"),
         ("grep -Eqi 'some|other'", 'grep -f "$patterns"'),
         ("def send(server, program):", "@decorated\ndef send(server, program):"),
@@ -1143,10 +1148,29 @@ def test_remote_stdin_reports_reinterpreted_argv() -> None:
     assert source[detail.start : detail.end] == "*map(str, fields)"
 
 
+def test_ssh_stdin_resolves_literal_option_tuple() -> None:
+    source = (
+        _remote_stdin_source()
+        .replace("class Remote:", "FLAGS = ('-o', 'BatchMode=yes')\nclass Remote:")
+        .replace("'ssh', self.server", "'ssh', *FLAGS, self.server")
+    )
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert detail and detail.check is ParserCheck.SSH_ARGUMENTS
+    detail = tm.bounded_parse_diagnostic(
+        source + "FLAGS = dynamic()\n", lambda: None, file_type="python"
+    )
+    assert detail and detail.check is not ParserCheck.SSH_ARGUMENTS
+
+
 @pytest.mark.parametrize(
     ("old", "new"),
     [
         ("map(str, fields)", "map(quote, fields)"),
+        ("class Remote:", "map = custom\nclass Remote:"),
+        ("class Remote:", "class Remote(Custom):"),
+        ("SOURCE = ", "Remote.execute = other\nSOURCE = "),
+        ("'ssh', self.server", "'ssh', *unknown_options, self.server"),
+        ("'ssh', self.server", "'ssh', 'early-destination', self.server"),
         ("worker = Remote()", "worker = Another()"),
         ("input=program", "input=other"),
         ("SOURCE, fields)", 'SOURCE.replace("show", "eval"), fields)'),
