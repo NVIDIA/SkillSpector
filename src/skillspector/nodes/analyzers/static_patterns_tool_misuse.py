@@ -9357,6 +9357,7 @@ def _markdown_shell_text(
     powershell_blocks: list[tuple[int, int]] | None = None,
     inline_code_ranges: list[tuple[int, int]] | None = None,
     inline_possessive_apostrophes: set[int] | None = None,
+    literal_label_positions: set[int] | None = None,
 ) -> str:
     """Mask Markdown delimiters while retaining code and exact source offsets.
 
@@ -9449,6 +9450,14 @@ def _markdown_shell_text(
             ):
                 prose_punctuation.add(close_end)
                 inline_possessives.add(close_end)
+            if (
+                literal_label_positions is not None
+                and close_start - end <= 128
+                and _markdown_backtick_label(content, end, close_start)
+            ):
+                # This character spells a documented key or HDL macro. Keep the raw bytes in the
+                # command-string, operand and finding readers.
+                literal_label_positions.add(end + 1)
         runs.clear()
 
     def prose_without_complete_inline_code(
@@ -11977,6 +11986,16 @@ _VERILOG_DIRECTIVE_LABEL = re.compile(
     r" `(?:(?:define|undef|ifdef|ifndef|elsif)(?: [A-Za-z_][A-Za-z0-9_]*\*?)?|else|endif|celldefine|endcelldefine) "
 )
 
+# UVM's report macros take a static message ID and message, and info reports
+# also take a verbosity enum. Elided operands are common in API examples.
+_UVM_DISPLAY_STRING = r'"[A-Za-z0-9_ .,:-]{1,64}"'
+_UVM_MESSAGE = rf"(?:{_UVM_DISPLAY_STRING}|\.\.\.)"
+_UVM_REPORT_LABEL = re.compile(
+    rf" `uvm_(?:info\({_UVM_DISPLAY_STRING},[ \t]*{_UVM_MESSAGE},[ \t]*"
+    rf"UVM_(?:NONE|LOW|MEDIUM|HIGH|FULL|DEBUG)\)|(?:warning|error|fatal)\("
+    rf"{_UVM_DISPLAY_STRING},[ \t]*{_UVM_MESSAGE}\)) "
+)
+
 
 def _markdown_backtick_label(content: str, start: int, end: int) -> bool:
     """Recognize a documented key or directive in an already paired code span."""
@@ -11989,6 +12008,9 @@ def _markdown_backtick_label(content: str, start: int, end: int) -> bool:
             re.search(r"\bbacktick[ \t\r\n(]*``$", content[max(0, start - 32) : start], re.I)
             is not None
         )
+    if end - start <= 128 and _UVM_REPORT_LABEL.fullmatch(content, start, end):
+        before = content[max(0, start - 32) : start - 2]
+        return re.search(r"\b(?:with|using|via|macro)[ \t]+$", before, re.I) is not None
     if end - start > 128 or not _VERILOG_DIRECTIVE_LABEL.fullmatch(content, start, end):
         return False
     # Require a descriptive phrase on both sides. A utility may take a
@@ -12415,6 +12437,7 @@ def _has_bounded_parse_exhaustion(
             complete_context=complete_context,
             word_apostrophes=word_apostrophes,
             directory_tree_markers=word_apostrophes,
+            literal_label_positions=structural_quote_closers if word_apostrophes else None,
             shell_fence_ranges=shell_fence_ranges,
             hardware_apostrophe_ambiguity=hardware_apostrophe_ambiguity,
             hardware_apostrophe_locations=hardware_apostrophe_locations,

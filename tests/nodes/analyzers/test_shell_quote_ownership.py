@@ -1909,3 +1909,37 @@ def test_shell_fence_stops_comment_punctuation_before_later_markdown() -> None:
 def test_malformed_example_cannot_supply_a_shell_fence_boundary(specimen: str) -> None:
     source = "```sh\n" + specimen + "\n```\n" + "a" * 8400 + " rm -rf /\n"
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="markdown")
+
+
+def test_documented_keyboard_backtick_keeps_raw_shell_execution_context() -> None:
+    label = "Press backtick\n(`` ` ``) or tilde (`~`)."
+    positions: set[int] = set()
+    projected = tm._markdown_shell_text(label, lambda: None, literal_label_positions=positions)
+    index = label.index(" ` ") + 1
+    assert positions == {index} and projected[index] == "`"
+    assert tm.bounded_parse_diagnostic(label, lambda: None, file_type="markdown") is None
+    for text in (label + "\n$TOOL -rf /\n", "sh -c 'echo \"" + label + "\"; $TOOL -rf /'\n"):
+        diagnostic = tm.bounded_parse_diagnostic(text, lambda: None, file_type="markdown")
+        assert diagnostic is not None and diagnostic.check in {
+            tm.ParserCheck.COMMAND_IDENTITY,
+            tm.ParserCheck.COMMAND_ARGUMENT_BOUNDARY,
+        }
+        assert diagnostic.start == text.index("$TOOL")
+
+
+@pytest.mark.parametrize(
+    "macro", ['uvm_info("STATUS", ..., UVM_NONE)', 'uvm_error("STATUS", "failed")']
+)
+def test_literal_report_macros_own_only_their_printed_prefix(macro: str) -> None:
+    source = "The message is emitted with `` `" + macro + " `` in the testbench."
+    positions: set[int] = set()
+    projected = tm._markdown_shell_text(source, lambda: None, literal_label_positions=positions)
+    start = source.index(" `" + macro) + 1
+    assert positions == {start} and projected[start] == "`"
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+    for replacement in ('uvm_error("STATUS", "$(run)")', 'uvm_error("STATUS", value())'):
+        other = source.replace(macro, replacement)
+        positions.clear()
+        tm._markdown_shell_text(other, lambda: None, literal_label_positions=positions)
+        assert not positions
+        assert tm.has_bounded_parse_exhaustion(other, lambda: None, file_type="markdown")
