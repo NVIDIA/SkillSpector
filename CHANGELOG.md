@@ -1,5 +1,6 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
+* fix(sc9): treat `.whl` as the expected suffix of a ZIP container, so a visible Python wheel no longer turns each of its executable members into a concealed-executable HIGH; wheel members are still inspected, and a dot-prefixed wheel or a non-ZIP file named `.whl` still raises SC9 (#1139)
 * fix(deps): bump the locked `langgraph` from 1.2.6 to 1.2.20 (and `langgraph-checkpoint` 4.1.1 to 4.3.1, which it requires) past GHSA-3fx2-cqw9-xr3c; the locked `langgraph-sdk` 0.4.10 was already patched (#1078)
 * fix(pi): accept scans from symlinked workspace roots while preserving the CLI's checks on symlinks below the workspace. Custom YARA rules loaded with `--yara-rules-dir` cannot use `include`; place each rule directly in the selected directory.
 * fix(coverage): account for successfully inspected linked ZIP containers while retaining member failures and archive limits

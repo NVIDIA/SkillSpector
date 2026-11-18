@@ -899,6 +899,38 @@ def test_nested_zip_preserves_full_virtual_provenance(tmp_path: Path) -> None:
     assert metadata["concealed_executable"] is True
 
 
+def test_visible_wheel_is_an_expected_zip_container(tmp_path: Path) -> None:
+    wheel_path = tmp_path / "vendor" / "tool-1.0.0-py3-none-any.whl"
+    wheel_path.parent.mkdir()
+    _write_archive(wheel_path, {"tool/cli.py": b"print('tool')\n"})
+    (tmp_path / "SKILL.md").write_text("# Tool\n", encoding="utf-8")
+
+    context = build_context({"skill_path": str(tmp_path)})
+    outer_path = "vendor/tool-1.0.0-py3-none-any.whl"
+    virtual_path = f"{outer_path}!/tool/cli.py"
+
+    outer = next(item for item in context["component_metadata"] if item["path"] == outer_path)
+    nested = next(item for item in context["component_metadata"] if item["path"] == virtual_path)
+    assert outer["disguised"] is False
+    assert nested["executable"] is True
+    assert nested["concealed_executable"] is False
+    assert _analyze_concealed_executables(context["component_metadata"]) == []
+
+
+def test_tar_named_as_wheel_stays_disguised(tmp_path: Path) -> None:
+    wheel_path = tmp_path / "tool-1.0.0-py3-none-any.whl"
+    wheel_path.write_bytes(_tar_bytes([("tool/cli.py", b"print('tool')\n")]))
+    (tmp_path / "SKILL.md").write_text("# Tool\n", encoding="utf-8")
+
+    context = build_context({"skill_path": str(tmp_path)})
+    virtual_path = "tool-1.0.0-py3-none-any.whl!/tool/cli.py"
+
+    nested = next(item for item in context["component_metadata"] if item["path"] == virtual_path)
+    assert nested["concealed_executable"] is True
+    findings = _analyze_concealed_executables(context["component_metadata"])
+    assert [finding.file for finding in findings] == [virtual_path]
+
+
 def test_supplied_outer_bytes_preserve_exact_virtual_member_bytes(tmp_path: Path) -> None:
     payload = b"\xff\x00\x80raw-member\r\n"
     outer_path = "cached.zip"
