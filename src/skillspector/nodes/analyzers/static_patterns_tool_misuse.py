@@ -5288,12 +5288,20 @@ def _command_string_from_clause(
         *,
         lower_bound: bool = False,
     ) -> tuple[bool, None]:
+        # The reader stops before a redirection operator. Name the character that
+        # blocked the wrapped word, including in examples containing <metavars>.
+        begin, end = start, cursor
+        if check is ParserCheck.COMMAND_WORD_BOUNDARY and content[cursor : cursor + 1] in {
+            "<",
+            ">",
+        }:
+            begin, end = cursor, cursor + 1
         _note_parser_diagnostic(
             diagnostics,
             cause,
             check,
-            start,
-            cursor,
+            begin,
+            end,
             ParserUncheckedScope.COMMAND_STRING,
             measurements=measurements,
             lower_bound=lower_bound,
@@ -5732,7 +5740,7 @@ def _command_string_from_clause(
                             return failed()
                         xargs_redirected = True
                         continue
-                    if xargs_redirected and cursor < len(content) and content[cursor] in "\r\n":
+                    if content.startswith(("\n", "\r\n"), cursor):
                         if not external_xargs_proved():
                             return failed(ParserCause.RUNTIME_DEPENDENT)
                         # Without an explicit utility xargs prints its input.
@@ -9965,6 +9973,22 @@ def _markdown_shell_text(
                             apostrophes.append(offset + prefix + word.start("apostrophe"))
                         if len(apostrophes) == prose_leading.count("'"):
                             prose_apostrophes.update(apostrophes)
+                    if (
+                        word_apostrophes
+                        and not runs
+                        and not heading
+                        and complete_context
+                        and "). " in leading
+                        and len(leading) <= 512
+                        and (
+                            line_index == 0
+                            or not lines[line_index - 1].rstrip("\r\n").endswith("\\")
+                        )
+                        and (sentence := _PARENTHETICAL_SENTENCE.fullmatch(leading))
+                    ):
+                        # A prose sentence can end in a parenthetical. The period
+                        # after ')' is not the shell's dot (source) command.
+                        prose_apostrophes.add(offset + prefix + sentence.start("period"))
                     pending_inline = bool(runs)
                     for match in backtick_runs.finditer(line):
                         check_runtime()
@@ -10056,6 +10080,13 @@ def _markdown_shell_text(
             cursor += 1
         return "".join(output)
     return projected
+
+
+_PARENTHETICAL_SENTENCE = re.compile(
+    r"(?:[A-Za-z]+ ){3}(?:[A-Za-z]+ |\([A-Za-z]+(?: [A-Za-z]+)*\) )*"
+    r"\((?:[A-Za-z]+(?: [A-Za-z]+)+|`[A-Z][A-Z0-9_]+`)\)(?P<period>\.) "
+    r"[A-Z][a-z]+(?: [A-Za-z]+)+[.!?]?"
+)
 
 
 _ASCII_TREE_ROW = re.compile(

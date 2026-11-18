@@ -150,6 +150,61 @@ printf 'Created %s\\n' "$root"
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("options", ["", " -0", " --"])
+def test_commandless_external_xargs_stops_at_its_physical_line(options, newline) -> None:
+    source = f'printf values | xargs{options}{newline}sh -c "$BODY"{newline}'
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None)
+
+    assert diagnostic is not None
+    assert diagnostic.start == source.index("sh -c")
+    assert tm.bounded_parse_diagnostic(source[: diagnostic.start], lambda: None) is None
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [' \\\n sh -c "$BODY"\n', " -n\n", ' "$UTILITY"\n', ""],
+)
+def test_unresolved_or_incomplete_xargs_keeps_its_warning(suffix) -> None:
+    assert tm.bounded_parse_diagnostic("xargs" + suffix, lambda: None) is not None
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "The value can be stale (cached state). Compare both values",
+        "Read the configured setting (`INPUT_FILE`). Verify the name",
+    ],
+)
+def test_prose_period_does_not_source_a_file_into_an_xargs_example(sentence) -> None:
+    source = sentence + "\n\n```sh\nprintf values | xargs\nrm -rf /\n```\n"
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+    assert any(item.rule_id == "TM1" for item in tm.analyze(source, "SKILL.md", "markdown"))
+
+
+@pytest.mark.parametrize(
+    "binding", [". helpers", "alias xargs=bash", 'case "$MODE" in one). helpers ;; esac']
+)
+def test_separate_shell_example_keeps_xargs_binding_uncertain(binding) -> None:
+    source = (
+        f"```sh\n{binding}\n```\n\n"
+        "The value can be stale (cached state). Compare both values\n\n"
+        "```sh\nprintf values | xargs\n```\n"
+    )
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.start == source.rindex("xargs")
+
+
+@pytest.mark.parametrize("command", ["env VALUE=<value> tool", "sudo <command> --list"])
+def test_unresolved_wrapper_points_to_the_ambiguous_operator(command) -> None:
+    source = f"Example\n\n```sh\n{command}\n```\n"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.check is tm.ParserCheck.COMMAND_WORD_BOUNDARY
+    assert (diagnostic.start, diagnostic.end) == (source.index("<"), source.index("<") + 1)
+
+
 @pytest.mark.parametrize("operator", ["<<<", "<<< "])
 def test_here_string_keeps_following_quote_bounds(operator: str) -> None:
     source = f'cat {operator}"$VALUE"\necho "waiting $(get_count) ${{DELAY}}s"\n'
