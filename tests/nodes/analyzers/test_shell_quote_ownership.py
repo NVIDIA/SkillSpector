@@ -1998,3 +1998,110 @@ def test_literal_report_macros_own_only_their_printed_prefix(macro: str) -> None
         tm._markdown_shell_text(other, lambda: None, literal_label_positions=positions)
         assert not positions
         assert tm.has_bounded_parse_exhaustion(other, lambda: None, file_type="markdown")
+
+
+_READ_LOOP = (
+    "for i in $(seq 0 7); do sudo inspect /dev/sample $(printf 0x%x $((0x100 + i*8))); done\n"
+)
+_NESTED_READ_LOOP = (
+    "device=/dev/sample\nfor row in $(seq 0 5); do address=$((0x200 + row*8))\n"
+    ' echo "row $row: $(for col in 0 4; do /usr/bin/inspect $device $(printf 0x%x $((address+col))); '
+    "done | tr '\\n' ' ')\"; done\n"
+)
+
+
+@pytest.mark.parametrize("body", [_READ_LOOP, _NESTED_READ_LOOP])
+@pytest.mark.parametrize("kind", ["markdown", "shell"])
+def test_numeric_loops_keep_formatted_operands_in_data_role(body: str, kind: str) -> None:
+    source = f"```bash\n{body}```\n" if kind == "markdown" else body
+    result = static_runner.run_static_patterns_with_ledger(
+        {
+            "components": [path := "example." + ("md" if kind == "markdown" else "sh")],
+            "file_cache": {path: source},
+        },
+        [tm],
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("seq 0 7", 'seq 0 "$end"'),
+        ("seq 0 7", "seq 0 512"),
+        ("seq 0 7", "seq -w 0 7"),
+        ("seq 0 7", "seq 0 7; echo data"),
+        ("$(seq 0 7)", "0 01x"),
+        ("+ i*8", "+ unknown*8"),
+        ("+ i*8", "+ array[i]"),
+        ("+ i*8", "+ i++"),
+        ("+ i*8", "+ i*2147483647"),
+        ("printf 0x%x", 'printf "$fmt"'),
+        ("do sudo", 'do i="$input"; sudo'),
+        ("do sudo", "do declare -a i; sudo"),
+        ("sudo inspect /dev/sample ", ""),
+        ("sudo inspect /dev/sample ", "sudo inspect >"),
+        ("sudo inspect /dev/sample ", "sh -c "),
+        ("sudo inspect /dev/sample ", "sudo inspect /dev/sample x"),
+        ("do sudo", "do sudo \\\n"),
+        ("$(printf 0x%x", "$(printf -v slot 0x%x"),
+        ("0x100 + i*8)))", "0x100 + i*8)) & )"),
+    ],
+)
+def test_numeric_argv_needs_a_bounded_value_and_complete_data_operand(old: str, new: str) -> None:
+    assert not tm.finite_numeric_operands(_READ_LOOP.replace(old, new), lambda: None)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "seq() { evil; }",
+        "printf() { echo rm; }",
+        "PATH=/other",
+        "LD_AUDIT=/other",
+        "DYLD_INSERT_LIBRARIES=/other",
+        "IFS=x",
+        'BASH_ENV="$file"',
+        "declare -A i",
+        "readonly i=other",
+        "i=(other)",
+        "alias seq=unknown",
+        "hash -p /tmp/other seq",
+        "read -a i",
+        "mapfile -t i",
+        "time read -a i",
+        "if read -a i\nthen true\nfi",
+        "r''ead -a i",
+        "a" * 8000 + "() { evil; }",
+        'eval "$setup"',
+    ],
+)
+@pytest.mark.parametrize("separate", [False, True])
+def test_numeric_argv_retains_rebinding_and_shell_state(prefix: str, separate: bool) -> None:
+    if separate:
+        source = f"```bash\n{prefix}\n```\n```bash\n{_READ_LOOP}```\n"
+        kind = "markdown"
+    else:
+        source, kind = prefix + "\n" + _READ_LOOP, "shell"
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type=kind) is not None
+
+
+def test_numeric_loops_survive_normalization_only_in_original_shell_scopes() -> None:
+    # Fullwidth text creates a second inspection view and shifts its source
+    # coordinates. A shell control that changes under normalization cannot
+    # acquire the proof associated with another spelling.
+    for body, expected in [(_READ_LOOP, True), (_READ_LOOP.replace("seq", "ｓｅｑ"), False)]:
+        source = "Ｍａｎｕａｌ…\n\n```bash\n" + body + "```\n"
+        result = static_runner.run_static_patterns_with_ledger(
+            {"components": ["example.md"], "file_cache": {"example.md": source}}, [tm]
+        )
+        assert (result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED) is expected
+
+
+def test_numeric_operand_proof_never_completes_a_dynamic_command_or_hides_a_finding() -> None:
+    source = "```bash\n" + _READ_LOOP + "```\n```bash\n$runner -rf /\nrm -rf /\n```\n"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.md"], "file_cache": {"example.md": source}}, [tm]
+    )
+    assert any(row["outcome"] is not LedgerOutcome.COMPLETED for row in result["inspection_ledger"])
+    assert any(row.rule_id == "TM1" for row in result["findings"])

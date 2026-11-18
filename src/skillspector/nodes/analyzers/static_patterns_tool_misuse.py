@@ -42,7 +42,12 @@ from skillspector.artifacts import (
     security_text_views,
 )
 from skillspector.baseline_tokens import baseline_rule_scalar_roles
-from skillspector.bash_syntax import bash_syntax, complete_shell_fences
+from skillspector.bash_syntax import (
+    bash_syntax,
+    complete_shell_fences,
+    finite_numeric_operands,
+    plain_shell_neighbor,
+)
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
     LedgerReason,
@@ -10869,9 +10874,51 @@ class _YamlParserAnalysis:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _FiniteShellSource:
+    content: str
+    scopes: tuple[tuple[int, int], ...]
+
+    def owns(
+        self,
+        view: SecurityTextView,
+        ranges: list[tuple[int, int]],
+        check_runtime: Callable[[], None],
+    ) -> bool:
+        # Normalization may change unrelated Markdown prose. Each complete
+        # shell scope must still map byte-for-byte to the same original scope.
+        if view.name != "normalized" or len(ranges) != len(self.scopes):
+            return False
+        for (start, end), (lo, hi) in zip(ranges, self.scopes, strict=True):
+            check_runtime()
+            if (
+                end <= start
+                or hi - lo != end - start
+                or self.content[lo:hi] != view.text[start:end]
+            ):
+                return False
+            for pos in range(start, end):
+                if not (pos - start) % 512:
+                    check_runtime()
+                if (
+                    view.source_offset(pos) != lo + pos - start
+                    or view.source_end_offset(pos) != lo + pos - start + 1
+                ):
+                    return False
+        return True
+
+
 def prepare_parser_analysis(
     content: str, file_type: str, check_runtime: Callable[[], None]
-) -> JSONSourceOwnership | _YamlParserAnalysis | None:
+) -> JSONSourceOwnership | _YamlParserAnalysis | _FiniteShellSource | None:
+    if file_type in {"shell", "markdown"} and "$(printf" in content and "0x%x" in content:
+        ranges = []
+        if file_type == "shell":
+            ranges.append((0, len(content)))
+        else:
+            _markdown_shell_text(content, check_runtime, shell_fence_ranges=ranges)
+        if 0 < len(ranges) <= 64 and sum(end - start for start, end in ranges) <= 1_000_000:
+            return _FiniteShellSource(content, tuple(ranges))
     if file_type == "json":
         return prepare_json_source(content, check_runtime)
     if file_type != "yaml":
@@ -12349,6 +12396,7 @@ def _has_bounded_parse_exhaustion(
             # Retain the native continuation contract before ownership is rebuilt.
             return continuation_diagnostics[0]
     structural_quote_openers = None
+    native_shell_input = content
     shell_fence_ranges: list[tuple[int, int]] = []
     json_strings: list[tuple[int, int]] = []
     json_operand_spans: list[tuple[int, int]] = []
@@ -12578,6 +12626,45 @@ def _has_bounded_parse_exhaustion(
             )
             assert structural_quote_closers is not None
             structural_quote_closers.update(start + position for position in closers)
+    if (
+        complete_context
+        and file_type in {"shell", "markdown"}
+        and "$(printf" in native_shell_input
+        and "0x%x" in native_shell_input
+    ):
+        ranges = shell_fence_ranges if file_type == "markdown" else [(0, len(content))]
+        # A setting in an earlier example can change later command bindings
+        # or arithmetic evaluation. Prefer the raw diagnostic in that case.
+        if (
+            0 < len(ranges) <= 64
+            and sum(end - start for start, end in ranges) <= 1_000_000
+            and (
+                source_view is None
+                or source_view.name == "raw"
+                or (
+                    isinstance(prepared_analysis, _FiniteShellSource)
+                    and source_view.text == native_shell_input
+                    and prepared_analysis.owns(source_view, ranges, check_runtime)
+                )
+            )
+        ):
+            proven = []
+            for start, end in ranges:
+                check_runtime()
+                body = native_shell_input[start:end]
+                spans = finite_numeric_operands(body, check_runtime)
+                if spans:
+                    proven.extend((start + low, start + high) for low, high in spans)
+                elif not plain_shell_neighbor(body, check_runtime):
+                    break
+            else:
+                if proven:
+                    view = list(shell_word_content)
+                    for low, high in proven:
+                        # One representative numeric operand preserves byte
+                        # offsets. Findings still use the complete raw source.
+                        view[low:high] = "0x0".ljust(high - low)
+                    shell_word_content = "".join(view)
     # Perl ``eval BLOCK`` is recognized from its clause-initial ``eval`` and the
     # adjacent brace alone, so unlike quote ownership it needs no full context.
     diagnostic = _has_shell_command_word_exhaustion(
