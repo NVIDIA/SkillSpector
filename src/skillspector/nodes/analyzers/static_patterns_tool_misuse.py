@@ -50,6 +50,7 @@ from skillspector.bash_syntax import (
     may_have_formatted_loop,
     plain_shell_neighbor,
     positional_shell_callers,
+    sourced_eval_argument,
 )
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
@@ -10586,6 +10587,20 @@ def _generated_helper_variants(
                 return output
             output[span] = program
     return output
+
+
+def sourced_callable_diagnostic(
+    path: str, content: str, sources: Mapping[str, str], check_runtime: Callable[[], None]
+) -> StaticParserDiagnostic | None:
+    witness = sourced_eval_argument(content, path, sources, check_runtime)
+    if witness is None:
+        return None
+    return StaticParserDiagnostic(
+        ParserCause.RUNTIME_DEPENDENT,
+        ParserCheck.COMMAND_STRING_RUNTIME,
+        *witness.caller_span,
+        ParserUncheckedScope.COMMAND_STRING,
+    )
 
 
 def prepare_source_analysis(

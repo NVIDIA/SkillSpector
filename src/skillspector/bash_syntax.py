@@ -9,8 +9,9 @@ import re
 import time
 from array import array
 from bisect import bisect_left
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 import tree_sitter_bash
 from tree_sitter import Language, Node, Parser, Tree
@@ -861,3 +862,230 @@ def positional_shell_callers(
         tuple((offset(low), offset(high)) for low, high in scopes),
         closed,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class SourcedEval:
+    caller_span: tuple[int, int]
+    definition_path: str
+    eval_span: tuple[int, int]
+
+
+def _forwarded_eval(
+    body: Node, supplied: list[Node], check_runtime: Callable[[], None]
+) -> tuple[int, Node] | None:
+    """Prove a straight-line positional argument reaches eval in the selected arm."""
+    variables: dict[bytes, tuple[int, bytes | None]] = {}
+    positional = rb'(?:"\$([1-9])"|"\$\{([1-9])(?::-([A-Za-z0-9_.-]+))?\}")'
+    statements = [node for node in body.named_children if node.type != "comment"]
+    if not 1 <= len(statements) <= 16 or body.type != "compound_statement":
+        return None
+    for node in statements[:-1]:
+        check_runtime()
+        if node.type != "declaration_command" or node.children[0].type != "local":
+            return None
+        for binding in node.named_children:
+            name = binding.child_by_field_name("name")
+            value = binding.child_by_field_name("value")
+            if name is None or value is None or binding.type != "variable_assignment":
+                return None
+            match = re.fullmatch(positional, value.text)
+            if not match or name.text in variables or not _ordinary_binding(name.text.decode()):
+                return None
+            variables[name.text] = (int(match[1] or match[2]), match[3])
+    node = statements[-1]
+    if node.type == "case_statement":
+        selector = node.child_by_field_name("value")
+        var = re.fullmatch(rb'"\$([A-Za-z_]\w*)"', selector.text) if selector is not None else None
+        if not var or var[1] not in variables:
+            return None
+        position, default = variables[var[1]]
+        value = _literal_argument(supplied[position - 1]) if position <= len(supplied) else ""
+        if value is None:
+            return None
+        selected_value = value.encode() or default or b""
+        for case in node.named_children:
+            check_runtime()
+            if case.type != "case_item":
+                continue
+            labels = case.children_by_field_name("value")
+            if not labels or any(
+                not re.fullmatch(rb"[A-Za-z0-9_.-]+|\*", label.text) for label in labels
+            ):
+                return None
+            if any(label.text in {b"*", selected_value} for label in labels):
+                actions = [item for item in case.named_children if item not in labels]
+                if len(actions) != 1 or not case.text.rstrip().endswith(b";;"):
+                    return None
+                node = actions[0]
+                break
+    if node.type == "subshell" and node.named_child_count == 1:
+        node = node.named_children[0]
+    if (
+        node.type != "command"
+        or node.named_child_count != 2
+        or node.named_children[0].text != b"eval"
+    ):
+        return None
+    argument = node.child_by_field_name("argument")
+    if argument is None:
+        return None
+    match = re.fullmatch(positional, argument.text)
+    if match is not None:
+        return int(match[1] or match[2]), argument
+    var = re.fullmatch(rb'"\$([A-Za-z_]\w*)"', argument.text)
+    return (variables[var[1]][0], argument) if var and var[1] in variables else None
+
+
+def sourced_eval_argument(
+    caller: str, path: str, sources: Mapping[str, str], check_runtime: Callable[[], None]
+) -> SourcedEval | None:
+    """Find an original script-relative library function consuming a runtime shell program.
+
+    Only declarative libraries and a straight-line caller prefix establish a binding.
+    This adds an uncertainty witness without granting any completion or removing findings.
+    """
+    if (
+        len(caller) > 131_072
+        or "BASH_SOURCE[0]" not in caller
+        or sources.get(path) != caller
+        or not ("source " in caller or ". " in caller)
+    ):
+        return None
+    deadline = time.monotonic() + 0.3
+    remaining_bytes = 256_000
+
+    def parse(text: str) -> Node | None:
+        nonlocal remaining_bytes
+        check_runtime()
+        if len(text) > remaining_bytes or (
+            text.startswith("#!")
+            and not re.fullmatch(
+                r"#![ \t]*(?:/bin/(?:ba)?sh|/usr/bin/(?:ba)?sh|/usr/bin/env[ \t]+(?:ba)?sh)[ \t]*",
+                text.partition("\n")[0],
+            )
+        ):
+            return None
+        raw = text.encode()
+        remaining_bytes -= len(raw)
+        if remaining_bytes < 0 or time.monotonic() >= deadline or b"\0" in raw:
+            return None
+        try:
+            tree = _tree(raw, deadline)
+        except (ValueError, OverflowError):
+            return None
+        if tree is None or tree.root_node.has_error or tree.root_node.end_byte != len(raw):
+            return None
+        if tree.root_node.descendant_count > 65_536:
+            return None
+        return tree.root_node
+
+    root = parse(caller)
+    if root is None or root.child_count > 512:
+        return None
+    directories: set[bytes] = set()
+    assigned: set[bytes] = set()
+    definitions: dict[bytes, tuple[str, Node]] = {}
+    loaded: set[str] = set()
+    for node in root.children:
+        check_runtime()
+        if time.monotonic() >= deadline:
+            return None
+        if node.type in {"comment", ";"}:
+            continue
+        if node.type == "variable_assignment":
+            name = node.child_by_field_name("name")
+            value = node.child_by_field_name("value")
+            if (
+                name is None
+                or value is None
+                or not re.fullmatch(rb"[A-Za-z_]\w*", name.text)
+                or is_managed_shell_variable(name.text.decode())
+                or name.text.startswith((b"LD_", b"DYLD_"))
+            ):
+                return None
+            if name.text in directories or name.text in assigned:
+                return None
+            assigned.add(name.text)
+            if value.text == b'"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"':
+                directories.add(name.text)
+            elif _literal_argument(value) is None:
+                return None
+            continue
+        if node.type != "command" or node.named_children[0] != node.child_by_field_name("name"):
+            return None
+        name = node.named_children[0].text
+        args = node.children_by_field_name("argument")
+        # Backgrounded imports, pipeline segments and conditional substitutions
+        # cannot introduce a function into the current shell unconditionally.
+        following = node.next_sibling
+        if following is not None and following.type == "&":
+            return None
+        if name in {b"source", b"."}:
+            if len(loaded) >= 12 or len(args) != 1:
+                return None
+            ref = re.fullmatch(
+                rb'"\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})/([\w./-]+)"', args[0].text
+            )
+            if not ref or (ref[1] or ref[2]) not in directories:
+                return None
+            relative = ref[3].decode().split("/")
+            if any(part in {"", ".", ".."} for part in relative):
+                return None
+            source_path = str(PurePosixPath(path).parent.joinpath(*relative))
+            library = sources.get(source_path)
+            if source_path in loaded or library is None:
+                return None
+            imported = parse(library)
+            if imported is None or imported.child_count > 512:
+                return None
+            loaded.add(source_path)
+            for item in imported.children:
+                check_runtime()
+                if item.type in {"comment", ";"}:
+                    continue
+                symbol = item.child_by_field_name("name")
+                body = item.child_by_field_name("body")
+                if item.type != "function_definition" or symbol is None or body is None:
+                    return None
+                if not re.fullmatch(rb"[A-Za-z_]\w*", symbol.text) or symbol.text in {
+                    b"source",
+                    b"eval",
+                    b"cd",
+                    b"dirname",
+                    b"pwd",
+                    b"local",
+                }:
+                    return None
+                definitions[symbol.text] = (source_path, body)
+            continue
+        if (
+            name not in definitions
+            or len(args) > 16
+            or not all(_single_argv_slot(arg) for arg in args)
+        ):
+            return None
+        source_path, body = definitions[name]
+        reached = _forwarded_eval(body, args, check_runtime)
+        if reached is not None:
+            slot, sink = reached
+            if slot <= len(args):
+                argument = args[slot - 1]
+                var = re.fullmatch(rb'"\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})"', argument.text)
+                if var and (var[1] or var[2]) not in assigned:
+                    raw = caller.encode()
+                    source_raw = sources[source_path].encode()
+                    return SourcedEval(
+                        (
+                            len(raw[: argument.start_byte].decode()),
+                            len(raw[: argument.end_byte].decode()),
+                        ),
+                        source_path,
+                        (
+                            len(source_raw[: sink.start_byte].decode()),
+                            len(source_raw[: sink.end_byte].decode()),
+                        ),
+                    )
+        # An intervening function may change the current shell's bindings.
+        return None
+    return None

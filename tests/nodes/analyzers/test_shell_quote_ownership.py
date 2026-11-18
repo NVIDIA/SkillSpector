@@ -2442,3 +2442,77 @@ def test_executable_backticks_remain_visible_after_a_normalized_comment() -> Non
     assert detail["check"] is tm.ParserCheck.EXPANSION_BOUNDARY
     assert source[detail["source_start_offset"] : detail["source_end_offset"]].startswith('`"')
     assert any(f.rule_id == "TM1" for f in result["findings"])
+
+
+_SOURCED_EVAL_LIB = """#!/bin/bash
+route() {
+  local program="$1" mode="${2:-print}"
+  case "$mode" in
+    shell) (eval "$program");;
+    print) printf '%s' "$program";;
+  esac
+}
+"""
+_SOURCE_RELATIVE = """#!/bin/bash
+base="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${base}/actions.sh"
+"""
+
+
+def test_sourced_function_reports_runtime_operand_in_the_caller(tmp_path: Path) -> None:
+    source = _SOURCE_RELATIVE + '# non-ASCII α\nroute "$REQUEST" shell\n'
+    state = _forwarder_context(tmp_path, {"main.sh": source, "actions.sh": _SOURCED_EVAL_LIB})
+    rows = {row["path"]: row for row in tm.node(state)["inspection_ledger"]}
+    assert set(rows) == {"actions.sh", "main.sh"}
+    assert rows["actions.sh"]["outcome"] == rows["main.sh"]["outcome"] == LedgerOutcome.PARTIAL
+    diagnostic = rows["main.sh"]["parser_diagnostic"]
+    assert diagnostic["check"] == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert (
+        source[diagnostic["source_start_offset"] : diagnostic["source_end_offset"]] == '"$REQUEST"'
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        _SOURCE_RELATIVE + 'route "$REQUEST" print',
+        _SOURCE_RELATIVE + 'route "$REQUEST"',
+        _SOURCE_RELATIVE + "route 'pwd' shell",
+        _SOURCE_RELATIVE + 'other "$REQUEST" shell',
+        _SOURCE_RELATIVE + 'route "$@" "$REQUEST" shell',
+        _SOURCE_RELATIVE + 'rebind() { eval "$1"; }\nrebind "$INIT"\nroute "$REQUEST" shell',
+        _SOURCE_RELATIVE + 'unset -f route\nroute "$REQUEST" shell',
+        _SOURCE_RELATIVE + 'REQUEST=pwd\nroute "$REQUEST" shell',
+        _SOURCE_RELATIVE + 'route() { printf "%s" "$1"; }\nroute "$REQUEST" shell',
+        _SOURCE_RELATIVE + 'source "$EXTERNAL"\nroute "$REQUEST" shell',
+        _SOURCE_RELATIVE + 'if false; then route "$REQUEST" shell; fi',
+        _SOURCE_RELATIVE + 'return 0\nroute "$REQUEST" shell',
+        _SOURCE_RELATIVE.replace('source "${base}/actions.sh"', "source ./actions.sh")
+        + 'route "$REQUEST" shell',
+    ],
+)
+def test_sourced_eval_needs_exact_binding_and_selected_arm(source: str) -> None:
+    sources = {"main.sh": source, "actions.sh": _SOURCED_EVAL_LIB}
+    assert tm.sourced_callable_diagnostic("main.sh", source, sources, lambda: None) is None
+
+
+def test_sourced_eval_confirms_original_library_location() -> None:
+    source = _SOURCE_RELATIVE + 'route "$input" shell'
+    library = _SOURCED_EVAL_LIB.replace("route()", "# λ\nroute()")
+    state = {"main.sh": source, "actions.sh": library}
+    result = tm.sourced_eval_argument(source, "main.sh", state, lambda: None)
+    assert result is not None
+    assert source[slice(*result.caller_span)] == '"$input"'
+    assert result.definition_path == "actions.sh"
+    assert library[slice(*result.eval_span)] == '"$program"'
+    assert tm.sourced_eval_argument(source, "main.sh", {"main.sh": source}, lambda: None) is None
+
+
+def test_sourced_eval_honors_later_library_replacement() -> None:
+    source = _SOURCE_RELATIVE + 'source "${base}/overrides.sh"\nroute "$program" shell'
+    sources = {
+        "main.sh": source,
+        "actions.sh": _SOURCED_EVAL_LIB,
+        "overrides.sh": 'route() { printf "%s" "$1"; }',
+    }
+    assert tm.sourced_eval_argument(source, "main.sh", sources, lambda: None) is None
