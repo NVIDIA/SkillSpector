@@ -87,6 +87,7 @@ from skillspector.shell_sources import (
     generated_file_is_unmodified,
 )
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+from skillspector.wordprocessingml import paragraph_contractions
 from skillspector.yaml_tokens import YamlScalar, YamlSourceSpans, yaml_source_spans
 
 from . import static_runner
@@ -12284,6 +12285,40 @@ def bounded_parse_diagnostic(
         python_import_check=python_import_check,
         python_stdlib_check=python_stdlib_check,
     )
+    if (
+        complete_context
+        and file_type in {"other", "xml"}
+        and "wordprocessingml/" in content[:8192]
+        and content.removeprefix("\ufeff").lstrip().startswith("<")
+    ):
+        paragraphs: list[tuple[int, int, str]] = []
+        projected = paragraph_contractions(content, check_runtime, paragraphs=paragraphs)
+        for begin, end, value in paragraphs:
+            check_runtime()
+            # Native text runs can divide a command or its argument in the
+            # middle of a word. Reassemble the paragraph before inspecting it.
+            inner = bounded_parse_diagnostic(value, check_runtime, file_type="markdown")
+            if inner is not None:
+                return inner.enclosed(begin, end)
+            if value not in content[begin:end] and analyze(
+                value, "<paragraph>", "markdown", check_runtime=check_runtime
+            ):
+                return StaticParserDiagnostic(
+                    ParserCause.UNSUPPORTED_SYNTAX,
+                    ParserCheck.COMMAND_STRING_EFFECTS,
+                    begin,
+                    end,
+                    ParserUncheckedScope.COMMAND_STRING,
+                    location_precision="enclosing_expression",
+                )
+        if (
+            projected != content
+            and exhausted is not None
+            and exhausted.check is ParserCheck.COMMAND_WORD_BOUNDARY
+        ):
+            exhausted = _has_bounded_parse_exhaustion(
+                projected, check_runtime, file_type=file_type, complete_context=True
+            )
     if exhausted is not None and not complete_context:
         exhausted = replace(exhausted, full_input_checked=False)
     if file_type == "yaml" and complete_context:
