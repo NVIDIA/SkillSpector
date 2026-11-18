@@ -2051,7 +2051,7 @@ def _ordinary_native_calls(
     rejected: set[str] = set()
     module_calls: dict[str, set[int]] = {}
     module_identifiers: dict[str, set[int]] = {}
-    for name, (binding, family, original, namespace) in bindings.items():
+    for name, (binding, family, imported_name, namespace) in bindings.items():
         calls: set[int] = set()
         identifiers = {binding.id}
         methods = _PATH_FUNCTIONS if family == "path" else _FS_PATH_METHODS | _FS_FD_METHODS
@@ -2070,17 +2070,18 @@ def _ordinary_native_calls(
             call = None if callee is None else callee.parent
             arguments = None if call is None else call.child_by_field_name("arguments")
             if (
-                call is None
+                callee is None
+                or call is None
                 or call.type != "call_expression"
                 or call.child_by_field_name("function") != callee
                 or arguments is None
                 or arguments.type != "arguments"
             ):
                 break
-            method = _callable_member(program, callee) if namespace else original
+            selected_method = _callable_member(program, callee) if namespace else imported_name
             if family == "path":
                 calls.add(call.id)
-            elif method in _FS_PATH_METHODS:
+            elif selected_method in _FS_PATH_METHODS:
                 # Exempt only the first argument when checking imported callables.
                 # Nested calls and all other arguments keep their own analysis.
                 args = [arg for arg in arguments.named_children if arg.type != "comment"]
@@ -2101,6 +2102,106 @@ def _ordinary_native_calls(
                 native_paths.update(calls)
             owned.update(module_identifiers[family])
     return owned, native_calls, native_paths
+
+
+def _array_accumulator_identifiers(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> set[int]:
+    """A lexical binding assigned only array literals or null is not callable."""
+    candidates: list[tuple[Node, Node, bool]] = []
+    references: dict[str, list[Node]] = {}
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return set()
+        if node.type not in {
+            "identifier",
+            "shorthand_property_identifier_pattern",
+            "shorthand_property_identifier",
+        }:
+            continue
+        name = program.text(node)
+        if name in {"eval", "Function"}:
+            return set()
+        if name.casefold() not in _SHELL_EXECUTION_CALLS:
+            continue
+        references.setdefault(name, []).append(node)
+        decl = node.parent
+        if (
+            decl is None
+            or decl.type != "variable_declarator"
+            or decl.child_by_field_name("name") != node
+        ):
+            continue
+        value, lexical = decl.child_by_field_name("value"), decl.parent
+        if (
+            value is not None
+            and value.type in {"null", "array"}
+            and lexical is not None
+            and lexical.type == "lexical_declaration"
+            and lexical.parent is not None
+            and lexical.parent.type == "statement_block"
+        ):
+            candidates.append((node, lexical.parent, value.type == "array"))
+
+    owned: set[int] = set()
+    budget = _MAX_TOKENS * 4
+    for binding, scope, saw_array in candidates:
+        ids = {binding.id}
+        for ref in references[program.text(binding)]:
+            budget -= 1
+            check_runtime()
+            if budget < 0:
+                return set()
+            if ref == binding or not (scope.start_byte <= ref.start_byte < scope.end_byte):
+                continue
+            use = ref.parent
+            if ref.start_byte < binding.end_byte or use is None:
+                break
+            if use.type == "assignment_expression" and use.child_by_field_name("left") == ref:
+                value = use.child_by_field_name("right")
+                if value is None or value.type not in {"null", "array"}:
+                    break
+                saw_array |= value.type == "array"
+            elif use.type == "member_expression" and use.child_by_field_name("object") == ref:
+                call = use.parent
+                if (
+                    _callable_member(program, use) != "push"
+                    or call is None
+                    or call.type != "call_expression"
+                    or call.child_by_field_name("function") != use
+                ):
+                    break
+            elif use.type == "arguments":
+                call = use.parent
+                callee = call.child_by_field_name("function") if call is not None else None
+                if (
+                    callee is None
+                    or callee.type != "member_expression"
+                    or _callable_member(program, callee) != "push"
+                ):
+                    break
+            elif use.type in {"parenthesized_expression", "unary_expression"}:
+                if use.type == "unary_expression" and (
+                    (operator := use.child_by_field_name("operator")) is None
+                    or program.text(operator) != "!"
+                ):
+                    break
+                condition = use if use.type == "parenthesized_expression" else use.parent
+                clause = None if condition is None else condition.parent
+                if (
+                    clause is None
+                    or clause.type != "if_statement"
+                    or clause.child_by_field_name("condition") != condition
+                ):
+                    break
+            else:
+                break
+            ids.add(ref.id)
+        else:
+            if saw_array:
+                owned.update(ids)
+    return owned
 
 
 def _data_parameter_identifiers(
@@ -2126,7 +2227,8 @@ def _data_parameter_identifiers(
         parent = node.parent
         if parent is None:
             continue
-        if parent.type == "formal_parameters":
+        in_parameters = parent.type == "formal_parameters"
+        if in_parameters:
             parent = parent.parent
         if (
             parent is not None
@@ -2137,10 +2239,7 @@ def _data_parameter_identifiers(
                 "arrow_function",
                 "method_definition",
             }
-            and (
-                node.parent.type == "formal_parameters"
-                or parent.child_by_field_name("parameter") == node
-            )
+            and (in_parameters or parent.child_by_field_name("parameter") == node)
         ):
             candidates.append((node, parent))
 
@@ -2195,7 +2294,7 @@ def _promise_settlers(program: JavaScriptProgram, check_runtime: Callable[[], No
     executors: list[Node] = []
     for node in program.nodes:
         check_runtime()
-        if node.type == "with_statement":
+        if node.type in {"with_statement", "this"}:
             return set()
         if node.type not in {
             "identifier",
@@ -2206,9 +2305,18 @@ def _promise_settlers(program: JavaScriptProgram, check_runtime: Callable[[], No
         }:
             continue
         spelling = program.text(node).strip("\"'")
-        if spelling in {"globalThis", "global", "window", "self", "Reflect", "eval"} or (
-            node.type != "string" and "\\" in spelling
-        ):
+        if spelling in {
+            "globalThis",
+            "global",
+            "window",
+            "self",
+            "Reflect",
+            "eval",
+            "Function",
+            "defineProperty",
+            "defineProperties",
+            "setPrototypeOf",
+        } or (node.type != "string" and "\\" in spelling):
             return set()
         if node.type in {
             "identifier",
@@ -2247,6 +2355,8 @@ def _promise_settlers(program: JavaScriptProgram, check_runtime: Callable[[], No
         )
         if len(bindings) > 2 or any(binding.type != "identifier" for binding in bindings):
             continue
+        if len({program.text(binding) for binding in bindings}) != len(bindings):
+            continue
         for binding in bindings:
             calls: set[int] = set()
             for ref in references[program.text(binding)]:
@@ -2263,8 +2373,8 @@ def _promise_settlers(program: JavaScriptProgram, check_runtime: Callable[[], No
                     call is None
                     or call.type != "call_expression"
                     or call.child_by_field_name("function") != ref
-                    or call.child_by_field_name("arguments") is None
-                    or call.child_by_field_name("arguments").type != "arguments"
+                    or (args_node := call.child_by_field_name("arguments")) is None
+                    or args_node.type != "arguments"
                 ):
                     break
                 calls.add(ref.id)
@@ -2429,6 +2539,7 @@ def _has_shell_execution_call(
     native_members, native_calls, native_paths = _ordinary_native_calls(program, check_runtime)
     owned_identifiers = scalar_identifiers | ordinary_identifiers | native_members
     owned_identifiers.update(_data_parameter_identifiers(program, check_runtime))
+    owned_identifiers.update(_array_accumulator_identifiers(program, check_runtime))
     uncertain_bindings: set[str] = set()
     global_objects = {"globalThis", "global", "window", "self"}
     imported_callables: set[str] = set()

@@ -3769,7 +3769,9 @@ def _has_shell_command_word_exhaustion(
             # Proven native matching patterns have no shell-word semantics.
             # This candidate owns no later host code or raw finding input.
             continue
-        if powershell is not None and powershell.owns(start):
+        if powershell is not None and (
+            powershell.owns(start) or start in powershell.assignment_targets
+        ):
             continue
         if start in powershell_here_closers:
             # This quote closes a proven host literal. Its body remains visible,
@@ -6882,6 +6884,7 @@ def _bounded_shell_tokens(
     current_leading_tilde_unquoted = False
     source_word_has_content = False
     expect_redirection_target = False
+    redirection_start = body_start
     quote: str | None = None
     ansi_c_quote = False
     boundary_incomplete = False
@@ -7256,6 +7259,7 @@ def _bounded_shell_tokens(
             flush()
             source_word_has_content = False
             expect_redirection_target = True
+            redirection_start = cursor
             if cursor + 1 < limit and content[cursor + 1] == character:
                 cursor += 1
             if cursor + 1 < limit and content[cursor + 1] in "&|":
@@ -7273,6 +7277,7 @@ def _bounded_shell_tokens(
             flush()
             source_word_has_content = False
             expect_redirection_target = True
+            redirection_start = cursor
             cursor += 1
             if cursor + 1 < limit and content[cursor + 1] == ">":
                 cursor += 1
@@ -7305,6 +7310,19 @@ def _bounded_shell_tokens(
     ) or known_terminator
     flush(complete=complete)
     if not complete:
+        if expect_redirection_target and limit == source_limit and source_end is not None:
+            # The native carrier established the end of this command. Point
+            # to the redirection missing an operand, rather than its earlier
+            # argument, which may legitimately contain variable expansion.
+            _note_parser_diagnostic(
+                diagnostics,
+                ParserCause.BOUNDARY_UNRESOLVED,
+                ParserCheck.COMMAND_REDIRECTION_TARGET,
+                redirection_start,
+                limit,
+                ParserUncheckedScope.COMMAND_ARGUMENTS,
+                full_input_checked=True,
+            )
         if limit < source_limit and neutral_state:
             _note_parser_diagnostic(
                 diagnostics,
@@ -10046,6 +10064,7 @@ def _fenced_powershell_source(
     clause_starts: set[int] = set()
     continuations: list[tuple[int, int]] = []
     invocations: list[tuple[int, int]] = []
+    assignment_targets: set[int] = set()
     for start, end in blocks:
         check_runtime()
         unresolved: list[int] = []
@@ -10069,9 +10088,16 @@ def _fenced_powershell_source(
             for string in source.strings
         )
         clause_starts.update(start + position for position in source.clause_starts)
+        assignment_targets.update(start + position for position in source.assignment_targets)
         continuations.extend((start + begin, start + end) for begin, end in source.continuations)
         invocations.extend((start + begin, start + end) for begin, end in source.invocations)
-    if not starts and not strings and not continuations and not invocations:
+    if (
+        not starts
+        and not strings
+        and not continuations
+        and not invocations
+        and not assignment_targets
+    ):
         return None
     source = PowerShellSource(tuple(starts), tuple(ends), tuple(strings), ())
     # Preserve the ordinary shell traversal outside the proven host spans.
@@ -10100,6 +10126,7 @@ def _fenced_powershell_source(
         tuple(sorted(clause_starts)),
         tuple(continuations),
         tuple(invocations),
+        frozenset(assignment_targets),
     )
 
 

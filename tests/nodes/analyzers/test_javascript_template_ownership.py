@@ -1347,3 +1347,17 @@ def test_native_tree_budget_reports_a_resource_limit(monkeypatch):
     )
     assert diagnostic.check == tm.ParserCheck.JAVASCRIPT_SYNTAX
     assert diagnostic.cause == tm.ParserCause.RESOURCE_LIMIT
+
+
+def test_array_accumulators_only_own_exact_non_callable_bindings():
+    source = "function group(i) { const all = []; let run = null; if (!run) run = [i]; run.push(i); if (run) all.push(run); run = null; return `group ${i}`; }"
+    assert javascript_template_spans(source, lambda: None)
+    for replacement in (
+        "run = callable",
+        "run.call(null, cmd)",
+        "const copy = run",
+        "for (run of callbacks) run(cmd)",
+        "eval(dynamic)",
+    ):
+        candidate = source.replace("run = null; return", replacement + "; return")
+        assert javascript_template_spans(candidate, lambda: None) is None

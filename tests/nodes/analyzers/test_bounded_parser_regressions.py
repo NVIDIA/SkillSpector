@@ -766,3 +766,18 @@ def test_output_reconciliation_only_clears_resolved_output_incompleteness(
         assert event["outcome"] is LedgerOutcome.COMPLETED
         assert "reason_code" not in event
         assert "parser_diagnostic" not in event
+
+
+def test_native_operand_boundary_points_to_the_missing_redirection_target() -> None:
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+
+    source = 'python3 "${ROOT}/task.py" --id <identifier>` trailing text'
+    end = source.index("`")
+    diagnostics = []
+    _, _, limited = tm._bounded_shell_tokens(
+        source, 0, len("python3"), source_end=end, diagnostics=diagnostics
+    )
+    assert limited and diagnostics[0].check == tm.ParserCheck.COMMAND_REDIRECTION_TARGET
+    assert source[diagnostics[0].start : diagnostics[0].end] == ">"
+    valid = 'python3 "${ROOT}/task.py" --id "<identifier>" > report.txt'
+    assert tm._bounded_shell_tokens(valid, 0, len("python3"), source_end=len(valid))[2] is False
