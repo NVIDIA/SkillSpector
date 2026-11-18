@@ -853,7 +853,7 @@ class ShellSourceResolver:
         """Recognize an immediately preceding plain assignment used by sh/bash -c."""
         raw = self.content
         use = re.fullmatch(
-            r'"[^"$`\\]*\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})[^"$`\\]*"',
+            r'"[^"$`\\\r\n]*\$(?:([A-Za-z_]\w*+)|\{([A-Za-z_]\w*+)\})[^"$`\\\r\n]*"',
             raw[start:end],
             re.ASCII,
         )

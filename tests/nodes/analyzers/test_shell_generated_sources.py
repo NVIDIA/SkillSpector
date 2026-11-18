@@ -117,6 +117,9 @@ def test_literal_command_binding_is_inspected_at_its_consumer(assignment, operan
         "cmd=safe\nsh -c $cmd",
         'cmd=safe\nsh -c "$1"',
         'cmd=safe\nsh -c "$cmd $INPUT"',
+        'cmd=safe\nsh -c "$cmd\nprintf next"',
+        'cmd=safe\nsh -c "echo\r$cmd"',
+        'cmd=safe\nsh -c "$cmd$cmd"',
         'cmd=safe\nread cmd\nsh -c "$cmd"',
     ],
 )
