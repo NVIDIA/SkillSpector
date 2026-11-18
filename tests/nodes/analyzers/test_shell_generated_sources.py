@@ -1101,3 +1101,74 @@ def test_unknown_archive_member_write_cannot_reuse_the_cached_copy() -> None:
     )
     prepared = _prepare(caller)
     assert prepared is None or not tuple(prepared.variants())
+
+
+def test_fixed_node_process_argv_and_native_regex_keep_data_in_host_language():
+    source = """
+import {execFileSync as inspect} from 'node:child_process';
+const pattern = /test/g;
+export function describe(config, value) {
+    const branch = inspect('git', ['-C', config.repo, 'rev-parse', '--abbrev-ref', 'HEAD'],
+        {encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000});
+    pattern.lastIndex = 0;
+    return pattern.exec(value) ? `Branch: ${branch}` : `Missing: ${value}`;
+}
+"""
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is None
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "inspect(binary, ['-C', dir, 'rev-parse', 'HEAD'])",
+        "inspect('git', ['-C', dir, 'rev-parse', flag])",
+        "inspect('git', ['-C', ...dirs, 'rev-parse', 'HEAD'])",
+        "inspect('git', ['-C', , 'rev-parse', 'HEAD'])",
+        "inspect('git', ['-C', dir, 'rev-parse', 'HEAD'], {shell:true})",
+        "inspect('git', ['-C', dir, 'rev-parse', 'HEAD'], {...options})",
+        "inspect('git', ['-C', dir, 'rev-parse', 'HEAD'], {env:{PATH:dir}})",
+        "inspect('git', ['-C', dir, 'rev-parse', 'HEAD'], {stdio:['pipe',, 'ignore']})",
+        "const config = { get dir() { return choose() } }; inspect('git', ['-C', config.dir, 'rev-parse', 'HEAD'])",
+        "inspect('sh', ['-c', command])",
+        "other(inspect)",
+        "import {syncBuiltinESMExports} from 'node:module'; syncBuiltinESMExports()",
+        "pattern.exec = userFunction",
+        "update(pattern)",
+        "RegExp.prototype.exec = userFunction",
+        "Object.prototype.shell = true",
+        "process.env.PATH = custom",
+        "process.env = alternate",
+        "const e = process.env; e.PATH = other",
+        "const p = process; p.env.PATH = other",
+        "Object.assign(process.env, options)",
+        "[process.env.PATH] = parts",
+        "delete process.env.PATH",
+        "import {env as settings} from 'node:process'; settings.PATH = other",
+        "Object.setPrototypeOf(pattern, other)",
+        "const make = RegExp; make.prototype.exec = other",
+        "target[key] = other",
+        "const p = /other/['__pro'+'to__']; Object.assign(p, {exec: userFunction})",
+        "const q = /other/; foreign(q)",
+        "foreign(/other/)",
+    ],
+)
+def test_dynamic_process_or_regex_use_preserves_incomplete_inspection(statement):
+    source = f"""
+import {{execFileSync as inspect}} from 'node:child_process';
+const pattern = /test/g;
+inspect('git', ['-C', dir, 'rev-parse', 'HEAD']);
+{statement};
+pattern.exec(`search ${{input}}`);
+"""
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is not None
+
+
+def test_dynamic_named_node_dispatch_identifies_invocation():
+    source = """
+import {spawn as launch} from 'node:child_process';
+export const label = `Mode: ${name}`;
+export function start(config) { return launch(config.binary, config.argv); }
+"""
+    result = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert result is not None
+    assert result.start == source.index("launch(config.binary")

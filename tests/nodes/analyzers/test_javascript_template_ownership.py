@@ -1554,3 +1554,62 @@ def test_import_fallback_preserves_live_caller_stage_attribution():
     ]:
         other = tm.bounded_parse_diagnostic(variant, lambda: None, file_type="javascript")
         assert other and other.start != variant.index("stage(items)")
+
+
+_REGEX_RULES = (
+    "const root = 'path';"
+    "const make = (pat, msg) => ({regex: pat instanceof RegExp ? pat : new RegExp(pat), msg});"
+    "const rules = [make(/a/, 'A'),make(root + 'x', 'X')];"
+    "const capture = /part (.*)/g;"
+    "function classify(text){for(const row of rules) if(row.regex.test(text)) return row.msg;"
+    "let match; while ((match = capture.exec(text))) {"
+    "match[1].trim().split(/ +/); if (/empty/.test(match[0])) break;}}"
+    "const result = capture.exec(`value ${arg}`);"
+)
+
+
+def test_closed_regex_rule_data_and_native_match_string_keep_raw_findings() -> None:
+    source = _REGEX_RULES + "const example = 'rm -rf /';"
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is None
+    assert any(
+        finding.rule_id == "TM1" for finding in tm.analyze(source, "sample.mjs", "javascript")
+    )
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("row.msg", "foreign(row)"),
+        ("row.msg", "foreign(row.regex)"),
+        ("row.msg", "row.regex"),
+        ("row.msg", "foreign.saved = row.regex"),
+        ("for(const row", "foreign(rules); for(const row"),
+        ("make(root + 'x', 'X')", "...incoming"),
+        ("make(root + 'x', 'X')", "make(incoming, 'X')"),
+        ("make(root + 'x', 'X')", "make(/x/, incoming)"),
+        (
+            "{regex: pat instanceof RegExp ? pat : new RegExp(pat), msg}",
+            "{regex: forward(pat), msg}",
+        ),
+        ("capture.exec(text)", "other.match(text)"),
+        ("match[1].trim().split", "other.value.split"),
+        ("match[1].trim().split", "other.value.trim().split"),
+        ("match[1].trim().split", "match = foreign(); match[1].trim().split"),
+        ("match[1].trim().split", "observe(match); match[1].trim().split"),
+        ("const result", "foreign(new RegExp('x')); const result"),
+        ("const result", "const extra = new RegExp('x'); foreign(extra); const result"),
+        ("const result", "observe(/x/); const result"),
+        ("const result", "let k = 'proto'; const p = /x/[k]; const result"),
+        ("const result", "Object.assign(RegExp.prototype, {exec: changed}); const result"),
+    ],
+)
+def test_regex_rule_proof_requires_closed_bindings_and_a_string_receiver(
+    old: str, new: str
+) -> None:
+    source = _REGEX_RULES.replace(old, new)
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is not None
+
+
+def test_regex_binding_cannot_cover_an_unrelated_scope() -> None:
+    source = "{const capture = /known/;} capture.exec(`value ${arg}`);"
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is not None
