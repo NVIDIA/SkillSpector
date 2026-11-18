@@ -1712,6 +1712,130 @@ def _only_thrown_messages(
     return bool(constructors)
 
 
+def _markup_parameter(
+    program: JavaScriptProgram,
+    template: Node,
+    parameters: set[str],
+    check_runtime: Callable[[], None],
+) -> Node | None:
+    """Identify parameters occupying whole attribute values in a template."""
+    marker = "__skillspector_dynamic_attribute_"
+    if template.end_byte - template.start_byte > 8192:
+        return None
+    chunks: list[str] = []
+    fields: dict[str, Node] = {}
+    for part in template.named_children:
+        check_runtime()
+        if part.type == "string_fragment":
+            chunk = program.text(part)
+            if marker in chunk:
+                return None
+        elif part.type == "template_substitution":
+            chunk = f"{marker}{len(chunks)}__"
+            field = part.named_children
+            if (
+                len(field) == 1
+                and field[0].type == "identifier"
+                and program.text(field[0]) in parameters
+            ):
+                fields[chunk] = part
+        else:
+            return None
+        chunks.append(chunk)
+    if not fields or not chunks or not chunks[0].lstrip().startswith("<"):
+        return None
+    found: list[Node] = []
+
+    class Attributes(HTMLParser):
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            check_runtime()
+            if marker in tag or any(marker in key for key, _ in attrs):
+                return
+            for _, value in attrs:
+                if value is not None and value in fields:
+                    found.append(fields[value])
+
+    parser = Attributes()
+    try:
+        parser.feed("".join(chunks))
+        parser.close()
+    except (ValueError, AssertionError):
+        return None
+    return next(iter(found), None)
+
+
+def _exported_markup_field(
+    program: JavaScriptProgram, templates: list[Node], check_runtime: Callable[[], None]
+) -> tuple[int, int] | None:
+    """Return the source field written verbatim to an exported HTML/SVG attribute."""
+    budget = _MAX_TOKENS * 4
+    # Keep more direct execution evidence independent of markup somewhere
+    # else in the same program.
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "import_statement":
+            imported = node.child_by_field_name("source")
+            if imported is None or _is_shell_execution_module(program.text(imported)):
+                return None
+        if node.type in {"call_expression", "new_expression"}:
+            callee = node.child_by_field_name("function") or node.child_by_field_name("constructor")
+            if callee is not None and (
+                callee.type == "import"
+                or callee.type == "identifier"
+                and program.text(callee).casefold() in _SHELL_EXECUTION_CALLS
+                or (_callable_member(program, callee) or "").casefold() in _SHELL_EXECUTION_CALLS
+            ):
+                return None
+    for template in templates:
+        check_runtime()
+        ret = template.parent
+        if ret is None or ret.type != "return_statement" or (body := ret.parent) is None:
+            continue
+        function = body.parent
+        if (
+            function is None
+            or function.type != "function_declaration"
+            or function.parent is None
+            or function.parent.type != "export_statement"
+            or (parameters := function.child_by_field_name("parameters")) is None
+        ):
+            continue
+        budget -= template.descendant_count + parameters.descendant_count
+        if budget < 0:
+            return None
+        names = _pattern_binding_names(program, parameters, check_runtime)
+        selected = _markup_parameter(program, template, names, check_runtime)
+        if selected is None:
+            continue
+        name = program.text(selected.named_children[0])
+        pending = [body]
+        while pending:
+            check_runtime()
+            budget -= 1
+            if budget < 0:
+                return None
+            node = pending.pop()
+            if node.type in {
+                "assignment_expression",
+                "augmented_assignment_expression",
+                "update_expression",
+                "variable_declarator",
+            }:
+                target = (
+                    node.child_by_field_name("left")
+                    or node.child_by_field_name("argument")
+                    or node.child_by_field_name("name")
+                )
+                if target is not None and name in _pattern_binding_names(
+                    program, target, check_runtime
+                ):
+                    break
+            pending.extend(node.named_children)
+        else:
+            return program.span(selected)
+    return None
+
+
 def _code_evaluation_witness(
     program: JavaScriptProgram, check_runtime: Callable[[], None]
 ) -> Node | None:
@@ -1752,6 +1876,7 @@ def javascript_template_spans(
     unresolved_executables: list[int] | None = None,
     parse_failures: list[ParseFailure] | None = None,
     regex_literals: list[tuple[int, int]] | None = None,
+    generated_markup: list[tuple[int, int]] | None = None,
 ) -> JavaScriptTemplateSpans | None:
     """Prove host delimiters while retaining unresolved executable templates.
 
@@ -1807,8 +1932,23 @@ def javascript_template_spans(
             ):
                 # The witness is the unresolved callable, which may precede or
                 # follow an ordinary template elsewhere in the same module.
-                witness = _code_evaluation_witness(program, check_runtime) or execution_node
-                unresolved_executables.append(program.span(witness)[0])
+                witness = _code_evaluation_witness(program, check_runtime)
+                if (
+                    witness is None
+                    and generated_markup is not None
+                    and execution_node.type == "identifier"
+                ):
+                    owner = execution_node.parent
+                    if (
+                        owner is not None
+                        and owner.type == "member_expression"
+                        and owner.child_by_field_name("object") == execution_node
+                        and _callable_member(program, owner) in {"length", "map", "slice", "push"}
+                    ):
+                        markup = _exported_markup_field(program, templates, check_runtime)
+                        if markup is not None:
+                            generated_markup.append(markup)
+                unresolved_executables.append(program.span(witness or execution_node)[0])
                 break
         return None
     if _has_unproven_assertion_template_call(content, projected, program, templates, check_runtime):
@@ -2901,6 +3041,16 @@ def _has_shell_execution_call(
             and node.parent.type == "member_expression"
         ):
             spelling = program.text(node)
+            parent = node.parent
+            if (
+                parent is not None
+                and parent.type == "for_in_statement"
+                and parent.child_by_field_name("left") == node
+                and any(child.type in {"let", "const"} for child in parent.children)
+            ):
+                # The loop declares this name. Its uses and the iterable are
+                # separate nodes, including any later invocation or escape.
+                continue
             # Escaped names and extracted callable aliases are not resolved here.
             if (
                 "\\" in spelling

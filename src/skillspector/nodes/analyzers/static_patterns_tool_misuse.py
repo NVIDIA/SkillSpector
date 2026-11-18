@@ -6734,6 +6734,7 @@ class _JavaScriptTemplateOwnership:
         self._spans_computed = False
         self._unresolved_executables: list[int] = []
         self._parse_failures: list[ParseFailure] = []
+        self._generated_markup: list[tuple[int, int]] = []
         self._regex_literals: list[tuple[int, int]] = []
         self._regex_starts: list[int] = []
 
@@ -6746,6 +6747,7 @@ class _JavaScriptTemplateOwnership:
                 unresolved_executables=self._unresolved_executables,
                 parse_failures=self._parse_failures,
                 regex_literals=self._regex_literals,
+                generated_markup=self._generated_markup,
             )
             self._regex_starts = [start for start, _ in self._regex_literals]
             self._spans_computed = True
@@ -6762,6 +6764,13 @@ class _JavaScriptTemplateOwnership:
                 len(self._content),
                 ParserUncheckedScope.REMAINING_INPUT,
                 full_input_checked=self._parse_failures[0] == "malformed_input",
+            )
+        if self._generated_markup:
+            return StaticParserDiagnostic(
+                ParserCause.RUNTIME_DEPENDENT,
+                ParserCheck.GENERATED_HTML_MARKUP,
+                *self._generated_markup[0],
+                ParserUncheckedScope.EXPRESSION,
             )
         if not self._unresolved_executables:
             return None

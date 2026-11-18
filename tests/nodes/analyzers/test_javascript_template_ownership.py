@@ -1390,3 +1390,38 @@ def test_dynamic_evaluator_is_attributed_even_after_a_regex_match():
     shadowed = "const Function = receiver; " + source
     target = tm.bounded_parse_diagnostic(shadowed, lambda: None, file_type="javascript")
     assert target is not None and target.start != shadowed.index("new Function")
+
+
+def test_iteration_bindings_and_exported_markup_have_independent_roles():
+    idle = "for (const run of values) { count++; } const msg = `count ${count}`;"
+    assert not tm.bounded_parse_diagnostic(idle, lambda: None, file_type="javascript")
+    for body in ("run(input)", "store(run)", "run.call(null,input)"):
+        d = tm.bounded_parse_diagnostic(
+            idle.replace("count++", body), lambda: None, file_type="javascript"
+        )
+        assert d is not None
+    trace = "for (const run of values) { run.map(x=>x); } "
+    svg = 'export function draw(tone) { return `<g class="info" data-tone="${tone}"></g>`; }'
+    d = tm.bounded_parse_diagnostic(trace + svg, lambda: None, file_type="javascript")
+    assert d is not None and d.check == tm.ParserCheck.GENERATED_HTML_MARKUP
+    assert (trace + svg)[d.start : d.end] == "${tone}"
+    for altered in (
+        svg.replace("return", "tone = 'safe'; return"),
+        svg.replace("${tone}", "${escape(tone)}"),
+        svg.replace("export ", ""),
+    ):
+        actual = tm.bounded_parse_diagnostic(trace + altered, lambda: None, file_type="javascript")
+        assert actual is not None and actual.check != tm.ParserCheck.GENERATED_HTML_MARKUP
+
+
+def test_markup_parameter_preserves_dynamic_calls_and_tracks_multiple_attributes():
+    read = "for (const run of values) { run.map(f); } "
+    export = 'export function draw(tone) { return `<svg aria-label="${escape(title)}" data-tone="${tone}"></svg>`; }'
+    source = read + export
+    hit = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert hit is not None and source[hit.start : hit.end] == "${tone}"
+    for tail in (" run(cmd);", " import {spawn} from 'node:child_process';"):
+        other = tm.bounded_parse_diagnostic(source + tail, lambda: None, file_type="javascript")
+        assert other is not None and other.check != tm.ParserCheck.GENERATED_HTML_MARKUP
+    clean = tm.bounded_parse_diagnostic(export, lambda: None, file_type="javascript")
+    assert clean is None
