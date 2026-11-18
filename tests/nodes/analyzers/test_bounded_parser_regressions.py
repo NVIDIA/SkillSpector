@@ -1148,6 +1148,13 @@ def test_remote_stdin_reports_reinterpreted_argv() -> None:
     assert source[detail.start : detail.end] == "*map(str, fields)"
 
 
+def test_python_method_and_its_parameter_have_separate_bindings() -> None:
+    source = _remote_stdin_source().replace("execute", "program")
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert detail and detail.check is ParserCheck.SSH_ARGUMENTS
+    assert source[detail.start : detail.end] == "*map(str, fields)"
+
+
 def test_ssh_stdin_resolves_literal_option_tuple() -> None:
     source = (
         _remote_stdin_source()

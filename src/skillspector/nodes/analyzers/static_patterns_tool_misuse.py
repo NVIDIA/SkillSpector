@@ -11770,7 +11770,7 @@ def _ssh_script_argument(
         )
 
     nodes = list(ast.walk(wrapper))
-    if any(_binds_generated_receiver(node, script) for node in nodes):
+    if any(node is not wrapper and _binds_generated_receiver(node, script) for node in nodes):
         return None
     for call in nodes:
         check_runtime()
