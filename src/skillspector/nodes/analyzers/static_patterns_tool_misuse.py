@@ -12410,6 +12410,7 @@ def _markdown_owned_commands_diagnostic(
     complete_context: bool,
     prepared_analysis: object | None = None,
     source_view: SecurityTextView | None = None,
+    fence_regions: list[tuple[int, int, str]] | None = None,
 ) -> StaticParserDiagnostic | None:
     if not complete_context:
         return _markdown_structure_diagnostic(
@@ -12421,7 +12422,7 @@ def _markdown_owned_commands_diagnostic(
         )
     ranges: list[tuple[int, int]] = []
     source_only: list[tuple[int, int]] = []
-    fenced: list[tuple[int, int, str]] = []
+    fenced = [] if fence_regions is None else fence_regions
     projected = _markdown_shell_text(
         content,
         check_runtime,
@@ -12518,22 +12519,6 @@ def _markdown_owned_commands_diagnostic(
         ),
     )
     if diagnostic is not None:
-        if diagnostic.check is ParserCheck.COMMAND_WORD_BOUNDARY:
-            for start, end, language in fenced:
-                if start <= diagnostic.start < end < len(content) and language in {
-                    "bash",
-                    "sh",
-                    "shell",
-                }:
-                    detail = fenced_redirect_diagnostic(
-                        content[start:end],
-                        diagnostic.start - start,
-                        check_runtime,
-                        stop=diagnostic.end - start,
-                    )
-                    if detail is not None:
-                        return detail.shifted(start)
-                    break
         return diagnostic
     for start, end in (*ranges, *source_only):
         check_runtime()
@@ -12735,19 +12720,37 @@ def bounded_parse_diagnostic(
             content = _rst_table_role_text(content, check_runtime)
         file_type = "other"
     if file_type == "markdown":
+        fenced: list[tuple[int, int, str]] = []
         original = _markdown_owned_commands_diagnostic(
             content,
             check_runtime,
             complete_context=complete_context,
             prepared_analysis=prepared_analysis,
             source_view=source_view,
+            fence_regions=fenced,
         )
         if original is not None and complete_context:
             projected = _audited_table_row(content, original, check_runtime)
             if projected is not None:
-                return _markdown_owned_commands_diagnostic(
+                original = _markdown_owned_commands_diagnostic(
                     projected, check_runtime, complete_context=True
                 )
+        if original is not None and original.check is ParserCheck.COMMAND_WORD_BOUNDARY:
+            for start, end, language in fenced:
+                if start <= original.start < end < len(content) and language in {
+                    "bash",
+                    "sh",
+                    "shell",
+                }:
+                    detail = fenced_redirect_diagnostic(
+                        content[start:end],
+                        original.start - start,
+                        check_runtime,
+                        stop=original.end - start,
+                    )
+                    if detail is not None:
+                        return detail.shifted(start)
+                    break
         return original
     exhausted = _has_bounded_parse_exhaustion(
         content,

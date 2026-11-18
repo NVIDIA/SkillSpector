@@ -209,6 +209,9 @@ def quoted_list_spans(content: str, check_runtime: Callable[[], None]) -> Quoted
 _BASH = Language(tree_sitter_bash.language())
 _REDIRECT_END = re.compile(rb"[ \t]*(?:[;&|)]|\r?\n|\Z)")
 _EXAMPLE_INPUT = re.compile(rb"<[A-Za-z_][A-Za-z0-9_.-]*")
+_MISSING_TARGET_EXAMPLE = re.compile(
+    r"<[A-Za-z_][A-Za-z0-9_.-]{0,127}>(?=[ \t]*(?:[;&|)]|\r?$))", re.MULTILINE
+)
 
 
 def fenced_redirect_diagnostic(
@@ -234,39 +237,50 @@ def fenced_redirect_diagnostic(
         return None
     at = len(section[:angle_pos].encode())
     root = tree.root_node
+    first_error = None
     if root.has_error:
-        # Bash rejects a redirection followed by a control operator without a
-        # target. The grammar may recover and nominate a later command instead.
+        # A malformed redirect can precede the clause where an existing word
+        # reader lost the command boundary. Only refine the same native list.
         pending = [root]
         while pending:
             check_runtime()
             node = pending.pop()
-            if node.start_byte > at:
-                break
             if node.is_error or node.is_missing:
+                first_error = node.start_byte
                 if node.text in {b">", b"<", b">>", b"<>"} and _REDIRECT_END.match(
                     raw, node.end_byte
                 ):
                     start = len(raw[: node.start_byte].decode())
-                    return StaticParserDiagnostic(
-                        ParserCause.MALFORMED_INPUT,
-                        ParserCheck.SHELL_REDIRECT_TARGET,
-                        start,
-                        start + len(node.text),
-                        ParserUncheckedScope.COMMAND_ARGUMENTS,
+                    marker = _MISSING_TARGET_EXAMPLE.match(section, angle_pos)
+                    same_marker = marker is not None and marker.end() == start + 1
+                    statement = node.parent
+                    same_list = (
+                        statement is not None
+                        and statement.type in {"list", "pipeline"}
+                        and node.end_byte <= at <= statement.end_byte
                     )
-                return None
+                    if same_list or same_marker:
+                        return StaticParserDiagnostic(
+                            ParserCause.MALFORMED_INPUT,
+                            ParserCheck.COMMAND_REDIRECTION_TARGET,
+                            start,
+                            start + len(node.text),
+                            ParserUncheckedScope.COMMAND_ARGUMENTS,
+                        )
+                break
             pending.extend(
                 child for child in reversed(node.children) if child.has_error or child.is_missing
             )
-        return None
+        if first_error is None or first_error <= at:
+            return None
 
     # In a documented 'sudo <TOOL> --list', Bash redirects input from TOOL
     # and output to --list. No word is passed to sudo to name the nested tool.
     angle = root.descendant_for_byte_range(at, at + 1)
-    redir = angle.parent
+    redir = angle.parent if angle is not None else None
     if (
-        angle.type != "<"
+        angle is None
+        or angle.type != "<"
         or redir is None
         or redir.type != "file_redirect"
         or redir.start_byte != at
@@ -276,6 +290,12 @@ def fenced_redirect_diagnostic(
         return None
     stmt = redir.parent
     if stmt is None or stmt.type != "redirected_statement":
+        return None
+    if first_error is not None and (
+        stmt.has_error
+        or first_error <= stmt.end_byte
+        or re.match(rb"[ \t]*(?:;|\r?\n)", raw[stmt.end_byte : first_error]) is None
+    ):
         return None
     body = stmt.child_by_field_name("body")
     if (

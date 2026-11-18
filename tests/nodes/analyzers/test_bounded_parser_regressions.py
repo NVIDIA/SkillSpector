@@ -788,7 +788,7 @@ def test_fenced_missing_redirection_target_precedes_later_wrapper():
     diagnostic = tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
     assert diagnostic is not None
     assert diagnostic.cause is ParserCause.MALFORMED_INPUT
-    assert diagnostic.check is ParserCheck.SHELL_REDIRECT_TARGET
+    assert diagnostic.check is ParserCheck.COMMAND_REDIRECTION_TARGET
     assert diagnostic.start == content.index(">") and diagnostic.end == diagnostic.start + 1
 
 
@@ -815,3 +815,16 @@ def test_documented_missing_tool_preserves_neighbor_findings_and_runtime_diagnos
     prior = example.replace("sudo", 'eval "$first"\nsudo')
     diagnostic = tm.bounded_parse_diagnostic(prior, lambda: None, file_type="markdown")
     assert diagnostic is not None and diagnostic.check is ParserCheck.COMMAND_STRING_RUNTIME
+
+
+def test_fenced_redirect_refines_the_nominated_command_only():
+    example = "```bash\nsudo <root> && echo ok\n```\n"
+    diag = tm.bounded_parse_diagnostic(example, lambda: None, file_type="markdown")
+    assert diag and diag.check is ParserCheck.COMMAND_REDIRECTION_TARGET
+    assert example[diag.start : diag.end] == ">"
+    fixed_head = "```bash\ncd <directory> && echo ok\n```\n"
+    assert tm.bounded_parse_diagnostic(fixed_head, lambda: None, file_type="markdown") is None
+    later_fault = "```bash\nsudo <tool> --list\ncd <directory> && echo ok\n```\n"
+    diag = tm.bounded_parse_diagnostic(later_fault, lambda: None, file_type="markdown")
+    assert diag and diag.check is ParserCheck.DOCUMENTED_COMMAND_OPERAND
+    assert later_fault[diag.start : diag.end] == "<tool>"
