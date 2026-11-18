@@ -3465,6 +3465,172 @@ _PRINTF_DATA_SUBSTITUTION_RE = re.compile(
 )
 
 
+def _quoted_string_comparison(prefix: str, suffix: str) -> bool:
+    """Bash compares quoted strings literally, including a fixed prefix/suffix glob."""
+    prefix = prefix.replace("\\\r\n", "").replace("\\\n", "").lstrip(" \t")
+    scalar = r'"\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})"'
+    if re.fullmatch(r'\[\[[ \t]+"', prefix):
+        return (
+            re.match(rf'"[ \t]+(?:==|!=|=)[ \t]+{scalar}[ \t]+\]\](?=[ \t;&|)\r\n]|$)', suffix)
+            is not None
+        )
+    return re.fullmatch(rf'\[\[[ \t]+{scalar}[ \t]+(?:==|!=|=)[ \t]+\*?"', prefix) is not None and (
+        re.match(r'"\*?[ \t]+\]\](?=[ \t;&|)\r\n]|$)', suffix) is not None
+    )
+
+
+_ENVIRONMENT_ROOT_RE = re.compile(
+    r'(?P<name>[A-Za-z_]\w*)="\$\{(?P<env>[A-Za-z_]\w*):-/[A-Za-z0-9_./-]+\}"(?=[ \t]*(?:\r?\n|$))'
+)
+_RUNTIME_SOURCE_RE = re.compile(
+    r'(?:source|\.)[ \t]+(?P<target>"\$\{(?P<root>[A-Za-z_]\w*)\}/[A-Za-z0-9_./-]+")'
+    r"(?=[ \t]*(?:\r?\n|$))"
+)
+_NORMALIZED_SOURCE_ROOT_RE = re.compile(
+    r"""(?P<name>[A-Za-z_]\w*)="\$\([ \t]*printf[ \t]+'%s'[ \t]+"\$(?P=name)"[ \t]*\|"""
+    r"""[ \t]*tr[ \t]+'\\\\'[ \t]+'/'[ \t]*\)"(?=[ \t]*(?:\r?\n|$))"""
+)
+
+_HEX_TEST_RE = re.compile(
+    r'(?P<name>[A-Za-z_]\w*)\(\)[ \t]*\{\s*\[\[[ \t]+"(?:\$1|\$\{1:-\})"'
+    r"[ \t]+=~[ \t]+\^\[0-9(?:a-fA-F|A-Fa-f)\]\{[1-9][0-9]?\}\$[ \t]+\]\]"
+    r"[ \t]*(?:;|\r?\n)[ \t]*\}(?=[ \t]*(?:\r?\n|$))"
+)
+_PREVIOUS_GUARD_RE = re.compile(
+    r'(?P<guard>[A-Za-z_]\w*)[ \t]+(?P<arg>"\$[A-Za-z_]\w*")[ \t]+\|\|[ \t]+'
+    r'(?P<fail>[A-Za-z_]\w*)(?:[ \t]+"[^"$`\\\r\n]*")?[ \t]*\Z'
+)
+
+
+def _single_filter_argument_receiver(content: str, start: int, name: str) -> bool:
+    """Keep an explicit execution sink in the receiver ahead of another witness."""
+    end = content.find("\n}", start, start + _ROOT_GLOB_COMMAND_CHARS)
+    if end < 0:
+        return False
+    body = content[start:end].splitlines()
+    if not body or not re.fullmatch(re.escape(name) + r"\(\)[ \t]*\{", body[0]):
+        return False
+    empty = set()
+    for raw in body[1:]:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if optional := re.fullmatch(r'local[ \t]+([A-Za-z_]\w*)="\$\{[2-9]:-\}"', line):
+            empty.add(optional[1])
+            continue
+        if any(re.search(r"\b" + re.escape(var) + r"\b(?![\x22}])", line) for var in empty):
+            return False
+        if re.search(r"(?:^|[;&|( \t])(?:eval|exec|source|\.|(?:ba|da|z|k)?sh)[ \t]", line):
+            inactive = re.match(
+                r'^\[\[[ \t]+-n[ \t]+"\$([A-Za-z_]\w*)"[ \t]+\]\][ \t]+&&[ \t]+', line
+            )
+            if not inactive or inactive[1] not in empty:
+                return False
+        if re.match(r'(?:["\x27]?\$|(?:shift|set|read|declare|typeset|unset)\b)', line):
+            return False
+    return True
+
+
+def _filter_runtime_source(
+    content: str,
+    detail: StaticParserDiagnostic,
+    quote_limits: dict[int, int],
+    check_runtime: Callable[[], None],
+) -> StaticParserDiagnostic | None:
+    """Prefer a runtime-loaded program to a bounded scalar filter in the same artifact.
+
+    A successful return only changes the witness for an already incomplete
+    inspection. Keep ordinary executable consumers of the filter as primary.
+    """
+    if (
+        detail.cause is not ParserCause.RUNTIME_DEPENDENT
+        or detail.check is not ParserCheck.PRINTF_INVOCATION
+    ):
+        return None
+    opening = content.rfind("$(printf", max(0, detail.start - 64), detail.start)
+    if (
+        opening < 1
+        or content[opening - 1] != '"'
+        or "source " not in content
+        and ". " not in content
+    ):
+        return None
+    match = _PRINTF_DATA_SUBSTITUTION_RE.match(content, opening)
+    if match is None or quote_limits.get(opening, -1) < match.end() or not match["pipeline"]:
+        return None
+    normalized = _SYMBOLIC_PRINTF_PIPELINE_RE.fullmatch(content, opening + 2, match.end() - 1)
+    if normalized is None or normalized.span("input") != (detail.start, detail.end):
+        return None
+    # The candidate must be one ordinary quoted argument to a local function,
+    # or the value operand of a complete native string comparison.
+    call_start = content.rfind("\n", 0, opening) + 1
+    prefix = content[call_start:opening].lstrip(" \t")
+    callee = re.fullmatch(r'([A-Za-z_]\w*)[ \t]+"', prefix)
+    guard = None
+    if callee:
+        if not re.match(r'"[ \t]*(?:\r?\n|$)', content[match.end() : match.end() + 128]):
+            return None
+        if not re.fullmatch(
+            r"""[ \t]*\|[ \t]*tr[ \t]+'(?:A-F|a-f)'[ \t]+'(?:A-F|a-f)'""", match["pipeline"]
+        ):
+            return None
+        previous = content.rfind("\n", max(0, call_start - 512), call_start - 1) + 1
+        guard = _PREVIOUS_GUARD_RE.fullmatch(content[previous : call_start - 1].strip())
+        if guard is None or guard["arg"] != normalized["input"]:
+            return None
+    elif not _quoted_string_comparison(prefix, content[match.end() : match.end() + 256]):
+        return None
+    roots: set[str] = set()
+    changed: set[str] = set()
+    declared = False
+    validated = False
+    exits = False
+    witnesses: list[tuple[str, tuple[int, int]]] = []
+    for start in _nonempty_shell_clause_starts(content, check_runtime):
+        check_runtime()
+        end = min(len(content), start + 512)
+        if callee and content.startswith(callee[1] + "()", start):
+            declared = _single_filter_argument_receiver(content, start, callee[1])
+        if guard and content.startswith(guard["guard"] + "()", start):
+            validated = bool(_HEX_TEST_RE.match(content, start, end))
+        if guard and content.startswith(guard["fail"] + "()", start):
+            # An ordinary diagnostic function may print a message, then must
+            # stop immediately. Refuse branches, returns and nested commands.
+            body_end = content.find("\n}", start, min(len(content), start + 2048))
+            if body_end != -1:
+                lines = content[start:body_end].splitlines()
+                exits = bool(
+                    len(lines) >= 2
+                    and re.fullmatch(r"[ \t]*exit[ \t]+[1-9][0-9]?[ \t]*", lines[-1])
+                    and all(
+                        re.match(r"[ \t]*(?:local |printf |\[\[ )", line)
+                        and not re.search(r"\b(?:exit|return|exec|eval|source|trap)\b|[()`]", line)
+                        for line in lines[1:-1]
+                    )
+                )
+        if established := _ENVIRONMENT_ROOT_RE.match(content, start, end):
+            if quote_limits.get(established.start("env") - 2) == established.end() - 1:
+                roots.add(established["name"])
+        elif assigned := re.match(
+            r"(?:(?:local|export|declare|typeset)[ \t]+)?([A-Za-z_]\w*)\+?=", content[start:end]
+        ):
+            name = assigned[1]
+            if name in roots and not _NORMALIZED_SOURCE_ROOT_RE.match(content, start, end):
+                changed.add(name)
+        elif sourced := _RUNTIME_SOURCE_RE.match(content, start, end):
+            if (
+                sourced["root"] in roots
+                and quote_limits.get(sourced.start("target") + 1) == sourced.end("target") - 1
+            ):
+                witnesses.append((sourced["root"], sourced.span("target")))
+                if len(witnesses) > 32:
+                    return None
+    witness = next((span for root, span in witnesses if root not in changed), None)
+    if witness is None or callee and not (declared and validated and exits):
+        return None
+    return replace(detail, check=ParserCheck.COMMAND_IDENTITY, start=witness[0], end=witness[1])
+
+
 def _shell_print_forwarder(
     content: str, check_runtime: Callable[[], None]
 ) -> tuple[str, int] | None:
@@ -3556,16 +3722,9 @@ def _quoted_printf_data_text(
         if not bound[pipeline]:
             continue
         prefix = content[start:opening]
-        if re.fullmatch(r'\[\[[ \t]+"', prefix):
-            # Comparing two quoted strings cannot reinterpret their values as
-            # shell syntax. Arithmetic and pattern operators retain raw analysis.
-            if not re.match(
-                r'"[ \t]+(?:==|!=|=)[ \t]+"\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})"'
-                r"[ \t]+\]\](?=[ \t;&|)\r\n]|$)",
-                content[end : end + 256],
-            ):
+        if not _quoted_string_comparison(prefix, content[end : end + 256]):
+            if captured or grouped_output:
                 continue
-        elif not captured and not grouped_output:
             shift = 0
             if not re.match(r"printf[ \t]", prefix):
                 if not checked_forwarder:
@@ -3616,8 +3775,6 @@ def _quoted_printf_data_text(
             tail = projected[spans[-1][1] :].lstrip(" \t")
             if (tail and tail[0] not in "\r\n") or (not tail and limit < len(content)):
                 continue
-        else:
-            continue
         if output is None:
             output = list(content)
         output[opening:end] = "x" * (end - opening)
@@ -13501,6 +13658,12 @@ def _has_bounded_parse_exhaustion(
             ParserCheck.PRINTF_INVOCATION,
         }:
             return printf_file_consumers[0]
+        if quote_limits is not None and file_type == "shell":
+            runtime_source = _filter_runtime_source(
+                content, diagnostic, quote_limits, check_runtime
+            )
+            if runtime_source is not None:
+                return runtime_source
         if python_source is not None:
             remote = python_source.remote_printf_argument(diagnostic)
             if remote is not None:

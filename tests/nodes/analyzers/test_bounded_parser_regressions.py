@@ -1249,3 +1249,84 @@ source "${parts[0]}" """
 def test_escaped_data_does_not_complete_unresolved_file_and_pipe_consumers(body: str) -> None:
     source = """parts+=("$(printf '%q' "$input")")\n""" + body
     assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell") is not None
+
+
+_FILTER_DATA = """$(printf '%s' "$ref" | tr 'A-F' 'a-f')"""
+
+
+@pytest.mark.parametrize("rhs", ['"{}"', '"{}"*', '*"{}"', '*"{}"*'])
+def test_string_comparison_uses_quoted_filter_as_data(rhs: str) -> None:
+    source = '[[ "$version" == ' + rhs.format(_FILTER_DATA) + " ]]"
+    assert tm.bounded_parse_diagnostic(source, lambda: None) is None
+    detail = tm.bounded_parse_diagnostic(source + '\n"$tool" -rf /', lambda: None)
+    assert detail and detail.check is ParserCheck.COMMAND_IDENTITY
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '[[ "$version" -eq "{}" ]]',
+        '[[ "$version" =~ "{}" ]]',
+        '[[ "$version" == "{}"$(other) ]]',
+        'sh -c "{}"',
+        'tr() {{ eval "$1"; }}; [[ "$version" == "{}"* ]]',
+        'PATH="$elsewhere"; [[ "$version" == "{}"* ]]',
+    ],
+)
+def test_runtime_filter_roles_preserve_binding_and_execution_controls(source: str) -> None:
+    assert tm.bounded_parse_diagnostic(source.format(_FILTER_DATA), lambda: None)
+
+
+def _filtered_selector() -> str:
+    return """SCRIPTS="${CALLER_ROOT:-/tmp/plugins}"
+valid() {
+    [[ "${1:-}" =~ ^[0-9a-fA-F]{40}$ ]]
+}
+fail() {
+    exit 1
+}
+select_ref() {
+    local key="$1"
+    local metadata="${2:-}"
+    [[ -n "$metadata" ]] && bash "$metadata" "$key"
+    printf '%s' "$key" > output
+}
+use() {
+    local ref="$1"
+    valid "$ref" || fail
+    select_ref "%FILTER%"
+}
+use "$1"
+source "${SCRIPTS}/helper.sh"
+""".replace("%FILTER%", _FILTER_DATA)
+
+
+def test_guarded_filter_points_at_runtime_loaded_source() -> None:
+    source = _filtered_selector()
+    detail = tm.bounded_parse_diagnostic(source, lambda: None)
+    assert detail and detail.check is ParserCheck.COMMAND_IDENTITY
+    assert source[detail.start : detail.end] == '"${SCRIPTS}/helper.sh"'
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ('[[ "${1:-}" =~ ^[0-9a-fA-F]{40}$ ]]', "return 0"),
+        ("exit 1", "return 0"),
+        ('valid "$ref" || fail', 'valid "$ref" || true'),
+        ('select_ref "%FILTER%"', 'eval "%FILTER%"'),
+        ('select_ref "%FILTER%"', 'select_ref "%FILTER%" extra'),
+        ('local metadata="${2:-}"', 'local metadata="$1"'),
+        ('[[ -n "$metadata" ]] && bash', "bash"),
+        ("printf '%s' \"$key\" > output", 'eval "$key"'),
+        ('source "${SCRIPTS}/helper.sh"', '# source "${SCRIPTS}/helper.sh"'),
+        ('source "${SCRIPTS}/helper.sh"', "cat <<'DATA'\nsource \"${SCRIPTS}/helper.sh\"\nDATA"),
+        ('source "${SCRIPTS}/helper.sh"', 'SCRIPTS=/fixed\nsource "${SCRIPTS}/helper.sh"'),
+    ],
+)
+def test_guarded_filter_retains_unverified_execution_or_source(before: str, after: str) -> None:
+    before, after = (part.replace("%FILTER%", _FILTER_DATA) for part in (before, after))
+    assert before in _filtered_selector()
+    source = _filtered_selector().replace(before, after)
+    detail = tm.bounded_parse_diagnostic(source, lambda: None)
+    assert detail and source[detail.start : detail.end] != '"${SCRIPTS}/helper.sh"'
