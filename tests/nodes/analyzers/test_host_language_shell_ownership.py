@@ -422,6 +422,45 @@ def test_constant_checkout_proof_preserves_real_shell_findings() -> None:
     assert any(finding.rule_id == "TM1" for finding in result["findings"])
 
 
+@pytest.mark.parametrize(
+    "expression,partial",
+    [
+        ('"$TOOL, $ROOT/path{cache}, harmless"', False),
+        ('f"$TOOL, $ROOT/path{{cache}}, harmless"', False),
+        ('("$TOOL, $ROOT/" f"{{cache}}, harmless")', False),
+        ('f"$TOOL, $ROOT/{choice}, harmless"', True),
+        ('f"$TOOL, $ROOT/{choice,choice}, harmless"', True),
+        ('("$TOOL, $ROOT/" f"{choice}, harmless")', True),
+        ('f"$TOOL, $ROOT/{{cache}}/{choice}, harmless"', True),
+        ('f"$TOOL -rf /{{cache}}, item"', True),
+    ],
+)
+def test_python_shell_operands_require_native_brace_ownership(
+    expression: str, partial: bool
+) -> None:
+    content = (
+        "import subprocess\ndef run(choice):\n    command = "
+        + expression
+        + "\n    subprocess.run(command, shell=True)\n"
+    )
+    event = _ledger("run.py", content)["inspection_ledger"][0]
+    assert event["outcome"] is (LedgerOutcome.PARTIAL if partial else LedgerOutcome.COMPLETED)
+    if partial:
+        assert event["parser_diagnostic"]["check"] in {"brace_syntax", "runtime_command_identity"}
+
+
+def test_shell_literal_braces_keep_unrelated_runtime_command_visible() -> None:
+    literal = "$TOOL, $ROOT/path{cache}, harmless"
+    assert not _shell(literal)
+    hazard = "$WHICH -rf /"
+    diagnostic = tm.bounded_parse_diagnostic(
+        literal + "\n" + hazard, lambda: None, file_type="shell"
+    )
+    assert diagnostic is not None
+    assert diagnostic.start == len(literal) + 1
+    assert diagnostic.check.value == "runtime_command_identity"
+
+
 @pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
 def test_constant_field_spans_exclude_literal_braces_and_format_specs(newline: str) -> None:
     content = (
@@ -1056,7 +1095,7 @@ def test_runtime_command_in_python_string_keeps_undecided_operands_partial(sourc
         pytest.param('X = "a `{b}` "[c]\n', None, id="subscript"),
         pytest.param(
             'X = f"a `{b}` {c} {{d}}" "{e}" f"{{{g}}}"\n',
-            "`{b}`  -rf {c} {{d}}{e}{{ -rf {g}}}",
+            "`{b}`  -rf {c} {d}{e}{ -rf {g}}",
             id="replacement-fields",
         ),
     ],
