@@ -23,6 +23,7 @@ from collections.abc import Callable
 from html.parser import HTMLParser
 from threading import Lock
 
+from skillspector.javascript_ast import parse_javascript_source
 from skillspector.javascript_tokens import browser_escaped_list_shell_text
 from skillspector.python_ast import MAX_PYTHON_AST_SOURCE_CHARS, parse_python_source
 
@@ -860,6 +861,129 @@ def python_browser_template_shell_text(content: str, check_runtime: Callable[[],
                         output[lower:upper] = " " * (upper - lower)
     check_runtime()
     return content if output is None else "".join(output)
+
+
+def python_text_assignment_script(
+    content: str, start: int, end: int, check_runtime: Callable[[], None]
+) -> tuple[tuple[int, int], str] | None:
+    """Find the constant JavaScript text assignment owning exact f-string bytes."""
+    if start < 1 or content[start - 1] != "`" or content[end : end + 1] != "`":
+        return None
+    spans = python_literal_spans(content, check_runtime)
+    if spans is None:
+        return None
+    index = bisect_right(spans[0], start) - 1
+    if index < 0 or end >= spans[1][index]:
+        return None
+    owner = spans[0][index], spans[1][index]
+    literal_runs = python_fstring_literal_spans(content, *owner, check_runtime)
+    if literal_runs is None:
+        return None
+    index = bisect_right(literal_runs[0], start - 1) - 1
+    if index < 0 or end >= literal_runs[1][index]:
+        return None
+    # A complete script inside a single constant-text run has exactly
+    # one source transformation here: Python collapses doubled braces.
+    run_start, run_end = literal_runs[0][index], literal_runs[1][index]
+    opening = content.rfind("<script>", run_start, start)
+    closing = content.find("</script>", end, run_end)
+    if opening < 0 or closing < 0:
+        return None
+    script_start = opening + len("<script>")
+    raw = content[script_start:closing]
+    if "\\" in raw or "<script>" in raw or "</script>" in raw:
+        return None
+
+    def decoded(text: str) -> str:
+        return text.replace("{{", "{").replace("}}", "}")
+
+    js_source = decoded(raw)
+    script = parse_javascript_source(js_source, check_runtime)
+    if script is None:
+        return None
+    at = len(decoded(content[script_start : start - 1]))
+    stop = at + len(decoded(content[start - 1 : end + 1]))
+    for node in script.nodes:
+        check_runtime()
+        if node.type != "template_string" or script.span(node) != (at, stop):
+            continue
+        parent = node.parent
+        if (
+            parent is None
+            or parent.type != "assignment_expression"
+            or parent.child_by_field_name("right") != node
+        ):
+            return None
+        left = parent.child_by_field_name("left")
+        if left is None or left.type != "member_expression":
+            return None
+        prop = left.child_by_field_name("property")
+        receiver = left.child_by_field_name("object")
+        if (
+            receiver is None
+            or receiver.type != "identifier"
+            or prop is None
+            or prop.type != "property_identifier"
+            or script.text(prop) != "textContent"
+        ):
+            return None
+        # A text setter can receive the result of arbitrary code. Keep the JS
+        # expression as the witness for calls, computed properties, updates,
+        # nesting, and every field outside simple display formatting.
+        fields = [child for child in node.named_children if child.type == "template_substitution"]
+        if not fields or any(
+            not re.fullmatch(
+                r"\$\{[ \t]*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){0,8}(?:\.toLocaleString\(\))?[ \t]*\}",
+                script.text(child),
+            )
+            for child in fields
+        ):
+            return None
+        break
+    else:
+        return None
+
+    return owner, js_source
+
+
+def html_template_contains_script(
+    template: ast.JoinedStr, script: str, check_runtime: Callable[[], None]
+) -> bool:
+    """Check the literal document layout. Dynamic fields keep the output uncertain."""
+    parts = [
+        part.value if isinstance(part, ast.Constant) and isinstance(part.value, str) else "\ufffc"
+        for part in template.values
+    ]
+    html = "".join(parts)
+    if not html.lstrip().lower().startswith(
+        "<!doctype html>"
+    ) or not html.rstrip().lower().endswith("</html>"):
+        return False
+
+    class Document(HTMLParser):
+        active = False
+        count = 0
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            self.active = tag == "script" and not attrs
+
+        def handle_endtag(self, tag: str) -> None:
+            self.active = False
+
+        def handle_data(self, data: str) -> None:
+            check_runtime()
+            if self.active and data == script:
+                self.count += 1
+
+    if html.count(script) != 1:
+        return False
+    parser = Document(convert_charrefs=False)
+    try:
+        parser.feed(html)
+        parser.close()
+    except (AssertionError, ValueError):
+        return False
+    return parser.count == 1
 
 
 class PythonStringClosers:

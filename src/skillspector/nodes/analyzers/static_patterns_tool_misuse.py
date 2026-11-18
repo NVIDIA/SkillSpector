@@ -33,6 +33,7 @@ from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
+from itertools import pairwise
 
 from skillspector.artifacts import (
     SecurityTextView,
@@ -69,8 +70,10 @@ from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_string_constants import python_constant_string_fields
 from skillspector.python_tokens import (
     PythonLiteralSpans,
+    html_template_contains_script,
     python_browser_template_shell_text,
     python_string_value_bounds_allowed,
+    python_text_assignment_script,
 )
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
 from skillspector.python_tokens import python_string_body as _python_string_body
@@ -2185,6 +2188,16 @@ _SYMBOLIC_PRINTF_PIPELINE_RE = re.compile(
 )
 
 
+# Integer operands with shell variable names can recursively evaluate their
+# values at runtime. This grammar only locates the arithmetic expression.
+_ARITHMETIC_ATOM = r"(?:0[xX][0-9A-Fa-f]+|[0-9]+|[A-Za-z_][A-Za-z_0-9]*)"
+_HEX_PRINTF_ARITHMETIC_RE = re.compile(
+    r"""[ \t]*printf[ \t]+(?P<fmt_quote>['"]?)(?:0[xX])?%[xX](?P=fmt_quote)[ \t]+"""
+    rf'(?P<arg_quote>"?)(?P<arithmetic>\$\(\([ \t]*(?P<expression>{_ARITHMETIC_ATOM}'
+    rf"(?:[ \t]*[+*-][ \t]*{_ARITHMETIC_ATOM})*)[ \t]*\)\))(?P=arg_quote)[ \t]*"
+)
+
+
 def _static_printf_substitution(
     content: str,
     start: int,
@@ -2229,6 +2242,26 @@ def _static_printf_substitution(
         # bytes even when it is the complete body of an outer substitution.
         # A real basename may still be formed by the words on either side.
         return ""
+    if "$((" in inner and (numeric := _HEX_PRINTF_ARITHMETIC_RE.fullmatch(inner)):
+        atoms = re.findall(_ARITHMETIC_ATOM, numeric["expression"])
+        # Only valid literal numbers and ordinary variable names establish
+        # this explanation. Unsupported arithmetic and re-parsed subscripts
+        # retain the original conservative diagnostic.
+        names = [atom for atom in atoms if atom[0].isalpha() or atom.startswith("_")]
+        if names and all(
+            atom in names or re.fullmatch(r"0[xX][0-9A-Fa-f]+|0[0-7]*|[1-9][0-9]*", atom)
+            for atom in atoms
+        ):
+            low, high = numeric.span("arithmetic")
+            _note_parser_diagnostic(
+                diagnostics,
+                ParserCause.RUNTIME_DEPENDENT,
+                ParserCheck.SHELL_ARITHMETIC,
+                inner_start + low,
+                inner_start + high,
+                ParserUncheckedScope.EXPRESSION,
+            )
+            return None
     if "|" in inner and (pipeline := _SYMBOLIC_PRINTF_PIPELINE_RE.fullmatch(inner)):
         # A variable grep pattern can supply flags as well as change matching.
         # Preserve that uncertainty at the argument that controls the filter.
@@ -10958,7 +10991,7 @@ def prepare_source_analysis(
     )
 
 
-def _yaml_source_start(
+def _raw_source_start(
     content: str,
     source_view: SecurityTextView | None,
     canonical: str,
@@ -10983,6 +11016,78 @@ def _yaml_source_start(
     return start
 
 
+def _binds_generated_receiver(node: ast.AST, name: str) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == name and not isinstance(node.ctx, ast.Load)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)):
+        return node.name == name
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return any(
+            (item.asname or item.name.split(".", 1)[0]) in {name, "*"} for item in node.names
+        )
+    if isinstance(node, (ast.MatchAs, ast.MatchStar)):
+        return node.name == name
+    if isinstance(node, ast.MatchMapping):
+        return node.rest == name
+    return False
+
+
+@dataclass(frozen=True)
+class _PythonGeneratedText:
+    content: str
+
+    def destination(
+        self, start: int, end: int, check_runtime: Callable[[], None]
+    ) -> tuple[int, int] | None:
+        """Locate the parameter receiving an HTML f-string with a JS text assignment.
+
+        This refines the source of existing uncertainty. Neither parsing the
+        embedded script nor calling write_text proves how the output is used.
+        """
+        content = self.content
+        assignment_script = python_text_assignment_script(content, start, end, check_runtime)
+        if assignment_script is None:
+            return None
+        owner, js_source = assignment_script
+        parsed = parse_python_source(content, "<generated text>")
+        if parsed.tree is None:
+            return None
+        for scope in ast.walk(parsed.tree):
+            check_runtime()
+            if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            span = _node_character_span(parsed, scope)
+            if span is None or not span[0] <= start < span[1]:
+                continue
+            for assignment, write in pairwise(scope.body):
+                if not isinstance(assignment, ast.Assign) or len(assignment.targets) != 1:
+                    continue
+                target = assignment.targets[0]
+                if (
+                    not isinstance(target, ast.Name)
+                    or not isinstance(assignment.value, ast.JoinedStr)
+                    or _node_character_span(parsed, assignment.value) != owner
+                    or not html_template_contains_script(assignment.value, js_source, check_runtime)
+                    or not isinstance(write, ast.Expr)
+                    or not isinstance(call := write.value, ast.Call)
+                    or not isinstance(call.func, ast.Attribute)
+                    or call.func.attr != "write_text"
+                    or not isinstance(receiver := call.func.value, ast.Name)
+                    or receiver.id not in _parameter_names(scope.args)
+                    or len(call.args) != 1
+                    or call.keywords
+                    or not isinstance(call.args[0], ast.Name)
+                    or call.args[0].id != target.id
+                ):
+                    continue
+                for node in ast.walk(scope):
+                    check_runtime()
+                    if _binds_generated_receiver(node, receiver.id):
+                        return None
+                return _node_character_span(parsed, receiver)
+        return None
+
+
 @dataclass(frozen=True)
 class _YamlParserAnalysis:
     content: str
@@ -11001,13 +11106,20 @@ class _YamlParserAnalysis:
     ) -> bool:
         return (
             len(content) == len(self.content)
-            and _yaml_source_start(content, source_view, self.content, check_runtime) == 0
+            and _raw_source_start(content, source_view, self.content, check_runtime) == 0
         )
 
 
 def prepare_parser_analysis(
     content: str, file_type: str, check_runtime: Callable[[], None]
-) -> JSONSourceOwnership | _YamlParserAnalysis | None:
+) -> JSONSourceOwnership | _YamlParserAnalysis | _PythonGeneratedText | None:
+    if (
+        file_type == "python"
+        and ".textContent" in content
+        and "<script>" in content
+        and ".write_text" in content
+    ):
+        return _PythonGeneratedText(content)
     if file_type == "json":
         return prepare_json_source(content, check_runtime)
     if file_type != "yaml":
@@ -11180,7 +11292,7 @@ class _PreparedYamlAnalysis:
         )
         if file_type != "yaml":
             return findings
-        source_start = _yaml_source_start(
+        source_start = _raw_source_start(
             content, source_view, self.parser.content, self.check_runtime
         )
         if source_start is None:
@@ -12297,6 +12409,37 @@ def bounded_parse_diagnostic(
         python_import_check=python_import_check,
         python_stdlib_check=python_stdlib_check,
     )
+    if (
+        file_type == "python"
+        and exhausted is not None
+        and exhausted.cause is ParserCause.RUNTIME_DEPENDENT
+        and exhausted.check is ParserCheck.COMMAND_IDENTITY
+        and exhausted.location_precision == "source_span"
+    ):
+        if prepared_analysis is None and complete_context:
+            prepared_analysis = prepare_parser_analysis(content, file_type, check_runtime)
+        if isinstance(prepared_analysis, _PythonGeneratedText):
+            origin = (
+                0
+                if source_view is None and complete_context and content == prepared_analysis.content
+                else _raw_source_start(
+                    content, source_view, prepared_analysis.content, check_runtime
+                )
+            )
+            if origin is not None:
+                destination = prepared_analysis.destination(
+                    exhausted.start + origin, exhausted.end + origin, check_runtime
+                )
+                if destination is not None and origin <= destination[0] < destination[
+                    1
+                ] <= origin + len(content):
+                    exhausted = replace(
+                        exhausted,
+                        check=ParserCheck.GENERATED_TEXT_DESTINATION,
+                        start=destination[0] - origin,
+                        end=destination[1] - origin,
+                        unchecked_scope=ParserUncheckedScope.EXPRESSION,
+                    )
     if exhausted is not None and not complete_context:
         exhausted = replace(exhausted, full_input_checked=False)
     if file_type == "yaml" and complete_context:

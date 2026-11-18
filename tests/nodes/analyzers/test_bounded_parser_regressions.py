@@ -954,3 +954,95 @@ def test_format_uncertainty_points_to_the_runtime_value(setup: str, expected: bo
         assert source[diagnostic.start : diagnostic.end] == "value"
     else:
         assert diagnostic is None
+
+
+@pytest.mark.parametrize(
+    "operand", ["08", "-1", "0x80000000", "$((1+2))", "$((08+idx))", "$((a[cmd]))"]
+)
+def test_hex_printf_unsupported_and_rebound_invocations_stay_partial(operand: str) -> None:
+    # A shell function or alias may replace printf. Never grant its use in
+    # a command word a fixed hexadecimal result on the basis of its spelling.
+    source = "printf() { echo rm; }; $(printf 0x%x " + operand + ") -rf /"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None)
+    assert diagnostic is not None
+    assert diagnostic.check is not ParserCheck.SHELL_ARITHMETIC
+
+
+def test_hex_printf_runtime_arithmetic_points_to_expression() -> None:
+    source = "tool device $(printf 0x%x $((base + index*16)))"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None)
+    assert diagnostic is not None
+    assert diagnostic.check is ParserCheck.SHELL_ARITHMETIC
+    assert source[diagnostic.start : diagnostic.end] == "$((base + index*16))"
+
+
+_HTML_REPORT = (
+    "def render(destination, value):\n"
+    "    page = f'''<!doctype html><html>{value}<script>\n"
+    "let count = 1; label.textContent = `${{count.toLocaleString()}} rows`;\n"
+    "</script></html>'''\n"
+    "    destination.write_text(page)\n"
+)
+
+
+@pytest.mark.parametrize("window", [False, True])
+def test_generated_text_reports_caller_selected_write_destination(window: bool) -> None:
+    source = "# initial line\n" + _HTML_REPORT
+    origin = source.index("def ") if window else 0
+    view = static_runner._absolute_source_view(
+        tm.SecurityTextView("raw", source[origin:]), source_start=origin
+    )
+    diagnostic = tm.bounded_parse_diagnostic(
+        source[origin:],
+        lambda: None,
+        file_type="python",
+        complete_context=not window,
+        prepared_analysis=tm.prepare_parser_analysis(source, "python", lambda: None),
+        source_view=view,
+    )
+    assert diagnostic is not None
+    assert diagnostic.check is ParserCheck.GENERATED_TEXT_DESTINATION
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+    assert not diagnostic.full_input_checked
+    assert source[origin + diagnostic.start : origin + diagnostic.end] == "destination"
+    assert source[: origin + diagnostic.start].count("\n") == 5
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("label.textContent", "label.innerHTML"),
+        ("label.textContent", "obtainNode().textContent"),
+        ("count.toLocaleString()", "eval(input)"),
+        ("count.toLocaleString()", "record[next()]"),
+        ("<script>", "<!-- <script>"),
+        ("label.textContent", "label[textContent]"),
+        ("<script>", "<script type='text/plain'>"),
+        ("count.toLocaleString()", "{value}"),
+        ("destination.write_text(page)", "run(page)"),
+        ("    page = ", "    destination = Fixed()\n    page = "),
+        ("    page = ", "    import other as destination\n    page = "),
+    ],
+)
+def test_unproven_generated_js_does_not_borrow_write_target(old: str, new: str) -> None:
+    source = _HTML_REPORT.replace(old, new)
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert diagnostic is None or diagnostic.check is not ParserCheck.GENERATED_TEXT_DESTINATION
+
+
+def test_generated_text_rejects_mismatched_or_nonraw_source_views() -> None:
+    prepared = tm.prepare_parser_analysis(_HTML_REPORT, "python", lambda: None)
+    for view in (
+        tm.SecurityTextView("decoded", _HTML_REPORT),
+        tm.SecurityTextView("raw", " " + _HTML_REPORT),
+    ):
+        diagnostic = tm.bounded_parse_diagnostic(
+            _HTML_REPORT,
+            lambda: None,
+            file_type="python",
+            complete_context=False,
+            prepared_analysis=prepared,
+            source_view=view,
+        )
+        assert diagnostic is not None
+        assert diagnostic.check is not ParserCheck.GENERATED_TEXT_DESTINATION
