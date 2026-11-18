@@ -1441,3 +1441,116 @@ def test_local_helper_and_regex_do_not_mask_runtime_call_locations():
     for source, location in sources:
         d = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
         assert d is not None and d.start == source.index(location)
+
+
+@pytest.mark.parametrize(
+    "definition,call",
+    [
+        ("function sample(get) {return get(1)}", "sample(i => coords[i])"),
+        ("const sample = (value, emit) => { if (emit) emit(value); }", "sample(1)"),
+        ("function sample(Kind) {return new Kind(4)}", "sample(Float64Array)"),
+        ("import * as v from './v.mjs'; const sample = v.scale;", "sample(2)"),
+    ],
+)
+def test_private_calls_use_source_bound_arguments(definition, call):
+    source = f"export const label = `item ${{i}}`; {definition}; {call};"
+    assert javascript_template_spans(source, lambda: None)
+    assert javascript_template_spans(source + " eval(userText);", lambda: None) is None
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "export {sample};",
+        "publish(sample);",
+        "sample(external);",
+        "sample(...args);",
+        "sample(i => runner(i));",
+        "sample(i => states[i]());",
+    ],
+)
+def test_private_callback_proof_requires_every_actual_caller(tail):
+    source = "export const label = `item ${i}`; function sample(get) {return get(1)}; sample(i => coords[i]); "
+    assert javascript_template_spans(source + tail, lambda: None) is None
+
+
+def test_private_calls_preserve_writes_guards_and_import_barriers():
+    for source in [
+        "function f(get) {get=other;return get(1)} f(x=>values[x])",
+        "function f(get) {arguments[0]=other;return get(1)} f(x=>values[x])",
+        "function f(a, record) {if (!record) record(a)} f(1)",
+        "function f(Kind) {return new Kind(4)} const Float64Array=ext; f(Float64Array)",
+        "import * as v from './v.js'; const f=v.runJob; f(`x ${arg}`)",
+        "import * as v from './v.js'; const f=v.exec; f(arg)",
+        "const v=runtime; const f=v.method; f(arg)",
+    ]:
+        assert (
+            javascript_template_spans("export const label=`item ${n}`;" + source, lambda: None)
+            is None
+        )
+
+
+def test_public_callback_witness_uses_exported_option_source():
+    source = (
+        "function elsewhere(a) {const step = x => [x]; step(3)} "
+        "function dummy(step){step(1)} "
+        "function mount({onChange=null}={}){ if (onChange) onChange(2); } "
+        "export const API={mount:mount};const label=`item ${val}`;"
+    )
+    hit = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert hit and hit.start == source.index("onChange(2)")
+
+
+def test_module_initialization_prefers_dynamic_markup_but_keeps_runtime_controls():
+    wrapper = "const wrap=(init,m)=>()=>m||(init((m={exports:{}}).exports,m),m); "
+    write = "const render=(node,markup)=>{if(node.namespaceURI){node.innerHTML=markup}}; const label=`id ${i}`;"
+    src = "(function(){" + wrapper + "wrap((exports,m)=>{});" + write + "})();"
+    hit = tm.bounded_parse_diagnostic(src, lambda: None, file_type="javascript")
+    assert hit and hit.check == tm.ParserCheck.GENERATED_HTML_MARKUP
+    assert src[hit.start : hit.end] == "node.innerHTML=markup"
+    for change in [
+        src.replace("m={exports:{}}", "m=chooseModule()"),
+        src.replace("wrap((exports,m)=>{})", "wrap(userSupplied)"),
+        src.replace("node.innerHTML=markup", "node.textContent=markup"),
+        src + " eval(unsafe);",
+    ]:
+        other = tm.bounded_parse_diagnostic(change, lambda: None, file_type="javascript")
+        assert other and other.check != tm.ParserCheck.GENERATED_HTML_MARKUP
+
+
+def test_fs_write_reports_embedded_executable_source_expression():
+    src = (
+        "import fs from 'node:fs/promises'; "
+        "const doc=`<!doctype html><script type='application/json'>${data}</script>"
+        "<script>${body.replace(/a/g,'b')}</script>`; fs.writeFile(dest,doc);"
+    )
+    hit = tm.bounded_parse_diagnostic(src, lambda: None, file_type="javascript")
+    assert hit and hit.check == tm.ParserCheck.GENERATED_HTML_MARKUP
+    assert src[hit.start : hit.end] == "${body.replace(/a/g,'b')}"
+    for change in [
+        src.replace("<script>", "<script type='application/json'>"),
+        src.replace("node:fs/promises", "./custom.js"),
+        src.replace("fs.writeFile(dest,doc)", "fs.writeFile(doc,dest)"),
+        src + " eval(userInput);",
+    ]:
+        other = tm.bounded_parse_diagnostic(change, lambda: None, file_type="javascript")
+        assert other is None or other.check != tm.ParserCheck.GENERATED_HTML_MARKUP
+
+
+def test_import_fallback_preserves_live_caller_stage_attribution():
+    source = (
+        "import {execFileSync} from 'node:child_process';"
+        "async function pipeline(items,...stages){return items.map(async (v)=>{for(const stage of stages){v=await stage(items)}})}"
+        "export const msg=`run ${id}`; runScript(body,{pipeline});"
+    )
+    hit = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert hit and hit.start == source.index("stage(items)")
+    for variant in [
+        source.replace("of stages", "of local"),
+        source.replace("{pipeline}", "{}"),
+        source + " execFileSync(selected, []);",
+        source.replace("for(const stage", "stages=[];for(const stage"),
+        source + " eval(unsafe);",
+    ]:
+        other = tm.bounded_parse_diagnostic(variant, lambda: None, file_type="javascript")
+        assert other and other.start != variant.index("stage(items)")

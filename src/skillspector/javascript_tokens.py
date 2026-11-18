@@ -20,6 +20,17 @@ from tree_sitter import Node
 
 from skillspector.javascript_ast import NODE_SHEBANG as _NODE_SHEBANG
 from skillspector.javascript_ast import JavaScriptProgram, ParseFailure, parse_javascript_source
+from skillspector.javascript_callables import (
+    _SHELL_EXECUTION_CALLS,
+    _callable_member,
+    _external_option_callback,
+    _forwarded_stage_call,
+    _is_shell_execution_module,
+    _module_wrapper_markup,
+    _pattern_binding_names,
+    _private_callable_uses,
+    _written_script_field,
+)
 
 _MAX_SOURCE_CHARS = 1_000_000
 _MAX_TOKENS = 100_000
@@ -1474,26 +1485,6 @@ def browser_escaped_list_shell_text(content: str, check_runtime: Callable[[], No
 JavaScriptTemplateSpans = tuple[tuple[int, ...], tuple[int, ...]]
 
 
-_SHELL_EXECUTION_CALLS = frozenset(
-    {
-        "exec",
-        "execfile",
-        "execfilesync",
-        "execsync",
-        "eval",
-        "function",
-        "execa",
-        "spawn",
-        "spawnfile",
-        "spawnfilesync",
-        "spawnsync",
-        "system",
-        "run",
-    }
-)
-_SHELL_EXECUTION_MODULES = frozenset({"child_process", "execa", "shelljs", "zx"})
-
-
 def browser_markup_witness(
     source: str, position: int, check_runtime: Callable[[], None]
 ) -> tuple[int, int] | None:
@@ -1903,6 +1894,13 @@ def _runtime_argument_call(
         if target is not None:
             for name in _pattern_binding_names(program, target, check_runtime):
                 rebindings.setdefault(name, []).append(part)
+    external = _external_option_callback(program, check_runtime) or _forwarded_stage_call(
+        program, check_runtime
+    )
+    proven = (
+        _promise_settlers(program, check_runtime)
+        | _private_callable_uses(program, check_runtime)[0]
+    )
     first_parameter = None
     budget = _MAX_TOKENS * 4
     for node in program.nodes:
@@ -1925,7 +1923,7 @@ def _runtime_argument_call(
             for arg in args.named_children
         ):
             return node
-        if first_parameter is not None:
+        if first_parameter is not None or callee.id in proven:
             continue
         scope = node.parent
         while scope is not None:
@@ -1949,6 +1947,18 @@ def _runtime_argument_call(
                         else set()
                     )
                 if name in parameters[scope.id]:
+                    # Prefer user-selected callbacks over settlers of a syntactic
+                    # Promise executor. The module-wide execution check still
+                    # retains unknown or shadowed constructors.
+                    parent = scope.parent
+                    if parent.type == "arguments" and parent.parent.type == "new_expression":
+                        constructor = parent.parent.child_by_field_name("constructor")
+                        if (
+                            constructor is not None
+                            and program.text(constructor) == "Promise"
+                            and "Promise" not in rebindings
+                        ):
+                            break
                     rebound = rebindings.get(name, ())
                     budget -= len(rebound)
                     if budget < 0:
@@ -1960,7 +1970,7 @@ def _runtime_argument_call(
                         first_parameter = node
                     break
             scope = scope.parent
-    return first_parameter
+    return external or first_parameter
 
 
 def _code_evaluation_witness(
@@ -2060,6 +2070,20 @@ def javascript_template_spans(
                 # The witness is the unresolved callable, which may precede or
                 # follow an ordinary template elsewhere in the same module.
                 witness = _code_evaluation_witness(program, check_runtime)
+                if (
+                    witness is None
+                    and generated_markup is not None
+                    and execution_node.type == "call_expression"
+                ):
+                    native_field = _module_wrapper_markup(
+                        program, execution_node, check_runtime
+                    ) or _written_script_field(program, execution_node, check_runtime)
+                    if native_field is not None:
+                        generated_markup.append(program.span(native_field))
+                if witness is None and execution_node.type == "import_statement":
+                    witness = _forwarded_stage_call(program, check_runtime)
+                if witness is None and execution_node.type == "new_expression":
+                    witness = _external_option_callback(program, check_runtime)
                 if witness is None and _local_or_regex_call(program, execution_node, check_runtime):
                     witness = _runtime_argument_call(program, check_runtime)
                 if (
@@ -3014,48 +3038,13 @@ def _numeric_local_identifiers(
     return owned
 
 
-def _pattern_binding_names(
-    program: JavaScriptProgram, pattern: Node, check_runtime: Callable[[], None]
-) -> set[str]:
-    """Collect the identifiers bound by a parameter or destructuring pattern.
-
-    Only binding positions count: the left side of assignment patterns, the
-    identifiers inside object and array patterns, and rest targets.
-    Default-value expressions, computed keys, and property names are
-    references, not bindings, so they are never descended into.
-    """
-    names: set[str] = set()
-    pending = [pattern]
-    while pending:
-        check_runtime()
-        node = pending.pop()
-        if node.type in {"identifier", "shorthand_property_identifier_pattern"}:
-            names.add(program.text(node))
-        elif node.type in {"assignment_pattern", "object_assignment_pattern"}:
-            left = node.child_by_field_name("left")
-            if left is not None:
-                pending.append(left)
-        elif node.type in {"required_parameter", "optional_parameter"}:
-            # Type annotations and default values do not bind runtime names.
-            bound = node.child_by_field_name("pattern")
-            if bound is not None:
-                pending.append(bound)
-        elif node.type == "pair_pattern":
-            value = node.child_by_field_name("value")
-            if value is not None:
-                pending.append(value)
-        elif node.type == "rest_pattern":
-            pending.extend(node.named_children)
-        elif node.type in {"formal_parameters", "object_pattern", "array_pattern"}:
-            pending.extend(node.named_children)
-    return names
-
-
 def _has_shell_execution_call(
     program: JavaScriptProgram, check_runtime: Callable[[], None]
 ) -> Node | None:
     scalar_identifiers = _scalar_template_identifiers(program, check_runtime)
     ordinary_identifiers = _numeric_local_identifiers(program, check_runtime)
+    private_calls, namespace_aliases = _private_callable_uses(program, check_runtime)
+    ordinary_identifiers.update(private_calls)
     ordinary_identifiers.update(_promise_settlers(program, check_runtime))
     native_members, native_calls, native_paths = _ordinary_native_calls(program, check_runtime)
     owned_identifiers = scalar_identifiers | ordinary_identifiers | native_members
@@ -3063,7 +3052,7 @@ def _has_shell_execution_call(
     owned_identifiers.update(_array_accumulator_identifiers(program, check_runtime))
     uncertain_bindings: set[str] = set()
     global_objects = {"globalThis", "global", "window", "self"}
-    imported_callables: set[str] = set()
+    imported_callables: set[str] = set(namespace_aliases)
     template_values: set[str] = set()
     aliases: dict[str, set[str]] = {}
     for node in program.nodes:
@@ -3270,13 +3259,6 @@ def _has_shell_execution_call(
     return None
 
 
-def _callable_member(program: JavaScriptProgram, node: Node) -> str | None:
-    member = node.child_by_field_name("property") or node.child_by_field_name("index")
-    if member is None or member.type not in {"property_identifier", "string"}:
-        return None
-    return program.text(member).strip("\"'")
-
-
 def _callable_values(
     program: JavaScriptProgram,
     value: Node,
@@ -3372,12 +3354,3 @@ def _is_assertion_like_callee(program: JavaScriptProgram, callee: Node) -> bool:
         return False
     member = callee.child_by_field_name("property") or callee.child_by_field_name("index")
     return member is not None and program.text(member).strip("\"'") in _MESSAGE_ARGUMENTS
-
-
-def _is_shell_execution_module(module: str) -> bool:
-    if "\\" in module:
-        return True
-    normalized = module.strip("\"'").removeprefix("node:")
-    return any(
-        normalized == name or normalized.startswith(f"{name}/") for name in _SHELL_EXECUTION_MODULES
-    )
