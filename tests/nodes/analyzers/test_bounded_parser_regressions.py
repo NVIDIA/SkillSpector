@@ -1376,3 +1376,79 @@ def test_guarded_filter_retains_unverified_execution_or_source(before: str, afte
     source = _filtered_selector().replace(before, after)
     detail = tm.bounded_parse_diagnostic(source, lambda: None)
     assert detail and source[detail.start : detail.end] != '"${SCRIPTS}/helper.sh"'
+
+
+@pytest.mark.parametrize("fmt", ["%q", "'%q'", '"%q"', "-- '%q'"])
+@pytest.mark.parametrize(
+    "after",
+    ["export hint", "unset hint\ndate", "export hint\nunset hint\ndate", "date\nexport hint"],
+)
+def test_printf_name_operations_do_not_execute_serialized_data(fmt: str, after: str) -> None:
+    source = f"""parts=()
+parts+=("$(printf {fmt} "$arg")")
+hint="tool ${{parts[*]}}"
+unset parts
+{after}
+"""
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell") is None
+
+
+@pytest.mark.parametrize(
+    ("consumer", "check", "span"),
+    [
+        ('logger "$hint"', ParserCheck.GENERATED_TEXT_DESTINATION, "$hint"),
+        ('printf "%s" "$hint" | sh', ParserCheck.GENERATED_TEXT_DESTINATION, "$hint"),
+        ('printf "%s" "$hint" >file', ParserCheck.GENERATED_TEXT_DESTINATION, "$hint"),
+        ('eval "$hint"', ParserCheck.COMMAND_STRING_RUNTIME, '"$hint"'),
+    ],
+)
+def test_exported_printf_data_retains_its_actual_consumer(
+    consumer: str, check: ParserCheck, span: str
+) -> None:
+    source = (
+        """parts=()
+[[ "$force" == yes ]] && parts+=("--force")
+parts+=("$(printf '%q' "$arg")")
+hint="tool ${parts[*]}"
+unset parts
+export hint
+"""
+        + consumer
+    )
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell")
+    assert detail is not None and detail.check is check
+    assert source[detail.start : detail.end].strip() == span
+    assert detail.start >= source.index(consumer)
+
+
+@pytest.mark.parametrize(
+    "after",
+    [
+        "export hint\nconsume_environment",
+        "export hint\nconsume_environment\nunset hint",
+        "export hint\nconsume_environment\nexport hint\nunset hint\ndate",
+        'unset() { eval "$1"; }\nunset hint',
+        'export() { eval "$1"; }\nexport hint',
+        "declare -i hint\nexport hint",
+    ],
+)
+def test_printf_name_operations_keep_runtime_consumption_visible(after: str) -> None:
+    source = """hint="$(printf '%q' "$arg")"\n""" + after
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell") is not None
+
+
+@pytest.mark.parametrize("declaration", ["declare -i hint", "declare -ai hint"])
+def test_encoded_scalar_retains_integer_binding(declaration: str) -> None:
+    source = declaration + """\nhint="$(printf '%q' "$arg")"\nexport hint\n"""
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell")
+    assert detail and detail.check is ParserCheck.SHELL_ARITHMETIC
+    assert (detail.start, detail.end) == (declaration.index("hint"), len(declaration))
+
+
+def test_import_can_change_unobserved_printf_binding() -> None:
+    source = """source ./bindings.sh
+hint="$(printf '%q' "$arg")"
+"""
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell")
+    assert detail and detail.check is ParserCheck.COMMAND_IDENTITY
+    assert source[detail.start : detail.end] == "printf"
