@@ -1605,105 +1605,6 @@ def browser_markup_witness(
     return None
 
 
-def _only_thrown_messages(
-    program: JavaScriptProgram, templates: list[Node], check_runtime: Callable[[], None]
-) -> bool:
-    """Recognize plain diagnostic arguments thrown directly by the native Error.
-
-    Limit the proof to independent data reads. A caught, intercepted, constructed,
-    or otherwise consumed message must still go through ordinary inspection.
-    """
-    constructors: set[int] = set()
-    for template in templates:
-        check_runtime()
-        arguments = template.parent
-        call = None if arguments is None else arguments.parent
-        if (
-            arguments is None
-            or arguments.type != "arguments"
-            or arguments.named_children != [template]
-            or call is None
-            or call.type != "new_expression"
-            or (constructor := call.child_by_field_name("constructor")) is None
-            or constructor.type != "identifier"
-            or program.text(constructor) != "Error"
-            or call.parent is None
-            or call.parent.type != "throw_statement"
-        ):
-            return False
-        constructors.add(constructor.id)
-        pending = list(template.named_children)
-        while pending:
-            check_runtime()
-            component = pending.pop()
-            if component.type not in {
-                "string_fragment",
-                "template_substitution",
-                "identifier",
-                "number",
-                "member_expression",
-                "property_identifier",
-                "subscript_expression",
-            }:
-                return False
-            pending.extend(component.named_children)
-    for node in program.nodes:
-        check_runtime()
-        if node.type in {"catch_clause", "with_statement", "this", "import", "escape_sequence"}:
-            return False
-        if node.type in {"call_expression", "new_expression"}:
-            callee = node.child_by_field_name("function") or node.child_by_field_name("constructor")
-            if callee is not None and (
-                (
-                    callee.type == "identifier"
-                    and program.text(callee).casefold() in _SHELL_EXECUTION_CALLS
-                )
-                or (_callable_member(program, callee) or "").casefold() in _SHELL_EXECUTION_CALLS
-            ):
-                return False
-        if node.type not in {
-            "identifier",
-            "property_identifier",
-            "shorthand_property_identifier",
-            "shorthand_property_identifier_pattern",
-            "string",
-        }:
-            continue
-        name = program.text(node).strip("\"'")
-        if (
-            (name == "Error" and node.id not in constructors)
-            or "\\" in name
-            or name
-            in {
-                "globalThis",
-                "global",
-                "self",
-                "window",
-                "process",
-                "Reflect",
-                "eval",
-                "Function",
-                "prototype",
-                "__proto__",
-                "constructor",
-                "require",
-                "defineProperty",
-                "defineProperties",
-                "setPrototypeOf",
-                "catch",
-                "then",
-                "onerror",
-                "addEventListener",
-                "prepareStackTrace",
-                "message",
-                "stack",
-            }
-            or _is_shell_execution_module(name)
-        ):
-            return False
-    return bool(constructors)
-
-
 def _markup_parameter(
     program: JavaScriptProgram,
     template: Node,
@@ -2051,7 +1952,7 @@ def javascript_template_spans(
     )
     if not checked_execution:
         execution_node = _has_shell_execution_call(program, check_runtime)
-    if execution_node is not None and not _only_thrown_messages(program, templates, check_runtime):
+    if execution_node is not None:
         for node in templates:
             check_runtime()
             start, end = program.span(node)
@@ -2085,7 +1986,21 @@ def javascript_template_spans(
                     witness = _forwarded_stage_call(program, check_runtime)
                 if witness is None and execution_node.type == "new_expression":
                     witness = _external_option_callback(program, check_runtime)
-                if witness is None and _local_or_regex_call(program, execution_node, check_runtime):
+                # A diagnostic string still evaluates its substitutions. Prefer a
+                # concrete callback over a same-spelled data member elsewhere.
+                args = node.parent
+                call = None if args is None else args.parent
+                thrown = (
+                    args is not None
+                    and args.type == "arguments"
+                    and call is not None
+                    and call.type == "new_expression"
+                    and call.parent is not None
+                    and call.parent.type == "throw_statement"
+                )
+                if witness is None and (
+                    thrown or _local_or_regex_call(program, execution_node, check_runtime)
+                ):
                     witness = _runtime_argument_call(program, check_runtime)
                 if (
                     witness is None
@@ -2728,6 +2643,106 @@ def _numeric_local_identifiers(
     return owned
 
 
+def _implicit_template_callback(
+    program: JavaScriptProgram, unknown: set[str], check_runtime: Callable[[], None]
+) -> Node | None:
+    """A property read or string conversion can invoke a registered callback."""
+    receivers: dict[tuple[int, str], bool] = {}
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "variable_declarator":
+            name = node.child_by_field_name("name")
+            value = node.child_by_field_name("value")
+            declaration = node.parent
+            if (
+                name is None
+                or name.type != "identifier"
+                or value is None
+                or declaration is None
+                or declaration.type != "lexical_declaration"
+                or declaration.children[0].type != "const"
+                or declaration.parent is None
+            ):
+                continue
+            proxy = value.type == "new_expression"
+            if proxy:
+                constructor = value.child_by_field_name("constructor")
+                args = value.child_by_field_name("arguments")
+                if (
+                    constructor is None
+                    or program.text(constructor) != "Proxy"
+                    or args is None
+                    or len(args.named_children) != 2
+                ):
+                    continue
+                value = args.named_children[1]
+            if value.type != "object":
+                continue
+            hooks: dict[str, Node | None] = {}
+            for field in value.named_children:
+                check_runtime()
+                key = field.child_by_field_name("key") or field.child_by_field_name("name")
+                if key is None:
+                    continue
+                if key.type == "computed_property_name" and key.named_child_count == 1:
+                    member = key.named_children[0]
+                    obj = member.child_by_field_name("object")
+                    if (
+                        obj is None
+                        or program.text(obj) != "Symbol"
+                        or _callable_member(program, member) != "toPrimitive"
+                    ):
+                        continue
+                    hook = "Symbol.toPrimitive"
+                else:
+                    hook = program.text(key).strip("\"'")
+                    if hook not in {"get", "toString", "valueOf"}:
+                        continue
+                hooks[hook] = field.child_by_field_name("value")
+            if proxy:
+                callback = hooks.get("get")
+            elif "Symbol.toPrimitive" in hooks:
+                callback = hooks["Symbol.toPrimitive"]
+            else:
+                callback = hooks.get("toString")
+                # The native inherited toString already returns a primitive.
+                # valueOf is reached here only when toString is non-callable.
+                if callback is not None and callback.type in {
+                    "null",
+                    "number",
+                    "string",
+                    "false",
+                    "true",
+                }:
+                    callback = hooks.get("valueOf")
+            if (
+                callback is not None
+                and callback.type == "identifier"
+                and program.text(callback) in unknown
+            ):
+                receivers[(declaration.parent.id, program.text(name))] = proxy
+        elif receivers and node.type == "template_substitution" and node.named_child_count == 1:
+            expression = node.named_children[0]
+            root = expression
+            while root.type in {"member_expression", "subscript_expression"}:
+                check_runtime()
+                receiver = root.child_by_field_name("object")
+                if receiver is None:
+                    break
+                root = receiver
+            if root.type != "identifier":
+                continue
+            scope = node.parent
+            while scope is not None and scope.type not in {"program", "statement_block"}:
+                check_runtime()
+                scope = scope.parent
+            if scope is not None:
+                receiver_is_proxy = receivers.get((scope.id, program.text(root)))
+                if receiver_is_proxy is True or (receiver_is_proxy is False and expression == root):
+                    return expression
+    return None
+
+
 def _has_shell_execution_call(
     program: JavaScriptProgram, check_runtime: Callable[[], None]
 ) -> Node | None:
@@ -2955,6 +2970,10 @@ def _has_shell_execution_call(
                 or _is_shell_execution_module(program.text(args[0]))
             ):
                 return node
+    if any(hook in program.content for hook in ("Proxy", "toString", "valueOf", "toPrimitive")):
+        return _implicit_template_callback(
+            program, uncertain_bindings | imported_callables, check_runtime
+        )
     return None
 
 

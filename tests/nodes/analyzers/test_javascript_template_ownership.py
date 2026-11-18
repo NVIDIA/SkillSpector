@@ -1367,7 +1367,9 @@ def test_uncaught_native_error_only_owns_direct_scalar_messages():
     source = (
         "function f(items, i) { group.run.push(i); throw new Error(`bad item ${items[i].name}`); }"
     )
-    assert javascript_template_spans(source, lambda: None)
+    assert javascript_template_spans(source, lambda: None) is None
+    ordinary = "const info = {name: 'plain'}; throw new Error(`bad item ${info.name}`);"
+    assert javascript_template_spans(ordinary, lambda: None)
     for candidate in (
         "let Error = receiver; " + source,
         "try { f(a, b); } catch (e) { use(e); }" + source,
@@ -1380,6 +1382,74 @@ def test_uncaught_native_error_only_owns_direct_scalar_messages():
         source + " tool.exec(other);",
     ):
         assert javascript_template_spans(candidate, lambda: None) is None
+
+
+@pytest.mark.parametrize(
+    "initializer",
+    [
+        "{ get detail() { return read(value); } }",
+        "{ [Symbol.toPrimitive]() { return read(value); } }",
+        "{ toString() { return read(value); } }",
+        "new Proxy({}, { get() { return read(value); } })",
+    ],
+)
+def test_thrown_template_keeps_callbacks_in_accessors_and_coercions(initializer):
+    source = (
+        "export function fail(read, value) { const info = "
+        + initializer
+        + "; throw new Error(`bad ${info.detail} ${info}`); }"
+    )
+    result = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert result is not None and result.check == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert result.start == source.index("read(value)")
+
+
+@pytest.mark.parametrize(
+    ("value", "field"),
+    [
+        ("new Proxy({}, {get: read})", "info.detail"),
+        ("{[Symbol.toPrimitive]: read}", "info"),
+        ("{toString: read}", "info"),
+        ("{toString: null, valueOf: read}", "info"),
+    ],
+)
+def test_interpolation_invokes_registered_runtime_callbacks(value, field):
+    source = (
+        "export function fail(read) { const info = "
+        + value
+        + "; throw new Error(`bad ${"
+        + field
+        + "}`); }"
+    )
+    result = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert result is not None and result.start == source.index("${") + 2
+    assert not tm.bounded_parse_diagnostic(
+        source.replace("${" + field + "}", "${7}"), lambda: None, file_type="javascript"
+    )
+
+
+@pytest.mark.parametrize(
+    "initializer",
+    [
+        "{valueOf: read}",
+        "{'[Symbol.toPrimitive]': read}",
+        "{toString: read, toString() {return 'plain'}}",
+        "new Proxy({}, {get: read, get() {return 'plain'}})",
+    ],
+)
+def test_interpolation_keeps_plain_and_overridden_properties(initializer):
+    source = (
+        "export function fail(read) { const info = "
+        + initializer
+        + "; throw new Error(`bad ${info}`); }"
+    )
+    assert not tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+
+
+def test_a_thrown_literal_does_not_clear_an_independent_call():
+    source = "export function fail(read) { read(7); throw new Error(`bad ${7}`); }"
+    result = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert result is not None and result.start == source.index("read(7)")
 
 
 def test_dynamic_evaluator_is_attributed_even_after_a_regex_match():
