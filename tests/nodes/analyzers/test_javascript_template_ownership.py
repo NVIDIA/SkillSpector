@@ -1380,3 +1380,13 @@ def test_uncaught_native_error_only_owns_direct_scalar_messages():
         source + " tool.exec(other);",
     ):
         assert javascript_template_spans(candidate, lambda: None) is None
+
+
+def test_dynamic_evaluator_is_attributed_even_after_a_regex_match():
+    source = "const got = /abc/.exec(text); other(/xyz/); const f = new Function(`return ${body}`);"
+    target = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert target is not None and target.cause == tm.ParserCause.RUNTIME_DEPENDENT
+    assert target.start == source.index("new Function")
+    shadowed = "const Function = receiver; " + source
+    target = tm.bounded_parse_diagnostic(shadowed, lambda: None, file_type="javascript")
+    assert target is not None and target.start != shadowed.index("new Function")

@@ -1712,6 +1712,38 @@ def _only_thrown_messages(
     return bool(constructors)
 
 
+def _code_evaluation_witness(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> Node | None:
+    """Prefer a direct evaluator to a less specific module-level witness."""
+    witnessed: dict[str, Node] = {}
+    uncertain: set[str] = set()
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return None
+        if node.type not in {"identifier", "shorthand_property_identifier_pattern"}:
+            continue
+        name = program.text(node)
+        if name not in {"Function", "eval"}:
+            continue
+        call = node.parent
+        if (
+            call is None
+            or call.type not in {"call_expression", "new_expression"}
+            or (call.child_by_field_name("function") or call.child_by_field_name("constructor"))
+            != node
+        ):
+            uncertain.add(name)
+            continue
+        arguments = call.child_by_field_name("arguments")
+        if arguments is not None and any(
+            arg.type not in {"string", "number", "comment"} for arg in arguments.named_children
+        ):
+            witnessed.setdefault(name, call)
+    return next((call for name, call in witnessed.items() if name not in uncertain), None)
+
+
 def javascript_template_spans(
     content: str,
     check_runtime: Callable[[], None],
@@ -1775,7 +1807,8 @@ def javascript_template_spans(
             ):
                 # The witness is the unresolved callable, which may precede or
                 # follow an ordinary template elsewhere in the same module.
-                unresolved_executables.append(program.span(execution_node)[0])
+                witness = _code_evaluation_witness(program, check_runtime) or execution_node
+                unresolved_executables.append(program.span(witness)[0])
                 break
         return None
     if _has_unproven_assertion_template_call(content, projected, program, templates, check_runtime):

@@ -877,13 +877,13 @@ def generated_script_markup_span(
     class Script(HTMLParser):
         active = False
 
-        def handle_starttag(self, tag, attrs):
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
             self.active = tag == "script" and not attrs
 
-        def handle_endtag(self, tag):
+        def handle_endtag(self, tag: str) -> None:
             self.active = False
 
-        def handle_data(self, data):
+        def handle_data(self, data: str) -> None:
             check_runtime()
             if self.active:
                 line, column = self.getpos()
