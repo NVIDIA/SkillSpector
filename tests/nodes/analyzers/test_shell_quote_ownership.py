@@ -2180,3 +2180,113 @@ def test_formatted_data_proof_preserves_runtime_command_diagnostics(command: str
     body = f"for i in 0 1; do {command}; done\n"
     diagnostic = tm.bounded_parse_diagnostic(body, lambda: None, file_type="shell")
     assert diagnostic is not None and diagnostic.check is tm.ParserCheck.PRINTF_FORMAT
+
+
+_FORWARD = 'invoke() { bash -c "$1"; }\n'
+
+
+@pytest.mark.parametrize(
+    ("definition", "calls"),
+    [
+        (_FORWARD, 'invoke pwd\ninvoke "uname -a"\n'),
+        ('function invoke { /bin/sh -c "${1}"; }\n', "invoke 'pwd'\n"),
+        ('invoke() { sh -c "$2"; }\n', 'invoke "$data" "pwd"\n'),
+        ('invoke() { timeout 3s sh -c "$1"; }\n', 'invoke "pwd"\n'),
+        (
+            'invoke() { timeout -s KILL "${2:-5}" /bin/bash -c "$1" 2>/dev/null; }\n',
+            "invoke 'pwd'\ninvoke 'uname -a' 8\n",
+        ),
+        (_FORWARD, 'result="$(invoke pwd)"\n'),
+    ],
+)
+def test_native_forwarder_inspects_fixed_direct_programs(definition: str, calls: str) -> None:
+    # Normalization changes the unrelated comment and its offset.
+    source = "#!/bin/bash\n# Ｍａｎｕａｌ…\n" + definition + calls
+    ledger = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )["inspection_ledger"]
+    assert ledger[0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "caller,span",
+    [
+        ('invoke "echo $external"', "$external"),
+        ('invoke "echo ${external}"', "${external}"),
+        ('if invoke "ls $(choose)"; then echo done; fi', "$(choose)"),
+        ('result=$(invoke "echo $external")', "$external"),
+        ('invoke "cat $external" >"$output"', "$external"),
+    ],
+)
+def test_native_forwarder_locates_the_unresolved_caller_operand(caller: str, span: str) -> None:
+    source = "#!/bin/bash\n# Ｍａｎｕａｌ…\n" + _FORWARD + 'invoke "pwd"\n' + caller + "\n"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None)
+    assert diagnostic is not None and diagnostic.check is tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert diagnostic.location_precision == "source_span"
+    assert (diagnostic.start, diagnostic.end) == (
+        source.index(span),
+        source.index(span) + len(span),
+    )
+    ledger = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )["inspection_ledger"]
+    assert ledger[0]["outcome"] is LedgerOutcome.PARTIAL
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        _FORWARD,
+        _FORWARD + "invoke $parts\n",
+        _FORWARD + 'invoke "$@"\n',
+        _FORWARD + 'invoke "${parts[@]}"\n',
+        _FORWARD.replace("$1", "$2") + "invoke $parts pwd\n",
+        _FORWARD.replace("$1", "$2") + 'invoke "$@" pwd\n',
+        _FORWARD + 'invoke pwd >"$out"\n',
+        _FORWARD + 'invoke pwd "$(foreign)"\n',
+        _FORWARD.replace("$1", "$2") + 'invoke "$(foreign)" pwd\n',
+        _FORWARD.replace("$1", "$2") + 'invoke "$((variable++))" pwd\n',
+        _FORWARD + 'source external\ninvoke "$data"\n',
+        _FORWARD + 'eval "$setup"\ninvoke "$data"\n',
+        _FORWARD + "hash -p ./other bash\ninvoke pwd\n",
+        _FORWARD + "export -f invoke\ninvoke pwd\n",
+        _FORWARD + 'command eval "$setup"\ninvoke pwd\n',
+        _FORWARD + "alias invoke=other\ninvoke pwd\n",
+        _FORWARD + "bash() { other; }\ninvoke pwd\n",
+        _FORWARD + "BASH_ENV=other\ninvoke pwd\n",
+        _FORWARD + "LD_PRELOAD=other\ninvoke pwd\n",
+        _FORWARD + "BASH_ENV=$(invoke pwd)\n",
+        _FORWARD + "prefix=anything invoke pwd\n",
+        _FORWARD.replace("; }", '; } >"$out"') + "invoke pwd\n",
+        _FORWARD.replace('";', '" >"$out";') + "invoke pwd\n",
+        _FORWARD.replace("bash -c", 'timeout "${2:-5}" bash -c') + 'invoke pwd "$seconds"\n',
+        "#!/bin/bash --rcfile /external\n" + _FORWARD + "invoke pwd\n",
+        _FORWARD + "invoke 'eval \"$user_program\"'\n",
+    ],
+)
+def test_native_forwarder_keeps_unresolved_programs_or_binding_changes_visible(source: str) -> None:
+    assert tm.bounded_parse_diagnostic(source, lambda: None) is not None
+
+
+def test_native_forwarder_preserves_earlier_limits_and_destructive_findings() -> None:
+    source = _FORWARD + "invoke 'rm -rf /'\n" + 'invoke "exec $later"\n'
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None)
+    assert diagnostic is not None and diagnostic.check is tm.ParserCheck.COMMAND_STRING_EFFECTS
+    assert source[diagnostic.start : diagnostic.end] == "'rm -rf /'"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+    source = _FORWARD + 'sh -c "$earlier"\ninvoke "echo $later"\n'
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None)
+    assert diagnostic is not None and "$earlier" in source[diagnostic.start : diagnostic.end]
+
+
+def test_transformed_control_syntax_cannot_acquire_physical_shell_forwarding_proof() -> None:
+    source = _FORWARD + 'invoke "ｅｃｈｏ data"\n'
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL

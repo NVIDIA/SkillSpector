@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import heapq
 import re
+import shlex
 import sys
 import time
 from bisect import bisect_left, bisect_right
@@ -48,6 +49,7 @@ from skillspector.bash_syntax import (
     finite_numeric_operands,
     may_have_formatted_loop,
     plain_shell_neighbor,
+    positional_shell_callers,
 )
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
@@ -10920,6 +10922,8 @@ def prepare_parser_analysis(
             _markdown_shell_text(content, check_runtime, shell_fence_ranges=ranges)
         if 0 < len(ranges) <= 64 and sum(end - start for start, end in ranges) <= 1_000_000:
             return _FiniteShellSource(content, tuple(ranges))
+    if file_type == "shell" and len(content) <= 131_072 and "-c" in content and "$" in content:
+        return _FiniteShellSource(content, ())
     if file_type == "json":
         return prepare_json_source(content, check_runtime)
     if file_type != "yaml":
@@ -12220,6 +12224,65 @@ def _markdown_owned_commands_diagnostic(
     )
 
 
+def _forwarded_shell_diagnostic(
+    content: str,
+    diagnostic: StaticParserDiagnostic,
+    check_runtime: Callable[[], None],
+    source_view: SecurityTextView | None,
+    prepared_analysis: object | None,
+) -> StaticParserDiagnostic | None:
+    proof = positional_shell_callers(content, diagnostic.start, diagnostic.end, check_runtime)
+    if proof is None:
+        return diagnostic
+    if source_view is not None and source_view.name != "raw":
+        if (
+            source_view.name != "normalized"
+            or not isinstance(prepared_analysis, _FiniteShellSource)
+            or source_view.text != content
+        ):
+            return diagnostic
+        physical = positional_shell_callers(
+            prepared_analysis.content,
+            source_view.source_offset(diagnostic.start),
+            source_view.source_end_offset(diagnostic.end - 1),
+            check_runtime,
+        )
+        if (
+            physical is None
+            or physical.closed != proof.closed
+            or not _FiniteShellSource(prepared_analysis.content, physical.scopes).owns(
+                source_view, list(proof.scopes), check_runtime
+            )
+        ):
+            return diagnostic
+    candidate = None
+    for caller in proof.callers:
+        check_runtime()
+        if caller.program is None:
+            candidate = replace(
+                diagnostic, start=caller.start, end=caller.end, location_precision="source_span"
+            )
+            break
+        # Inspect the recovered literal with ordinary command-string semantics,
+        # including nested commands, destructive effects and independent limits.
+        nested = _has_bounded_parse_exhaustion(
+            "sh -c " + shlex.quote(caller.program), check_runtime, file_type="shell"
+        )
+        if nested is not None:
+            candidate = nested.enclosed(caller.start, caller.end)
+            break
+    if candidate is None and not proof.closed:
+        return diagnostic
+    start, end = proof.argument
+    # This diagnostic pass replaces only the positional argument in the
+    # declaration. Finding collection and caller inspection retain every byte.
+    projected = content[:start] + "':'".ljust(end - start) + content[end:]
+    other = _has_bounded_parse_exhaustion(projected, check_runtime, file_type="shell")
+    if other is not None and (candidate is None or other.start <= candidate.start):
+        return other
+    return candidate
+
+
 def bounded_parse_diagnostic(
     content: str,
     check_runtime: Callable[[], None],
@@ -12250,6 +12313,16 @@ def bounded_parse_diagnostic(
         python_import_check=python_import_check,
         python_stdlib_check=python_stdlib_check,
     )
+    if (
+        file_type == "shell"
+        and complete_context
+        and (source_view is None or source_view.name in {"raw", "normalized"})
+        and exhausted is not None
+        and exhausted.check is ParserCheck.COMMAND_STRING_RUNTIME
+    ):
+        exhausted = _forwarded_shell_diagnostic(
+            content, exhausted, check_runtime, source_view, prepared_analysis
+        )
     if (
         file_type == "shell"
         and complete_context

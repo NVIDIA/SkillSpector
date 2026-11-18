@@ -529,3 +529,335 @@ def finite_numeric_operands(
         return True
 
     return operands if walk(tree.root_node, {}, 0) else []
+
+
+@dataclass(frozen=True, slots=True)
+class ShellProgramCaller:
+    start: int
+    end: int
+    program: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ShellProgramForwarding:
+    argument: tuple[int, int]
+    callers: tuple[ShellProgramCaller, ...]
+    scopes: tuple[tuple[int, int], ...]
+    closed: bool
+
+
+def _literal_argument(node: Node) -> str | None:
+    raw = node.text
+    if len(raw) > 2048:
+        return None
+    if node.type == "raw_string" and raw[:1] == raw[-1:] == b"'":
+        return raw[1:-1].decode()
+    if node.type == "string" and raw[:1] == raw[-1:] == b'"':
+        if (
+            all(child.type == "string_content" for child in node.named_children)
+            and b"\\" not in raw
+        ):
+            return raw[1:-1].decode()
+    if node.type in {"word", "number", "command_name"} and re.fullmatch(
+        rb"[a-zA-Z0-9_./:+-]+", raw
+    ):
+        return raw.decode()
+    return None
+
+
+_DURATION = re.compile(r"[0-9]{1,6}(?:\.[0-9]{1,3})?[smhd]?")
+
+
+def _single_argv_slot(word: Node) -> bool:
+    if _literal_argument(word) is not None:
+        return True
+    if word.type != "string":
+        return False
+    for child in word.named_children:
+        if child.type in {"string_content", "command_substitution", "arithmetic_expansion"}:
+            continue
+        if child.type in {"expansion", "simple_expansion"} and re.fullmatch(
+            rb"\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]|\{(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+)\})", child.text
+        ):
+            continue
+        return False
+    return True
+
+
+def _forwarding_parameters(command: Node) -> tuple[Node, int, int, str] | None:
+    """Recognize a single positional script, optionally behind a fixed timeout."""
+    if command.type != "command" or not 3 <= command.named_child_count <= 10:
+        return None
+    words = command.named_children
+    if (
+        command.child_by_field_name("name") != words[0]
+        or len(command.children_by_field_name("argument")) != len(words) - 1
+    ):
+        return None
+    duration_index, default = 0, ""
+    if _literal_argument(words[0]) in {"timeout", "/bin/timeout", "/usr/bin/timeout"}:
+        opts = words[1:-3]
+        if not opts:
+            return None
+        duration = opts[-1]
+        options = [_literal_argument(word) for word in opts[:-1]]
+        while options:
+            flag = options.pop(0)
+            if flag in {"--foreground", "--preserve-status"}:
+                continue
+            if (
+                flag in {"-s", "--signal"}
+                and options
+                and re.fullmatch(r"[A-Z]{1,12}|[0-9]{1,2}", options.pop(0) or "")
+            ):
+                continue
+            return None
+        if not _DURATION.fullmatch(_literal_argument(duration) or ""):
+            number = re.fullmatch(
+                rb'"\$([1-9])"|"\$\{([1-9])(?::-([0-9]{1,6}[smhd]?))?\}"', duration.text
+            )
+            if number is None:
+                return None
+            duration_index = int(number[1] or number[2])
+            default = (number[3] or b"").decode()
+        words = words[-3:]
+    if (
+        len(words) != 3
+        or _literal_argument(words[0])
+        not in {"sh", "bash", "/bin/sh", "/bin/bash", "/usr/bin/bash", "/usr/bin/sh"}
+        or _literal_argument(words[1]) != "-c"
+    ):
+        return None
+    number = re.fullmatch(rb'"\$([1-9])"|"\$\{([1-9])\}"', words[2].text)
+    if number is None:
+        return None
+    return words[2], int(number[1] or number[2]), duration_index, default
+
+
+def _forwarded_argument(
+    command: Node, index: int, duration_index: int, default: str
+) -> tuple[Node, str | None, bool] | None:
+    args = command.children_by_field_name("argument")
+    if len(args) > 32 or command.named_child_count != len(args) + 1 or index > len(args):
+        return None
+    if any(not _single_argv_slot(word) for word in args[: max(index, duration_index)]):
+        return None
+    if duration_index:
+        duration = (
+            _literal_argument(args[duration_index - 1]) if duration_index <= len(args) else default
+        )
+        if duration is None or not _DURATION.fullmatch(duration or default):
+            return None
+    operand = args[index - 1]
+    program = _literal_argument(operand)
+    if program is None:
+        # A quoted scalar has one argv position. Locate the expansion that
+        # actually supplies unknown command text in that position.
+        if operand.type != "string":
+            return None
+        origin = next(
+            (child for child in operand.named_children if child.type in _SHELL_EXPANSIONS), None
+        )
+        if origin is None:
+            return None
+    else:
+        origin = operand
+    # An unrelated expansion can execute another command or change shell state
+    # (e.g. in arithmetic). A quoted scalar read still occupies exactly one slot.
+    other_args = [arg for arg in args if arg != operand]
+    inert = all(
+        _literal_argument(arg) is not None
+        or (
+            _single_argv_slot(arg)
+            and all(
+                c.type in {"string_content", "simple_expansion", "expansion"}
+                for c in arg.named_children
+            )
+        )
+        for arg in other_args
+    )
+    return origin, program, inert
+
+
+_SHELL_EXPANSIONS = {
+    "expansion",
+    "simple_expansion",
+    "command_substitution",
+    "arithmetic_expansion",
+}
+_BINDING_COMMANDS = frozenset(
+    ". alias builtin complete declare enable eval exec export hash mapfile read readarray "
+    "readonly shopt source trap typeset unalias unset".split()
+)
+
+
+def positional_shell_callers(
+    content: str, start: int, end: int, check_runtime: Callable[[], None]
+) -> ShellProgramForwarding | None:
+    """Trace an ordinary function forwarding one quoted positional shell program."""
+    if (
+        len(content) > 131_072
+        or "-c" not in content
+        or ("(" not in content and "function" not in content)
+        or "\0" in content
+        or (
+            content.startswith("#!")
+            and not re.fullmatch(
+                r"#![ \t]*(?:/bin/(?:ba)?sh|/usr/bin/(?:ba)?sh|/usr/bin/env[ \t]+(?:ba)?sh)[ \t]*",
+                content.partition("\n")[0],
+            )
+        )
+    ):
+        return None
+    deadline = time.monotonic() + 0.5
+    try:
+        raw = content.encode()
+        tree = _tree(raw, deadline)
+    except (UnicodeError, TypeError, ValueError, OverflowError):
+        return None
+    if (
+        tree is None
+        or tree.root_node.has_error
+        or tree.root_node.descendant_count > 65_536
+        or tree.root_node.end_byte != len(raw)
+    ):
+        return None
+    begin, finish = len(content[:start].encode()), len(content[:end].encode())
+    if not begin < finish:
+        return None
+    node = tree.root_node.descendant_for_byte_range(begin, finish)
+    while node is not None and node.type != "function_definition":
+        node = node.parent
+    if node is None or node.parent != tree.root_node:
+        return None
+    owner = node
+    named, body = owner.child_by_field_name("name"), owner.child_by_field_name("body")
+    if (
+        named is None
+        or owner.child_by_field_name("redirect") is not None
+        or not re.fullmatch(rb"[A-Za-z_][A-Za-z0-9_]{0,63}", named.text)
+        or body is None
+        or body.type != "compound_statement"
+        or body.named_child_count != 1
+        or any(not child.is_named and child.type not in {"{", "}", ";"} for child in body.children)
+    ):
+        return None
+    command = body.named_children[0]
+    if command.type == "redirected_statement":
+        for redirect in command.children_by_field_name("redirect"):
+            if redirect.type != "file_redirect" or not re.fullmatch(
+                rb"(?:[12]?>[ \t]*/dev/null|[12]?>&[12])", redirect.text
+            ):
+                return None
+        command = command.child_by_field_name("body")
+    if command is None or not (command.start_byte <= begin < finish <= command.end_byte):
+        return None
+    params = _forwarding_parameters(command)
+    if params is None:
+        return None
+    argument, index, duration_index, default = params
+    if not begin <= argument.start_byte < argument.end_byte <= finish:
+        return None
+    name = named.text.decode()
+    protected = {name, "bash", "sh", "timeout"}
+    if name in {"sh", "bash", "timeout", "command_not_found_handle"} or name in _BINDING_BUILTINS:
+        return None
+    # Only the lexical calls in an entirely closed top-level script can clear
+    # a declaration. In a larger script a demonstrably dynamic direct call may
+    # refine its location, even when other possible callers remain unknown.
+    calls: list[ShellProgramCaller] = []
+    known_commands = set()
+    scopes = [(owner.start_byte, owner.end_byte)]
+    uncertain_scopes: list[tuple[int, int]] = []
+    closed = True
+    pending = [tree.root_node]
+
+    def offset(byte: int) -> int:
+        return byte if len(raw) == len(content) else len(raw[:byte].decode())
+
+    while pending:
+        check_runtime()
+        n = pending.pop()
+        pending.extend(reversed(n.named_children))
+        if time.monotonic() >= deadline:
+            return None
+        if n.type == "function_definition" and n != owner:
+            fn = n.child_by_field_name("name")
+            if fn is None or fn.text.decode() in protected:
+                return None
+        if n.type in {"word", "raw_string", "string", "concatenation"} and n.text in {
+            named.text,
+            b"'" + named.text + b"'",
+            b'"' + named.text + b'"',
+        }:
+            parent = n.parent
+            direct = parent is not None and parent.type == "command_name"
+            if not direct and n != named:
+                closed = False
+        if n.type in {"command", "variable_assignment"} and n != command:
+            target = n.child_by_field_name("name")
+            if target is None:
+                return None
+            spelling = _literal_argument(target)
+            if n.type == "variable_assignment":
+                var = target.text.decode()
+                hazard = is_managed_shell_variable(var) or var.startswith(("LD_", "DYLD_"))
+            else:
+                hazard = spelling is None or spelling in _BINDING_COMMANDS
+                if spelling == "command":
+                    first = n.child_by_field_name("argument")
+                    hazard = first is None or _literal_argument(first) not in {"-v", "-V"}
+            if hazard:
+                closed = False
+                scope = n.parent
+                while scope is not None and scope.type not in {
+                    "command_substitution",
+                    "subshell",
+                    "program",
+                }:
+                    scope = scope.parent
+                if scope is not None:
+                    if len(uncertain_scopes) >= 128:
+                        return None
+                    uncertain_scopes.append((n.start_byte, scope.end_byte))
+            if n.type == "command" and spelling == name:
+                if target.text != named.text or n.start_byte < owner.end_byte or len(calls) >= 128:
+                    return None
+                if any(a < n.start_byte < b for a, b in uncertain_scopes):
+                    # A later binding change cannot invalidate an earlier,
+                    # independently established unresolved call, but it does
+                    # prevent a closed-world claim on subsequent calls.
+                    closed = False
+                    continue
+                caller = _forwarded_argument(n, index, duration_index, default)
+                if caller is None:
+                    return None
+                span, literal, fixed_other_args = caller
+                closed = closed and fixed_other_args
+                calls.append(
+                    ShellProgramCaller(offset(span.start_byte), offset(span.end_byte), literal)
+                )
+                known_commands.add(n.id)
+                scopes.append((n.start_byte, n.end_byte))
+    if not calls:
+        return None
+
+    def accounted_statement(statement: Node) -> bool:
+        if statement == owner or statement.type == "comment" or statement.id in known_commands:
+            return True
+        if statement.type != "variable_assignment":
+            return False
+        binding = statement.child_by_field_name("name")
+        value = statement.child_by_field_name("value")
+        if binding is None or value is None or not _ordinary_binding(binding.text.decode()):
+            return False
+        captured = _substitution_command(_unquote_expansion(value))
+        return captured is not None and captured.id in known_commands
+
+    closed = closed and all(accounted_statement(child) for child in tree.root_node.named_children)
+    return ShellProgramForwarding(
+        (offset(argument.start_byte), offset(argument.end_byte)),
+        tuple(calls),
+        tuple((offset(low), offset(high)) for low, high in scopes),
+        closed,
+    )
