@@ -14,6 +14,8 @@ from functools import lru_cache
 _MAX_SOURCE_CHARS = 131_072
 _MAX_TOKENS = 16_384
 _LITERAL_CODE = re.compile(r"[A-Za-z0-9_./:<>=@%+,?*~ \t-]+\Z")
+_NAMED_PATH = re.compile(r"\$[A-Z_][A-Z0-9_]*/[A-Za-z0-9_./-]+\Z")
+_TEMPLATE_WORD = re.compile(r"\{[A-Z_][A-Z0-9_]*\}")
 _CONTAINER_MARKER = re.compile(
     r"(?m)(?:^|(?<=\r)) {0,3}(?:>|(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t\r\n]|$))"
 )
@@ -23,6 +25,7 @@ _CONTAINER_MARKER = re.compile(
 class QuotedListSpans:
     code: tuple[tuple[int, int, int, int], ...]
     lines: tuple[tuple[int, int], ...]
+    fence_markers: tuple[tuple[int, int], ...] = ()
 
 
 @lru_cache(maxsize=8)
@@ -50,6 +53,7 @@ def _quoted_list_spans(content: str) -> QuotedListSpans | None:
         offsets.append(offsets[-1] + len(line))
     code: list[tuple[int, int, int, int]] = []
     lines: list[tuple[int, int]] = []
+    fence_markers: list[tuple[int, int]] = []
     ancestors: list[str] = []
     for block in blocks:
         if block.nesting == 1:
@@ -58,6 +62,27 @@ def _quoted_list_spans(content: str) -> QuotedListSpans | None:
                 return None
         elif block.nesting == -1:
             ancestors.pop()
+        elif block.type == "fence" and "blockquote_open" in ancestors and block.map:
+            first, finish = block.map
+            if finish - first < 2:
+                continue
+            # Both source lines must explicitly own the same quoted container;
+            # an EOF-closed or lazily continued fence grants no source bytes.
+            marker = re.compile(r"^(?P<quote>(?: {0,3}> ?)+) {0,3}(?P<mark>`{3,}|~{3,})")
+            opened = marker.match(raw_lines[first])
+            closed = marker.match(raw_lines[finish - 1])
+            if (
+                opened
+                and closed
+                and opened["mark"] == block.markup
+                and opened["quote"].count(">") == closed["quote"].count(">")
+                and closed["mark"].startswith(block.markup)
+                and not raw_lines[finish - 1][closed.end() :].strip()
+            ):
+                for row, match in ((first, opened), (finish - 1, closed)):
+                    fence_markers.append(
+                        (offsets[row] + match.start("mark"), offsets[row] + match.end("mark"))
+                    )
         elif (
             block.type == "inline"
             and (
@@ -117,7 +142,24 @@ def _quoted_list_spans(content: str) -> QuotedListSpans | None:
                 for begin, finish, width in captured:
                     body = block.content[begin + width : finish - width]
                     if _LITERAL_CODE.fullmatch(body) is None:
-                        continue
+                        # A fixed filename may carry a template-name marker.
+                        # Parameter expansion, braces with alternatives, and
+                        # dynamic executable words keep the existing fallback.
+                        with_names = _TEMPLATE_WORD.sub("NAME", body) if "{" in body else body
+                        if _LITERAL_CODE.fullmatch(with_names) is None and not (
+                            _NAMED_PATH.fullmatch(body)
+                            and (
+                                re.search(
+                                    r"\b(?:(?:over|under|inside|in|at) +|Read +[0-9]+ +— +)$",
+                                    block.content[max(0, begin - 20) : begin],
+                                )
+                                or re.match(
+                                    r" is the (?:canonical |primary )?(?:source|path)\b",
+                                    block.content[finish : finish + 40],
+                                )
+                            )
+                        ):
+                            continue
                     index = bisect_right(starts, begin) - 1
                     low, high, absolute = mapping[index]
                     if low <= begin and finish <= high:
@@ -131,7 +173,7 @@ def _quoted_list_spans(content: str) -> QuotedListSpans | None:
                             )
                         )
                 lines.extend((absolute, absolute + high - low) for low, high, absolute in mapping)
-    return QuotedListSpans(tuple(code), tuple(lines))
+    return QuotedListSpans(tuple(code), tuple(lines), tuple(fence_markers))
 
 
 def quoted_list_spans(content: str, check_runtime: Callable[[], None]) -> QuotedListSpans | None:

@@ -275,7 +275,7 @@ _MARKDOWN_CONTRACTION_PROSE_RE = re.compile(
 # ``reference's`` or ``don't``. The suffix must end the word, so a quote that
 # closes a shell word, as in ``r'm'``, never matches.
 _MARKDOWN_WORD_APOSTROPHE_RE = re.compile(
-    r"(?<![\w'/.~-])[A-Za-z]++(?P<apostrophe>')(?:s|t|d|m|re|ve|ll)(?![\w'/])",
+    r"(?<![\w'/.~-])(?:[A-Za-z]++|[A-Za-z0-9]++(?='s\b))(?P<apostrophe>')(?:s|t|d|m|re|ve|ll)(?![\w'/])",
     re.IGNORECASE,
 )
 # Shell syntax that opens a quote, an expansion, or a line continuation.
@@ -9353,6 +9353,15 @@ _MARKDOWN_EXAMPLE_CELL = re.compile(
 )
 
 
+_CONSOLE_PATH_ERROR = re.compile(
+    r"^[a-zA-Z][a-zA-Z0-9_.-]*: (?:error|fatal): [a-zA-Z][a-zA-Z ]{1,80} "
+    r"(?P<open>`)/[a-zA-Z0-9_./-]+(?P<close>')[.!]?[ \t]*\r?$",
+    re.M,
+)
+_MARKDOWN_QUOTED_STATUS = re.compile(
+    r'\*\*(?P<open>")[A-Z][A-Za-z ]{0,48}\([A-Za-z]+(?: [A-Za-z]+){0,3}\)(?P<close>")\*\*'
+    r"(?= +(?:and|or) +)"
+)
 _MARKDOWN_HEADER_QUALIFIER = re.compile(
     r"[ \t]*[A-Z][a-zA-Z]+[ \t]+(?P<open>\()[A-Za-z]+(?: [A-Za-z]+){0,3}(?P<close>\))[ \t]*"
 )
@@ -9426,6 +9435,7 @@ def _markdown_shell_text(
     powershell_blocks: list[tuple[int, int]] | None = None,
     inline_code_ranges: list[tuple[int, int]] | None = None,
     inline_possessive_apostrophes: set[int] | None = None,
+    nested_markdown: bool = True,
 ) -> str:
     """Mask Markdown delimiters while retaining code and exact source offsets.
 
@@ -9447,6 +9457,8 @@ def _markdown_shell_text(
     prose_apostrophes: set[int] = set()
     inline_possessives: set[int] = set()
     runs: list[tuple[int, int]] = []
+    closed_fences: list[tuple[int, int]] = []
+    inline_messages: dict[int, int] = {}
     list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
     backtick_runs = re.compile(r"`+")
 
@@ -9502,6 +9514,14 @@ def _markdown_shell_text(
                 if (start - escape_start) % 2 == 0:
                     return
         for (start, end), (close_start, close_end) in pairs:
+            if (
+                close_start - end <= 1024
+                and content.startswith(("Error: ", "Warning: ", "Fatal: "), end)
+                and not re.search(
+                    r"[;`$\\|<>&\r\n]|\b(?:eval|(?:ba)?sh)\b", content[end:close_start]
+                )
+            ):
+                inline_messages[end] = close_start
             if inline_regions is not None:
                 inline_regions.append((end, close_start))
             output[start:end] = " " * (end - start)
@@ -9728,6 +9748,43 @@ def _markdown_shell_text(
                     and fence[3] in {"powershell", "pwsh", "ps1"}
                 ):
                     powershell_blocks.append((fence_body_start, offset))
+                closed_fences.append((fence_body_start, offset))
+                if complete_context and nested_markdown and fence[3] in {"markdown", "md"}:
+                    # Only project delimiter pairs that the child Markdown
+                    # document actually owns. A second nested fence remains
+                    # literal, and all command strings in the outer source
+                    # continue through their normal checks.
+                    section = content[fence_body_start:offset]
+                    child_ranges: list[tuple[int, int]] = []
+                    _markdown_shell_text(
+                        section,
+                        check_runtime,
+                        inline_code_ranges=child_ranges,
+                        nested_markdown=False,
+                    )
+                    for inner_start, inner_end in child_ranges:
+                        check_runtime()
+                        start, end = fence_body_start + inner_start, fence_body_start + inner_end
+                        if inline_code_ranges is not None:
+                            inline_code_ranges.append((start, end))
+                        if inner_end - inner_start > 128 or not re.fullmatch(
+                            r"(?:[A-Za-z][A-Za-z0-9_./: (),!…\[\]-]*|<[A-Za-z][A-Za-z0-9_.: ,/-]*>|(?:[A-Za-z][\w.-]*-)?<[A-Za-z][\w-]*>(?:-[A-Za-z][\w.-]*)?)",
+                            section[inner_start:inner_end],
+                        ):
+                            continue
+                        # Restrict this projection to single delimiters. Other
+                        # widths may themselves demonstrate inline markup.
+                        if content[start - 2 : start] == "``" or content[end : end + 2] == "``":
+                            continue
+                        output[start - 1] = output[end] = " "
+                        if inline_regions is not None:
+                            inline_regions.append((start, end))
+                if complete_context and fence[3] in {"", "text", "plaintext", "console"}:
+                    # A complete, tool-prefixed error line quotes the path
+                    # printed by the program, including traditional GNU quotes.
+                    for message in _CONSOLE_PATH_ERROR.finditer(content, fence_body_start, offset):
+                        check_runtime()
+                        output[message.start("open")] = output[message.start("close")] = " "
                 if complete_context and fence[3] == "text":
                     for arrow in _SEQUENCE_DIAGRAM_ARROW.finditer(
                         content, fence_body_start, offset
@@ -9975,6 +10032,20 @@ def _markdown_shell_text(
                                 prose_apostrophes.update(apostrophes)
                 elif not separator and not empty_list_item:
                     if (
+                        heading
+                        and word_apostrophes
+                        and complete_context
+                        and not runs
+                        and len(leading) <= 180
+                        and re.fullmatch(r"#{1,6} +[A-Za-z0-9 ,.'_-]+", leading)
+                    ):
+                        marks = list(_MARKDOWN_WORD_APOSTROPHE_RE.finditer(leading))
+                        if len(marks) == leading.count("'"):
+                            prose_apostrophes.update(
+                                offset + prefix + m.start("apostrophe") for m in marks
+                            )
+
+                    if (
                         complete_context
                         and has_list_marker
                         and not runs
@@ -9983,6 +10054,17 @@ def _markdown_shell_text(
                     ):
                         output[offset + note.start("open")] = " "
                         output[offset + note.start("close")] = " "
+                    if (
+                        complete_context
+                        and not runs
+                        and (status := _MARKDOWN_QUOTED_STATUS.match(leading))
+                    ):
+                        prose_apostrophes.update(
+                            (
+                                offset + prefix + status.start("open"),
+                                offset + prefix + status.start("close"),
+                            )
+                        )
                     if complete_context and has_list_marker and not runs and len(leading) <= 512:
                         if message := _MARKDOWN_RECORD_MESSAGE.match(leading):
                             prose_apostrophes.update(
@@ -10110,6 +10192,7 @@ def _markdown_shell_text(
     quoted_code: dict[int, tuple[int, int, int]] = {}
     if complete_context and (quoted := quoted_list_spans(content, check_runtime)) is not None:
         quoted_code = {start: (body, close, end) for start, body, close, end in quoted.code}
+        quoted_code.update((start, (end, end, end)) for start, end in quoted.fence_markers)
         if word_apostrophes:
             code_starts = sorted(quoted_code)
             for start, end in quoted.lines:
@@ -10144,10 +10227,24 @@ def _markdown_shell_text(
         parameter_ends: dict[int, _ParameterExpansionEnd] = {}
         substitution_ends: dict[int, int | None] = {}
         backtick_ends: dict[int, int | None] = {}
+        fence_index = 0
         while cursor <= last_candidate:
+            while fence_index < len(closed_fences) and closed_fences[fence_index][1] <= cursor:
+                fence_index += 1
+            if fence_index < len(closed_fences):
+                fence_start, fence_end = closed_fences[fence_index]
+                if fence_start <= cursor < fence_end:
+                    # Punctuation inside a closed source block cannot consume
+                    # later, separately owned Markdown prose. The block keeps
+                    # its raw content for the independent execution checks.
+                    cursor = fence_end
+                    continue
             if cursor >= next_runtime_check:
                 check_runtime()
                 next_runtime_check = cursor + 4096
+            if cursor in inline_messages:
+                cursor = inline_messages[cursor]
+                continue
             if cursor in quoted_code:
                 body, close, end = quoted_code[cursor]
                 output[cursor:body] = " " * (body - cursor)

@@ -886,3 +886,39 @@ def test_prose_ownership_checks_cancellation_after_word_jumps(
     content += "\n\n" + prefix + "The interface doesn't match the spec.\n"
     with pytest.raises(TimeoutError, match="cancelled"):
         tm._markdown_shell_text(content, cancel)
+
+
+def test_quoted_fence_markers_need_an_explicit_matching_close():
+    from skillspector.markdown_tokens import quoted_list_spans
+
+    closed = "> ```text\n> status\n> ```\n"
+    open_only = "> ```text\n> status\n"
+    for source, expected in [(closed, ["```", "```"]), (open_only, [])]:
+        spans = quoted_list_spans(source, lambda: None)
+        assert spans is not None
+        assert [source[a:b] for a, b in spans.fence_markers] == expected
+
+
+@pytest.mark.parametrize("name", ["gen2's", "2's"])
+def test_alphanumeric_possessive_in_documentation(name: str):
+    source = f"Use {name} ordinary output.\n\n> Read `guide.md` in this guide.\n"
+    assert "'" not in tm._markdown_shell_text(source, lambda: None, word_apostrophes=True)
+
+
+def test_nested_markdown_example_keeps_executing_inline_and_fenced_sinks():
+    safe = "````markdown\n- **State:** the `READY_FLAG` value.\n````\n"
+    harmful = safe.replace("the `READY_FLAG` value", 'the `sh -c "$CMD"` command')
+    actual = safe + "\n```sh\nsudo rm -rf /\n```\n"
+
+    assert tm.bounded_parse_diagnostic(safe, lambda: None, file_type="markdown") is None
+    assert tm.bounded_parse_diagnostic(harmful, lambda: None, file_type="markdown") is not None
+    assert any(f.rule_id == "TM1" for f in tm.analyze(actual, "example.md", "markdown"))
+
+
+def test_documentation_can_quote_a_path_in_console_output():
+    message = "tool: error: cannot open `/tmp/output'\n"
+    closed = "```console\n" + message + "```\n"
+    as_shell = "```sh\n" + message + "```\n"
+    assert " /tmp/output " in tm._markdown_shell_text(closed, lambda: None)
+    for source in ["```console\n" + message, as_shell, closed.replace("/tmp/output", "$TARGET")]:
+        assert "`" in tm._markdown_shell_text(source, lambda: None)
