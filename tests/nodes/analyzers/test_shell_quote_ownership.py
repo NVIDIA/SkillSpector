@@ -2487,8 +2487,6 @@ def test_sourced_function_reports_runtime_operand_in_the_caller(tmp_path: Path) 
         _SOURCE_RELATIVE + 'source "$EXTERNAL"\nroute "$REQUEST" shell',
         _SOURCE_RELATIVE + 'if false; then route "$REQUEST" shell; fi',
         _SOURCE_RELATIVE + 'return 0\nroute "$REQUEST" shell',
-        _SOURCE_RELATIVE.replace('source "${base}/actions.sh"', "source ./actions.sh")
-        + 'route "$REQUEST" shell',
     ],
 )
 def test_sourced_eval_needs_exact_binding_and_selected_arm(source: str) -> None:
@@ -2516,3 +2514,26 @@ def test_sourced_eval_honors_later_library_replacement() -> None:
         "overrides.sh": 'route() { printf "%s" "$1"; }',
     }
     assert tm.sourced_eval_argument(source, "main.sh", sources, lambda: None) is None
+
+
+@pytest.mark.parametrize(
+    "derive",
+    [
+        'base=$( cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P )',
+        'base="$( cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+    ],
+)
+def test_sourced_eval_script_directory_follows_native_words(derive: str) -> None:
+    source = derive + '\nsource "$base/actions.sh"\nroute "$REQUEST" shell'
+    state = {"main.sh": source, "actions.sh": _SOURCED_EVAL_LIB}
+    diag = tm.sourced_callable_diagnostic("main.sh", source, state, lambda: None)
+    assert diag and diag.check == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert source[diag.start : diag.end] == '"$REQUEST"'
+
+
+def test_working_directory_relative_source_reports_uncertain_callee_identity() -> None:
+    source = 'source ./actions.sh\nroute "$REQUEST" shell'
+    state = {"main.sh": source, "actions.sh": _SOURCED_EVAL_LIB}
+    diag = tm.sourced_callable_diagnostic("main.sh", source, state, lambda: None)
+    assert diag and diag.check == tm.ParserCheck.COMMAND_IDENTITY
+    assert source[diag.start : diag.end] == "route"

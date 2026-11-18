@@ -10597,9 +10597,13 @@ def sourced_callable_diagnostic(
         return None
     return StaticParserDiagnostic(
         ParserCause.RUNTIME_DEPENDENT,
-        ParserCheck.COMMAND_STRING_RUNTIME,
+        ParserCheck.COMMAND_STRING_RUNTIME
+        if witness.script_relative
+        else ParserCheck.COMMAND_IDENTITY,
         *witness.caller_span,
-        ParserUncheckedScope.COMMAND_STRING,
+        ParserUncheckedScope.COMMAND_STRING
+        if witness.script_relative
+        else ParserUncheckedScope.COMMAND_WORD,
     )
 
 

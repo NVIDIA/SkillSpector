@@ -11,12 +11,12 @@ from array import array
 from bisect import bisect_left
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import PurePosixPath
 
 import tree_sitter_bash
 from tree_sitter import Language, Node, Parser, Tree
 
 from skillspector.shell_helper_argv import is_managed_shell_variable
+from skillspector.shell_sources import bundled_script_sibling
 
 _LANGUAGE = Language(tree_sitter_bash.language())
 _SHEBANG = re.compile(r"^#![ \t]*(?:/[^ \t\r\n]*/|/)(?:env[ \t]+)?(?:bash|sh)(?:[ \t\r\n]|$)")
@@ -869,6 +869,7 @@ class SourcedEval:
     caller_span: tuple[int, int]
     definition_path: str
     eval_span: tuple[int, int]
+    script_relative: bool
 
 
 def _forwarded_eval(
@@ -937,17 +938,47 @@ def _forwarded_eval(
     return (variables[var[1]][0], argument) if var and var[1] in variables else None
 
 
+def _script_directory(value: Node) -> bool:
+    """Match a directory derived from the original script's positional identity."""
+    value = _unquote_expansion(value)
+    if value.type != "command_substitution" or value.named_child_count != 1:
+        return False
+    sequence = value.named_children[0]
+    if sequence.type != "list" or [n.type for n in sequence.children] != [
+        "command",
+        "&&",
+        "command",
+    ]:
+        return False
+    cd, pwd = sequence.named_children
+    cd_words, pwd_words = cd.named_children, pwd.named_children
+    if [word.text for word in pwd_words] not in ([b"pwd"], [b"pwd", b"-P"]):
+        return False
+    if [word.text for word in cd_words[:-1]] not in ([b"cd"], [b"cd", b"--"]):
+        return False
+    directory = cd_words[-1]
+    if directory.type != "string" or directory.named_child_count != 1:
+        return False
+    command = _substitution_command(directory.named_children[0])
+    if command is None:
+        return False
+    words = command.named_children
+    return [word.text for word in words[:-1]] in ([b"dirname"], [b"dirname", b"--"]) and words[
+        -1
+    ].text == b'"${BASH_SOURCE[0]}"'
+
+
 def sourced_eval_argument(
     caller: str, path: str, sources: Mapping[str, str], check_runtime: Callable[[], None]
 ) -> SourcedEval | None:
     """Find an original script-relative library function consuming a runtime shell program.
 
     Only declarative libraries and a straight-line caller prefix establish a binding.
+    A working-directory-relative include establishes only a possible callable identity.
     This adds an uncertainty witness without granting any completion or removing findings.
     """
     if (
         len(caller) > 131_072
-        or "BASH_SOURCE[0]" not in caller
         or sources.get(path) != caller
         or not ("source " in caller or ". " in caller)
     ):
@@ -985,7 +1016,7 @@ def sourced_eval_argument(
         return None
     directories: set[bytes] = set()
     assigned: set[bytes] = set()
-    definitions: dict[bytes, tuple[str, Node]] = {}
+    definitions: dict[bytes, tuple[str, Node, bool]] = {}
     loaded: set[str] = set()
     for node in root.children:
         check_runtime()
@@ -1007,7 +1038,7 @@ def sourced_eval_argument(
             if name.text in directories or name.text in assigned:
                 return None
             assigned.add(name.text)
-            if value.text == b'"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"':
+            if _script_directory(value):
                 directories.add(name.text)
             elif _literal_argument(value) is None:
                 return None
@@ -1027,12 +1058,19 @@ def sourced_eval_argument(
             ref = re.fullmatch(
                 rb'"\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})/([\w./-]+)"', args[0].text
             )
-            if not ref or (ref[1] or ref[2]) not in directories:
+            script_relative = bool(ref and (ref[1] or ref[2]) in directories)
+            literal = _literal_argument(args[0])
+            if script_relative and ref:
+                suffix = ref[3].decode()
+            elif literal and literal.startswith("./"):
+                suffix = literal[2:]
+            else:
                 return None
-            relative = ref[3].decode().split("/")
-            if any(part in {"", ".", ".."} for part in relative):
+            source_path = bundled_script_sibling(path, suffix)
+            if source_path is None:
                 return None
-            source_path = str(PurePosixPath(path).parent.joinpath(*relative))
+            if not script_relative and suffix != source_path and suffix in sources:
+                return None
             library = sources.get(source_path)
             if source_path in loaded or library is None:
                 return None
@@ -1057,7 +1095,7 @@ def sourced_eval_argument(
                     b"local",
                 }:
                     return None
-                definitions[symbol.text] = (source_path, body)
+                definitions[symbol.text] = (source_path, body, script_relative)
             continue
         if (
             name not in definitions
@@ -1065,7 +1103,7 @@ def sourced_eval_argument(
             or not all(_single_argv_slot(arg) for arg in args)
         ):
             return None
-        source_path, body = definitions[name]
+        source_path, body, script_relative = definitions[name]
         reached = _forwarded_eval(body, args, check_runtime)
         if reached is not None:
             slot, sink = reached
@@ -1075,16 +1113,18 @@ def sourced_eval_argument(
                 if var and (var[1] or var[2]) not in assigned:
                     raw = caller.encode()
                     source_raw = sources[source_path].encode()
+                    witness = argument if script_relative else node.named_children[0]
                     return SourcedEval(
                         (
-                            len(raw[: argument.start_byte].decode()),
-                            len(raw[: argument.end_byte].decode()),
+                            len(raw[: witness.start_byte].decode()),
+                            len(raw[: witness.end_byte].decode()),
                         ),
                         source_path,
                         (
                             len(source_raw[: sink.start_byte].decode()),
                             len(source_raw[: sink.end_byte].decode()),
                         ),
+                        script_relative,
                     )
         # An intervening function may change the current shell's bindings.
         return None
