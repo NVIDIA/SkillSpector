@@ -899,9 +899,9 @@ def test_executor_member_reads_keep_existing_conservative_coverage(source: str) 
         "import {win32 as p} from 'node:path'; const path = p.join(`${name}`, 'file');",
         "import {join as makePath} from 'path'; const path = makePath(`${name}`, 'file');",
         "import {join as run} from 'node:path'; const path = run(`${name}`, 'file');",
-        "function hash(values) { const r = (x, n) => (x >>> n) | (x << (32 - n)); return r(values[0], 7); } function other(r) { return r; }",
-        "function hash(values) { const run = x => x * 2; return run(values[0]); } function other(r) { return r; }",
-        "function first(values) { const r = x => x + 1; return r(values[0]); } function second(r) { return r; }",
+        "function hash(values) { const r = (x, n) => (x >>> n) | (x << (32 - n)); return r(35, 7); } function other(r) { return r; }",
+        "function hash(values) { const run = x => x * 2; return run(12); } function other(r) { return r; }",
+        "function first(values) { const r = x => x + 1; return r(12); } function second(r) { return r; }",
     ],
 )
 @pytest.mark.parametrize("suffix", ["", _PADDING], ids=["short", "padded"])
@@ -1516,7 +1516,7 @@ def test_local_helper_and_regex_do_not_mask_runtime_call_locations():
 @pytest.mark.parametrize(
     "definition,call",
     [
-        ("function sample(get) {return get(1)}", "sample(i => coords[i])"),
+        ("const coords=[0,2]; function sample(get) {return get(1)}", "sample(i => coords[i])"),
         ("const sample = (value, emit) => { if (emit) emit(value); }", "sample(1)"),
         ("function sample(Kind) {return new Kind(4)}", "sample(Float64Array)"),
         ("import * as v from './v.mjs'; const sample = v.scale;", "sample(2)"),
@@ -1717,3 +1717,103 @@ def test_external_option_witness_requires_unchanged_source(mutation):
         source.replace("const {cb}", mutation + "const {cb}"), lambda: None
     )
     assert changed is not None and _external_option_callback(changed, lambda: None) is None
+
+
+@pytest.mark.parametrize(
+    "setup, body, argument, expected",
+    [
+        ("const table=new Proxy({}, {get:hook});", "i=>table[i]", "1", False),
+        ("const table={get 1(){return hook()}};", "i=>table[i]", "1", False),
+        ("const table=[2,3];", "i=>table[i]", "1", True),
+        ("const table=[2,,3];", "i=>table[i]", "1", False),
+        ("const table=[2,3];", "i=>table[i]", "3", False),
+        ("const table=[2,3]; expose(table);", "i=>table[i]", "1", False),
+        ("const table=[2,3];", "i=>table[i]", "key", False),
+        ("", "i=>i+1", "key", False),
+        ("const y={[Symbol.toPrimitive]:hook};", "i=>i+1", "y", False),
+        ("const y=3;", "i=>i+1", "y", True),
+        ("", "i=>i===1", "key", True),
+    ],
+)
+def test_private_arrow_implicit_operations(setup, body, argument, expected):
+    source = (
+        "export function select(hook,key) {"
+        + setup
+        + f"function take(fn) {{return fn({argument})}}"
+        + "return `sample ${take("
+        + body
+        + ")}`; }"
+    )
+    assert bool(javascript_template_spans(source, lambda: None)) == expected
+
+
+@pytest.mark.parametrize(
+    "arg, safe",
+    [
+        ("1", True),
+        ("", True),
+        ("list", False),
+        ("{[Symbol.iterator]:step}", False),
+        ("{valueOf:step}", False),
+        ("...rest", False),
+    ],
+)
+def test_private_typed_constructor_only_owns_primitive_input(arg, safe):
+    source = (
+        "export function select(list,step,...rest){"
+        + "function make(Kind){return new Kind("
+        + arg
+        + ")}"
+        + "return `sample ${make(Uint8Array)}`;}"
+    )
+    assert bool(javascript_template_spans(source, lambda: None)) == safe
+
+
+@pytest.mark.parametrize("input_value, data", [("item", False), ("4", True), ("opts[0]", False)])
+def test_local_numeric_helper_checks_implicit_conversions(input_value, data):
+    source = (
+        "export function compute(handler,opts){const item={[Symbol.toPrimitive]:handler};"
+        "const run=(i)=>i+1; return `value ${run(" + input_value + ")}`;}"
+    )
+    assert bool(javascript_template_spans(source, lambda: None)) == data
+
+
+@pytest.mark.parametrize("value,data", [("2", True), ("{[Symbol.toPrimitive]:handler}", False)])
+def test_returned_private_value_reaches_interpolation(value, data):
+    source = (
+        "export function compute(handler){const v="
+        + value
+        + "; function take(fn){return fn(v)} return `value ${take(i=>i)}`;}"
+    )
+    assert bool(javascript_template_spans(source, lambda: None)) == data
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "function hash(values) { const r = (x, n) => (x >>> n) | (x << (32 - n)); return r(values[0], 7); } function other(r) { return r; }",
+        "function hash(values) { const run = x => x * 2; return run(values[0]); } function other(r) { return r; }",
+        "function first(values) { const r = x => x + 1; return r(values[0]); } function second(r) { return r; }",
+        "function first(values){const alias=values;const nested=alias;const r=x=>x+1;return r(nested[0]);}",
+    ],
+)
+def test_local_numeric_helpers_retain_unconstrained_operands(statement):
+    assert (
+        javascript_template_spans(statement + " console.log(`value ${key}`)", lambda: None) is None
+    )
+
+
+@pytest.mark.parametrize(
+    "usage, complete",
+    [
+        ("for(let i=0;i<16;i++) n(i);", True),
+        ("for(let i=0;i<16;i++) {i=props.input;n(i)}", False),
+        ("[1,2,3].map(i=>n(i))", True),
+        ("external.map(i=>n(i))", False),
+        ("Array.prototype.map = invoke; [1,2,3].map(i=>n(i))", False),
+        ("[1,external].map(i=>n(i))", False),
+    ],
+)
+def test_local_numeric_helpers_only_accept_source_bound_iterations(usage, complete):
+    source = "const n = x => x*2;" + usage + "; const mark=`value ${key}`;"
+    assert bool(javascript_template_spans(source, lambda: None)) == complete
