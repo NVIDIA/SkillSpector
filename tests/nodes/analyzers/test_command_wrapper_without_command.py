@@ -374,12 +374,18 @@ def test_documented_examples_keep_adjacent_shell_checks(content: str) -> None:
     [
         "Execute `` `name` ``.\n",
         "Run `$((n+1))`.\n",
-        "Run `$()`.\n",
+        "Run `$($tool -rf /)`.\n",
         'Make expands its own `$(eval "$value")` expressions.\n',
     ],
 )
 def test_unproved_shell_contexts_stay_partial(content: str) -> None:
     assert _exhausted(content, "markdown")
+
+
+def test_run_instruction_does_not_mark_an_empty_substitution_as_prose() -> None:
+    content = "Run `$()`.\n"
+    start = content.index("$()")
+    assert not tm_module._documented_expansion_placeholder(content, start, start + len("$()"))
 
 
 def test_typeset_notice_requires_closed_prose_and_preserves_shell_consumers() -> None:
