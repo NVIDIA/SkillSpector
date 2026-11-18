@@ -30,6 +30,9 @@ _ESCAPES = {
     "t": "\t",
     "v": "\v",
 }
+_ASSIGNMENT_TARGET = re.compile(
+    r"(\$(?:[A-Za-z_][A-Za-z0-9_:]*|\{[A-Za-z_][A-Za-z0-9_:]*\}))[ \t]*(?:\?\?=|[-+*/%]?=)(?!=)"
+)
 _DYNAMIC_CODE = re.compile(
     r"\b(?:Invoke-Expression|iex|InvokeScript|Set-Alias|New-Alias)\b"
     r"|\[\s*scriptblock\s*\]\s*::\s*Create\b",
@@ -55,6 +58,7 @@ class PowerShellSource:
     clause_starts: tuple[int, ...]
     continuations: tuple[tuple[int, int], ...] = ()
     invocations: tuple[tuple[int, int], ...] = ()
+    assignment_targets: frozenset[int] = frozenset()
 
     def owns(self, position: int) -> bool:
         index = bisect_right(self.starts, position) - 1
@@ -86,6 +90,7 @@ def powershell_source(
     clause_starts: set[int] = {0}
     continuations: list[tuple[int, int]] = []
     invocations: list[tuple[int, int]] = []
+    assignment_targets: set[int] = set()
     checked = -1024
 
     def executable_boundary(start: int, end: int) -> None:
@@ -105,6 +110,7 @@ def powershell_source(
             + len(clause_starts)
             + len(continuations)
             + len(invocations)
+            + len(assignment_targets)
             > _MAX_SPANS
         ):
             raise _UnprovenPowerShellError
@@ -403,6 +409,16 @@ def powershell_source(
                 # merely data. Until their command identity is reconstructed,
                 # keep the original conservative traversal for this source.
                 raise _UnprovenPowerShellError
+            if character == "$" and (target := _ASSIGNMENT_TARGET.match(content, cursor)):
+                previous = cursor - 1
+                while previous >= 0 and content[previous] in " \t":
+                    previous -= 1
+                if previous < 0 or content[previous] in "\r\n;{":
+                    # Only the lvalue is syntax. Subexpressions in the RHS
+                    # and later invocations of this variable stay executable.
+                    assignment_targets.add(cursor)
+                    cursor = target.end(1)
+                    continue
             if content.startswith("${", cursor):
                 cursor = variable(cursor, depth)
                 continue
@@ -445,4 +461,5 @@ def powershell_source(
         tuple(sorted(clause_starts)),
         tuple(continuations),
         tuple(invocations),
+        frozenset(assignment_targets),
     )
