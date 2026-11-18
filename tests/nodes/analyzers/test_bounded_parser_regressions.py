@@ -816,6 +816,45 @@ def test_output_reconciliation_only_clears_resolved_output_incompleteness(
         assert "parser_diagnostic" not in event
 
 
+def test_native_operand_boundary_points_to_the_missing_redirection_target() -> None:
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+
+    source = 'python3 "${ROOT}/task.py" --id <identifier>` trailing text'
+    end = source.index("`")
+    diagnostics = []
+    _, _, limited = tm._bounded_shell_tokens(
+        source, 0, len("python3"), source_end=end, diagnostics=diagnostics
+    )
+    assert limited and diagnostics[0].check == tm.ParserCheck.COMMAND_REDIRECTION_TARGET
+    assert source[diagnostics[0].start : diagnostics[0].end] == ">"
+    valid = 'python3 "${ROOT}/task.py" --id "<identifier>" > report.txt'
+    assert tm._bounded_shell_tokens(valid, 0, len("python3"), source_end=len(valid))[2] is False
+
+
+def test_rendered_browser_markup_reports_the_dynamic_write_at_its_source():
+    from skillspector.python_tokens import generated_script_markup_span
+
+    script = "const d = PLACEHOLDER; const o = document.createElement('option'); o.textContent = `${d.name}`; el.innerHTML = `<b>${d.html}</b>`;"
+    source = f'PAGE = r"""<!doctype html><html>\n<!-- 🚀 -->\n<script>{script}</script></html>"""\np.write_text(PAGE.replace("PLACEHOLDER", data))\n'
+    offset = source.index("${d.name}")
+    span = generated_script_markup_span(source, offset, lambda: None)
+    assert span is not None
+    assert source[slice(*span)] == "el.innerHTML = `<b>${d.html}</b>`"
+    for change in (
+        source + "shell(PAGE)",
+        source.replace("write_text", "run"),
+        source.replace('r"""', '"""'),
+        source.replace("el.innerHTML", "el.textContent"),
+        source.replace("createElement('option')", "createElement('script')"),
+        source.replace("createElement('option')", "getElementById('option')"),
+        source.replace("o.textContent", "o.innerHTML"),
+        source.replace("const d =", "document.createElement = custom; const d ="),
+        source.replace("<script>", "<!-- <script>").replace("</script>", "</script> -->"),
+        source.replace("PLACEHOLDER;", "SOMETHING;"),
+    ):
+        assert generated_script_markup_span(change, change.index("${d.name}"), lambda: None) is None
+
+
 @pytest.mark.parametrize(
     "source",
     [

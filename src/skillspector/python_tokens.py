@@ -24,7 +24,7 @@ from html.parser import HTMLParser
 from threading import Lock
 
 from skillspector.javascript_ast import parse_javascript_source
-from skillspector.javascript_tokens import browser_escaped_list_shell_text
+from skillspector.javascript_tokens import browser_escaped_list_shell_text, browser_markup_witness
 from skillspector.python_ast import MAX_PYTHON_AST_SOURCE_CHARS, parse_python_source
 
 # The tokenizer and the compiler disagree about a carriage return that does
@@ -787,6 +787,122 @@ def _python_browser_strings(
                 if not path_use(reference):
                     return set()
     return result if budget > 0 else set()
+
+
+def generated_script_markup_span(
+    content: str, position: int, check_runtime: Callable[[], None]
+) -> tuple[int, int] | None:
+    """Locate a dynamic markup write in a Python-rendered JavaScript program.
+
+    Refine an existing incomplete shell reading of a JavaScript interpolation.
+    No byte acquires an exemption and this function cannot declare an input clean.
+    """
+    if "innerHTML" not in content or "<!doctype html>" not in content.lower():
+        return None
+    spans = python_literal_spans(content, check_runtime)
+    if spans is None:
+        return None
+    idx = bisect_right(spans[0], position) - 1
+    if idx < 0 or position >= spans[1][idx]:
+        return None
+    start, end = spans[0][idx], spans[1][idx]
+    if content[start].lower() != "r":
+        return None
+    lo, hi = python_string_body(content, start, end)
+    body = content[lo:hi]
+    if not body.lstrip().lower().startswith(
+        "<!doctype html>"
+    ) or not body.rstrip().lower().endswith("</html>"):
+        return None
+    with _PYTHON_OWNERSHIP_PARSE_LOCK, warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        parsed = parse_python_source(content, "<generated script>")
+    if parsed.tree is None:
+        return None
+    # Only trace an exact module-level string with one ordinary render consumer.
+    binding = next(
+        (
+            stmt.targets[0].id
+            for stmt in parsed.tree.body
+            if isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value == body
+            and parsed.line_character_starts[stmt.value.lineno - 1]
+            + (parsed.character_column(stmt.value.lineno, stmt.value.col_offset) or 0)
+            == start
+        ),
+        None,
+    )
+    if binding is None:
+        return None
+    uses = []
+    rendered = []
+    for index, node in enumerate(ast.walk(parsed.tree)):
+        if index % 256 == 0:
+            check_runtime()
+        if index >= 100_000:
+            return None
+        if isinstance(node, ast.Name) and node.id == binding:
+            uses.append(node)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "write_text"
+            and len(node.args) == 1
+            and isinstance(replacement := node.args[0], ast.Call)
+            and isinstance(replacement.func, ast.Attribute)
+            and replacement.func.attr == "replace"
+            and isinstance(receiver := replacement.func.value, ast.Name)
+            and receiver.id == binding
+            and len(replacement.args) == 2
+            and not replacement.keywords
+            and isinstance(marker := replacement.args[0], ast.Constant)
+            and isinstance(marker.value, str)
+            and marker.value
+        ):
+            rendered.append((receiver, marker.value))
+    if (
+        len(uses) != 2
+        or len(rendered) != 1
+        or rendered[0][0] not in uses
+        or body.count(rendered[0][1]) != 1
+    ):
+        return None
+    # The HTML tokenizer supplies the actual plain script, excluding markup in
+    # comments and script-looking text in attributes. Keep original coordinates.
+    lines = [0, *(match.end() for match in re.finditer("\n", body))]
+    scripts: list[tuple[int, str]] = []
+
+    class Script(HTMLParser):
+        active = False
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            self.active = tag == "script" and not attrs
+
+        def handle_endtag(self, tag: str) -> None:
+            self.active = False
+
+        def handle_data(self, data: str) -> None:
+            check_runtime()
+            if self.active:
+                line, column = self.getpos()
+                scripts.append((lo + lines[line - 1] + column, data))
+
+    html = Script(convert_charrefs=False)
+    try:
+        html.feed(body)
+        html.close()
+    except (ValueError, AssertionError):
+        return None
+    for origin, script in scripts:
+        check_runtime()
+        if not origin <= position < origin + len(script) or rendered[0][1] not in script:
+            continue
+        markup = browser_markup_witness(script, position - origin, check_runtime)
+        return None if markup is None else (origin + markup[0], origin + markup[1])
+    return None
 
 
 def python_browser_template_shell_text(content: str, check_runtime: Callable[[], None]) -> str:

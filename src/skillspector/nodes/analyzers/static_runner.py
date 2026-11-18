@@ -1419,6 +1419,17 @@ def _bounded_parser_incomplete(
     python_import_bounds: PythonImportBounds | None = None,
     prepared_analysis: object | None = None,
 ) -> bool:
+    # Parser hooks consume the native dialect for the actual source path,
+    # including marker and derived views. Finding applicability keeps its
+    # established inventory type.
+    if file_type == "other":
+        suffix = path.lower().rsplit(".", 1)[-1]
+        file_type = {
+            "jsx": "javascript",
+            "tsx": "tsx",
+            "mts": "typescript",
+            "cts": "typescript",
+        }.get(suffix, file_type)
     kwargs = {"file_type": file_type, "complete_context": complete_context}
     if vars(module).get("USES_PREPARED_PARSER_ANALYSIS") is True:
         kwargs.update(
@@ -1615,7 +1626,19 @@ class _CompleteSourceCache:
     text: Mapping[str, str]
     raw: Mapping[str, bytes] | None
     inventory: object
+    only_planned_path: str | None = None
     _validated: Mapping[str, str] | None = None
+
+    def is_sole_original(self, path: str, content: str, check_runtime: Callable[[], None]) -> bool:
+        # A validated subset does not establish an absence of other callers.
+        return (
+            self.only_planned_path == path
+            and isinstance(self.inventory, list)
+            and len(self.inventory) == len(self.text) == 1
+            and self.raw is not None
+            and len(self.raw) == 1
+            and self.validated(check_runtime).get(path) == content
+        )
 
     def validated(self, check_runtime: Callable[[], None]) -> Mapping[str, str]:
         check_runtime()
@@ -3557,8 +3580,18 @@ def _scan_all_views_with_parser_diagnostics(
                 if prepare_parser is not None:
                     parser_analyses[id(module)] = prepare_parser(
                         content=content,
-                        file_type="json" if _oms_projected else _infer_file_type(path),
+                        file_type=parser_file_type,
                         check_runtime=finding_budget.check_runtime,
+                        **(
+                            {"sole_original_shell": True}
+                            if parser_file_type == "shell"
+                            and source_cache is not None
+                            and vars(module).get("USES_SOLE_ORIGINAL_SHELL") is True
+                            and source_cache.is_sole_original(
+                                path, content, finding_budget.check_runtime
+                            )
+                            else {}
+                        ),
                     )
                     finding_budget.check_runtime()
                 prepare = _explicit_analysis_hook(module, "prepare_analysis")
@@ -4408,7 +4441,12 @@ def run_static_patterns(
         and "!/" not in str(metadata.get("path", ""))
     }
     raw_inventory = state.get("artifact_inventory", [])
-    source_cache = _CompleteSourceCache(file_cache, raw_file_cache, raw_inventory)
+    source_cache = _CompleteSourceCache(
+        file_cache,
+        raw_file_cache,
+        raw_inventory,
+        components[0] if len(components) == 1 and state.get("inspection_ledger") == [] else None,
+    )
     binary_paths = (
         {
             str(item.get("path", ""))
@@ -4553,7 +4591,12 @@ def run_static_patterns_with_ledger(
     events: list[InspectionLedgerEvent] = []
     notices: list[dict[str, object]] = []
     raw_inventory = state.get("artifact_inventory", [])
-    source_cache = _CompleteSourceCache(file_cache, raw_file_cache, raw_inventory)
+    source_cache = _CompleteSourceCache(
+        file_cache,
+        raw_file_cache,
+        raw_inventory,
+        components[0] if len(components) == 1 and state.get("inspection_ledger") == [] else None,
+    )
     inventory: dict[str, dict[str, object]] = (
         {str(item.get("path", "")): item for item in raw_inventory if isinstance(item, dict)}
         if isinstance(raw_inventory, list)
