@@ -1273,6 +1273,30 @@ def test_escaped_data_does_not_complete_unresolved_file_and_pipe_consumers(body:
     assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell") is not None
 
 
+@pytest.mark.parametrize(
+    "script",
+    [
+        """PROMPT_COMMAND+=("$(printf '%q' "$input")")""",
+        """declare -ai parts\nparts+=("$(printf '%q' "$input")")""",
+        """parts+=("$(printf '%q' "$input")")\nlet 'parts[0]'""",
+        """parts+=("$(printf '%q' "$input")")\ncoproc "${parts[0]}" """,
+        """parts+=("$(printf '%q' "$input")")\npython3.13 "${parts[0]}" """,
+        """parts+=("$(printf '%q' "$input")")\nrunner "${parts[0]}" """,
+        """parts+=("$(printf '%q' "$input")")\ncopy="${parts[0]}"\nrunner "$copy" """,
+        """parts+=("$(printf '%q' "$input")")\n{\nprintf '%s' "${parts[0]}"\n} | sh""",
+        """parts+=("$(printf '%q' "$input")")\nresult=$(\nprintf '%s' "${parts[0]}"\n)\n"$result" """,
+        """parts+=("$(printf '%q' "$input")")\nexec >runner\nprintf '%s' "${parts[0]}"\nbash runner""",
+    ],
+)
+def test_printf_storage_requires_a_proven_data_consumer(script: str) -> None:
+    assert tm.bounded_parse_diagnostic(script, lambda: None, file_type="shell") is not None
+
+
+def test_plain_array_binding_and_literal_output_remain_inspectable() -> None:
+    source = """declare -a parts\nparts+=("$(printf '%q' "$input")")\nprintf '%s' "${parts[0]}" """
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell") is None
+
+
 _FILTER_DATA = """$(printf '%s' "$ref" | tr 'A-F' 'a-f')"""
 
 

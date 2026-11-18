@@ -3795,6 +3795,34 @@ _QUOTED_ASSIGNMENT = re.compile(
 
 _PRINTF_CARRY = re.compile(r"""[ \t]*(?P<name>[A-Za-z_][A-Za-z_0-9]*)\+?="(?P<rhs>.*)"[ \t]*$""")
 
+# Prove that display output stays on the ordinary output stream. A command
+# substitution, a redirected group or an earlier exec redirect can capture a
+# printf even when the printf line itself contains no redirection.
+_PRINTF_DISPLAY_PARAMETER = r"\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*(?:\[(?:[0-9]+|[@*])\])?\})"
+_PRINTF_DISPLAY_WORD = (
+    r"""(?:[A-Za-z0-9_./:%+,-]++|'[A-Za-z0-9_ ./:%+,\\-]*'|"""
+    rf""""(?:[A-Za-z0-9_ ./:%+,@*-]|\\[nrt]|{_PRINTF_DISPLAY_PARAMETER})*")"""
+)
+_PRINTF_DISPLAY_RECORD = re.compile(
+    rf"(?:[A-Za-z_]\w*\+?=(?:{_PRINTF_DISPLAY_WORD}|\((?:{_PRINTF_DISPLAY_WORD})?\))"
+    rf"|(?:declare|typeset|local)[ \t]+-a[ \t]+[A-Za-z_]\w*"
+    rf"|echo(?:[ \t]+{_PRINTF_DISPLAY_WORD})*"
+    rf"""|printf[ \t]+(?P<q>['"])(?!-)(?:[A-Za-z0-9_ ./,:-]|%%|%s|\\[nrt])++(?P=q)(?:[ \t]+{_PRINTF_DISPLAY_WORD})*)"""
+)
+
+
+def _standalone_printf_output(content: str, check_runtime: Callable[[], None]) -> bool:
+    for line in content.splitlines():
+        check_runtime()
+        line = line.strip(" \t")
+        if not line or line.startswith("#"):
+            continue
+        if len(line) > _ROOT_GLOB_COMMAND_CHARS or not _PRINTF_DISPLAY_RECORD.fullmatch(
+            _QUOTED_PRINTF_ENCODE.sub("value", line)
+        ):
+            return False
+    return True
+
 
 def _printf_storage_uses(
     content: str,
@@ -3803,23 +3831,24 @@ def _printf_storage_uses(
     check_runtime: Callable[[], None],
     budget: list[int],
     seen: set[str],
-    local_functions: set[str],
+    output_builtins_bound: bool,
 ) -> bool:
     """Follow transparent scalar copies. Keep file, pipe and executable uses live."""
+    # Bash consumes command text and startup paths from these variables even
+    # when the script contains no explicit parameter expansion of the name.
+    if name in {"PROMPT_COMMAND", "BASH_ENV", "ENV", "PS0", "PS1", "PS2", "PS3", "PS4"}:
+        return False
     if name in seen:
         return True
     if len(seen) >= 8 or budget[0] < len(content):
         return False
     seen.add(name)
     budget[0] -= len(content)
-    # A literal variable name can feed a nameref or an indirect expansion.
-    # Such consumers do not necessarily contain an ordinary $name token.
-    if re.search(
-        r"""\b[A-Za-z_][A-Za-z_0-9]*=["']?""" + re.escape(name) + r"""["']?(?=[ \t;&\r\n]|$)""",
-        content,
-    ):
-        return False
-    identifier = re.compile(r"\$\{?" + re.escape(name) + r"\b")
+    # Bash also reads names without a dollar sign in arithmetic, namerefs,
+    # declarations and builtin arguments. Only a plain binding can be skipped.
+    identifier = re.compile(
+        r"(?P<expansion>\$\{?)" + re.escape(name) + r"\b|\b" + re.escape(name) + r"\b"
+    )
     for occurrence in identifier.finditer(content):
         check_runtime()
         pos = occurrence.start()
@@ -3832,6 +3861,15 @@ def _printf_storage_uses(
         line = content[begin:stop]
         if line.lstrip().startswith("#"):
             continue
+        if occurrence["expansion"] is None:
+            prefix = line[: pos - begin].strip(" \t")
+            tail = content[occurrence.end() : stop]
+            ordinary_declaration = re.fullmatch(r"(?:local|declare|typeset)(?:[ \t]+-a)?", prefix)
+            if (not prefix or ordinary_declaration) and re.match(r"\+?=", tail):
+                continue
+            if ordinary_declaration and not tail.strip():
+                continue
+            return False
         close = quote_limits.get(pos)
         if close is None:
             return False
@@ -3839,7 +3877,13 @@ def _printf_storage_uses(
         if carry is not None:
             rhs = _QUOTED_PRINTF_ENCODE.sub("", carry["rhs"])
             if any(marker in rhs for marker in ("$(", "`", "\\", '"')) or not _printf_storage_uses(
-                content, carry["name"], quote_limits, check_runtime, budget, seen, local_functions
+                content,
+                carry["name"],
+                quote_limits,
+                check_runtime,
+                budget,
+                seen,
+                output_builtins_bound,
             ):
                 return False
             continue
@@ -3848,9 +3892,8 @@ def _printf_storage_uses(
             line,
         ):
             continue
-        # A fixed argv consumer does not execute a quoted parameter merely
-        # because its data looks like a command. Refuse shell interpreters,
-        # redirections, pipelines, local wrappers and unproved syntax.
+        # Preserve downstream diagnostics for a known execution sink. An
+        # arbitrary program may also interpret a single argument as code.
         if not _QUOTED_PRINTF_ENCODE.search(line) and re.match(
             r'[ \t]*(?:eval[ \t]+|(?:bash|sh)[ \t]+-c[ \t]+|"\$)', line
         ):
@@ -3870,53 +3913,7 @@ def _printf_storage_uses(
         if command is None or close >= stop or line[close - begin + 1 :].strip():
             return False
         cmd = command[1]
-        if cmd in _SHELL_COMMAND_STRING_SHELLS or cmd in {
-            "source",
-            "parallel",
-            "find",
-            "make",
-            "gmake",
-            "eval",
-            "exec",
-            "env",
-            "xargs",
-            "sudo",
-            "command",
-            "builtin",
-            "python",
-            "python3",
-            "perl",
-            "node",
-            "ruby",
-            "lua",
-            "php",
-            "pwsh",
-            "powershell",
-            "busybox",
-            "tclsh",
-            "awk",
-            "sed",
-            "ssh",
-            "read",
-            "mapfile",
-            "readarray",
-        }:
-            return False
-        before = line[command.end() : pos - begin]
-        if cmd == "printf":
-            # printf's previous literal formatting argument may contain an
-            # escaped newline. It cannot turn a subsequent %s operand into code.
-            fmt = re.match(
-                r"""(?P<q>['"])(?P<body>(?:[^%'":\\]|\\[nrt]|%%|%s){1,128})(?P=q)[ \t]+""", before
-            )
-            if fmt is None:
-                return False
-            before = before[fmt.end() :]
-        elif re.fullmatch(r'[ 	]*"[^"$`\\]*', before) is None:
-            # In particular a command's -e/-r/-c option can introduce an
-            # interpreter even when its argument is a single quoted word.
-            return False
-        if any(c in before for c in "|;&<>()`\\") or cmd in local_functions:
+        if not output_builtins_bound or cmd not in {"printf", "echo"}:
             return False
     return True
 
@@ -4033,17 +4030,12 @@ def _quoted_printf_assignments(
     if execution:
         return projected
     budget = [16 * len(content)]
-    local_functions = set(
-        re.findall(
-            r"(?m)^[ \t]*(?:function[ \t]+)?([A-Za-z_][A-Za-z_0-9.-]{0,127})[ \t]*\([ \t]*\)",
-            content,
-        )
-    )
+    output_builtins_bound = _standalone_printf_output(content, check_runtime)
     safe_storage = {
         name
         for name in assigned
         if _printf_storage_uses(
-            content, name, quote_limits, check_runtime, budget, set(), local_functions
+            content, name, quote_limits, check_runtime, budget, set(), output_builtins_bound
         )
     }
     if not safe_storage:
