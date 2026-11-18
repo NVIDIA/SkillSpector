@@ -968,3 +968,32 @@ def test_timing_diagram_requires_axis_and_plain_signal_row():
     assert "`" not in projection(axis + row)
     assert row in projection(row)
     assert row.rstrip() + "$CMD" in projection(axis + row.rstrip() + "$CMD\n")
+
+
+def test_single_make_recipe_output_owns_its_source_quotes():
+    recipe = '\t@echo "$@ $(LOGS)/$@.log" >> runs.txt'
+    source = "LOGS=log\nrun: input\n" + recipe + "\n"
+    ranges = tm._make_output_recipe_ranges(source, lambda: None)
+    assert [source[lo:hi] for lo, hi in ranges] == [recipe]
+    wrapped = "```makefile\n" + source + "```\n"
+    assert tm.bounded_parse_diagnostic(wrapped, lambda: None, file_type="markdown") is None
+    assert tm.bounded_parse_diagnostic(
+        wrapped + '\n```sh\nsh -c "$CMD"\n```\n', lambda: None, file_type="markdown"
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '\t@echo "$@" > output\n',
+        'all:\n\t@echo "$@" > "$DEST"\n',
+        'all:\n\t@echo "$(shell touch /tmp/work)" > output\n',
+        'all:\n\t@sh -c "$@" > output\n',
+        '.ONESHELL:\nall:\n\t@echo "$@" > output\n',
+        'all: SHELL := custom\n\t@echo "$@" > output\n',
+        'include options.mk\nall:\n\t@echo "$@" > output\n',
+        'all:\n\t@echo one \\\n\t@echo "$@" > output\n',
+    ],
+)
+def test_unproved_make_recipes_retain_original_boundaries(source):
+    assert tm._make_output_recipe_ranges(source, lambda: None) == []

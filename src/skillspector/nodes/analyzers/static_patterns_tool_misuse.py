@@ -9353,6 +9353,40 @@ _MARKDOWN_EXAMPLE_CELL = re.compile(
 )
 
 
+_MAKE_SIMPLE_TARGET = re.compile(r"(?:[a-zA-Z0-9_./-]+|\$\([A-Z_][A-Z0-9_]*\)):(?![=:])")
+_MAKE_ECHO_RECIPE = re.compile(
+    r'\t@?echo +"(?:[a-zA-Z0-9_./: -]++|\$@|\$\([A-Z_][A-Z0-9_]*\))+"'
+    r" +>{1,2} +[a-zA-Z0-9_./-]+[ \t]*"
+)
+_MAKE_LAYOUT_OVERRIDE = re.compile(
+    r"^[ \t]*(?:(?:-?include|sinclude|define|override|load)\b|\.ONESHELL[ \t]*:)|"
+    r"(?<!\w)(?:\.RECIPEPREFIX|\.SHELLFLAGS|SHELL)[ \t]*[:?+!]*=|\$[({]eval[ \t]",
+    re.M,
+)
+
+
+def _make_output_recipe_ranges(
+    source: str, check_runtime: Callable[[], None]
+) -> list[tuple[int, int]]:
+    """Prove physical, uncontinued output records in a conventional Make recipe."""
+    if _MAKE_LAYOUT_OVERRIDE.search(source):
+        return []
+    result = []
+    offset = 0
+    in_rule = continued = False
+    for line in source.splitlines(keepends=True):
+        check_runtime()
+        raw = line.rstrip("\r\n")
+        if raw.startswith("\t"):
+            if in_rule and not continued and len(raw) <= 1024 and _MAKE_ECHO_RECIPE.fullmatch(raw):
+                result.append((offset, offset + len(raw)))
+        elif raw and not raw.startswith(("#", " ")):
+            in_rule = _MAKE_SIMPLE_TARGET.match(raw) is not None
+        continued = raw.endswith("\\")
+        offset += len(line)
+    return result
+
+
 _WAVEFORM_AXIS = re.compile(r"^[ \t]*\|(?:[ \t]+\|){2,}[ \t]*\r?$", re.M)
 _WAVEFORM_ROW = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*[ \t]+(?P<signal>[_`|]+)[ \t]*\r?$", re.M)
 _DIRECTORY_TREE_NOTE = re.compile(
@@ -9867,6 +9901,17 @@ def _markdown_shell_text(
                     ):
                         check_runtime()
                         output[arrow.start(1)] = " "
+                if (
+                    complete_context
+                    and fence[3] in {"make", "makefile", "gmake"}
+                    and shell_fence_ranges is not None
+                ):
+                    shell_fence_ranges.extend(
+                        (fence_body_start + lo, fence_body_start + hi)
+                        for lo, hi in _make_output_recipe_ranges(
+                            content[fence_body_start:offset], check_runtime
+                        )
+                    )
                 if shell_fence_start is not None and shell_fence_ranges is not None:
                     shell_fence_ranges.append((shell_fence_start, offset))
                 shell_fence_start = None
