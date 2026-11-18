@@ -428,7 +428,9 @@ def test_comma_outside_single_braces_is_literal(word: str) -> None:
 def test_literal_brace_argument_preserves_following_dynamic_command() -> None:
     command = "$value, $mapping{$field}, next"
     assert tm.bounded_parse_diagnostic(command, lambda: None, file_type="perl") is None
-    diagnostic = tm.bounded_parse_diagnostic(command + "\n$tool -rf /", lambda: None, file_type="perl")
+    diagnostic = tm.bounded_parse_diagnostic(
+        command + "\n$tool -rf /", lambda: None, file_type="perl"
+    )
     assert diagnostic is not None
     assert diagnostic.check is ParserCheck.COMMAND_IDENTITY
 
@@ -444,6 +446,7 @@ def test_unsupported_brace_forms_keep_diagnostics(word: str) -> None:
     ("inner", "cause", "check"),
     [
         ("printf '%q' \"$value\"", ParserCause.RUNTIME_DEPENDENT, ParserCheck.PRINTF_FORMAT),
+        ("printf '%s' \"x|$value\"", ParserCause.RUNTIME_DEPENDENT, ParserCheck.PRINTF_FORMAT),
         ("printf '%s' x | head -1", ParserCause.UNSUPPORTED_SYNTAX, ParserCheck.PRINTF_INVOCATION),
         ("printf '%d' 3", ParserCause.UNSUPPORTED_SYNTAX, ParserCheck.PRINTF_FORMAT),
         ("printf '%s' *", ParserCause.UNSUPPORTED_SYNTAX, ParserCheck.PRINTF_FORMAT),
@@ -454,9 +457,12 @@ def test_quoted_printf_reports_the_unresolved_operation(
 ) -> None:
     source = "$(" + inner + ")"
     diagnostics = []
-    assert tm._static_printf_substitution(
-        source, 0, len(source), quoted_result=True, diagnostics=diagnostics
-    ) is None
+    assert (
+        tm._static_printf_substitution(
+            source, 0, len(source), quoted_result=True, diagnostics=diagnostics
+        )
+        is None
+    )
     assert (diagnostics[0].cause, diagnostics[0].check) == (cause, check)
 
 

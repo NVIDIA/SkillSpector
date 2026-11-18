@@ -2207,6 +2207,22 @@ def _static_printf_substitution(
     literal_result = quoted_result and not backtick and _has_literal_printf_arguments(inner)
     invocation_diagnostics: list[StaticParserDiagnostic] = []
     recognized, arguments = _printf_invocation_arguments(inner, diagnostics=invocation_diagnostics)
+    runtime_argument = any(
+        marker in word
+        for word in arguments
+        for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+    )
+    if quoted_result and not backtick and not literal_result:
+        command, _, _ = _next_shell_invocation_word(inner, 0, lambda: None)
+        if command == "printf" and arguments:
+            # Parsing complete argv distinguishes a runtime value from a
+            # pipeline, even when a quoted argument contains a literal pipe.
+            failed(
+                cause=ParserCause.RUNTIME_DEPENDENT
+                if runtime_argument
+                else ParserCause.UNSUPPORTED_SYNTAX
+            )
+            return None
     if not recognized or (not literal_result and re.search(r"[;|&<>\r\n]", inner) is not None):
         if diagnostics is not None and invocation_diagnostics:
             diagnostics.extend(item.shifted(inner_start) for item in invocation_diagnostics[:1])
@@ -2242,23 +2258,11 @@ def _static_printf_substitution(
                 ParserCause.RESOURCE_LIMIT,
                 {"observed_characters": longest, "limit_characters": 64},
             )
-        elif any(
-            marker in word
-            for word in arguments
-            for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
-        ):
+        elif runtime_argument:
             failed(ParserCheck.PRINTF_FORMAT, ParserCause.RUNTIME_DEPENDENT)
         else:
             failed()
         return None
-
-    if quoted_result and not backtick and not literal_result:
-        # Even a word that survived the static character allowlist may have
-        # unquoted shell syntax. A direct quoted result requires literal argv.
-        command, _, _ = _next_shell_invocation_word(inner, 0, lambda: None)
-        if command == "printf":
-            failed()
-            return None
 
     segments: list[str | None] = []
     literal: list[str] = []
