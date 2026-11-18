@@ -3888,6 +3888,12 @@ def _printf_storage_uses(
             "perl",
             "node",
             "ruby",
+            "lua",
+            "php",
+            "pwsh",
+            "powershell",
+            "busybox",
+            "tclsh",
             "awk",
             "sed",
             "ssh",
@@ -3906,9 +3912,20 @@ def _printf_storage_uses(
             if fmt is None:
                 return False
             before = before[fmt.end() :]
+        elif re.fullmatch(r'[ 	]*"[^"$`\\]*', before) is None:
+            # In particular a command's -e/-r/-c option can introduce an
+            # interpreter even when its argument is a single quoted word.
+            return False
         if any(c in before for c in "|;&<>()`\\") or cmd in local_functions:
             return False
     return True
+
+
+_SHELL_EVALUATED_PARAMETER = re.compile(
+    r"(?:(?:busybox[ \t]+)?(?:ba|da|k|z)?sh[ \t]+-c|"
+    r"(?:lua|perl|node|ruby)[ \t]+-e|python(?:3)?[ \t]+-c|php[ \t]+-r)"
+    r'[ \t]+(?P<arg>"\$(?:\{(?P<long>[A-Za-z_][A-Za-z0-9_]*)(?:\[[0-9@*]+\])?\}|(?P<short>[A-Za-z_][A-Za-z0-9_]*))")(?=[\s;&|]|$)'
+)
 
 
 _SHELL_FILE_PARAMETER = re.compile(
@@ -3922,7 +3939,7 @@ def _quoted_printf_assignments(
     projected: str,
     quote_limits: dict[int, int],
     check_runtime: Callable[[], None],
-    file_consumers: list[StaticParserDiagnostic],
+    execution: list[StaticParserDiagnostic],
 ) -> str:
     """Retain one symbolic data operand inside an ordinary scalar/array assignment."""
     if not quote_limits or "'%q'" not in content:
@@ -3968,12 +3985,28 @@ def _quoted_printf_assignments(
         substitutions.append((start, end, assignment["name"]))
     if not assigned:
         return projected
-    # The contents of a path subsequently passed to a shell are unknown.
-    # Keep that limitation at the executable-file consumer where it arises.
+    # Verify the actual consumer when a stored scalar reaches an interpreter.
+    # A plain scalar may be lexically complete even when its use as code isn't.
     for pos in _nonempty_shell_clause_starts(content, check_runtime, shell_substitutions=True):
-        if content[pos : pos + 1] not in {".", "s", "b", "/"}:
-            continue
-        invocation = _SHELL_FILE_PARAMETER.match(content, pos)
+        prefix = content[pos : pos + 256]
+        if re.match(
+            r"(?:function[ \t]+printf\b|printf[ \t]*\(|"
+            r"(?:(?:command|builtin)[ \t]+)?(?:alias[ \t]+printf=|enable[ \t]+-n[ \t]+printf\b))",
+            prefix,
+        ):
+            start = substitutions[0][0] + 2
+            execution.append(
+                StaticParserDiagnostic(
+                    ParserCause.RUNTIME_DEPENDENT,
+                    ParserCheck.COMMAND_IDENTITY,
+                    start,
+                    start + len("printf"),
+                    ParserUncheckedScope.COMMAND_WORD,
+                )
+            )
+            return projected
+        evaluated = _SHELL_EVALUATED_PARAMETER.match(content, pos)
+        invocation = evaluated or _SHELL_FILE_PARAMETER.match(content, pos)
         if invocation is None:
             continue
         name = invocation["short"] or invocation["long"]
@@ -3985,17 +4018,19 @@ def _quoted_printf_assignments(
             # original uncertainty unless its immediate consumer is visible.
             return projected
         lo, hi = invocation.span("arg")
-        file_consumers.append(
+        execution.append(
             StaticParserDiagnostic(
                 ParserCause.RUNTIME_DEPENDENT,
-                ParserCheck.SHELL_SCRIPT_PATH,
+                ParserCheck.COMMAND_STRING_RUNTIME if evaluated else ParserCheck.SHELL_SCRIPT_PATH,
                 lo,
                 hi,
-                ParserUncheckedScope.COMMAND_ARGUMENTS,
+                ParserUncheckedScope.COMMAND_STRING
+                if evaluated
+                else ParserUncheckedScope.COMMAND_ARGUMENTS,
             )
         )
         break
-    if file_consumers:
+    if execution:
         return projected
     budget = [16 * len(content)]
     local_functions = set(
@@ -13601,7 +13636,7 @@ def _has_bounded_parse_exhaustion(
         else {}
     )
     quote_limits = None
-    printf_file_consumers: list[StaticParserDiagnostic] = []
+    printf_execution: list[StaticParserDiagnostic] = []
     if file_type == "shell" and complete_context:
         # A closing delimiter in proven shell source cannot open a new
         # command word. Nested substitutions retain their own lexical walk,
@@ -13612,7 +13647,7 @@ def _has_bounded_parse_exhaustion(
         )
         shell_word_content = _quoted_printf_data_text(content, quote_limits, check_runtime)
         shell_word_content = _quoted_printf_assignments(
-            content, shell_word_content, quote_limits, check_runtime, printf_file_consumers
+            content, shell_word_content, quote_limits, check_runtime, printf_execution
         )
     elif file_type == "markdown" and complete_context:
         quote_limits = {}
@@ -13653,11 +13688,11 @@ def _has_bounded_parse_exhaustion(
         **json_word_roles,
     )
     if diagnostic is not None:
-        if printf_file_consumers and diagnostic.check in {
+        if printf_execution and diagnostic.check in {
             ParserCheck.PRINTF_FORMAT,
             ParserCheck.PRINTF_INVOCATION,
         }:
-            return printf_file_consumers[0]
+            return printf_execution[0]
         if quote_limits is not None and file_type == "shell":
             runtime_source = _filter_runtime_source(
                 content, diagnostic, quote_limits, check_runtime
@@ -13669,8 +13704,8 @@ def _has_bounded_parse_exhaustion(
             if remote is not None:
                 return remote
         return diagnostic
-    if printf_file_consumers:
-        return printf_file_consumers[0]
+    if printf_execution:
+        return printf_execution[0]
     json_starts = [start for start, _ in json_operand_spans]
     native_backtick_starts = sorted(native_backtick_bounds)
     native_reported_starts: Iterator[int] | None = None

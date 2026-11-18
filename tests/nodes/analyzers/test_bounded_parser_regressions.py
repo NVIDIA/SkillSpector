@@ -1223,6 +1223,14 @@ def test_escaped_printf_preserves_runtime_execution_consumer(
         assert source[detail.start : detail.end] == '"$hint"'
 
 
+@pytest.mark.parametrize("command", ["php -r", "lua -e", "busybox sh -c"])
+def test_stored_scalar_retains_interpreter_argument(command: str) -> None:
+    source = """hint="$(printf '%q' "$input")"\n""" + command + ' "$hint"'
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell")
+    assert detail and detail.check is ParserCheck.COMMAND_STRING_RUNTIME
+    assert source[detail.start : detail.end] == '"$hint"'
+
+
 def test_escaped_assignment_cannot_authorize_a_different_source_binding() -> None:
     source = """parts+=("$(printf '%q' "$input")")
 parts=(other)
@@ -1243,6 +1251,13 @@ source "${parts[0]}" """
         'declare -n alias=parts\nsource "${alias[0]}"',
         'which=parts\nsource "${!which}"',
         'env sh -c "${parts[0]}"',
+        'php -r "${parts[0]}"',
+        'busybox sh -c "${parts[0]}"',
+        'lua -e "${parts[0]}"',
+        'unknown_interpreter -r "${parts[0]}"',
+        'load_script module "${parts[0]}"',
+        """alias printf='other'\necho "${parts[0]}" """.strip(),
+        'enable -n printf\necho "${parts[0]}"',
         'find . -exec sh -c "${parts[0]}"',
     ],
 )
