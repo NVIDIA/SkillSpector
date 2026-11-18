@@ -110,8 +110,7 @@ def test_display_word_fragment_does_not_independently_establish_execution(word: 
     [
         ("sh -c '{}'", ParserCheck.COMMAND_IDENTITY),
         ("eval '{}'", ParserCheck.COMMAND_IDENTITY),
-        # Existing substitution reconstruction runs before the owned worker.
-        ("echo $({})", ParserCheck.PRINTF_INVOCATION),
+        ("echo $({})", ParserCheck.COMMAND_IDENTITY),
     ],
 )
 def test_executed_and_nested_dynamic_word_fragments_remain_uncertain(
