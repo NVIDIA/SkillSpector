@@ -346,3 +346,58 @@ def test_only_plain_declared_list_table_roles_own_rst_punctuation() -> None:
 )
 def test_rst_unproved_role_and_literal_context_remains_visible(body: str) -> None:
     assert tm_module._rst_table_role_text(body, lambda: None) == body
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "| Command (worked example) | Owner |\n|---|---|\n| `ls` | Reader |\n",
+        'The summary reports "two of three\ncomplete" for this record.\n',
+        "Use inline `**bold**`, `*italic*`, `` `code` ``, or a link.\n",
+        "`` `example` `` → `<code>example</code>`.\n",
+        "Make expands its own `$(...)` expressions.\n",
+        "The runner rejects shell arithmetic: use a counter instead of `$((n+1))`.\n",
+        "The notation changes (csh: no `$()`, `&&`).\n",
+    ],
+)
+def test_documented_examples_keep_adjacent_shell_checks(content: str) -> None:
+    assert not _exhausted(content, "markdown")
+    assert _exhausted(content + '\n```sh\nbash -c "$payload"\n```\n', "markdown")
+    assert any(
+        f.rule_id == "TM1"
+        for f in tm_module.analyze(content + "\n`sudo rm -rf /`\n", "SKILL.md", "markdown")
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Execute `` `name` ``.\n",
+        "Run `$((n+1))`.\n",
+        "Run `$()`.\n",
+        'Make expands its own `$(eval "$value")` expressions.\n',
+    ],
+)
+def test_unproved_shell_contexts_stay_partial(content: str) -> None:
+    assert _exhausted(content, "markdown")
+
+
+def test_typeset_notice_requires_closed_prose_and_preserves_shell_consumers() -> None:
+    header = "# Third-party license notices\n\n"
+    start = "````text\n"
+    end = "````\n"
+    words = "Use the terms `Sample Project' and ``AS IS'' in descriptions.\n"
+    payload = 'sh -c "echo `Example Term\'"\n'
+    source = header + start + words + payload + end
+    expected = source.replace("`Sample Project'", " Sample Project ").replace(
+        "``AS IS''", "  AS IS  "
+    )
+
+    assert tm_module._typeset_notice_text(source, lambda: None) == expected
+    for variant in [start + words + end, header + start + words, header + "````sh\n" + words + end]:
+        assert tm_module._typeset_notice_text(variant, lambda: None) == variant
+
+
+def test_shell_syntax_never_becomes_a_plain_wrapped_quotation() -> None:
+    content = 'The summary reports "one of three\nsudo $command".\n'
+    assert tm_module._markdown_shell_text(content, lambda: None) == content

@@ -9352,6 +9352,64 @@ _MARKDOWN_EXAMPLE_CELL = re.compile(
 )
 
 
+_MARKDOWN_HEADER_QUALIFIER = re.compile(
+    r"[ \t]*[A-Z][a-zA-Z]+[ \t]+(?P<open>\()[A-Za-z]+(?: [A-Za-z]+){0,3}(?P<close>\))[ \t]*"
+)
+_MARKDOWN_QUOTE_LEAD = re.compile(
+    r"(?:[A-Za-z][A-Za-z ,'-]*\b(?:and|for|says?|reads?|reports?)"
+    r"|[-*] +`[A-Za-z][\w-]*`[ A-Za-z]+→)[ \t]+$"
+)
+_MARKDOWN_QUOTE_FIRST_LINE = re.compile(r'"[A-Za-z]+(?: [A-Za-z]+){1,16}$')
+_MARKDOWN_QUOTE_LAST_LINE = re.compile(r'[ \t]*[A-Za-z]+(?: [A-Za-z]+){0,8}[.!?]?"')
+_MARKDOWN_RECORD_MESSAGE = re.compile(
+    r"(?:^`[A-Za-z][A-Za-z0-9_-]*` +→|\b(?:log|message|output) +(?:stops at|says|reads)) +"
+    r'(?P<open>")(?=[A-Za-z]+ +)[A-Za-z][A-Za-z ,.;-]{1,120}(?P<close>")(?=[ .;,!?]|$)',
+    re.I,
+)
+
+
+def _documented_expansion_placeholder(content: str, start: int, end: int) -> bool:
+    """Prove a displayed expansion placeholder from its enclosing explanatory phrase."""
+    if end - start > 80 or not content.startswith("$(", start):
+        return False
+    before = content[max(0, start - 160) : start - 1].rpartition("\n")[2]
+    after = content[end + 1 : end + 50]
+    body = content[start:end]
+    if body == "$()":
+        return bool(
+            re.search(r"\b(?:no|without) +$", before) and re.match(r", +`(?:&&|\|\|)`", after)
+        )
+    if body in {"$(...)", "$(…)"}:
+        return bool(
+            re.search(r"\bmake +expands? [a-z ]{0,20}$", before, re.I)
+            and re.match(r" +expressions?\b", after, re.I)
+        )
+    return bool(
+        re.fullmatch(r"\$\(\([A-Za-z_][A-Za-z0-9_]* *[+-] *[0-9]+\)\)", body)
+        and re.search(r"\b(?:rejects|does not support) shell arithmetic:", before, re.I)
+        and before.endswith(" instead of ")
+        and re.match(r"[.!?](?:\s|$)", after)
+    )
+
+
+def _markdown_syntax_example(content: str, start: int, end: int) -> bool:
+    """Identify a literal Markdown code span demonstrated inside a longer delimiter."""
+    if end - start > 80 or content[start - 2 : start] != "``" or content[end : end + 2] != "``":
+        return False
+    match = re.fullmatch(r" `([A-Za-z][A-Za-z0-9_-]*)` ", content[start:end])
+    if match is None:
+        return False
+    # A rendered equivalent or a list of inline markup forms establishes the
+    # display role. Bare double-delimited shell snippets still execute.
+    after = content[end + 2 : end + 125]
+    before = content[max(0, start - 100) : start - 2]
+    return bool(
+        re.match(r"[ \t]*→[ \t]*`<code>" + re.escape(match[1]) + r"</code>`", after)
+        or re.search(r"\binline +`\*\*[A-Za-z]+\*\*`, +`\*[A-Za-z]+\*`, +$", before)
+        and re.match(r"[,.;]", after)
+    )
+
+
 def _markdown_shell_text(
     content: str,
     check_runtime: Callable[[], None],
@@ -9447,6 +9505,8 @@ def _markdown_shell_text(
                 inline_regions.append((end, close_start))
             output[start:end] = " " * (end - start)
             output[close_start:close_end] = " " * (close_end - close_start)
+            if _markdown_syntax_example(content, end, close_start):
+                output[end + 1] = output[close_start - 2] = " "
             if inline_code_ranges is not None:
                 inline_code_ranges.append((end, close_start))
             if (
@@ -9872,6 +9932,28 @@ def _markdown_shell_text(
                             ):
                                 output[offset + note.start("open")] = " "
                                 output[offset + note.start("close")] = " "
+                            if (
+                                complete_context
+                                and line_index + 1 == table_delimiter_line
+                                and cell_end - cell_start <= 128
+                                and (
+                                    qualifier := _MARKDOWN_HEADER_QUALIFIER.fullmatch(
+                                        stripped, cell_start, cell_end
+                                    )
+                                )
+                            ):
+                                output[offset + qualifier.start("open")] = " "
+                                output[offset + qualifier.start("close")] = " "
+                            if complete_context and cell_end - cell_start <= 512:
+                                for message in _MARKDOWN_RECORD_MESSAGE.finditer(
+                                    stripped, cell_start, cell_end
+                                ):
+                                    prose_apostrophes.update(
+                                        (
+                                            offset + message.start("open"),
+                                            offset + message.start("close"),
+                                        )
+                                    )
                             for match in backtick_runs.finditer(stripped, cell_start, cell_end):
                                 check_runtime()
                                 runs.append((offset + match.start(), offset + match.end()))
@@ -9900,6 +9982,42 @@ def _markdown_shell_text(
                     ):
                         output[offset + note.start("open")] = " "
                         output[offset + note.start("close")] = " "
+                    if complete_context and has_list_marker and not runs and len(leading) <= 512:
+                        if message := _MARKDOWN_RECORD_MESSAGE.match(leading):
+                            prose_apostrophes.update(
+                                (
+                                    offset + prefix + message.start("open"),
+                                    offset + prefix + message.start("close"),
+                                )
+                            )
+                    if (
+                        complete_context
+                        and paragraph_open
+                        and not has_list_marker
+                        and not heading
+                        and not runs
+                        and line_index
+                        and len(leading) <= 512
+                        and '"' in leading
+                    ):
+                        previous = lines[line_index - 1].strip()
+                        first = previous.find('"')
+                        last = _MARKDOWN_QUOTE_LAST_LINE.match(leading)
+                        if (
+                            0 < first <= 256
+                            and len(previous) <= 512
+                            and last
+                            and _MARKDOWN_QUOTE_LEAD.fullmatch(previous[:first])
+                            and _MARKDOWN_QUOTE_FIRST_LINE.fullmatch(previous[first:])
+                            and re.fullmatch(
+                                r"[.!?]?(?: +[A-Za-z0-9 %.,-]+)?", leading[last.end() :]
+                            )
+                        ):
+                            # Use the same outer-shell ownership proof as contractions.
+                            previous_start = offset - len(lines[line_index - 1].lstrip())
+                            prose_apostrophes.update(
+                                (previous_start + first, offset + prefix + last.end() - 1)
+                            )
                     prose_leading = leading
                     inline_runtime_guard = False
                     if (
@@ -12013,6 +12131,10 @@ def _markdown_owned_commands_diagnostic(
         return diagnostic
     for start, end in ranges:
         check_runtime()
+        if _markdown_syntax_example(content, start, end) or _documented_expansion_placeholder(
+            content, start, end
+        ):
+            continue
         diagnostic = _owned_inline_command_diagnostic(
             content[start:end],
             check_runtime,
@@ -12040,6 +12162,51 @@ _RST_TEXT_CELL = re.compile(
     r" +(?:\* +)?- +:([a-zA-Z][a-zA-Z0-9-]*):"
     r"(?P<open>`)(?P<body>[a-zA-Z][a-zA-Z0-9 ,./()'_-]*)(?P<close>`)[ \t]*"
 )
+
+
+# Traditional typeset notices use one or two opening graves and the
+# same number of closing apostrophes. Only alphabetic display terms qualify.
+_TYPESET_WORDS = re.compile(
+    r"(?<![a-zA-Z0-9_$\\`])(?P<open>`{1,2})(?P<term>[A-Za-z]++(?:[- .\n]++[A-Za-z]++){0,12})"
+    r"(?P<close>'{1,2})(?![a-zA-Z0-9_'])"
+)
+_NOTICE_FENCES = re.compile(r"^(`{3,})(text)?[ \t]*\r?$", re.M)
+
+
+def _typeset_notice_text(content: str, check_runtime: Callable[[], None]) -> str:
+    """Project paired typography inside closed plain-text notices, preserving source offsets."""
+    if not re.match(r"^# [^\r\n]{0,80}\b(?:licenses?|notices?)\b", content, re.I):
+        return content
+    output: list[str] | None = None
+    opening: re.Match[str] | None = None
+    for fence in _NOTICE_FENCES.finditer(content):
+        check_runtime()
+        if opening is None:
+            if fence[2]:
+                opening = fence
+            continue
+        if fence[2] or len(fence[1]) < len(opening[1]):
+            continue
+        for term in _TYPESET_WORDS.finditer(content, opening.end(), fence.start()):
+            check_runtime()
+            if len(term["open"]) != len(term["close"]):
+                continue
+            # Retain actual shell clauses, escapes and command substitution
+            # wherever the surrounding physical line can consume this term.
+            begin = content.rfind("\n", max(opening.end(), term.start() - 512), term.start()) + 1
+            end = content.find("\n", term.end(), min(fence.start(), term.end() + 512))
+            if (
+                not begin
+                or end < 0
+                or re.search(r'[$\\|<>&"]|\b(?:eval|(?:ba)?sh)\b', content[begin:end])
+            ):
+                continue
+            if output is None:
+                output = list(content)
+            for mark in ("open", "close"):
+                output[term.start(mark) : term.end(mark)] = " " * len(term[mark])
+        opening = None
+    return content if output is None else "".join(output)
 
 
 def _rst_table_role_text(content: str, check_runtime: Callable[[], None]) -> str:
@@ -12093,6 +12260,8 @@ def bounded_parse_diagnostic(
     python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
 ) -> StaticParserDiagnostic | None:
     """Explain the existing first incomplete parser scope without reparsing it."""
+    if file_type == "text" and complete_context:
+        content = _typeset_notice_text(content, check_runtime)
     if file_type == "rst":
         if complete_context:
             content = _rst_table_role_text(content, check_runtime)
