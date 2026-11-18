@@ -1553,7 +1553,7 @@ def _consume_printf_invocation(
             _note_parser_diagnostic(
                 diagnostics,
                 ParserCause.RUNTIME_DEPENDENT,
-                ParserCheck.PRINTF_INVOCATION,
+                ParserCheck.COMMAND_IDENTITY,
                 0,
                 source_end,
                 ParserUncheckedScope.COMMAND_WORD,
@@ -1584,7 +1584,7 @@ def _consume_printf_invocation(
                 _note_parser_diagnostic(
                     diagnostics,
                     ParserCause.RUNTIME_DEPENDENT,
-                    ParserCheck.PRINTF_INVOCATION,
+                    ParserCheck.COMMAND_IDENTITY,
                     0,
                     source_end,
                     ParserUncheckedScope.COMMAND_WORD,
@@ -2535,7 +2535,7 @@ def _is_printf_substitution(
         _note_parser_diagnostic(
             diagnostics,
             ParserCause.RUNTIME_DEPENDENT,
-            ParserCheck.PRINTF_INVOCATION,
+            ParserCheck.COMMAND_IDENTITY,
             start,
             end,
             ParserUncheckedScope.COMMAND_WORD,
@@ -11354,7 +11354,7 @@ def _message_inline_runtime_diagnostic(
     """Refine an existing, source-owned legacy-backtick limitation only."""
     if raw_diagnostic is None or (
         raw_diagnostic.cause is not ParserCause.RUNTIME_DEPENDENT
-        or raw_diagnostic.check is not ParserCheck.PRINTF_INVOCATION
+        or raw_diagnostic.check not in {ParserCheck.PRINTF_INVOCATION, ParserCheck.COMMAND_IDENTITY}
         or raw_diagnostic.location_precision != "source_span"
     ):
         return raw_diagnostic
@@ -11372,6 +11372,18 @@ def _message_inline_runtime_diagnostic(
         or "`" in projected
     ):
         return raw_diagnostic
+    if raw_diagnostic.check is ParserCheck.COMMAND_IDENTITY:
+        # Only refine identity uncertainty produced by the existing nested
+        # substitution reader. Unrelated execution diagnostics stay intact.
+        details: list[StaticParserDiagnostic] = []
+        _printf_invocation_arguments(
+            content[raw_diagnostic.start : raw_diagnostic.end],
+            runtime_command_context=True,
+            check_runtime=check_runtime,
+            diagnostics=details,
+        )
+        if not details or details[0].check is not ParserCheck.COMMAND_IDENTITY:
+            return raw_diagnostic
     diagnostic = _inline_shell_execution_diagnostic(
         content,
         check_runtime,
