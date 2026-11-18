@@ -471,8 +471,332 @@ def _module_wrapper_markup(
     return None
 
 
+_PLAIN_SCALARS = frozenset({"number", "string", "true", "false", "null"})
+_SCALARS = _PLAIN_SCALARS | {"template_string"}
+_NONCOERCING_OPERATORS = frozenset({"===", "!==", "&&", "||", "??"})
+
+
+def _closed_literal(
+    program: JavaScriptProgram,
+    node: Node,
+    refs: dict[str, list[Node]],
+    spend: Callable[[int], bool],
+) -> Node | None:
+    """Follow ordered const aliases. Objects may have no other reads or escapes."""
+    while node.type == "identifier":
+        uses = refs.get(program.text(node), ())
+        if not spend(len(uses)):
+            return None
+        value = None
+        for binding in uses:
+            if binding == node:
+                continue
+            decl = binding.parent
+            if decl is not None and decl.type == "arguments":
+                continue
+            lexical = decl.parent if decl is not None else None
+            block = lexical.parent if lexical is not None else None
+            if (
+                value is not None
+                or decl is None
+                or decl.type != "variable_declarator"
+                or decl.child_by_field_name("name") != binding
+                or lexical is None
+                or lexical.type != "lexical_declaration"
+                or lexical.children[0].type != "const"
+                or block is None
+                or block.type not in {"program", "statement_block"}
+                or not decl.end_byte <= node.start_byte < block.end_byte
+            ):
+                return None
+            value = decl.child_by_field_name("value")
+        if value is None or (len(uses) != 2 and value.type not in _SCALARS):
+            return None
+        node = value
+    return node
+
+
+def _ordinary_array_map(program: JavaScriptProgram, check_runtime: Callable[[], None]) -> bool:
+    """Reject visible prototype replacement, reflective hooks and unknown member writes."""
+    if ".map" not in program.content or "\\" in program.content:
+        return False
+    for node in program.nodes:
+        check_runtime()
+        if node.type in {"with_statement", "import_statement"}:
+            return False
+        if node.type == "call_expression":
+            callee = node.child_by_field_name("function")
+            if callee is not None and callee.type == "subscript_expression":
+                return False
+        if node.type in {"identifier", "property_identifier", "string_fragment"} and program.text(
+            node
+        ) in {
+            "Object",
+            "Reflect",
+            "Proxy",
+            "eval",
+            "Function",
+            "globalThis",
+            "window",
+            "global",
+            "self",
+            "require",
+            "constructor",
+            "prototype",
+            "__proto__",
+            "defineProperty",
+            "setPrototypeOf",
+        }:
+            return False
+        if node.type in {
+            "assignment_expression",
+            "augmented_assignment_expression",
+            "update_expression",
+            "unary_expression",
+        }:
+            target = node.child_by_field_name("left") or node.child_by_field_name("argument")
+            if target is not None and target.type in {"member_expression", "subscript_expression"}:
+                return False
+    return True
+
+
+def _numeric_iteration_value(
+    program: JavaScriptProgram,
+    node: Node,
+    refs: dict[str, list[Node]],
+    spend: Callable[[int], bool],
+    plain_map: bool,
+) -> bool:
+    """A self-updating numeric counter or a numeric literal array's map parameter."""
+    if node.type != "identifier":
+        return False
+    scope = node.parent
+    name = program.text(node)
+    while scope is not None and spend(1):
+        binding = None
+        allowed_write = None
+        if scope.type == "for_statement":
+            initializer = scope.child_by_field_name("initializer")
+            update = scope.child_by_field_name("increment")
+            if (
+                initializer is not None
+                and initializer.type == "lexical_declaration"
+                and update is not None
+            ):
+                declarations = initializer.named_children
+                if len(declarations) == 1:
+                    decl = declarations[0]
+                    initial = decl.child_by_field_name("value")
+                    binding = decl.child_by_field_name("name")
+                    allowed_write = update.child_by_field_name("argument")
+                    if (
+                        initial is None
+                        or initial.type != "number"
+                        or binding is None
+                        or update.type != "update_expression"
+                        or allowed_write is None
+                        or program.text(allowed_write) != program.text(binding)
+                    ):
+                        binding = None
+        elif scope.type == "arrow_function":
+            params = scope.child_by_field_name("parameters")
+            binding = scope.child_by_field_name("parameter")
+            if params is not None and params.named_child_count == 1:
+                binding = params.named_children[0]
+            if binding is None or program.text(binding) != name:
+                return False
+            args = scope.parent
+            call = args.parent if args is not None else None
+            callee = call.child_by_field_name("function") if call is not None else None
+            recv = callee.child_by_field_name("object") if callee is not None else None
+            if (
+                args is None
+                or args.type != "arguments"
+                or args.named_children != [scope]
+                or callee is None
+                or _callable_member(program, callee) != "map"
+                or recv is None
+                or recv.type != "array"
+                or not spend(recv.named_child_count)
+                or not all(element.type == "number" for element in recv.named_children)
+            ):
+                return False
+            if not plain_map:
+                return False
+        elif scope.type in {
+            "function_declaration",
+            "function_expression",
+            "method_definition",
+            "program",
+        }:
+            return False
+        if binding is not None and binding.type == "identifier" and program.text(binding) == name:
+            uses = refs.get(name, ())
+            if not spend(len(uses)):
+                return False
+            for ref in uses:
+                if (
+                    ref == binding
+                    or ref == allowed_write
+                    or not scope.start_byte <= ref.start_byte < scope.end_byte
+                ):
+                    continue
+                use = ref.parent
+                if use is None or use.type not in {
+                    "arguments",
+                    "binary_expression",
+                    "subscript_expression",
+                    "unary_expression",
+                    "template_substitution",
+                }:
+                    return False
+            return True
+        scope = scope.parent
+    return False
+
+
+def _private_arrow_barrier(
+    program: JavaScriptProgram,
+    arrow: Node,
+    calls: list[Node],
+    refs: dict[str, list[Node]],
+    spend: Callable[[int], bool],
+    *,
+    result_used: bool,
+    plain_map: bool,
+) -> Node | None:
+    """Return an operation whose execution can invoke a getter, iterator or coercion hook."""
+    body = arrow.child_by_field_name("body")
+    if body is None:
+        return arrow
+    formal = arrow.child_by_field_name("parameters")
+    single = arrow.child_by_field_name("parameter")
+    params = (
+        formal.named_children if formal is not None else ([single] if single is not None else [])
+    )
+    if any(p.type != "identifier" for p in params):
+        return arrow
+    slots = {program.text(p): i for i, p in enumerate(params)}
+    if len(slots) != len(params):
+        return arrow
+    # All possible direct calls must supply suitable data. Missing/expanded
+    # inputs cannot prove either an integer own index or a primitive operand.
+    supplied: dict[int, list[Node]] = {}
+    numbers: set[int] = set()
+
+    def values(node: Node) -> list[Node]:
+        slot = slots.get(program.text(node)) if node.type == "identifier" else None
+        if slot is None:
+            literal = _closed_literal(program, node, refs, spend)
+            return [] if literal is None else [literal]
+        if slot not in supplied:
+            items = []
+            for ref in calls:
+                if not spend(1):
+                    return []
+                call = ref.parent
+                args = call.child_by_field_name("arguments") if call is not None else None
+                if args is None or not spend(args.named_child_count):
+                    return []
+                actual = [v for v in args.named_children if v.type != "comment"]
+                if slot >= len(actual) or any(v.type == "spread_element" for v in actual):
+                    return []
+                value = _closed_literal(program, actual[slot], refs, spend)
+                if value is None:
+                    if not _numeric_iteration_value(program, actual[slot], refs, spend, plain_map):
+                        return []
+                    value = actual[slot]
+                    numbers.add(value.id)
+                items.append(value)
+            supplied[slot] = items
+        return supplied[slot]
+
+    # Postorder allows checked primitive results (e.g. a+b) to feed another
+    # arithmetic operation without repeating subtree walks.
+    scalars: set[int] = set()
+    pending = [(body, False)]
+    while pending:
+        part, expanded = pending.pop()
+        if not spend(1):
+            return part
+        kind = part.type
+        if kind in _PLAIN_SCALARS:
+            scalars.add(part.id)
+        elif kind == "identifier":
+            actual = values(part)
+            if not spend(len(actual)):
+                return part
+            if actual and all(v.type in _SCALARS or v.id in numbers for v in actual):
+                scalars.add(part.id)
+            elif program.text(part) not in slots:
+                return part
+        elif kind == "subscript_expression":
+            receiver = part.child_by_field_name("object")
+            index = part.child_by_field_name("index")
+            if receiver is None or index is None:
+                return part
+            arrays, indices = values(receiver), values(index)
+            if not arrays or not indices:
+                return part
+            limit = None
+            for arr in arrays:
+                if arr.type != "array" or not spend(arr.child_count):
+                    return part
+                # Only dense, initialized own scalar slots are safe. A hole
+                # or an out-of-bounds lookup can reach a prototype accessor.
+                children = [n for n in arr.children[1:-1] if n.type != "comment"]
+                if any(
+                    (n.type not in _PLAIN_SCALARS if i % 2 == 0 else n.type != ",")
+                    for i, n in enumerate(children)
+                ):
+                    return part
+                length = (len(children) + 1) // 2
+                limit = length if limit is None else min(limit, length)
+            for idx in indices:
+                if not spend(1) or idx.type != "number" or idx.end_byte - idx.start_byte > 6:
+                    return part
+                key = program.text(idx)
+                if not key.isascii() or not key.isdecimal() or limit is None or int(key) >= limit:
+                    return part
+            scalars.add(part.id)
+        elif kind in {"binary_expression", "unary_expression", "parenthesized_expression", "array"}:
+            if not spend(part.named_child_count):
+                return part
+            children = [n for n in part.named_children if n.type != "comment"]
+            if not expanded:
+                pending.append((part, True))
+                pending.extend((child, False) for child in reversed(children))
+                continue
+            if kind == "array":
+                continue
+            primitive = all(c.id in scalars for c in children)
+            if kind == "binary_expression":
+                op = part.child_by_field_name("operator")
+                if op is None or program.text(op) in {"instanceof", "in"}:
+                    return part
+                if not primitive and program.text(op) not in _NONCOERCING_OPERATORS:
+                    return part
+                primitive |= program.text(op) in {"===", "!=="}
+            if kind == "unary_expression":
+                op = part.child_by_field_name("operator")
+                if op is None or program.text(op) == "delete":
+                    return part
+                if program.text(op) in {"!", "void", "typeof"}:
+                    primitive = True
+                if not primitive:
+                    return part
+            if primitive:
+                scalars.add(part.id)
+        else:
+            return arrow
+    # A returned object can itself enter a template, key or numeric conversion.
+    return body if result_used and body.id not in scalars else None
+
+
 def _private_callable_uses(
-    program: JavaScriptProgram, check_runtime: Callable[[], None]
+    program: JavaScriptProgram,
+    check_runtime: Callable[[], None],
+    implicit: dict[int, Node] | None = None,
 ) -> tuple[set[int], set[str]]:
     """Resolve direct calls to fixed namespace members and private function arguments.
 
@@ -539,6 +863,15 @@ def _private_callable_uses(
     owned: set[int] = set()
     imported: set[str] = set()
     budget = _MAX_BINDING_VISITS
+
+    plain_map = _ordinary_array_map(program, check_runtime)
+
+    def spend(count: int) -> bool:
+        nonlocal budget
+        check_runtime()
+        budget -= count
+        return budget >= 0
+
     for name, receiver in aliases:
         spelling = program.text(receiver)
         if spelling not in namespaces:
@@ -582,6 +915,7 @@ def _private_callable_uses(
             continue
         uses = refs[program.text(name)]
         cases: list[list[Node]] = []
+        helper_result_used = False
         budget -= len(uses)
         if budget < 0:
             break
@@ -598,6 +932,9 @@ def _private_callable_uses(
             if any(arg.type == "spread_element" for arg in actual):
                 break
             cases.append(actual)
+            assert call is not None
+            use = call.parent
+            helper_result_used |= use is None or use.type != "expression_statement"
         else:
             if not cases or any(
                 fn.start_byte < ref.start_byte < fn.end_byte for ref in refs.get("arguments", ())
@@ -640,31 +977,36 @@ def _private_callable_uses(
                 elif all(arg.type == "arrow_function" for arg in target):
                     if any(ref.parent.type != "call_expression" for ref in calls):
                         continue
-                    if any(
-                        (formal := arg.child_by_field_name("parameters")) is not None
-                        and any(child.type != "identifier" for child in formal.named_children)
-                        for arg in target
-                    ):
-                        continue
-                    pending = [arg.child_by_field_name("body") for arg in target]
-                    while pending:
-                        check_runtime()
-                        part = pending.pop()
-                        budget -= 1
-                        if budget < 0:
-                            return owned, imported
-                        if part is None or part.type not in {
-                            "identifier",
-                            "number",
-                            "subscript_expression",
-                            "binary_expression",
-                            "parenthesized_expression",
-                            "array",
-                        }:
-                            break
-                        pending.extend(part.named_children)
+                    if not spend(len(calls)):
+                        return owned, imported
+                    result_used = any(
+                        (direct := ref.parent) is None
+                        or (use := direct.parent) is None
+                        or use.type != "expression_statement"
+                        and (use.type != "return_statement" or helper_result_used)
+                        for ref in calls
+                    )
+                    conversion = None
+                    for arg in target:
+                        assert arg is not None
+                        barrier = _private_arrow_barrier(
+                            program,
+                            arg,
+                            calls,
+                            refs,
+                            spend,
+                            result_used=result_used,
+                            plain_map=plain_map,
+                        )
+                        if barrier is not None:
+                            if barrier == arg or implicit is None:
+                                break
+                            if conversion is None:
+                                conversion = barrier
                     else:
                         owned.update(ref.id for ref in calls)
+                        if conversion is not None and implicit is not None:
+                            implicit.update((ref.id, conversion) for ref in calls)
                     continue
                 elif all(
                     arg.type == "identifier"
@@ -683,6 +1025,26 @@ def _private_callable_uses(
                     for arg in target
                 ):
                     if any(ref.parent.type != "new_expression" for ref in calls):
+                        continue
+                    # A typed-array constructor can consume an iterator,
+                    # indexed getter or scalar conversion hook on its input.
+                    opaque_input = None
+                    for ref in calls:
+                        call = ref.parent
+                        args = call.child_by_field_name("arguments") if call is not None else None
+                        if args is None:
+                            continue
+                        if not spend(args.named_child_count):
+                            return owned, imported
+                        values = [v for v in args.named_children if v.type != "comment"]
+                        if len(values) > 1 or any(
+                            (value := _closed_literal(program, v, refs, spend)) is None
+                            or value.type not in _SCALARS
+                            for v in values
+                        ):
+                            opaque_input = call
+                            break
+                    if opaque_input is not None and implicit is None:
                         continue
                     supplied = {arg.id for arg in target}
                     native_names = {program.text(arg) for arg in target}
@@ -716,6 +1078,8 @@ def _private_callable_uses(
                         for key in ("globalThis", "window", "self", "global", "Reflect", "Function")
                     ):
                         continue
+                    if opaque_input is not None and implicit is not None:
+                        implicit.update((ref.id, opaque_input) for ref in calls)
                 else:
                     continue
                 owned.update(ref.id for ref in calls)
