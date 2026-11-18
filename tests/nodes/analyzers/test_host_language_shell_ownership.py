@@ -439,11 +439,9 @@ def test_python_shell_operands_require_native_brace_ownership(
     expression: str, partial: bool
 ) -> None:
     content = (
-        _OPTION_TEXT
-        + "import subprocess\ndef run(choice):\n    command = "
+        "import subprocess\ndef run(choice):\n    command = "
         + expression
         + "\n    subprocess.run(command, shell=True)\n"
-        + _TAIL
     )
     event = _ledger("run.py", content)["inspection_ledger"][0]
     assert event["outcome"] is (LedgerOutcome.PARTIAL if partial else LedgerOutcome.COMPLETED)

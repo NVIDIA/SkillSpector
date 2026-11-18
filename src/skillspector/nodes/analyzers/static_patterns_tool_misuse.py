@@ -4471,6 +4471,7 @@ def _has_shell_command_word_exhaustion(
     may_have_destructive_outer_operands = _may_have_destructive_outer_operands(content) or any(
         string.decoded for string in powershell_strings.values()
     )
+    has_python_fields = python_source is not None and "{" in content
     json_openers = sorted(structural_quote_openers or ())
     backtick_values = tuple(
         span for span in json_value_spans if content.find("`", span[0] + 1, span[1] - 1) >= 0
@@ -4937,7 +4938,10 @@ def _has_shell_command_word_exhaustion(
             if parsed.dynamic and may_have_destructive_outer_operands
             else None
         )
-        if operand_diagnostic is not None:
+        # Adjacent Python literals can contribute fields and operands that
+        # belong to a single command even when each raw source word is benign.
+        verify_python_value = parsed.dynamic and has_python_fields
+        if operand_diagnostic is not None or verify_python_value:
             comment = python_source.comment(start) if python_source is not None else None
             while perl_header is not None and start >= perl_header.end():
                 perl_header = _PERL_HEADER_LINE_RE.match(content, perl_header.end())
@@ -4966,11 +4970,17 @@ def _has_shell_command_word_exhaustion(
                     else None
                 )
                 if value is None:
+                    if operand_diagnostic is None:
+                        continue
                     if python_source is not None:
                         runtime_field = python_source.runtime_format_argument(start, parsed.end)
                         if runtime_field is not None:
                             return runtime_field
                     return operand_diagnostic
+                if operand_diagnostic is None and (
+                    not unknown_fields or not _may_have_destructive_outer_operands(value[0])
+                ):
+                    continue
                 value_diagnostic = _has_runtime_command_operand_exhaustion(
                     *value,
                     check_runtime,
@@ -4984,7 +4994,7 @@ def _has_shell_command_word_exhaustion(
             # named in it can take operands only from the same comment, never
             # from later host code. Recheck that comment as standalone shell
             # text.
-            if comment not in complete_comments:
+            if operand_diagnostic is not None and comment not in complete_comments:
                 diagnostic = _has_shell_command_word_exhaustion(
                     content[comment[0] : comment[1]],
                     check_runtime,
