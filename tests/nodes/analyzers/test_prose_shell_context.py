@@ -1007,6 +1007,10 @@ def test_unproved_make_recipes_retain_original_boundaries(source):
         ("VALUE ?= output", "all", "${VALUE}"),
         ('VALUE = "; $$PROGRAM; echo "', "all", "$(VALUE)"),
         ('override VALUE := "; $$PROGRAM; echo "', "all", "$(VALUE)"),
+        ('# SHELL = configurable\nVALUE := "; $$PROGRAM; echo "', "all", "$(VALUE)"),
+        ("SHELL := /bin/sh\nVALUE ?= output", "all", "$(VALUE)"),
+        ("include settings.mk", "all", "$(VALUE)"),
+        ("ifdef OTHER\noverride VALUE := output\nendif", "all", "$(VALUE)"),
         ('Q := "; $$PROGRAM; echo "', "all", "$Q"),
         ('all: VALUE = "; $$PROGRAM; echo "', "all", "$(VALUE)"),
         ("TARGETS ?= one", "$(TARGETS)", "$@"),
@@ -1027,6 +1031,11 @@ def test_make_substitution_preserves_earlier_runtime_command():
     diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
     assert diagnostic is not None
     assert diagnostic.start < source.index("```make")
+
+
+def test_make_unconditional_forced_literal_value_can_be_inspected():
+    source = '```make\noverride VALUE := fixed-path\nall:\n\t@echo "$(VALUE)" > out\n```\n'
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
 
 
 def test_documented_stdout_substitution_must_be_a_placeholder() -> None:

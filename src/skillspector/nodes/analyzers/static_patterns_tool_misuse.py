@@ -9373,6 +9373,10 @@ _MAKE_ECHO_RECIPE = re.compile(
     rf'\t@?echo +"(?:[a-zA-Z0-9_./: -]++|{_MAKE_RECIPE_VALUE.pattern})+"'
     r" +>{1,2} +[a-zA-Z0-9_./-]+[ \t]*"
 )
+_MAKE_LITERAL_OVERRIDE = re.compile(
+    r"override[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*:=[ \t]*[A-Za-z0-9_./: -]*"
+)
+_MAKE_LITERAL_RULE = re.compile(r"[A-Za-z0-9_./-]+:[ \tA-Za-z0-9_./-]*")
 _MAKE_LAYOUT_OVERRIDE = re.compile(
     r"^[ \t]*(?:(?:-?include|sinclude|define|load)\b|"
     r"override\b(?![ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*[:?+!]?=)|\.ONESHELL[ \t]*:)|"
@@ -9381,16 +9385,34 @@ _MAKE_LAYOUT_OVERRIDE = re.compile(
 )
 
 
+def _make_literal_overrides(lines: list[str], check_runtime: Callable[[], None]) -> set[str]:
+    """Prove forced literal values only in a complete, straight-line Make fragment."""
+    names = set()
+    for line in lines:
+        check_runtime()
+        raw = line.rstrip("\r\n")
+        if not raw.strip() or raw.lstrip(" ").startswith("#"):
+            continue
+        if assigned := _MAKE_LITERAL_OVERRIDE.fullmatch(raw):
+            names.add(assigned[1])
+        elif not (_MAKE_LITERAL_RULE.fullmatch(raw) or _MAKE_ECHO_RECIPE.fullmatch(raw)):
+            # Includes, conditional definitions, generated Make syntax and
+            # target-specific bindings can change a value for this recipe.
+            return set()
+    return names
+
+
 def _make_output_recipes(
     source: str, check_runtime: Callable[[], None]
 ) -> Iterator[tuple[int, int, StaticParserDiagnostic | None]]:
     """Separate the physical recipe line from substitutions which can change its shell syntax."""
-    if _MAKE_LAYOUT_OVERRIDE.search(source):
-        return
+    standard_layout = _MAKE_LAYOUT_OVERRIDE.search(source) is None
+    lines = source.splitlines(keepends=True)
+    fixed = _make_literal_overrides(lines, check_runtime) if "override" in source else set()
     offset = 0
     target = None
     continued = False
-    for line in source.splitlines(keepends=True):
+    for line in lines:
         check_runtime()
         raw = line.rstrip("\r\n")
         if raw.startswith("\t"):
@@ -9404,6 +9426,9 @@ def _make_output_recipes(
                         ref[0] == "$@" and not target[1].startswith(("$", "."))
                     ):
                         continue
+                    name = ref[0][2:-1] if ref[0][1] in "({" else ref[0][1:]
+                    if name in fixed:
+                        continue
                     diagnostic = StaticParserDiagnostic(
                         ParserCause.RUNTIME_DEPENDENT,
                         ParserCheck.COMMAND_STRING_RUNTIME,
@@ -9412,7 +9437,10 @@ def _make_output_recipes(
                         ParserUncheckedScope.COMMAND_STRING,
                     )
                     break
-                yield offset, offset + len(raw), diagnostic
+                # Uncertain layout cannot establish where literal shell quotes
+                # end. It also cannot prove a Make substitution stays data.
+                if diagnostic is not None or standard_layout:
+                    yield offset, offset + len(raw), diagnostic
         elif raw and not raw.startswith(("#", " ")):
             target = _MAKE_SIMPLE_TARGET.match(raw)
         continued = raw.endswith("\\")
@@ -12774,7 +12802,7 @@ def bounded_parse_diagnostic(
                         stop=original.end - start,
                     )
                     if detail is not None:
-                        return detail.shifted(start)
+                        original = detail.shifted(start)
                     break
         if complete_context:
             for start, end, language in fenced:
