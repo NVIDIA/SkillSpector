@@ -514,6 +514,35 @@ def test_python_exact_literal_format_keeps_its_shell_option_role(field: str, par
     assert _python(source) is partial
 
 
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        (
+            '"""\nFallback: {"<key>": <text>, "status_code": n}).\n'
+            " * A check is non-fatal: it's logged before the ordinary work resumes.\n"
+            ' - Any row `detail: "fast"` -> response:fast (+ reason)\n'
+            "A result that turns non-zero or records non-data continues with its current\n"
+            'state (non-blocking, matching the user\'s "non-2 stop is non-blocking");\n"""\n',
+            None,
+        ),
+        (
+            "items = {\"guide\": 'Read the record for '\n"
+            '    "`case-brief.txt`. This note is read-only and the result\'s display "\n'
+            "    'uses `01-review/detail-map.md`.'}\nprint(items[\"guide\"])\n",
+            None,
+        ),
+        ('command = ("$TOOL " "-rf " "/")', "runtime_command_identity"),
+        ('command = ("$TOOL " "-rf " "/\'open")', "command_argument_boundary"),
+        ('command = ("$TOOL " "$prefix-rf " "/\'open")', "command_argument_boundary"),
+    ],
+)
+def test_reconstructed_python_argument_boundary_needs_viable_options(
+    source: str, expected: str | None
+) -> None:
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert (diagnostic.check.value if diagnostic else None) == expected
+
+
 def test_shell_literal_braces_keep_unrelated_runtime_command_visible() -> None:
     literal = "$TOOL, $ROOT/path{cache}, harmless"
     assert not _shell(literal)

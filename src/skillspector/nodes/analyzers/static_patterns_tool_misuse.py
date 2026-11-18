@@ -250,6 +250,11 @@ _PYTHON_FORMAT_NAME_RE = re.compile(r"\.format\([ \t]*([A-Za-z_][A-Za-z0-9_]*)[ 
 # Python operators that can still extend or rewrite a string value.
 _PYTHON_STRING_EXTENSION_OPERATORS = frozenset({"+", "%", ".", "*", "["})
 # One brace opens an f-string replacement field; a doubled brace is literal.
+# A literal prefix keeps its internal hyphens inside the same argument.
+# Exclude shell expansions and escapes, whose prefix can disappear.
+_PLAIN_HYPHENATED_WORD_RE = re.compile(
+    r"(?<![A-Za-z0-9_.$/\\])[A-Za-z0-9_./]++(?:-[A-Za-z0-9_./]++)+"
+)
 _PYTHON_OPERAND_SYNTAX_RE = re.compile(
     r"""\\(?:N\{[a-zA-Z0-9 -]+\}|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}"""
     r"""|[0-7]{1,3}|[abfnrtv\\'"]|\r?\n)|\{\{|\}\}|(\{)"""
@@ -4963,22 +4968,18 @@ def _has_shell_command_word_exhaustion(
                 # concatenated with it. A value that code can still extend,
                 # for example with ``%`` or ``.format``, stays partial.
                 value_source_range: list[int] = []
-                unknown_fields: set[int] = set()
-                field_ranges: dict[int, int] = {}
-                open_tail: list[bool] = []
+                projection = _PythonOperandProjection()
                 value = (
                     python_source.string_value(
                         start,
                         parsed.end,
                         source_range=value_source_range,
-                        unknown_fields=unknown_fields,
-                        field_ranges=field_ranges,
-                        open_tail=open_tail,
+                        projection=projection,
                     )
                     if python_source is not None
                     else None
                 )
-                if value is None or (open_tail and operand_diagnostic is not None):
+                if value is None or (projection.open_tail and operand_diagnostic is not None):
                     if operand_diagnostic is None:
                         continue
                     if python_source is not None:
@@ -4986,41 +4987,48 @@ def _has_shell_command_word_exhaustion(
                         if runtime_field is not None:
                             return runtime_field
                     return operand_diagnostic
-                if operand_diagnostic is None and not _may_have_destructive_outer_operands(
-                    value[0]
+                # A successful raw check already covers the unchanged body of a
+                # single literal. Additional candidates must come from Python
+                # actually decoding, interpolating or joining operand text.
+                if operand_diagnostic is None and (
+                    not projection.changed or not _may_have_destructive_outer_operands(value[0])
                 ):
                     continue
                 value_diagnostic = _has_runtime_command_operand_exhaustion(
                     *value,
                     check_runtime,
                     quoted_printf_allowed=quoted_printf_allowed,
-                    unresolved_braces=unknown_fields,
+                    unresolved_braces=projection.unknown_fields,
                 )
-                if value_diagnostic is None and field_ranges:
-                    # Keep one typed hole per native field. Unlike the coarse
-                    # unquoted projection, a hole inside shell quotes can itself
-                    # constitute a complete option or part of an option cluster.
+                if value_diagnostic is None and projection.field_ranges:
                     text, start_in_value, end_in_value = value
-                    pieces: list[str] = []
-                    holes: set[int] = set()
-                    cursor = projected = 0
-                    for left, right in field_ranges.items():
-                        pieces.extend((text[cursor:left], "\x00"))
-                        projected += left - cursor
-                        holes.add(projected)
-                        projected += 1
-                        cursor = right
-                    pieces.append(text[cursor:])
+                    typed_words, holes = projection.argument_holes(text)
                     value_diagnostic = _has_runtime_command_operand_exhaustion(
-                        "".join(pieces),
+                        typed_words,
                         start_in_value,
                         end_in_value,
                         check_runtime,
                         quoted_printf_allowed=quoted_printf_allowed,
                         python_fields=holes,
                     )
+                if (
+                    value_diagnostic is not None
+                    and value_diagnostic.check is ParserCheck.COMMAND_ARGUMENT_BOUNDARY
+                    and value_diagnostic.full_input_checked
+                    and projection.complete
+                    and not projection.open_tail
+                    and not projection.unknown_fields
+                ):
+                    # An unclosed quote can hide following option words. Fixed
+                    # hyphens in filenames such as "guide-first/review-map"
+                    # cannot introduce an option, even across joined literals.
+                    potential_options = _PLAIN_HYPHENATED_WORD_RE.sub(
+                        lambda match: match[0].replace("-", "_"), value[0]
+                    )
+                    if not _may_have_destructive_outer_operands(potential_options):
+                        continue
                 if value_diagnostic is not None:
-                    if open_tail:
+                    if projection.open_tail:
                         return StaticParserDiagnostic(
                             ParserCause.BOUNDARY_UNRESOLVED,
                             ParserCheck.COMMAND_ARGUMENT_BOUNDARY,
@@ -7372,17 +7380,39 @@ def _powershell_shell_text(
     return "".join(output)
 
 
+@dataclass
+class _PythonOperandProjection:
+    complete: bool = False
+    changed: bool = False
+    open_tail: bool = False
+    unknown_fields: set[int] = field(default_factory=set)
+    field_ranges: dict[int, int] = field(default_factory=dict)
+
+    def argument_holes(self, text: str) -> tuple[str, set[int]]:
+        """Keep a typed hole for each field, including fields inside shell quotes."""
+        pieces: list[str] = []
+        holes: set[int] = set()
+        cursor = projected = 0
+        for left, right in self.field_ranges.items():
+            pieces.extend((text[cursor:left], "\x00"))
+            projected += left - cursor
+            holes.add(projected)
+            projected += 1
+            cursor = right
+        pieces.append(text[cursor:])
+        return "".join(pieces), holes
+
+
 def _python_literal_operands(
     content: str,
     token: tuple[int, int],
     start: int,
     end: int,
     constant_fields: tuple[tuple[int, int, str], ...] = (),
-    unknown_fields: set[int] | None = None,
+    projection: _PythonOperandProjection | None = None,
     projected_start: int = 0,
     literal_runs: PythonLiteralSpans | None = None,
     field_ends: Mapping[int, int] | None = None,
-    field_ranges: dict[int, int] | None = None,
 ) -> str:
     """Return string literal body text from ``start`` that a shell reads as operands.
 
@@ -7442,10 +7472,12 @@ def _python_literal_operands(
                 )
                 if fixed_value is None:
                     rendered = " -rf " + content[match.start() : cursor]
-                    if field_ranges is not None and complete_field:
-                        field_ranges[projected_start] = projected_start + len(rendered)
-                    if unknown_fields is not None:
-                        unknown_fields.add(projected_start + len(" -rf "))
+                    if projection is not None:
+                        projection.unknown_fields.add(projected_start + len(" -rf "))
+                        if complete_field:
+                            projection.field_ranges[projected_start] = projected_start + len(
+                                rendered
+                            )
                 else:
                     rendered = fixed_value
             elif formatted and literal_runs is not None:
@@ -7562,9 +7594,7 @@ class _PythonSourceOwnership:
         end: int,
         *,
         source_range: list[int] | None = None,
-        unknown_fields: set[int] | None = None,
-        field_ranges: dict[int, int] | None = None,
-        open_tail: list[bool] | None = None,
+        projection: _PythonOperandProjection | None = None,
     ) -> tuple[str, int, int] | None:
         """Return the proven string value that holds a shell word, and its span.
 
@@ -7630,12 +7660,13 @@ class _PythonSourceOwnership:
                 begin,
                 stop,
                 self._constant_fields or (),
-                unknown_fields,
+                projection,
                 projected_end,
                 self._literal_runs.get(token),
                 self._field_ends,
-                field_ranges,
             )
+            if projection is not None and (token != owner or part != content[begin:stop]):
+                projection.changed = True
             pieces.append(part)
             projected_end += len(part)
 
@@ -7680,10 +7711,12 @@ class _PythonSourceOwnership:
                 cursor = next_token(cursor + 1)
                 operator = content[cursor : cursor + 1]
             if operator in _PYTHON_STRING_EXTENSION_OPERATORS:
-                if open_tail is None:
+                if projection is None:
                     return None
-                open_tail.append(True)
+                projection.open_tail = True
             break
+        if projection is not None:
+            projection.complete = remaining > 0
         if remaining <= 0 and self._constant_fields:
             # Constant replacement can shorten the projected text. Reaching
             # the source bound cannot prove that later operands are absent.
