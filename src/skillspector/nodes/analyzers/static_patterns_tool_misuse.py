@@ -51,6 +51,7 @@ from skillspector.inspection_ledger import (
     ResourceMeasurements,
     StaticParserDiagnostic,
 )
+from skillspector.javascript_ast import ParseFailure
 from skillspector.javascript_tokens import JavaScriptTemplateSpans, assertion_template_shell_text
 from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
 from skillspector.json_tokens import JSONSourceOwnership, prepare_json_source
@@ -6720,12 +6721,16 @@ class _PythonSourceOwnership:
 class _JavaScriptTemplateOwnership:
     """Lazily proven ownership of template literal bytes in complete JavaScript."""
 
-    def __init__(self, content: str, check_runtime: Callable[[], None]) -> None:
+    def __init__(
+        self, content: str, check_runtime: Callable[[], None], dialect: str = "javascript"
+    ) -> None:
+        self._dialect = dialect
         self._content = content
         self._check_runtime = check_runtime
         self._spans: JavaScriptTemplateSpans | None = None
         self._spans_computed = False
         self._unresolved_executables: list[int] = []
+        self._parse_failures: list[ParseFailure] = []
         self._regex_literals: list[tuple[int, int]] = []
         self._regex_starts: list[int] = []
 
@@ -6734,7 +6739,9 @@ class _JavaScriptTemplateOwnership:
             self._spans = _javascript_template_spans(
                 self._content,
                 self._check_runtime,
+                dialect=self._dialect,
                 unresolved_executables=self._unresolved_executables,
+                parse_failures=self._parse_failures,
                 regex_literals=self._regex_literals,
             )
             self._regex_starts = [start for start, _ in self._regex_literals]
@@ -6744,6 +6751,15 @@ class _JavaScriptTemplateOwnership:
     def unresolved_execution_diagnostic(self) -> StaticParserDiagnostic | None:
         """Keep dynamic execution incomplete even when raw shell text is short."""
         self._owned_spans()
+        if self._parse_failures:
+            return StaticParserDiagnostic(
+                ParserCause(self._parse_failures[0]),
+                ParserCheck.JAVASCRIPT_SYNTAX,
+                0,
+                len(self._content),
+                ParserUncheckedScope.REMAINING_INPUT,
+                full_input_checked=self._parse_failures[0] == "malformed_input",
+            )
         if not self._unresolved_executables:
             return None
         return StaticParserDiagnostic(
@@ -12162,10 +12178,10 @@ def _has_bounded_parse_exhaustion(
         python_source = _PythonSourceOwnership(
             content, check_runtime, python_import_check, python_stdlib_check
         )
-    if file_type == "javascript" and complete_context:
+    if file_type in {"javascript", "typescript", "tsx"} and complete_context:
         # Modern host syntax owns literal delimiters only after a bounded,
         # complete parse. Unresolved executable interpolations keep their bounds.
-        javascript_source = _JavaScriptTemplateOwnership(content, check_runtime)
+        javascript_source = _JavaScriptTemplateOwnership(content, check_runtime, file_type)
         diagnostic = javascript_source.unresolved_execution_diagnostic()
         if diagnostic is not None:
             return diagnostic

@@ -3400,6 +3400,8 @@ def _scan_all_views_with_parser_diagnostics(
     # Decode ownership uses JSON grammar; rule applicability retains the carrier
     # type so opaque and unknown bundle fields keep their original security checks.
     parser_file_type = "json" if _oms_projected else _infer_file_type(path)
+    if not _oms_projected and path.lower().endswith(".tsx"):
+        parser_file_type = "tsx"
     ast_modules = [module for module in pattern_modules if _uses_python_ast(module)]
     lexical_modules = [module for module in pattern_modules if not _uses_python_ast(module)]
     if python_source is None:

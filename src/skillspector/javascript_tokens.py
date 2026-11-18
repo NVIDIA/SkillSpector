@@ -19,7 +19,7 @@ from html.parser import HTMLParser
 from tree_sitter import Node
 
 from skillspector.javascript_ast import NODE_SHEBANG as _NODE_SHEBANG
-from skillspector.javascript_ast import JavaScriptProgram, parse_javascript_source
+from skillspector.javascript_ast import JavaScriptProgram, ParseFailure, parse_javascript_source
 
 _MAX_SOURCE_CHARS = 1_000_000
 _MAX_TOKENS = 100_000
@@ -1498,7 +1498,9 @@ def javascript_template_spans(
     content: str,
     check_runtime: Callable[[], None],
     *,
+    dialect: str = "javascript",
     unresolved_executables: list[int] | None = None,
+    parse_failures: list[ParseFailure] | None = None,
     regex_literals: list[tuple[int, int]] | None = None,
 ) -> JavaScriptTemplateSpans | None:
     """Prove host delimiters while retaining unresolved executable templates.
@@ -1510,25 +1512,33 @@ def javascript_template_spans(
     """
     if "`" not in content:
         return None
-    program = parse_javascript_source(content, check_runtime)
+    program = parse_javascript_source(
+        content, check_runtime, dialect=dialect, failures=parse_failures
+    )
     if program is None:
         if unresolved_executables is not None:
             unresolved_executables.append(content.index("`"))
         return None
-    executable = None
+    execution_node = None
+    checked_execution = False
     if regex_literals is not None and any(node.type == "regex" for node in program.nodes):
         # A lexical boundary cannot replace unresolved behavior. Apply the
         # existing execution barrier even when the source has no templates.
-        executable = _has_shell_execution_call(program, check_runtime)
-        if not executable:
+        execution_node = _has_shell_execution_call(program, check_runtime)
+        checked_execution = True
+        if execution_node is None:
             regex_literals.extend(_plain_regex_value_spans(program, check_runtime))
     templates = [node for node in program.nodes if node.type == "template_string"]
     if not templates:
         return None
-    projected = assertion_template_shell_text(content, check_runtime)
-    if executable is None:
-        executable = _has_shell_execution_call(program, check_runtime)
-    if executable:
+    projected = (
+        assertion_template_shell_text(content, check_runtime)
+        if dialect == "javascript"
+        else content
+    )
+    if not checked_execution:
+        execution_node = _has_shell_execution_call(program, check_runtime)
+    if execution_node is not None:
         for node in templates:
             check_runtime()
             start, end = program.span(node)
@@ -1545,7 +1555,10 @@ def javascript_template_spans(
                     and node.parent.child_by_field_name("arguments") == node
                 )
             ):
-                unresolved_executables.append(start)
+                # The witness is the unresolved callable, which may precede or
+                # follow an ordinary template elsewhere in the same module.
+                unresolved_executables.append(program.span(execution_node)[0])
+                break
         return None
     if _has_unproven_assertion_template_call(content, projected, program, templates, check_runtime):
         return None
@@ -1798,9 +1811,47 @@ _PATH_FUNCTIONS = frozenset(
 )
 
 
+# Only a filesystem path argument has native filename semantics. In particular,
+# generated file contents can carry executable text and still need inspection.
+_FS_PATH_METHODS = frozenset(
+    {
+        "access",
+        "accessSync",
+        "appendFile",
+        "appendFileSync",
+        "existsSync",
+        "lstat",
+        "lstatSync",
+        "mkdir",
+        "mkdirSync",
+        "open",
+        "openSync",
+        "readFile",
+        "readFileSync",
+        "readdir",
+        "readdirSync",
+        "realpath",
+        "realpathSync",
+        "rm",
+        "rmSync",
+        "stat",
+        "statSync",
+        "truncate",
+        "truncateSync",
+        "unlink",
+        "unlinkSync",
+        "writeFile",
+        "writeFileSync",
+    }
+)
+_FS_FD_METHODS = frozenset(
+    {"close", "closeSync", "fsync", "fsyncSync", "read", "readSync", "write", "writeSync"}
+)
+
+
 def _ordinary_native_calls(
     program: JavaScriptProgram, check_runtime: Callable[[], None]
-) -> tuple[set[int], set[int]]:
+) -> tuple[set[int], set[int], set[int]]:
     """Prove direct native calls without granting ownership to escaped methods.
 
     As with the existing browser/assertion proofs, ordinary built-ins are
@@ -1808,12 +1859,12 @@ def _ordinary_native_calls(
     cannot borrow that assumption. Raw finding inspection remains unchanged.
     """
     references: dict[str, list[Node]] = {}
-    path_bindings: dict[str, tuple[Node, bool]] = {}
+    bindings: dict[str, tuple[Node, str, str, bool]] = {}
     regex_calls: list[Node] = []
     regex_bindings: dict[str, Node] = {}
     intrinsic_override = False
-    path_unproven = False
-    path_imports = 0
+    module_unproven = False
+    imports: dict[str, int] = {}
     override_names = {
         "RegExp",
         "Reflect",
@@ -1831,7 +1882,7 @@ def _ordinary_native_calls(
     for node in program.nodes:
         check_runtime()
         if node.type == "with_statement":
-            return set(), set()
+            return set(), set(), set()
         if node.type in {
             "identifier",
             "shorthand_property_identifier",
@@ -1843,7 +1894,7 @@ def _ordinary_native_calls(
             if spelling in override_names:
                 intrinsic_override = True
             if spelling in {"syncBuiltinESMExports", "require", "getBuiltinModule"}:
-                path_unproven = True
+                module_unproven = True
             if spelling == "prototype":
                 # A direct hasOwnProperty.call read does not expose a prototype
                 # to an uploaded mutator. Other prototype uses remain unproved.
@@ -1911,23 +1962,38 @@ def _ordinary_native_calls(
                 if (
                     len(args) != 1
                     or args[0].type != "string"
-                    or program.text(args[0]).strip("\"'") in {"node:path", "path"}
+                    or program.text(args[0]).strip("\"'").removeprefix("node:")
+                    in {"path", "fs", "fs/promises"}
                 ):
-                    path_unproven = True
+                    module_unproven = True
         if node.type != "import_statement":
             continue
         source = node.child_by_field_name("source")
         module = "" if source is None else program.text(source).strip("\"'")
         if module.removeprefix("node:").startswith("path/"):
-            path_unproven = True
-        if module not in {"node:path", "path"}:
+            module_unproven = True
+        module = module.removeprefix("node:")
+        if module not in {"path", "fs", "fs/promises"}:
             continue
-        path_imports += 1
+        family = module.split("/")[0]
+        imports[family] = imports.get(family, 0) + 1
+        methods = _PATH_FUNCTIONS if module == "path" else _FS_PATH_METHODS | _FS_FD_METHODS
         for clause in node.named_children:
-            if clause.type == "import_clause" and any(
-                child.type != "named_imports" for child in clause.named_children
-            ):
-                path_unproven = True
+            if clause.type != "import_clause":
+                continue
+            for selector in clause.named_children:
+                if selector.type == "named_imports":
+                    continue
+                binding = selector
+                if selector.type == "namespace_import" and len(selector.named_children) == 1:
+                    binding = selector.named_children[0]
+                if binding.type != "identifier" or program.text(binding).casefold() in {
+                    "eval",
+                    "function",
+                }:
+                    module_unproven = True
+                    continue
+                bindings[program.text(binding)] = (binding, family, "", True)
         pending = list(node.named_children)
         while pending:
             check_runtime()
@@ -1938,12 +2004,13 @@ def _ordinary_native_calls(
                 if original is not None and binding is not None:
                     name = program.text(original)
                     if program.text(binding).casefold() in {"eval", "function"}:
-                        path_unproven = True
+                        module_unproven = True
                         continue
-                    if name in _PATH_FUNCTIONS or name in {"posix", "win32"}:
-                        path_bindings[program.text(binding)] = (binding, name in {"posix", "win32"})
+                    path_namespace = module == "path" and name in {"posix", "win32"}
+                    if name in methods or path_namespace:
+                        bindings[program.text(binding)] = (binding, family, name, path_namespace)
                     else:
-                        path_unproven = True
+                        module_unproven = True
             pending.extend(specifier.named_children)
     for name, binding in regex_bindings.items():
         for reference in references[name]:
@@ -1981,11 +2048,13 @@ def _ordinary_native_calls(
             property_node = member.child_by_field_name("property")
             if property_node is not None:
                 owned.add(property_node.id)
-    path_calls: set[int] = set()
-    path_identifiers: set[int] = set()
-    for name, (binding, namespace) in path_bindings.items():
+    rejected: set[str] = set()
+    module_calls: dict[str, set[int]] = {}
+    module_identifiers: dict[str, set[int]] = {}
+    for name, (binding, family, original, namespace) in bindings.items():
         calls: set[int] = set()
         identifiers = {binding.id}
+        methods = _PATH_FUNCTIONS if family == "path" else _FS_PATH_METHODS | _FS_FD_METHODS
         for reference in references[name]:
             check_runtime()
             if reference == binding:
@@ -1995,30 +2064,213 @@ def _ordinary_native_calls(
                 callee is None
                 or callee.type != "member_expression"
                 or callee.child_by_field_name("object") != reference
-                or _callable_member(program, callee) not in _PATH_FUNCTIONS
+                or _callable_member(program, callee) not in methods
             ):
-                path_unproven = True
                 break
             call = None if callee is None else callee.parent
+            arguments = None if call is None else call.child_by_field_name("arguments")
             if (
                 call is None
                 or call.type != "call_expression"
                 or call.child_by_field_name("function") != callee
-                or call.child_by_field_name("arguments") is None
-                or call.child_by_field_name("arguments").type == "template_string"
+                or arguments is None
+                or arguments.type != "arguments"
             ):
                 break
-            calls.add(call.id)
+            method = _callable_member(program, callee) if namespace else original
+            if family == "path":
+                calls.add(call.id)
+            elif method in _FS_PATH_METHODS:
+                # Exempt only the first argument when checking imported callables.
+                # Nested calls and all other arguments keep their own analysis.
+                args = [arg for arg in arguments.named_children if arg.type != "comment"]
+                if args and args[0].type != "spread_element":
+                    calls.add(args[0].id)
             identifiers.add(reference.id)
         else:
-            path_calls.update(calls)
-            path_identifiers.update(identifiers)
+            module_calls.setdefault(family, set()).update(calls)
+            module_identifiers.setdefault(family, set()).update(identifiers)
             continue
-        path_unproven = True
-    if not path_unproven and path_imports == 1:
-        native_calls.update(path_calls)
-        owned.update(path_identifiers)
-    return owned, native_calls
+        rejected.add(family)
+    native_paths: set[int] = set()
+    for family, calls in module_calls.items():
+        if not module_unproven and family not in rejected and imports[family] == 1:
+            if family == "path":
+                native_calls.update(calls)
+            else:
+                native_paths.update(calls)
+            owned.update(module_identifiers[family])
+    return owned, native_calls, native_paths
+
+
+def _data_parameter_identifiers(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> set[int]:
+    """A parameter used exclusively for field reads is never itself invoked."""
+    references: dict[str, list[Node]] = {}
+    candidates: list[tuple[Node, Node]] = []
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return set()
+        if node.type not in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            continue
+        name = program.text(node)
+        if name.casefold() not in _SHELL_EXECUTION_CALLS - {"eval", "function"}:
+            continue
+        references.setdefault(name, []).append(node)
+        parent = node.parent
+        if parent is None:
+            continue
+        if parent.type == "formal_parameters":
+            parent = parent.parent
+        if (
+            parent is not None
+            and parent.type
+            in {
+                "function_declaration",
+                "function_expression",
+                "arrow_function",
+                "method_definition",
+            }
+            and (
+                node.parent.type == "formal_parameters"
+                or parent.child_by_field_name("parameter") == node
+            )
+        ):
+            candidates.append((node, parent))
+
+    owned: set[int] = set()
+    budget = _MAX_TOKENS * 4
+    for binding, function in candidates:
+        identifiers = {binding.id}
+        for reference in references[program.text(binding)]:
+            budget -= 1
+            if budget < 0:
+                return set()
+            check_runtime()
+            if reference == binding or not (
+                function.start_byte <= reference.start_byte < function.end_byte
+            ):
+                continue
+            member = reference.parent
+            if (
+                member is None
+                or member.type != "member_expression"
+                or member.child_by_field_name("object") != reference
+            ):
+                break
+            field = _callable_member(program, member)
+            consumer = member.parent
+            if (
+                not field
+                or field.casefold() in _SHELL_EXECUTION_CALLS
+                or field in {"call", "apply", "bind", "constructor", "prototype", "__proto__"}
+            ):
+                break
+            if consumer is None or (
+                consumer.type in {"call_expression", "new_expression"}
+                and member
+                in (
+                    consumer.child_by_field_name("function"),
+                    consumer.child_by_field_name("constructor"),
+                )
+            ):
+                break
+            identifiers.add(reference.id)
+        else:
+            owned.update(identifiers)
+    return owned
+
+
+def _promise_settlers(program: JavaScriptProgram, check_runtime: Callable[[], None]) -> set[int]:
+    """Identify direct calls to unchanged, lexically bound native Promise settlers."""
+    if "Promise" not in program.content:
+        return set()
+    references: dict[str, list[Node]] = {}
+    executors: list[Node] = []
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return set()
+        if node.type not in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+            "property_identifier",
+            "string",
+        }:
+            continue
+        spelling = program.text(node).strip("\"'")
+        if spelling in {"globalThis", "global", "window", "self", "Reflect", "eval"} or (
+            node.type != "string" and "\\" in spelling
+        ):
+            return set()
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            references.setdefault(spelling, []).append(node)
+        if spelling != "Promise":
+            continue
+        new = node.parent
+        if (
+            node.type != "identifier"
+            or new is None
+            or new.type != "new_expression"
+            or new.child_by_field_name("constructor") != node
+        ):
+            return set()
+        arguments = new.child_by_field_name("arguments")
+        args = (
+            []
+            if arguments is None
+            else [arg for arg in arguments.named_children if arg.type != "comment"]
+        )
+        if len(args) == 1 and args[0].type in {"arrow_function", "function_expression"}:
+            executors.append(args[0])
+
+    owned: set[int] = set()
+    budget = _MAX_TOKENS * 4
+    for executor in executors:
+        parameters = executor.child_by_field_name("parameters")
+        single = executor.child_by_field_name("parameter")
+        bindings = (
+            [single]
+            if single is not None
+            else ([] if parameters is None else parameters.named_children)
+        )
+        if len(bindings) > 2 or any(binding.type != "identifier" for binding in bindings):
+            continue
+        for binding in bindings:
+            calls: set[int] = set()
+            for ref in references[program.text(binding)]:
+                check_runtime()
+                budget -= 1
+                if budget < 0:
+                    return set()
+                if ref == binding or not (
+                    executor.start_byte <= ref.start_byte < executor.end_byte
+                ):
+                    continue
+                call = ref.parent
+                if (
+                    call is None
+                    or call.type != "call_expression"
+                    or call.child_by_field_name("function") != ref
+                    or call.child_by_field_name("arguments") is None
+                    or call.child_by_field_name("arguments").type != "arguments"
+                ):
+                    break
+                calls.add(ref.id)
+            else:
+                owned.update(calls)
+    return owned
 
 
 def _numeric_local_identifiers(
@@ -2152,6 +2404,11 @@ def _pattern_binding_names(
             left = node.child_by_field_name("left")
             if left is not None:
                 pending.append(left)
+        elif node.type in {"required_parameter", "optional_parameter"}:
+            # Type annotations and default values do not bind runtime names.
+            bound = node.child_by_field_name("pattern")
+            if bound is not None:
+                pending.append(bound)
         elif node.type == "pair_pattern":
             value = node.child_by_field_name("value")
             if value is not None:
@@ -2165,11 +2422,13 @@ def _pattern_binding_names(
 
 def _has_shell_execution_call(
     program: JavaScriptProgram, check_runtime: Callable[[], None]
-) -> bool:
+) -> Node | None:
     scalar_identifiers = _scalar_template_identifiers(program, check_runtime)
     ordinary_identifiers = _numeric_local_identifiers(program, check_runtime)
-    native_members, native_calls = _ordinary_native_calls(program, check_runtime)
+    ordinary_identifiers.update(_promise_settlers(program, check_runtime))
+    native_members, native_calls, native_paths = _ordinary_native_calls(program, check_runtime)
     owned_identifiers = scalar_identifiers | ordinary_identifiers | native_members
+    owned_identifiers.update(_data_parameter_identifiers(program, check_runtime))
     uncertain_bindings: set[str] = set()
     global_objects = {"globalThis", "global", "window", "self"}
     imported_callables: set[str] = set()
@@ -2288,7 +2547,7 @@ def _has_shell_execution_call(
                     and node.id not in owned_identifiers
                 )
             ):
-                return True
+                return node
         if node.type == "subscript_expression":
             owner = node.child_by_field_name("object")
             while owner is not None and owner.type in {"member_expression", "subscript_expression"}:
@@ -2299,17 +2558,17 @@ def _has_shell_execution_call(
             ):
                 # A computed global can supply eval/Function through an alias,
                 # including an object or array later destructured elsewhere.
-                return True
+                return node
         if node.type == "import_statement":
             source = node.child_by_field_name("source")
             if source is None or _is_shell_execution_module(program.text(source)):
-                return True
+                return node
         if node.type not in {"call_expression", "new_expression"}:
             continue
         callee = node.child_by_field_name("function") or node.child_by_field_name("constructor")
         arguments = node.child_by_field_name("arguments")
         if callee is None or arguments is None or arguments.type == "template_string":
-            return True
+            return node
         selected_names: set[str] = set()
         callable_ids = {origin.id for origin in _callable_values(program, callee, check_runtime)}
         for origin in _callable_values(program, callee, check_runtime, all_receivers=True):
@@ -2321,12 +2580,12 @@ def _has_shell_execution_call(
                     and name in uncertain_bindings
                     and origin.id not in ordinary_identifiers
                 ):
-                    return True
+                    return node
             elif origin.type in {"call_expression", "new_expression"}:
                 # Unknown call results, including bound functions, cannot
                 # borrow the ordinary direct-call ownership heuristic.
                 if origin.id in callable_ids:
-                    return True
+                    return node
             elif origin.type in {"member_expression", "subscript_expression"}:
                 member = _callable_member(program, origin)
                 if (
@@ -2334,9 +2593,9 @@ def _has_shell_execution_call(
                     and member.casefold() in _SHELL_EXECUTION_CALLS
                     and origin.id not in native_members
                 ):
-                    return True
+                    return node
                 if member == "construct":
-                    return True
+                    return node
                 if (
                     origin.id in callable_ids
                     and origin.type == "subscript_expression"
@@ -2344,19 +2603,19 @@ def _has_shell_execution_call(
                 ):
                     index = origin.child_by_field_name("index")
                     if index is None or index.type not in {"number", "null", "true", "false"}:
-                        return True
+                        return node
         if selected_names & imported_callables and node.id not in native_calls:
             # An unresolved imported function may execute its argument. Keep
             # direct template arguments and simple local aliases unowned;
             # this does not claim interprocedural argument-flow analysis.
-            pending = list(arguments.named_children)
+            pending = [arg for arg in arguments.named_children if arg.id not in native_paths]
             while pending:
                 check_runtime()
                 argument = pending.pop()
                 if argument.type == "template_string" or (
                     argument.type == "identifier" and program.text(argument) in template_values
                 ):
-                    return True
+                    return node
                 pending.extend(argument.named_children)
         if selected_names & {"require", "import"} or callee.type == "import":
             args = arguments.named_children
@@ -2365,8 +2624,8 @@ def _has_shell_execution_call(
                 or args[0].type != "string"
                 or _is_shell_execution_module(program.text(args[0]))
             ):
-                return True
-    return False
+                return node
+    return None
 
 
 def _callable_member(program: JavaScriptProgram, node: Node) -> str | None:
@@ -2390,6 +2649,16 @@ def _callable_values(
         node = pending.pop()
         if node.type in {"parenthesized_expression", "await_expression"}:
             pending.extend(node.named_children)
+        elif node.type in {
+            "as_expression",
+            "satisfies_expression",
+            "non_null_expression",
+            "instantiation_expression",
+        }:
+            # A TypeScript type annotation leaves the runtime callee unchanged.
+            pending.extend(node.named_children[:1])
+        elif node.type == "type_assertion":
+            pending.extend(node.named_children[-1:])
         elif (
             node.type == "binary_expression"
             and (operator := node.child_by_field_name("operator")) is not None

@@ -894,6 +894,8 @@ def test_executor_member_reads_keep_existing_conservative_coverage(source: str) 
         "const match = /exec/.exec(text); const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);",
         "const NUMBER = /^[0-9]+$/; const valid = value => NUMBER.test(value); const match = /[0-9]+/.exec(text);",
         "import {posix} from 'node:path'; const path = posix.join(posix.dirname(source), `${name}.json`);",
+        "import path from 'node:path'; const pathName = path.join(root, `${name}.txt`);",
+        "import * as path from 'node:path'; const pathName = path.join(root, `${name}.txt`);",
         "import {win32 as p} from 'node:path'; const path = p.join(`${name}`, 'file');",
         "import {join as makePath} from 'path'; const path = makePath(`${name}`, 'file');",
         "import {join as run} from 'node:path'; const path = run(`${name}`, 'file');",
@@ -956,6 +958,8 @@ def test_proven_native_and_local_numeric_calls_retain_templates(
         "const eval = x => x + 1; eval(`${command}`);",
         "const run = x => x + 1; with (tools) { run(`${command}`); }",
         "import {join as run} from 'node:path'; const alias = run; alias(`${command}`);",
+        "import path from 'node:path'; path.join = executor; path.join(`${command}`);",
+        "import * as path from 'node:path'; const mutate = path.posix; mutate.join = executor; path.join(`${command}`);",
         "import {posix as p, posix as q} from 'node:path'; q.join = executor; p.join(`${command}`);",
         "import {posix as p} from 'node:path'; import {posix as q} from 'node:path'; q.join = executor; p.join(`${command}`);",
         "import path, {posix as p} from 'node:path'; path.posix.join = executor; p.join(`${command}`);",
@@ -1252,3 +1256,94 @@ def test_native_pattern_boundaries_cannot_hide_a_later_dynamic_consumer():
         f.rule_id == "TM1"
         for f in tm.analyze(source + "exec('rm -rf /');", "control.mjs", "javascript")
     )
+
+
+@pytest.mark.parametrize(
+    ("dialect", "source"),
+    [
+        ("typescript", "interface Row { n: number }; const label = (r: Row) => `row ${r.n}`;"),
+        ("tsx", "type P = { n: number }; const Card = ({n}: P) => <i title={`row ${n}`}/>;"),
+    ],
+)
+def test_native_dialect_owns_typed_template_delimiters(dialect, source):
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type=dialect) is None
+    assert javascript_template_spans(source, lambda: None, dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "function go(f: (s: string) => void) { (f!) (`cmd ${arg}`); }",
+        "function go(f?: (s: string) => void) { (f as any)(`cmd ${arg}`); }",
+        "const f = globalThis[key] as Function; (f satisfies Function)(`cmd ${arg}`);",
+    ],
+)
+def test_type_annotations_preserve_uncertain_runtime_callables(source):
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="typescript") is not None
+
+
+def test_native_promise_settlers_own_data_but_unknown_callbacks_stay_visible():
+    source = "new Promise((send, fail) => { try { send(1); } catch (e) { fail(e); } }); const label = `count: ${n}`;"
+    assert javascript_template_spans(source, lambda: None)
+    for prefix in ("const Promise = makeRunner(); ", "globalThis.Promise = runner; "):
+        assert javascript_template_spans(prefix + source, lambda: None) is None
+    for body in ("send = other; send(1)", "function nested(send) {send(1)}", "eval(arg); send(1)"):
+        assert javascript_template_spans(source.replace("send(1)", body), lambda: None) is None
+
+
+@pytest.mark.parametrize(
+    "binding, method",
+    [
+        ("import {writeFileSync as save} from 'node:fs';", "save"),
+        ("import * as io from 'node:fs';", "io.writeFileSync"),
+        ("import io from 'node:fs/promises';", "io.writeFile"),
+    ],
+)
+def test_fs_paths_and_generated_contents_have_different_consumers(binding, method):
+    assert javascript_template_spans(f"{binding} {method}(`/tmp/${{name}}`, 'data');", lambda: None)
+    assert (
+        javascript_template_spans(f"{binding} {method}('/tmp/out', `${{command}}`);", lambda: None)
+        is None
+    )
+    assert (
+        javascript_template_spans(
+            f"{binding} import {{unknown}} from 'other'; {method}(unknown(`${{command}}`), 'data');",
+            lambda: None,
+        )
+        is None
+    )
+
+
+def test_parameter_field_reads_preserve_the_shell_role_of_other_bindings():
+    benign = "function label(run) { return `frame ${run.index} ${run.info.name}`; }"
+    assert javascript_template_spans(benign, lambda: None)
+    for expression in (
+        "run()",
+        "run.call(null, line)",
+        "run.launch(line)",
+        "run[key](line)",
+        "fn(run)",
+        "run = executor",
+    ):
+        source = benign.replace("return", expression + "; return")
+        assert javascript_template_spans(source, lambda: None) is None
+
+
+def test_js_runtime_witness_and_invalid_native_syntax_are_distinct():
+    source = "const label = `heading ${name}`; function go(callback) { callback(label); }"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert diagnostic.check == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert diagnostic.start == source.index("callback(label)")
+    malformed = "let = ) ; const label = `heading ${name}`;"
+    diagnostic = tm.bounded_parse_diagnostic(malformed, lambda: None, file_type="javascript")
+    assert diagnostic.check == tm.ParserCheck.JAVASCRIPT_SYNTAX
+    assert diagnostic.cause == tm.ParserCause.MALFORMED_INPUT
+
+
+def test_native_tree_budget_reports_a_resource_limit(monkeypatch):
+    monkeypatch.setattr(js, "_MAX_NODES", 4)
+    diagnostic = tm.bounded_parse_diagnostic(
+        "const label = `heading ${name}`;", lambda: None, file_type="javascript"
+    )
+    assert diagnostic.check == tm.ParserCheck.JAVASCRIPT_SYNTAX
+    assert diagnostic.cause == tm.ParserCause.RESOURCE_LIMIT
