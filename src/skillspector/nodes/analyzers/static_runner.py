@@ -1420,6 +1420,12 @@ def _bounded_parser_incomplete(
     prepared_analysis: object | None = None,
 ) -> bool:
     kwargs = {"file_type": file_type, "complete_context": complete_context}
+    if (
+        file_type == "other"
+        and path.lower().endswith(".rst")
+        and getattr(module, "USES_RST_SOURCE_TYPE", False) is True
+    ):
+        kwargs["file_type"] = "rst"
     if vars(module).get("USES_PREPARED_PARSER_ANALYSIS") is True:
         kwargs.update(
             prepared_analysis=prepared_analysis,

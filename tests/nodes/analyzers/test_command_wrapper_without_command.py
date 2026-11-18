@@ -300,3 +300,49 @@ def test_wrapper_chain_budget_stays_partial(wrapper: str) -> None:
     source = " ".join([wrapper] * 40) + " sh -c 'echo ready'\n"
 
     assert _exhausted(source, "shell")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "- Cause -> resolution: Find the problem (timeout -> see 42)\n",
+        '| Name | Meaning |\n|---|---|\n| wait | Timeout (e.g. `"2m"`, `"3h"`) |\n',
+        'The command uses `ssh host "batch -p\n<queue> -A <account> file"` here.\n',
+    ],
+)
+def test_markdown_documentation_punctuation_keeps_later_executable_content(content: str) -> None:
+    dangerous = "\n```sh\nsudo rm -rf /\n```\n"
+    unresolved = '\n```sh\nsudo >log "$command"\n```\n'
+
+    assert not _exhausted(content, "markdown")
+    assert _exhausted(content + unresolved, "markdown")
+    assert any(
+        f.rule_id == "TM1" for f in tm_module.analyze(content + dangerous, "SKILL.md", "markdown")
+    )
+
+
+def test_only_plain_declared_list_table_roles_own_rst_punctuation() -> None:
+    document = ".. role:: note\n\n.. list-table:: Names\n\n   * - :note:`The child's name.`\n"
+    projected = tm_module._rst_table_role_text(document, lambda: None)
+
+    assert projected == document.replace("`", " ").replace("'", " ")
+    assert _exhausted(document + '\nsudo >log "$command"\n', "rst")
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["references/guide.rst"], "file_cache": {"references/guide.rst": document}},
+        [tm_module],
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        ".. role:: note(code)\n\n.. list-table:: Names\n\n   * - :note:`The child's name.`\n",
+        ".. role:: note\n\n.. list-table:: Names\n\n   * - :note:`$(shell)`\n",
+        ".. role:: note\n\n.. code-block:: sh\n\n   * - :note:`The child's name.`\n",
+        ".. role:: note\n\n.. list-table:: Names\n\n   * - .. code:: bash\n        - :note:`Code`\n",
+        ".. role:: note\n\n.. include:: roles.rst\n\n.. list-table:: Names\n\n   * - :note:`Code`\n",
+    ],
+)
+def test_rst_unproved_role_and_literal_context_remains_visible(body: str) -> None:
+    assert tm_module._rst_table_role_text(body, lambda: None) == body
