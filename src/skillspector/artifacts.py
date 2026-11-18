@@ -962,17 +962,15 @@ def _obfuscated_instruction_right_context(
     action_end: int,
     check_runtime: Callable[[], None] | None = None,
 ) -> _ObfuscatedWordMatch | None:
-    """Return the end of an existing right-side P1 context, when present."""
+    """Return the end of an existing right-side P1 context, when present.
+
+    The word sequences below follow P1_PATTERNS in static_patterns_prompt_injection.
+    """
     cursor = _skip_required_security_whitespace(text, action_end, check_runtime)
     if cursor is None:
         return None
-    gaps: tuple[tuple[int, int], ...] = ()
-    requires_targeted = False
-
-    def keep(match: _ObfuscatedWordMatch) -> None:
-        nonlocal gaps, requires_targeted
-        gaps += match.gaps
-        requires_targeted = requires_targeted or match.requires_targeted_reconstruction
+    # A step of a word sequence is (accepted words, whether the step may be absent).
+    optional, required = True, False
 
     def match_one(start: int, expected_words: tuple[str, ...]) -> _ObfuscatedWordMatch | None:
         for expected in expected_words:
@@ -986,101 +984,63 @@ def _obfuscated_instruction_right_context(
                 return match
         return None
 
-    if action in {"ignore", "disregard", "forget"}:
-        all_match = _match_obfuscated_security_word(
-            text,
-            cursor,
-            "all",
-            check_runtime,
-        )
-        if all_match is not None:
-            next_cursor = _skip_required_security_whitespace(
-                text,
-                all_match.end,
-                check_runtime,
-            )
-            if next_cursor is None:
+    def sequence(*steps: tuple[tuple[str, ...], bool]) -> _ObfuscatedWordMatch | None:
+        """Match each step's word in order; a step flagged optional may be absent.
+
+        Whitespace must follow every matched word except the last step's.
+        """
+        position = cursor
+        end = cursor
+        gaps: tuple[tuple[int, int], ...] = ()
+        requires_targeted = False
+        for index, (expected_words, may_be_absent) in enumerate(steps):
+            match = match_one(position, expected_words)
+            if match is None:
+                if may_be_absent:
+                    continue
                 return None
-            keep(all_match)
-            cursor = next_cursor
+            gaps += match.gaps
+            requires_targeted = requires_targeted or match.requires_targeted_reconstruction
+            end = match.end
+            if index + 1 < len(steps):
+                next_position = _skip_required_security_whitespace(text, end, check_runtime)
+                if next_position is None:
+                    return None
+                position = next_position
+        return _ObfuscatedWordMatch(end, gaps, requires_targeted)
+
+    def quantified(*steps: tuple[tuple[str, ...], bool]) -> _ObfuscatedWordMatch | None:
+        """Match the steps, with or without a leading "all" or "any" and its "of"."""
+        return sequence((("all", "any"), required), (("of",), optional), *steps) or sequence(*steps)
+
+    earlier = ("previous", "prior")
+    instructions = ("instruction", "instructions")
 
     if action == "ignore":
-        previous_match = _match_obfuscated_security_word(
-            text,
-            cursor,
-            "previous",
-            check_runtime,
+        return quantified(
+            (("your", "the"), optional), (earlier, required), (instructions, required)
+        ) or sequence(
+            (("all",), optional),
+            (("safety", "security"), required),
+            (("rule", "rules", "constraint", "constraints", "guideline", "guidelines"), required),
         )
-        if previous_match is not None:
-            target_start = _skip_required_security_whitespace(
-                text,
-                previous_match.end,
-                check_runtime,
-            )
-            if target_start is None:
-                return None
-            target_match = match_one(target_start, ("instruction", "instructions"))
-            if target_match is None:
-                return None
-            keep(previous_match)
-            keep(target_match)
-            return _ObfuscatedWordMatch(target_match.end, gaps, requires_targeted)
-
-        policy_match = match_one(cursor, ("safety", "security"))
-        if policy_match is None:
-            return None
-        target_start = _skip_required_security_whitespace(
-            text,
-            policy_match.end,
-            check_runtime,
-        )
-        if target_start is None:
-            return None
-        target_match = match_one(
-            target_start,
-            ("rule", "rules", "constraint", "constraints", "guideline", "guidelines"),
-        )
-        if target_match is None:
-            return None
-        keep(policy_match)
-        keep(target_match)
-        return _ObfuscatedWordMatch(target_match.end, gaps, requires_targeted)
 
     if action == "disregard":
-        context_match = match_one(cursor, ("previous", "safety", "security"))
-        if context_match is None:
-            return None
-        keep(context_match)
-        return _ObfuscatedWordMatch(context_match.end, gaps, requires_targeted)
+        return quantified(
+            (("your",), optional), ((*earlier, "safety", "security"), required)
+        ) or quantified((("the",), required), (earlier, required), (instructions, required))
 
     if action == "forget":
-        context_match = match_one(cursor, ("previous", "your"))
-        if context_match is None:
-            return None
-        target_start = _skip_required_security_whitespace(
-            text,
-            context_match.end,
-            check_runtime,
-        )
-        if target_start is None:
-            return None
-        target_match = match_one(target_start, ("instruction", "instructions"))
-        if target_match is None:
-            return None
-        keep(context_match)
-        keep(target_match)
-        return _ObfuscatedWordMatch(target_match.end, gaps, requires_targeted)
+        return quantified(
+            (("your",), required), (earlier, optional), (instructions, required)
+        ) or quantified((("the",), optional), (earlier, required), (instructions, required))
 
     expected_contexts = (
         ("safety", "security", "system")
         if action == "override"
         else ("safety", "security", "restriction", "restrictions", "constraint", "constraints")
     )
-    context_match = match_one(cursor, expected_contexts)
-    if context_match is None:
-        return None
-    keep(context_match)
-    return _ObfuscatedWordMatch(context_match.end, gaps, requires_targeted)
+    return sequence((expected_contexts, required))
 
 
 def _obfuscated_instruction_left_context(
