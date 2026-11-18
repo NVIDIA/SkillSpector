@@ -2205,11 +2205,6 @@ def _static_printf_substitution(
         )
         return None
     literal_result = quoted_result and not backtick and _has_literal_printf_arguments(inner)
-    if quoted_result and not backtick and not literal_result:
-        command, _, _ = _next_shell_invocation_word(inner, 0, lambda: None)
-        if command == "printf":
-            failed()
-            return None
     invocation_diagnostics: list[StaticParserDiagnostic] = []
     recognized, arguments = _printf_invocation_arguments(inner, diagnostics=invocation_diagnostics)
     if not recognized or (not literal_result and re.search(r"[;|&<>\r\n]", inner) is not None):
@@ -2256,6 +2251,14 @@ def _static_printf_substitution(
         else:
             failed()
         return None
+
+    if quoted_result and not backtick and not literal_result:
+        # Even a word that survived the static character allowlist may have
+        # unquoted shell syntax. A direct quoted result requires literal argv.
+        command, _, _ = _next_shell_invocation_word(inner, 0, lambda: None)
+        if command == "printf":
+            failed()
+            return None
 
     segments: list[str | None] = []
     literal: list[str] = []
@@ -7423,6 +7426,11 @@ def _static_brace_expansions(
             },
         )
         return None
+    # A comma outside a single brace pair does not introduce alternatives.
+    # Ranges and nested or unmatched braces still need their own grammar.
+    single_brace = re.fullmatch(r"[^{}]*\{([^,{}]*)\}[^{}]*", word)
+    if single_brace is not None and ".." not in single_brace[1]:
+        return (word,)
     expanded = [word]
     changed = False
     for _ in range(4):
