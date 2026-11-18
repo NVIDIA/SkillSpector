@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -1036,6 +1038,15 @@ def test_make_substitution_preserves_earlier_runtime_command():
 def test_make_unconditional_forced_literal_value_can_be_inspected():
     source = '```make\noverride VALUE := fixed-path\nall:\n\t@echo "$(VALUE)" > out\n```\n'
     assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+
+
+def test_adjacent_shell_variables_in_an_unmatched_make_recipe_finish():
+    script = r"""
+from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+line = '\t@echo "' + '$$Letters' * 70 + '%" > out\n'
+assert list(tm._make_output_recipes("all:\n" + line, lambda: None)) == []
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=15)
 
 
 def test_documented_stdout_substitution_must_be_a_placeholder() -> None:

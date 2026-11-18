@@ -9366,7 +9366,7 @@ _MAKE_SIMPLE_TARGET = re.compile(
     r"(?![=:])"
 )
 _MAKE_RECIPE_VALUE = re.compile(
-    r"\$\$[A-Za-z_][A-Za-z0-9_]*|\$[@A-Za-z]|\$\([A-Za-z_][A-Za-z0-9_]*\)|"
+    r"\$\$[A-Za-z_][A-Za-z0-9_]*+|\$[@A-Za-z]|\$\([A-Za-z_][A-Za-z0-9_]*\)|"
     r"\$\{[A-Za-z_][A-Za-z0-9_]*\}"
 )
 _MAKE_ECHO_RECIPE = re.compile(
@@ -9393,6 +9393,8 @@ def _make_literal_overrides(lines: list[str], check_runtime: Callable[[], None])
         raw = line.rstrip("\r\n")
         if not raw.strip() or raw.lstrip(" ").startswith("#"):
             continue
+        if len(raw) > 1024:
+            return set()
         if assigned := _MAKE_LITERAL_OVERRIDE.fullmatch(raw):
             names.add(assigned[1])
         elif not (_MAKE_LITERAL_RULE.fullmatch(raw) or _MAKE_ECHO_RECIPE.fullmatch(raw)):
