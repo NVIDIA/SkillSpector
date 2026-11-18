@@ -2269,10 +2269,14 @@ def _static_printf_substitution(
         _note_parser_diagnostic(
             diagnostics,
             ParserCause.RUNTIME_DEPENDENT,
-            ParserCheck.PRINTF_INVOCATION,
+            ParserCheck.SHELL_FILTER_ARGUMENT
+            if pipeline["pattern"]
+            else ParserCheck.PRINTF_INVOCATION,
             inner_start + low,
             inner_start + high,
-            ParserUncheckedScope.COMMAND_WORD,
+            ParserUncheckedScope.COMMAND_ARGUMENTS
+            if pipeline["pattern"]
+            else ParserUncheckedScope.COMMAND_WORD,
         )
         return None
     literal_result = quoted_result and not backtick and _has_literal_printf_arguments(inner)
@@ -3618,6 +3622,245 @@ def _quoted_printf_data_text(
             output = list(content)
         output[opening:end] = "x" * (end - opening)
     return "".join(output) if output is not None else content
+
+
+# Quoted printf %q can encode a single scalar for storage. Keep the
+# unknown value symbolic: assigning it never establishes what a future
+# interpreter, array expansion or executable consumer will do with it.
+_QUOTED_PRINTF_ENCODE = re.compile(
+    r"""\$\(printf[ \t]+'%q'[ \t]+"(?P<value>\$(?:[A-Za-z_][A-Za-z0-9_]*"""
+    r"""|\{[A-Za-z_][A-Za-z0-9_]*(?:\[[0-9]{1,5}\])?\})(?:/[A-Za-z0-9_./-]+)?)"\)"""
+)
+_QUOTED_ASSIGNMENT = re.compile(
+    r'''[ \t]*(?P<name>[a-zA-Z_][a-zA-Z_0-9]*)(?:\+?=)(?P<array>\(?)"'''
+)
+
+
+_PRINTF_CARRY = re.compile(r"""[ \t]*(?P<name>[A-Za-z_][A-Za-z_0-9]*)\+?="(?P<rhs>.*)"[ \t]*$""")
+
+
+def _printf_storage_uses(
+    content: str,
+    name: str,
+    quote_limits: dict[int, int],
+    check_runtime: Callable[[], None],
+    budget: list[int],
+    seen: set[str],
+    local_functions: set[str],
+) -> bool:
+    """Follow transparent scalar copies. Keep file, pipe and executable uses live."""
+    if name in seen:
+        return True
+    if len(seen) >= 8 or budget[0] < len(content):
+        return False
+    seen.add(name)
+    budget[0] -= len(content)
+    # A literal variable name can feed a nameref or an indirect expansion.
+    # Such consumers do not necessarily contain an ordinary $name token.
+    if re.search(
+        r"""\b[A-Za-z_][A-Za-z_0-9]*=["']?""" + re.escape(name) + r"""["']?(?=[ \t;&\r\n]|$)""",
+        content,
+    ):
+        return False
+    identifier = re.compile(r"\$\{?" + re.escape(name) + r"\b")
+    for occurrence in identifier.finditer(content):
+        check_runtime()
+        pos = occurrence.start()
+        begin = content.rfind("\n", max(0, pos - _ROOT_GLOB_COMMAND_CHARS), pos) + 1
+        stop = content.find("\n", pos, min(len(content), pos + _ROOT_GLOB_COMMAND_CHARS))
+        if stop < 0:
+            stop = len(content)
+        if stop - begin > _ROOT_GLOB_COMMAND_CHARS:
+            return False
+        line = content[begin:stop]
+        if line.lstrip().startswith("#"):
+            continue
+        close = quote_limits.get(pos)
+        if close is None:
+            return False
+        carry = _PRINTF_CARRY.fullmatch(line)
+        if carry is not None:
+            rhs = _QUOTED_PRINTF_ENCODE.sub("", carry["rhs"])
+            if any(marker in rhs for marker in ("$(", "`", "\\", '"')) or not _printf_storage_uses(
+                content, carry["name"], quote_limits, check_runtime, budget, seen, local_functions
+            ):
+                return False
+            continue
+        if re.fullmatch(
+            r"""\s*(?:if[ \t]+)?\[\[[ \t]+-[nz][ \t]+"[^"\r\n]*"[ \t]+\]\](?:;[ \t]+then)?[ \t]*""",
+            line,
+        ):
+            continue
+        # A fixed argv consumer does not execute a quoted parameter merely
+        # because its data looks like a command. Refuse shell interpreters,
+        # redirections, pipelines, local wrappers and unproved syntax.
+        if not _QUOTED_PRINTF_ENCODE.search(line) and re.match(
+            r'[ \t]*(?:eval[ \t]+|(?:bash|sh)[ \t]+-c[ \t]+|"\$)', line
+        ):
+            # This downstream command already has a separate, source-owned
+            # diagnostic for its runtime command or interpreter body.
+            known = _has_shell_command_word_exhaustion(line, check_runtime)
+            if known is None:
+                details: list[StaticParserDiagnostic] = []
+                _has_destructive_command_string(line, diagnostics=details)
+                known = next(iter(details), None)
+            if known is not None and known.check in {
+                ParserCheck.COMMAND_IDENTITY,
+                ParserCheck.COMMAND_STRING_RUNTIME,
+            }:
+                continue
+        command = re.match(r"[ \t]*([A-Za-z_][A-Za-z_0-9.-]*)[ \t]+", line)
+        if command is None or close >= stop or line[close - begin + 1 :].strip():
+            return False
+        cmd = command[1]
+        if cmd in _SHELL_COMMAND_STRING_SHELLS or cmd in {
+            "source",
+            "parallel",
+            "find",
+            "make",
+            "gmake",
+            "eval",
+            "exec",
+            "env",
+            "xargs",
+            "sudo",
+            "command",
+            "builtin",
+            "python",
+            "python3",
+            "perl",
+            "node",
+            "ruby",
+            "awk",
+            "sed",
+            "ssh",
+            "read",
+            "mapfile",
+            "readarray",
+        }:
+            return False
+        before = line[command.end() : pos - begin]
+        if cmd == "printf":
+            # printf's previous literal formatting argument may contain an
+            # escaped newline. It cannot turn a subsequent %s operand into code.
+            fmt = re.match(
+                r"""(?P<q>['"])(?P<body>(?:[^%'":\\]|\\[nrt]|%%|%s){1,128})(?P=q)[ \t]+""", before
+            )
+            if fmt is None:
+                return False
+            before = before[fmt.end() :]
+        if any(c in before for c in "|;&<>()`\\") or cmd in local_functions:
+            return False
+    return True
+
+
+_SHELL_FILE_PARAMETER = re.compile(
+    r"(?:source|\.|(?:/bin/)?(?:ba)?sh)[ \t]+(?:--[ \t]+)?"
+    r'(?P<arg>"\$(?:(?P<short>[A-Za-z_][A-Za-z0-9_]*)|\{(?P<long>[A-Za-z_][A-Za-z0-9_]*)(?:\[[0-9@*]+\])?\})")(?=[\s;&|]|$)'
+)
+
+
+def _quoted_printf_assignments(
+    content: str,
+    projected: str,
+    quote_limits: dict[int, int],
+    check_runtime: Callable[[], None],
+    file_consumers: list[StaticParserDiagnostic],
+) -> str:
+    """Retain one symbolic data operand inside an ordinary scalar/array assignment."""
+    if not quote_limits or "'%q'" not in content:
+        return projected
+    assigned: dict[str, int] = {}
+    substitutions: list[tuple[int, int, str]] = []
+    for match in _QUOTED_PRINTF_ENCODE.finditer(content):
+        check_runtime()
+        start, end = match.span()
+        close = quote_limits.get(start)
+        if close is None or close < end:
+            continue
+        line = content.rfind("\n", max(0, start - _ROOT_GLOB_COMMAND_CHARS), start) + 1
+        if start - line >= _ROOT_GLOB_COMMAND_CHARS:
+            continue
+        assignment = _QUOTED_ASSIGNMENT.match(content, line)
+        if assignment is None or assignment.end() > start:
+            continue
+        tail_end = content.find("\n", close, min(len(content), close + 128))
+        if tail_end < 0:
+            if close + 128 < len(content):
+                continue
+            tail_end = len(content)
+        tail = content[close + 1 : tail_end].strip(" \t\r")
+        if tail != (")" if assignment["array"] else ""):
+            continue
+        # In an array accept exactly one quoted element. A scalar may include
+        # ordinary literal text and a simple interpolation, but never replace
+        # an executed interpreter operand or a command captured by the RHS.
+        prefix = content[assignment.end() : start]
+        if (assignment["array"] and (prefix or close != end)) or any(
+            char in prefix for char in "'\"$`\\"
+        ):
+            continue
+        # A literal -c in a generated command introduces an interpreter body
+        # and needs its own provenance. The other ordinary interpolation and
+        # outer consumers are inspected from their original characters.
+        if re.search(r"(?:^|[ \t])(?:bash|sh|zsh|ksh)[ \t]+-c(?:[ \t]|$)", prefix):
+            continue
+        assigned[assignment["name"]] = tail_end
+        # One parameter expansion remains one unknown double-quoted scalar.
+        # Keep all offsets and all later command consumers unchanged.
+        substitutions.append((start, end, assignment["name"]))
+    if not assigned:
+        return projected
+    # The contents of a path subsequently passed to a shell are unknown.
+    # Keep that limitation at the executable-file consumer where it arises.
+    for pos in _nonempty_shell_clause_starts(content, check_runtime, shell_substitutions=True):
+        if content[pos : pos + 1] not in {".", "s", "b", "/"}:
+            continue
+        invocation = _SHELL_FILE_PARAMETER.match(content, pos)
+        if invocation is None:
+            continue
+        name = invocation["short"] or invocation["long"]
+        assigned_end = assigned.get(name)
+        if assigned_end is None or assigned_end >= pos:
+            continue
+        if content[assigned_end:pos].strip():
+            # Another statement may rebind the shell variable. Retain the
+            # original uncertainty unless its immediate consumer is visible.
+            return projected
+        lo, hi = invocation.span("arg")
+        file_consumers.append(
+            StaticParserDiagnostic(
+                ParserCause.RUNTIME_DEPENDENT,
+                ParserCheck.SHELL_SCRIPT_PATH,
+                lo,
+                hi,
+                ParserUncheckedScope.COMMAND_ARGUMENTS,
+            )
+        )
+        break
+    if file_consumers:
+        return projected
+    budget = [16 * len(content)]
+    local_functions = set(
+        re.findall(
+            r"(?m)^[ \t]*(?:function[ \t]+)?([A-Za-z_][A-Za-z_0-9.-]{0,127})[ \t]*\([ \t]*\)",
+            content,
+        )
+    )
+    safe_storage = {
+        name
+        for name in assigned
+        if _printf_storage_uses(
+            content, name, quote_limits, check_runtime, budget, set(), local_functions
+        )
+    }
+    if not safe_storage:
+        return projected
+    changed = list(projected)
+    for start, end, name in substitutions:
+        if name in safe_storage:
+            changed[start:end] = "$" + "{" + "x" * (end - start - 3) + "}"
+    return "".join(changed)
 
 
 def _quoted_candidate_is_complete(
@@ -13109,6 +13352,7 @@ def _has_bounded_parse_exhaustion(
         else {}
     )
     quote_limits = None
+    printf_file_consumers: list[StaticParserDiagnostic] = []
     if file_type == "shell" and complete_context:
         # A closing delimiter in proven shell source cannot open a new
         # command word. Nested substitutions retain their own lexical walk,
@@ -13118,6 +13362,9 @@ def _has_bounded_parse_exhaustion(
             content, check_runtime, quote_closers=structural_quote_closers
         )
         shell_word_content = _quoted_printf_data_text(content, quote_limits, check_runtime)
+        shell_word_content = _quoted_printf_assignments(
+            content, shell_word_content, quote_limits, check_runtime, printf_file_consumers
+        )
     elif file_type == "markdown" and complete_context:
         quote_limits = {}
         for start, end in shell_fence_ranges:
@@ -13157,11 +13404,18 @@ def _has_bounded_parse_exhaustion(
         **json_word_roles,
     )
     if diagnostic is not None:
+        if printf_file_consumers and diagnostic.check in {
+            ParserCheck.PRINTF_FORMAT,
+            ParserCheck.PRINTF_INVOCATION,
+        }:
+            return printf_file_consumers[0]
         if python_source is not None:
             remote = python_source.remote_printf_argument(diagnostic)
             if remote is not None:
                 return remote
         return diagnostic
+    if printf_file_consumers:
+        return printf_file_consumers[0]
     json_starts = [start for start, _ in json_operand_spans]
     native_backtick_starts = sorted(native_backtick_bounds)
     native_reported_starts: Iterator[int] | None = None

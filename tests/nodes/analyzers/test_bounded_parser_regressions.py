@@ -910,7 +910,9 @@ def test_symbolic_printf_pipeline_reports_the_runtime_argument(pipeline: str, un
     detail = diagnostics[0]
     assert (detail.cause, detail.check) == (
         ParserCause.RUNTIME_DEPENDENT,
-        ParserCheck.PRINTF_INVOCATION,
+        ParserCheck.SHELL_FILTER_ARGUMENT
+        if unknown == '"$omit"'
+        else ParserCheck.PRINTF_INVOCATION,
     )
     assert source[detail.start : detail.end] == unknown
 
@@ -1158,3 +1160,68 @@ def test_ssh_stdin_witness_requires_original_script_and_unquoted_remote_argv(
     source = _remote_stdin_source().replace(old, new)
     detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
     assert detail and detail.check is not ParserCheck.SSH_ARGUMENTS
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        """parts+=("$(printf '%q' "$input")")""",
+        """hint="tool $(printf '%q' "$root/run") ${parts[*]}" """.rstrip(),
+        """hint="tool $(printf '%q' "${files[0]}")" """.rstrip(),
+    ],
+)
+def test_escaped_printf_assignment_keeps_runtime_value_as_data(assignment: str) -> None:
+    source = assignment + '\nprintf "%s\\n" "$hint"\n'
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell") is None
+
+
+@pytest.mark.parametrize(
+    ("assignment", "consumer", "expected"),
+    [
+        ("parts+=", 'eval "${parts[*]}"', ParserCheck.COMMAND_STRING_RUNTIME),
+        ("parts+=", '"${parts[@]}" -rf /', ParserCheck.COMMAND_IDENTITY),
+        ("hint=", 'eval "$hint"', ParserCheck.COMMAND_STRING_RUNTIME),
+        ("hint=", 'source "$hint"', ParserCheck.SHELL_SCRIPT_PATH),
+        ("hint=", 'bash "$hint"', ParserCheck.SHELL_SCRIPT_PATH),
+        ("hint=", '"$hint" -rf /', ParserCheck.COMMAND_IDENTITY),
+    ],
+)
+def test_escaped_printf_preserves_runtime_execution_consumer(
+    assignment: str, consumer: str, expected: ParserCheck
+) -> None:
+    value = """ "$(printf '%q' "$input")" """.strip()
+    if assignment.endswith("+="):
+        value = "(" + value + ")"
+    source = assignment + value + "\n" + consumer
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell")
+    assert detail and detail.check is expected
+    if expected is ParserCheck.SHELL_SCRIPT_PATH:
+        assert source[detail.start : detail.end] == '"$hint"'
+
+
+def test_escaped_assignment_cannot_authorize_a_different_source_binding() -> None:
+    source = """parts+=("$(printf '%q' "$input")")
+parts=(other)
+source "${parts[0]}" """
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell")
+    assert detail and detail.check is not ParserCheck.SHELL_SCRIPT_PATH
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'printf "%s" "${parts[*]}" | sh',
+        'printf "%s" "${parts[*]}" >runner.sh\nbash runner.sh',
+        'next="${parts[0]}"\nsource "$next"',
+        'load() { source "$1"; }\nload "${parts[0]}"',
+        'cat >"${parts[0]}"',
+        'parallel "${parts[0]}"',
+        'declare -n alias=parts\nsource "${alias[0]}"',
+        'which=parts\nsource "${!which}"',
+        'env sh -c "${parts[0]}"',
+        'find . -exec sh -c "${parts[0]}"',
+    ],
+)
+def test_escaped_data_does_not_complete_unresolved_file_and_pipe_consumers(body: str) -> None:
+    source = """parts+=("$(printf '%q' "$input")")\n""" + body
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell") is not None

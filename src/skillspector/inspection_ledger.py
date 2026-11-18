@@ -651,6 +651,8 @@ class ParserCheck(StrEnum):
     PRINTF_ARGUMENT_CHARACTERS = "printf_argument_characters"
     PRINTF_OUTPUT_CHARACTERS = "printf_output_characters"
     SSH_ARGUMENTS = "ssh_arguments"
+    SHELL_FILTER_ARGUMENT = "shell_filter_argument"
+    SHELL_SCRIPT_PATH = "shell_script_path"
     SHELL_ARITHMETIC = "shell_arithmetic"
     PRINTF_FORMAT = "printf_format"
     PRINTF_INVOCATION = "printf_invocation"
