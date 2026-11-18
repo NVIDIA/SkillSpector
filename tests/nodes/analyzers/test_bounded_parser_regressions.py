@@ -814,3 +814,77 @@ def test_output_reconciliation_only_clears_resolved_output_incompleteness(
         assert event["outcome"] is LedgerOutcome.COMPLETED
         assert "reason_code" not in event
         assert "parser_diagnostic" not in event
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """printf '%s\\n' "name $(printf '%q' "$name")" """,
+        """[[ "$(printf '%s' "$word" | tr 'A-F' 'a-f')" == "$target" ]]""",
+    ],
+)
+def test_printf_substitution_in_known_shell_data_operand(source: str) -> None:
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell") is None
+    assert (
+        tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell", complete_context=False)
+        is not None
+    )
+    assert tm.bounded_parse_diagnostic(source + "\n$tool -rf /", lambda: None) is not None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """eval "$(printf '%s' "$name")" """,
+        """printf '%s' "$(printf '%s' "$name")" | sh""",
+        """printf '%s' "$(printf '%s' "$name")" > script""",
+        """printf '%d' "$(printf '%s' "$name")" """,
+        """printf -v cmd '%s' "$(printf '%s' "$name")" """,
+        """printf "$(printf '%s' "$name")" """,
+        """echo "$(printf '%s' "$name")" """,
+        """out=$(printf '%s' "$(printf '%s' "$name")"\n)\n"$out" """,
+        """{\nprintf '%s' "$(printf '%s' "$name")"\n} | sh""",
+        """[[ "$(printf '%s' "$name" | tr 'A-Z' 'a-z')" -eq "$target" ]]""",
+        """tr() { eval "$1"; }\n[[ "$(printf '%s' "$name" | tr 'A-Z' 'a-z')" == "$target" ]]""",
+        """printf() { eval "$1"; }\nprintf '%s' "$(printf '%s' "$name")" """,
+        """PATH=/tmp/bin\n[[ "$(printf '%s' "$name" | tr 'A-Z' 'a-z')" == "$target" ]]""",
+        """printf '%s' "$(printf '%s' "$(other)")" """,
+    ],
+)
+def test_printf_substitution_without_known_data_ownership_keeps_uncertainty(source: str) -> None:
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell") is not None
+
+
+def test_python_cross_literal_command_still_checks_actual_operands() -> None:
+    source = 'note("readable text.", keys=[row["key"]])\n' + 'note("TEAM/RM plain text.")'
+    start = source.index("text.")
+    end = source.index("/RM") + len("/RM")
+    owner = tm._PythonSourceOwnership(source, lambda: None)
+    assert owner.crosses_literal_prose(start, end)
+    for replacement in ("-rf /", "$flags /", "unknown " + "\\x24" + "HOME"):
+        dangerous = source.replace("plain text.", replacement)
+        assert not tm._PythonSourceOwnership(dangerous, lambda: None).crosses_literal_prose(
+            start, end
+        )
+    extended = source.replace('plain text.")', 'plain text." + value)')
+    assert not tm._PythonSourceOwnership(extended, lambda: None).crosses_literal_prose(start, end)
+
+
+def test_perl_header_comment_cannot_charge_operands_to_another_line() -> None:
+    header = "# It's an owner's note and no shell is involved\n"
+    source = header + "my $data = 'example';\n" + "# note\n" * 1500 + "my $example = '-rf /';\n"
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="perl") is None
+    assert tm.bounded_parse_diagnostic(source + "$tool -rf /", lambda: None, file_type="perl")
+
+
+@pytest.mark.parametrize("separator", ["$()", "$( )", "`$()`", "$( $( ) )"])
+def test_empty_command_substitution_preserves_surrounding_command(separator: str) -> None:
+    command = "r" + separator + "m -rf /"
+    assert list(tm._destructive_command_words(command)) == [(0, 2 + len(separator))]
+    assert list(tm._destructive_command_effects(command))
+    assert (
+        tm.bounded_parse_diagnostic(
+            '"""The notation `$()` describes an empty value."""', lambda: None, file_type="python"
+        )
+        is None
+    )

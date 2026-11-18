@@ -2204,6 +2204,11 @@ def _static_printf_substitution(
             {"observed_characters": len(inner), "limit_characters": _PRINTF_STATIC_CHARS},
         )
         return None
+    if re.fullmatch(r"[ \t\n]*(?:\$\([ \t\n]*\)[ \t\n]*)?", inner):
+        # An empty command substitution runs no command. It contributes no
+        # bytes even when it is the complete body of an outer substitution.
+        # A real basename may still be formed by the words on either side.
+        return ""
     literal_result = quoted_result and not backtick and _has_literal_printf_arguments(inner)
     invocation_diagnostics: list[StaticParserDiagnostic] = []
     recognized, arguments = _printf_invocation_arguments(inner, diagnostics=invocation_diagnostics)
@@ -3378,6 +3383,108 @@ def _shell_quoted_candidate_limits(
     return limits
 
 
+# These substitutions read one quoted scalar. The optional transliteration
+# takes two literal alphabets. This grammar cannot run another substitution,
+# name an output variable, read a file or construct a pipeline consumer.
+_PRINTF_DATA_SUBSTITUTION_RE = re.compile(
+    r"""\$\(printf[ \t]+(?P<format>['"])%[qs](?:\\n)?(?P=format)[ \t]+"""
+    r'"\$(?:[a-zA-Z_][a-zA-Z_0-9]*|\{[a-zA-Z_][a-zA-Z_0-9]*\})"'
+    r"""(?P<tr>[ \t]*\|[ \t]*tr(?:[ \t]+'[a-zA-Z0-9][a-zA-Z0-9-]*'){2})?[ \t]*\)"""
+)
+
+
+def _quoted_printf_data_text(
+    content: str, quote_limits: dict[int, int], check_runtime: Callable[[], None]
+) -> str:
+    """Keep static output/conditional operands out of command-name reconstruction."""
+    if not quote_limits or "$(printf" not in content:
+        return content
+    scopes: list[int] = []
+    starts = (
+        (position, bool(scopes))
+        for position in _nonempty_shell_clause_starts(
+            content, check_runtime, shell_substitutions=True, substitution_scopes=scopes
+        )
+    )
+    following = next(starts, None)
+    start, captured = 0, False
+    grouped_output = (
+        re.search(r"(?m)(?:^[ \t]*}|(?<=[;&])[ \t]*}|\))[ \t]*(?:1?>|\|)", content) is not None
+    )
+    bound: dict[bool, bool] = {}
+    output: list[str] | None = None
+    budget = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
+    for match in _PRINTF_DATA_SUBSTITUTION_RE.finditer(content):
+        check_runtime()
+        opening, end = match.span()
+        if quote_limits.get(opening, -1) < end:
+            continue
+        while following is not None and following[0] <= opening:
+            start, captured = following
+            following = next(starts, None)
+        if opening - start >= _ROOT_GLOB_COMMAND_CHARS:
+            continue
+        needs_tr = match["tr"] is not None
+        if needs_tr not in bound:
+            names = frozenset({"printf", "tr"} if needs_tr else {"printf"})
+            bound[needs_tr] = not _shell_redefines_primitives(
+                content, check_runtime, names, shell_substitutions=True, check_search_path=needs_tr
+            )
+        if not bound[needs_tr]:
+            continue
+        prefix = content[start:opening]
+        if re.fullmatch(r'\[\[[ \t]+"', prefix):
+            # Comparing two quoted strings cannot reinterpret their values as
+            # shell syntax. Arithmetic and pattern operators retain raw analysis.
+            if not re.match(
+                r'"[ \t]+(?:==|!=|=)[ \t]+"\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})"'
+                r"[ \t]+\]\](?=[ \t;&|)\r\n]|$)",
+                content[end : end + 256],
+            ):
+                continue
+        elif not captured and not grouped_output and re.match(r"printf[ \t]", prefix):
+            # Re-read the complete command with the one scalar represented as
+            # data. Preserve the original width, positions and quoting. Reject
+            # redirection, captured output and pipe-to-interpreter consumers.
+            limit = min(len(content), start + _ROOT_GLOB_COMMAND_CHARS + 1)
+            budget -= limit - start
+            if budget < 0:
+                break
+            projected = prefix + "x" * (end - opening) + content[end:limit]
+            spans: list[tuple[int, int]] = []
+            _command_string_from_clause(
+                projected,
+                0,
+                check_runtime,
+                data_argument_spans=spans,
+                output_binding_proven=True,
+                output_argument_end=len(projected),
+            )
+            if len(spans) < 2 or not any(
+                lo <= opening - start and end - start <= hi for lo, hi in spans[1:]
+            ):
+                continue
+            fmt, _offset, limited = _next_shell_invocation_word(
+                projected, spans[0][0], check_runtime
+            )
+            if (
+                limited
+                or fmt is None
+                or fmt == "--"
+                or "%" in fmt.replace("%%", "").replace("%s", "")
+            ):
+                continue
+            tail = projected[spans[-1][1] :].lstrip(" \t")
+            if (tail and tail[0] not in "\r\n") or (not tail and limit < len(content)):
+                continue
+        else:
+            continue
+        if output is None:
+            output = list(content)
+        output[opening:end] = "x" * (end - opening)
+    return "".join(output) if output is not None else content
+
+
 def _quoted_candidate_is_complete(
     content: str,
     start: int,
@@ -3630,6 +3737,13 @@ def _has_shell_command_word_exhaustion(
         content, check_runtime
     )
 
+    # Before the first Perl statement, a line beginning with # is a native
+    # comment. Later lines may belong to heredocs, regexes or quote operators.
+    perl_comment_prefix = (
+        re.match(r"(?:[ \t]*+(?:#[^\r\n]*+)?(?:\r\n?|\n))*+", content)
+        if file_type == "perl" and complete_context
+        else None
+    )
     parsed_through = 0
     # A word that spans lines may pair a heredoc, comment or prose quote with
     # a later command line. Main skips the candidates inside such a word, so
@@ -4121,6 +4235,11 @@ def _has_shell_command_word_exhaustion(
         )
         if operand_diagnostic is not None:
             comment = python_source.comment(start) if python_source is not None else None
+            if perl_comment_prefix is not None and start < perl_comment_prefix.end():
+                begin = max(content.rfind("\n", 0, start), content.rfind("\r", 0, start)) + 1
+                newline = LOGICAL_LINE_BREAK.search(content, start, perl_comment_prefix.end())
+                end = newline.start() if newline is not None else perl_comment_prefix.end()
+                comment = (begin, end)
             if comment is None:
                 if _quoted_candidate_is_complete(
                     content, start, quote_limits, check_runtime, quoted_printf_allowed
@@ -4145,7 +4264,7 @@ def _has_shell_command_word_exhaustion(
                 if value_diagnostic is not None:
                     return value_diagnostic.enclosed(*value_source_range)
                 continue
-            # A Python comment is prose that no shell receives, so a command
+            # A native comment is prose that no shell receives, so a command
             # named in it can take operands only from the same comment, never
             # from later host code. Recheck that comment as standalone shell
             # text.
@@ -4813,6 +4932,7 @@ def _shell_redefines_primitives(
     candidate_starts: Iterator[int] | None = None,
     remaining_work: list[int] | None = None,
     shell_substitutions: bool = False,
+    check_search_path: bool = False,
 ) -> bool:
     """Retain bounded source binding proof for the selected primitive names."""
     work_limit = 4 * len(content) + _ROOT_GLOB_COMMAND_CHARS
@@ -4842,7 +4962,7 @@ def _shell_redefines_primitives(
         if start >= scope_end:
             continue
         source = content[start : min(scope_end, start + _ROOT_GLOB_COMMAND_CHARS + 1)]
-        if "xargs" in names and _shell_clause_sets_startup(
+        if (check_search_path or "xargs" in names) and _shell_clause_sets_startup(
             source,
             0,
             check_runtime,
@@ -6693,6 +6813,30 @@ class _PythonSourceOwnership:
             # the source bound cannot prove that later operands are absent.
             return None
         return "".join(pieces), word_start - origin, word_end - origin
+
+    def crosses_literal_prose(self, start: int, end: int) -> bool:
+        """Recognize a raw destructive basename assembled across two Python strings."""
+        first, last = self._owner(start), self._owner(end - 1)
+        if first is None or last is None or first == last or first[1] > last[0]:
+            return False
+        # The raw word reader skips the bytes between its mismatched quotes.
+        # Keep its uncertainty if they may contain destructive operands.
+        skipped = self._content[start:end]
+        if any(marker in skipped for marker in ("$", "`", "\\", "{", "}")) or (
+            _may_have_destructive_outer_operands(skipped)
+        ):
+            return False
+        tail_range: list[int] = []
+        tail = self.string_value(end - 1, end, source_range=tail_range)
+        if tail is None or tail_range[1] - end >= _ROOT_GLOB_COMMAND_CHARS:
+            return False
+        # Check the actual operands following the apparent basename, including
+        # adjacent literals. Only ordinary, option-free text is settled here.
+        operands = re.sub(r"(?<=[A-Za-z])'(?=[A-Za-z])", "", tail[0][tail[2] :])
+        return bool(
+            re.fullmatch(r"[ A-Za-z0-9,.:;!?()/\t\r\n-]*", operands)
+            and re.search(r"(?:^|\s)-(?=\S)", operands) is None
+        )
 
     def word_end(self, start: int) -> int:
         """Return the end of the host region a shell word at ``start`` can own."""
@@ -12362,6 +12506,7 @@ def _has_bounded_parse_exhaustion(
         quote_limits = _shell_quoted_candidate_limits(
             content, check_runtime, quote_closers=structural_quote_closers
         )
+        shell_word_content = _quoted_printf_data_text(content, quote_limits, check_runtime)
     elif file_type == "markdown" and complete_context:
         quote_limits = {}
         for start, end in shell_fence_ranges:
@@ -12421,6 +12566,10 @@ def _has_bounded_parse_exhaustion(
         # the same predicate below would discard it after parsing.  Short-circuit
         # it here to keep bounded-runtime accounting linear for documentation.
         if _is_root_glob_documentation(content, command_start, body_start):
+            continue
+        if python_source is not None and python_source.crosses_literal_prose(
+            command_start, body_start
+        ):
             continue
         argument_diagnostics: list[StaticParserDiagnostic] = []
         native_index = bisect_right(native_backtick_starts, command_start) - 1
