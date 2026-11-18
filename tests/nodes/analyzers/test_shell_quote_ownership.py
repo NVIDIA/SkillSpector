@@ -2310,3 +2310,59 @@ def test_transformed_control_syntax_cannot_acquire_physical_shell_forwarding_pro
         {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
     )
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+
+
+_COMMENT_EXAMPLE = (
+    "#!/bin/bash\n# Ｍ…\n"
+    "# The example continues across two comment lines: `tool\n"
+    "# <option>` --force.\n"
+    "# Compare `exit 1` against /tmp.\n"
+)
+
+
+def test_normalized_bash_comment_delimiters_do_not_capture_later_code() -> None:
+    source = _COMMENT_EXAMPLE + "rm -rf /\n"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert any(f.rule_id == "TM1" for f in result["findings"])
+
+    source = _COMMENT_EXAMPLE + 'sh -c "$program"\n'
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    detail = result["inspection_ledger"][0]["parser_diagnostic"]
+    assert detail["check"] is tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert source[detail["source_start_offset"] : detail["source_end_offset"]] == 'sh -c "$program"'
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("#!/bin/bash", "#!/usr/bin/python"),
+        ("# Compare", "＃ Compare"),
+        ("# Compare", "# Ｆoo Compare"),
+        ("# Compare `exit 1` against /tmp.", "echo '# Compare `exit 1` against /tmp.'"),
+        ("# Compare `exit 1` against /tmp.", "cat <<'END'\n# Compare `exit 1` against /tmp.\nEND"),
+    ],
+)
+def test_cross_view_backtick_requires_the_same_physical_bash_comment(old: str, new: str) -> None:
+    source = _COMMENT_EXAMPLE.replace(old, new)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    detail = result["inspection_ledger"][0]["parser_diagnostic"]
+    assert detail["check"] is tm.ParserCheck.EXPANSION_BOUNDARY
+    assert source[detail["source_start_offset"] :].startswith("` against /tmp.")
+
+
+def test_executable_backticks_remain_visible_after_a_normalized_comment() -> None:
+    source = _COMMENT_EXAMPLE + 'echo "`rm -rf /`"\n'
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    detail = result["inspection_ledger"][0]["parser_diagnostic"]
+    assert detail["check"] is tm.ParserCheck.EXPANSION_BOUNDARY
+    assert source[detail["source_start_offset"] : detail["source_end_offset"]].startswith('`"')
+    assert any(f.rule_id == "TM1" for f in result["findings"])

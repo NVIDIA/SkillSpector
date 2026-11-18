@@ -10922,7 +10922,10 @@ def prepare_parser_analysis(
             _markdown_shell_text(content, check_runtime, shell_fence_ranges=ranges)
         if 0 < len(ranges) <= 64 and sum(end - start for start, end in ranges) <= 1_000_000:
             return _FiniteShellSource(content, tuple(ranges))
-    if file_type == "shell" and len(content) <= 131_072 and "-c" in content and "$" in content:
+    if file_type == "shell" and (
+        (len(content) <= 131_072 and "-c" in content and "$" in content)
+        or (len(content) <= 1_000_000 and content.startswith("#!") and "`" in content)
+    ):
         return _FiniteShellSource(content, ())
     if file_type == "json":
         return prepare_json_source(content, check_runtime)
@@ -12283,6 +12286,52 @@ def _forwarded_shell_diagnostic(
     return candidate
 
 
+def _normalized_bash_comment_diagnostic(
+    content: str,
+    diagnostic: StaticParserDiagnostic,
+    check_runtime: Callable[[], None],
+    view: SecurityTextView,
+    original: _FiniteShellSource,
+) -> StaticParserDiagnostic | None:
+    if view.text != content or content[diagnostic.start : diagnostic.start + 1] != "`":
+        return diagnostic
+    derived = bash_syntax(content, check_runtime)
+    if derived is None or not any(lo <= diagnostic.start < hi for lo, hi in derived.comments):
+        return diagnostic
+    physical = bash_syntax(original.content, check_runtime)
+    if physical is None:
+        return diagnostic
+    physical_comments = set(physical.comments)
+    projected = list(content)
+    replaced_origin = False
+    for lo, hi in derived.comments:
+        check_runtime()
+        comment = content[lo:hi]
+        if "`" not in comment:
+            continue
+        # Normalization can manufacture a comment opener or delimiter. Both
+        # complete native parses must own this exact, one-to-one source range.
+        span = (view.source_offset(lo), view.source_end_offset(hi - 1))
+        if span not in physical_comments or not _FiniteShellSource(original.content, (span,)).owns(
+            view, [(lo, hi)], check_runtime
+        ):
+            continue
+        projected[lo:hi] = _blank_line_local_paired_backticks(comment)
+        if lo <= diagnostic.start < hi and projected[diagnostic.start] == " ":
+            replaced_origin = True
+    if not replaced_origin:
+        return diagnostic
+    # Leave all shell operands, executable substitutions, quoted strings and
+    # heredocs in the derived view intact, including independent later limits.
+    return _has_bounded_parse_exhaustion(
+        "".join(projected),
+        check_runtime,
+        file_type="shell",
+        source_view=view,
+        prepared_analysis=original,
+    )
+
+
 def bounded_parse_diagnostic(
     content: str,
     check_runtime: Callable[[], None],
@@ -12321,6 +12370,18 @@ def bounded_parse_diagnostic(
         and exhausted.check is ParserCheck.COMMAND_STRING_RUNTIME
     ):
         exhausted = _forwarded_shell_diagnostic(
+            content, exhausted, check_runtime, source_view, prepared_analysis
+        )
+    if (
+        file_type == "shell"
+        and complete_context
+        and source_view is not None
+        and source_view.name == "normalized"
+        and isinstance(prepared_analysis, _FiniteShellSource)
+        and exhausted is not None
+        and exhausted.check is ParserCheck.EXPANSION_BOUNDARY
+    ):
+        exhausted = _normalized_bash_comment_diagnostic(
             content, exhausted, check_runtime, source_view, prepared_analysis
         )
     if (
