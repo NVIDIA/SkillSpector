@@ -11,6 +11,16 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 
+import tree_sitter_bash
+from tree_sitter import Language, Parser
+
+from skillspector.inspection_ledger import (
+    ParserCause,
+    ParserCheck,
+    ParserUncheckedScope,
+    StaticParserDiagnostic,
+)
+
 _MAX_SOURCE_CHARS = 131_072
 _MAX_TOKENS = 16_384
 _LITERAL_CODE = re.compile(r"[A-Za-z0-9_./:<>=@%+,?*~ \t-]+\Z")
@@ -194,3 +204,109 @@ def quoted_list_spans(content: str, check_runtime: Callable[[], None]) -> Quoted
     result = _quoted_list_spans(content)
     check_runtime()
     return result
+
+
+_BASH = Language(tree_sitter_bash.language())
+_REDIRECT_END = re.compile(rb"[ \t]*(?:[;&|)]|\r?\n|\Z)")
+_EXAMPLE_INPUT = re.compile(rb"<[A-Za-z_][A-Za-z0-9_.-]*")
+
+
+def fenced_redirect_diagnostic(
+    section: str, offset: int, check_runtime: Callable[[], None], *, stop: int | None = None
+) -> StaticParserDiagnostic | None:
+    """Refine an existing boundary warning using the literal shell in a closed fence."""
+    if len(section) > _MAX_SOURCE_CHARS:
+        return None
+    # Some readers mark the wrapper prefix up to the redirection. Others
+    # point at the operator itself. Only consider that bounded source range.
+    stop = offset if stop is None else min(stop, len(section))
+    angle_pos = section.find("<", offset, stop + 1)
+    if angle_pos < 0 or "\n" in section[offset:angle_pos].replace("\\\r\n", "").replace("\\\n", ""):
+        return None
+    check_runtime()
+    try:
+        raw = section.encode()
+        tree = Parser(_BASH, timeout_micros=100_000).parse(raw)
+    except (UnicodeError, ValueError, OverflowError):
+        return None
+    check_runtime()
+    if tree is None:
+        return None
+    at = len(section[:angle_pos].encode())
+    root = tree.root_node
+    if root.has_error:
+        # Bash rejects a redirection followed by a control operator without a
+        # target. The grammar may recover and nominate a later command instead.
+        pending = [root]
+        while pending:
+            check_runtime()
+            node = pending.pop()
+            if node.start_byte > at:
+                break
+            if node.is_error or node.is_missing:
+                if node.text in {b">", b"<", b">>", b"<>"} and _REDIRECT_END.match(
+                    raw, node.end_byte
+                ):
+                    start = len(raw[: node.start_byte].decode())
+                    return StaticParserDiagnostic(
+                        ParserCause.MALFORMED_INPUT,
+                        ParserCheck.SHELL_REDIRECT_TARGET,
+                        start,
+                        start + len(node.text),
+                        ParserUncheckedScope.COMMAND_ARGUMENTS,
+                    )
+                return None
+            pending.extend(
+                child for child in reversed(node.children) if child.has_error or child.is_missing
+            )
+        return None
+
+    # In a documented 'sudo <TOOL> --list', Bash redirects input from TOOL
+    # and output to --list. No word is passed to sudo to name the nested tool.
+    angle = root.descendant_for_byte_range(at, at + 1)
+    redir = angle.parent
+    if (
+        angle.type != "<"
+        or redir is None
+        or redir.type != "file_redirect"
+        or redir.start_byte != at
+        or not _EXAMPLE_INPUT.fullmatch(redir.text)
+        or raw[redir.end_byte : redir.end_byte + 1] != b">"
+    ):
+        return None
+    stmt = redir.parent
+    if stmt is None or stmt.type != "redirected_statement":
+        return None
+    body = stmt.child_by_field_name("body")
+    if (
+        body is None
+        or body.type != "command"
+        or body.text
+        not in {
+            b"sudo",
+            b"/usr/bin/sudo",
+            b"doas",
+            b"/usr/bin/doas",
+            b"/usr/local/bin/doas",
+        }
+    ):
+        return None
+    if len(section[:offset].encode()) < body.start_byte:
+        return None
+    redirects = stmt.children_by_field_name("redirect")
+    if len(redirects) < 2 or redirects[0] != redir or redirects[1].start_byte != redir.end_byte:
+        return None
+    for item in redirects:
+        check_runtime()
+        words = item.children_by_field_name("destination")
+        # The Bash grammar attaches ordinary words following the target to
+        # the same node. Extra words may supply a real executable operand.
+        if item.type != "file_redirect" or len(words) != 1 or words[0].type != "word":
+            return None
+    return StaticParserDiagnostic(
+        ParserCause.BOUNDARY_UNRESOLVED,
+        ParserCheck.DOCUMENTED_COMMAND_OPERAND,
+        angle_pos,
+        angle_pos + len(redir.text) + 1,
+        ParserUncheckedScope.COMMAND_WORD,
+    )

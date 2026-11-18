@@ -644,6 +644,8 @@ class ParserCheck(StrEnum):
     COMMAND_ARGUMENT_CHARACTERS = "command_argument_characters"
     COMMAND_WORD_BOUNDARY = "command_word_boundary"
     COMMAND_ARGUMENT_BOUNDARY = "command_argument_boundary"
+    SHELL_REDIRECT_TARGET = "shell_redirect_target"
+    DOCUMENTED_COMMAND_OPERAND = "documented_command_operand"
     COMMAND_IDENTITY = "runtime_command_identity"
     PRINTF_INPUT_CHARACTERS = "printf_input_characters"
     PRINTF_ARGUMENT_COUNT = "printf_argument_count"

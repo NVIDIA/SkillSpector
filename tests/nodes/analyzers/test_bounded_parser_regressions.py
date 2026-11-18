@@ -766,3 +766,52 @@ def test_output_reconciliation_only_clears_resolved_output_incompleteness(
         assert event["outcome"] is LedgerOutcome.COMPLETED
         assert "reason_code" not in event
         assert "parser_diagnostic" not in event
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sudo <tool-name> --list",
+        "sudo <tool-name> -d <device> --read | tee result",
+    ],
+)
+def test_documented_privileged_command_has_only_redirects(command):
+    content = f"# Example λ\n\n```bash\n{command}\n```\n"
+    diagnostic = tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.check is ParserCheck.DOCUMENTED_COMMAND_OPERAND
+    assert content[diagnostic.start : diagnostic.end] == "<tool-name>"
+
+
+def test_fenced_missing_redirection_target_precedes_later_wrapper():
+    content = "# λ\n\n```bash\ncd <directory> && env FILE=<config> process\n```\n"
+    diagnostic = tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.MALFORMED_INPUT
+    assert diagnostic.check is ParserCheck.SHELL_REDIRECT_TARGET
+    assert diagnostic.start == content.index(">") and diagnostic.end == diagnostic.start + 1
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sudo '<tool-name>' --list",
+        "sudo <tool-name> --list program --option",
+        'sudo <tool-name> --list "$selected"',
+        'sudo <tool-name> "$(lookup)"',
+        "printf '%s' 'cd <directory> && env FILE=<config> process'",
+        "cat <<'END'\nsudo <tool-name> --list\nEND\n",
+    ],
+)
+def test_redirect_refinement_requires_native_command_and_source_roles(command):
+    from skillspector.markdown_tokens import fenced_redirect_diagnostic
+
+    assert fenced_redirect_diagnostic(command, command.index("<"), lambda: None) is None
+
+
+def test_documented_missing_tool_preserves_neighbor_findings_and_runtime_diagnostics():
+    example = "```bash\nsudo <tool> --list | rm -rf /\n```\n"
+    assert _public_result(example, "SKILL.md")["findings"]
+    prior = example.replace("sudo", 'eval "$first"\nsudo')
+    diagnostic = tm.bounded_parse_diagnostic(prior, lambda: None, file_type="markdown")
+    assert diagnostic is not None and diagnostic.check is ParserCheck.COMMAND_STRING_RUNTIME

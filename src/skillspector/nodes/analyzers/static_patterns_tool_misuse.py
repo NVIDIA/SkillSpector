@@ -55,7 +55,7 @@ from skillspector.javascript_tokens import JavaScriptTemplateSpans, assertion_te
 from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
 from skillspector.json_tokens import JSONSourceOwnership, prepare_json_source
 from skillspector.logging_config import get_logger
-from skillspector.markdown_tokens import quoted_list_spans
+from skillspector.markdown_tokens import fenced_redirect_diagnostic, quoted_list_spans
 from skillspector.models import (
     AnalyzerFinding,
     Finding,
@@ -12518,6 +12518,22 @@ def _markdown_owned_commands_diagnostic(
         ),
     )
     if diagnostic is not None:
+        if diagnostic.check is ParserCheck.COMMAND_WORD_BOUNDARY:
+            for start, end, language in fenced:
+                if start <= diagnostic.start < end < len(content) and language in {
+                    "bash",
+                    "sh",
+                    "shell",
+                }:
+                    detail = fenced_redirect_diagnostic(
+                        content[start:end],
+                        diagnostic.start - start,
+                        check_runtime,
+                        stop=diagnostic.end - start,
+                    )
+                    if detail is not None:
+                        return detail.shifted(start)
+                    break
         return diagnostic
     for start, end in (*ranges, *source_only):
         check_runtime()
