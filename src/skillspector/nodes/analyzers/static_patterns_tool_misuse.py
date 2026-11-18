@@ -239,6 +239,7 @@ _PYTHON_SHELL_WORD_BREAK_RE = re.compile(r"(?<!\\)(?<!\\\r)[\s;|&()<>]")
 # Whitespace and line continuations between Python tokens. Comments are
 # tokens of their own.
 _PYTHON_TOKEN_GAP_RE = re.compile(r"(?:\s|\\\r?\n)*+")
+_PYTHON_FORMAT_NAME_RE = re.compile(r"\.format\([ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*\)")
 # Python operators that can still extend or rewrite a string value.
 _PYTHON_STRING_EXTENSION_OPERATORS = frozenset({"+", "%", ".", "*", "["})
 # One brace opens an f-string replacement field; a doubled brace is literal.
@@ -2166,6 +2167,24 @@ def _has_literal_printf_arguments(inner: str) -> bool:
     return command == "printf" and not limited
 
 
+# A bounded shell pipeline whose input is a quoted scalar can be understood
+# structurally without knowing its output. This is diagnostic evidence only:
+# it never evaluates a filter or establishes that the consumer is harmless.
+_QUOTED_PRINTF_SCALAR = r'"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})"'
+_STATIC_FILTER_ARG = r"'(?!-)[^'\r\n]{1,128}'"
+_SYMBOLIC_PRINTF_PIPELINE_RE = re.compile(
+    r"""[ \t]*printf[ \t]+(?P<q>['"])%[qs](?:\\{1,2}n)?(?P=q)[ \t]+"""
+    rf"(?P<input>{_QUOTED_PRINTF_SCALAR})"
+    rf"(?:[ \t]*\|[ \t]*(?:tr(?:[ \t]+{_STATIC_FILTER_ARG}){{2}}"
+    r"|head[ \t]+-[1-9][0-9]{0,2}"
+    r"|grep(?:[ \t]+-(?:[EFiqvx]{1,8}|m[1-9][0-9]{0,2})){0,4}[ \t]+"
+    rf"(?:[A-Za-z0-9_][A-Za-z0-9_./-]*|{_STATIC_FILTER_ARG}|(?P<pattern>{_QUOTED_PRINTF_SCALAR}))"
+    r"|sed[ \t]+'(?:s/[^/;'\\\r\n]{1,32}/[^/;'\\\r\n]{0,32}/g?|/[^/;'\\\r\n]{1,32}/d)'"
+    r")){1,6}"
+    r"(?:[ \t]*&&[ \t]*echo[ \t]+[A-Za-z0-9_]+[ \t]*\|\|[ \t]*echo[ \t]+[A-Za-z0-9_]+)?[ \t]*"
+)
+
+
 def _static_printf_substitution(
     content: str,
     start: int,
@@ -2210,6 +2229,19 @@ def _static_printf_substitution(
         # bytes even when it is the complete body of an outer substitution.
         # A real basename may still be formed by the words on either side.
         return ""
+    if "|" in inner and (pipeline := _SYMBOLIC_PRINTF_PIPELINE_RE.fullmatch(inner)):
+        # A variable grep pattern can supply flags as well as change matching.
+        # Preserve that uncertainty at the argument that controls the filter.
+        low, high = pipeline.span("pattern" if pipeline["pattern"] is not None else "input")
+        _note_parser_diagnostic(
+            diagnostics,
+            ParserCause.RUNTIME_DEPENDENT,
+            ParserCheck.PRINTF_INVOCATION,
+            inner_start + low,
+            inner_start + high,
+            ParserUncheckedScope.COMMAND_WORD,
+        )
+        return None
     literal_result = quoted_result and not backtick and _has_literal_printf_arguments(inner)
     invocation_diagnostics: list[StaticParserDiagnostic] = []
     recognized, arguments = _printf_invocation_arguments(inner, diagnostics=invocation_diagnostics)
@@ -3389,7 +3421,7 @@ def _shell_quoted_candidate_limits(
 # name an output variable, read a file or construct a pipeline consumer.
 _PRINTF_DATA_SUBSTITUTION_RE = re.compile(
     r"""\$\(printf[ \t]+(?P<format>['"])%[qs](?:\\n)?(?P=format)[ \t]+"""
-    r'"\$(?:[a-zA-Z_][a-zA-Z_0-9]*|\{[a-zA-Z_][a-zA-Z_0-9]*\})"'
+    rf"{_QUOTED_PRINTF_SCALAR}"
     r"""(?P<tr>[ \t]*\|[ \t]*tr(?:[ \t]+'[a-zA-Z0-9][a-zA-Z0-9-]*'){2})?[ \t]*\)"""
 )
 
@@ -4255,6 +4287,10 @@ def _has_shell_command_word_exhaustion(
                     else None
                 )
                 if value is None:
+                    if python_source is not None:
+                        runtime_field = python_source.runtime_format_argument(start, parsed.end)
+                        if runtime_field is not None:
+                            return runtime_field
                     return operand_diagnostic
                 value_diagnostic = _has_runtime_command_operand_exhaustion(
                     *value, check_runtime, quoted_printf_allowed=quoted_printf_allowed
@@ -6811,6 +6847,76 @@ class _PythonSourceOwnership:
             # the source bound cannot prove that later operands are absent.
             return None
         return "".join(pieces), word_start - origin, word_end - origin
+
+    def runtime_format_argument(self, start: int, end: int) -> StaticParserDiagnostic | None:
+        """Locate a simple format field sourced from the enclosing function's input."""
+        owner = self._owner(start)
+        if owner is None or end <= owner[1] or self._content[owner[0]] == "#":
+            return None
+        begin, stop = _python_string_body(self._content, *owner)
+        text = self._content[begin:stop]
+        field = text.find("{}")
+        if (
+            field < 0
+            or text.count("{") != 1
+            or text.count("}") != 1
+            or start not in (begin + field, begin + field - 1)
+        ):
+            return None
+        argument = _PYTHON_FORMAT_NAME_RE.match(self._content, owner[1])
+        if argument is None:
+            return None
+        parsed = parse_python_source(self._content, "<shell-string-owner>")
+        if parsed.tree is None:
+            return None
+        # The parameter or its directly assigned attribute is selected on
+        # every call. A name with a local constant or ambiguous binding keeps
+        # the existing conservative diagnostic.
+        scope = None
+        for node in ast.walk(parsed.tree):
+            self._check_runtime()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+                (span := _node_character_span(parsed, node)) is not None
+                and span[0] <= owner[0] < span[1]
+            ):
+                scope = node
+        if scope is None:
+            return None
+        name = argument[1]
+        parameters = _parameter_names(scope.args)
+        stores = []
+        rebound_parameters = set()
+        for node in ast.walk(scope):
+            self._check_runtime()
+            if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+                if node.id == name:
+                    stores.append(node)
+                if node.id in parameters:
+                    rebound_parameters.add(node.id)
+        from_parameter = name in parameters and not stores
+        if len(stores) == 1:
+            for statement in scope.body:
+                if (
+                    isinstance(statement, ast.Assign)
+                    and statement.targets == stores
+                    and isinstance(statement.value, ast.Attribute)
+                    and isinstance(statement.value.value, ast.Name)
+                    and statement.value.value.id in parameters
+                    and statement.value.value.id not in rebound_parameters
+                    and (span := _node_character_span(parsed, statement)) is not None
+                    and span[1] <= owner[0]
+                ):
+                    from_parameter = True
+                    break
+        if not from_parameter:
+            return None
+        return StaticParserDiagnostic(
+            ParserCause.RUNTIME_DEPENDENT,
+            ParserCheck.COMMAND_STRING_RUNTIME,
+            argument.start(1),
+            argument.end(1),
+            ParserUncheckedScope.COMMAND_STRING,
+        )
 
     def crosses_literal_prose(self, start: int, end: int) -> bool:
         """Recognize a raw destructive basename assembled across two Python strings."""

@@ -888,3 +888,69 @@ def test_empty_command_substitution_preserves_surrounding_command(separator: str
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "unknown"),
+    [
+        ("""printf '%s' "$value" | head -1""", '"$value"'),
+        ("""printf '%s' "$value" | tr 'A-Z' 'a-z'""", '"$value"'),
+        ("""printf '%s' "$value" | grep -i -m1 ready""", '"$value"'),
+        ("""printf '%s' "$value" | grep -vxF "$omit" | sed 's/:$//'""", '"$omit"'),
+        ("""printf '%s\\n' "$rows" | grep -Eqi 'a.*(x|y)' && echo yes || echo no""", '"$rows"'),
+    ],
+)
+def test_symbolic_printf_pipeline_reports_the_runtime_argument(pipeline: str, unknown: str) -> None:
+    source = "text $( " + pipeline + " ) suffix"
+    diagnostics = []
+    assert (
+        tm._static_printf_substitution(source, 5, len(source) - 7, diagnostics=diagnostics) is None
+    )
+    assert len(diagnostics) == 1
+    detail = diagnostics[0]
+    assert (detail.cause, detail.check) == (
+        ParserCause.RUNTIME_DEPENDENT,
+        ParserCheck.PRINTF_INVOCATION,
+    )
+    assert source[detail.start : detail.end] == unknown
+
+
+@pytest.mark.parametrize(
+    "pipeline",
+    [
+        """printf '%s' "$value" | sh""",
+        """printf '%s' "$value" | head -1 program""",
+        """printf '%s' "$value" | grep -f patterns""",
+        """printf '%s' "$value" | sed 's/ok/other/e'""",
+        """printf '%s' "$value" | grep -v ok && eval "$action" || echo no""",
+    ],
+)
+def test_pipeline_with_additional_effects_preserves_unsupported_scope(pipeline: str) -> None:
+    source = "$(" + pipeline + ")"
+    diagnostics = []
+    assert tm._static_printf_substitution(source, 0, len(source), diagnostics=diagnostics) is None
+    assert diagnostics[0].cause is ParserCause.UNSUPPORTED_SYNTAX
+
+
+@pytest.mark.parametrize(
+    ("setup", "expected"),
+    [
+        ("def render(value):\n", True),
+        ("def render(options):\n    value = options.label\n", True),
+        ('def render():\n    value = "fixed"\n', False),
+        ('def render(value):\n    value = "fixed"\n', False),
+        ("def render(options):\n    if options.flag:\n        value = options.label\n", False),
+        ("def render(options):\n    options = Fixed()\n    value = options.label\n", False),
+    ],
+)
+def test_format_uncertainty_points_to_the_runtime_value(setup: str, expected: bool) -> None:
+    source = setup + """    label = "print '{}'".format(value)\n"""
+    owner = tm._PythonSourceOwnership(source, lambda: None)
+    diagnostic = owner.runtime_format_argument(source.index("'{}"), len(source))
+    if expected:
+        assert diagnostic is not None
+        assert diagnostic.check is ParserCheck.COMMAND_STRING_RUNTIME
+        assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+        assert source[diagnostic.start : diagnostic.end] == "value"
+    else:
+        assert diagnostic is None
