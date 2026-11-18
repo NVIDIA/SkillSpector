@@ -9332,6 +9332,7 @@ def _markdown_shell_text(
     *,
     complete_context: bool = True,
     word_apostrophes: bool = False,
+    directory_tree_markers: bool = False,
     fence_boundaries: list[int] | None = None,
     fence_regions: list[tuple[int, int, str]] | None = None,
     inline_regions: list[tuple[int, int]] | None = None,
@@ -9359,7 +9360,7 @@ def _markdown_shell_text(
     whose quote ownership can be checked independently of surrounding prose.
     """
     output = list(content)
-    prose_apostrophes: set[int] = set()
+    prose_punctuation: set[int] = set()
     inline_possessives: set[int] = set()
     runs: list[tuple[int, int]] = []
     list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
@@ -9431,7 +9432,7 @@ def _markdown_shell_text(
                     or re.match(r"[\w'/]", content[close_end + 2]) is None
                 )
             ):
-                prose_apostrophes.add(close_end)
+                prose_punctuation.add(close_end)
                 inline_possessives.add(close_end)
         runs.clear()
 
@@ -9485,6 +9486,9 @@ def _markdown_shell_text(
     fence_literal_ownership = True
     fence_has_literal_apostrophe = False
     fence_has_nonliteral_apostrophe = False
+    # A shell heredoc may own an apparent display fence and expand its markers.
+    tree_fences_allowed = directory_tree_markers and complete_context and "<<" not in content
+    tree_fence_start: int | None = None
     shell_fence_start: int | None = None
     quoted_block = False
     html_end: str | None = None
@@ -9627,6 +9631,11 @@ def _markdown_shell_text(
                 and closing_fence[1][0] == fence[0]
                 and len(closing_fence[1]) >= fence[1]
             ):
+                if tree_fence_start == fence_body_start:
+                    prose_punctuation.update(
+                        _directory_tree_elbows(content, fence_body_start, offset, check_runtime)
+                    )
+                tree_fence_start = None
                 begin, end = closing_fence.span(1)
                 body_start = offset + len(stripped) - len(fence_body)
                 output[body_start + begin : body_start + end] = " " * (end - begin)
@@ -9796,6 +9805,14 @@ def _markdown_shell_text(
                 fence_has_nonliteral_apostrophe = False
                 output[offset + prefix + begin : offset + prefix + end] = " " * (end - begin)
                 if (
+                    tree_fences_allowed
+                    and not content[max(0, offset - 3) : offset].rstrip("\r\n").endswith("\\")
+                    and not has_list_marker
+                    and not paragraph_in_list
+                    and info == "text"
+                ):
+                    tree_fence_start = fence_body_start
+                if (
                     complete_context
                     and shell_fence_ranges is not None
                     and not has_list_marker
@@ -9858,7 +9875,7 @@ def _markdown_shell_text(
                                 for word in _MARKDOWN_WORD_APOSTROPHE_RE.finditer(stripped)
                             ]
                             if len(apostrophes) == stripped.count("'"):
-                                prose_apostrophes.update(apostrophes)
+                                prose_punctuation.update(apostrophes)
                 elif not separator and not empty_list_item:
                     prose_leading = leading
                     inline_runtime_guard = False
@@ -9889,7 +9906,7 @@ def _markdown_shell_text(
                         # The restrictive grammar excludes code delimiters and
                         # shell syntax. Fences, indented code, HTML, tables, and
                         # pending multiline inline spans never reach this rule.
-                        prose_apostrophes.add(offset + prefix + prose.start("apostrophe"))
+                        prose_punctuation.add(offset + prefix + prose.start("apostrophe"))
                     elif (
                         word_apostrophes
                         and complete_context
@@ -9923,7 +9940,7 @@ def _markdown_shell_text(
                             check_runtime()
                             apostrophes.append(offset + prefix + word.start("apostrophe"))
                         if len(apostrophes) == prose_leading.count("'"):
-                            prose_apostrophes.update(apostrophes)
+                            prose_punctuation.update(apostrophes)
                     pending_inline = bool(runs)
                     for match in backtick_runs.finditer(line):
                         check_runtime()
@@ -9973,15 +9990,15 @@ def _markdown_shell_text(
                         for word in _MARKDOWN_WORD_APOSTROPHE_RE.finditer(prose)
                     ]
                     if len(apostrophes) == prose.count("'"):
-                        prose_apostrophes.update(apostrophes)
-    if prose_apostrophes or quoted_code:
+                        prose_punctuation.update(apostrophes)
+    if prose_punctuation or quoted_code:
         # A prose-looking line can still be inside an earlier shell word, such
         # as a multiline bash -c string. Reuse the shell parser to preserve that
-        # ownership before masking any apostrophe. Unresolved words retain all
+        # ownership before masking prose punctuation. Unresolved words retain all
         # remaining bytes; this pass never grants ownership past a parse limit.
         cursor = 0
         next_runtime_check = 0
-        last_candidate = max(prose_apostrophes | quoted_code.keys())
+        last_candidate = max(prose_punctuation | quoted_code.keys())
         parameter_ends: dict[int, _ParameterExpansionEnd] = {}
         substitution_ends: dict[int, int | None] = {}
         backtick_ends: dict[int, int | None] = {}
@@ -9995,7 +10012,7 @@ def _markdown_shell_text(
                 output[close:end] = " " * (end - close)
                 cursor = end
                 continue
-            if cursor in prose_apostrophes:
+            if cursor in prose_punctuation:
                 output[cursor] = " "
                 if inline_possessive_apostrophes is not None and cursor in inline_possessives:
                     inline_possessive_apostrophes.add(cursor)
@@ -10015,6 +10032,58 @@ def _markdown_shell_text(
             cursor += 1
         return "".join(output)
     return projected
+
+
+_ASCII_TREE_ROW = re.compile(
+    r"(?P<indent>(?:\|   |    ){0,16})(?P<branch>\|--|`--) "
+    r"(?P<entry>[A-Za-z0-9_][A-Za-z0-9_.-]*/?)(?:[ \t]+#[ A-Za-z0-9_./(),;:+\t-]*)?"
+)
+
+
+def _directory_tree_elbows(
+    content: str, start: int, end: int, check_runtime: Callable[[], None]
+) -> list[int]:
+    """Return marker offsets only when every row describes one complete tree."""
+    if end - start > 65536 or content.find("`-- ", start, end) < 0:
+        return []
+    lines = content[start:end].splitlines(keepends=True)
+    if (
+        len(lines) < 3
+        or re.fullmatch(r"(?:[A-Za-z0-9_.-]+|<[A-Za-z0-9_-]+>)/\r?\n", lines[0]) is None
+    ):
+        return []
+    offset = start + len(lines[0])
+    last_child: list[bool] = []
+    elbows: list[int] = []
+    previous_directory = True
+    fork = False
+    for line in lines[1:]:
+        check_runtime()
+        row = _ASCII_TREE_ROW.fullmatch(line.rstrip(" \t\r\n"))
+        if row is None:
+            return []
+        indent = row["indent"]
+        depth = len(indent) // 4
+        if depth > len(last_child):
+            return []
+        if depth == len(last_child):
+            if not previous_directory:
+                return []
+        else:
+            if last_child[depth] or not all(last_child[depth + 1 :]):
+                return []
+            del last_child[depth:]
+        if indent != "".join("    " if last else "|   " for last in last_child):
+            return []
+        last = row["branch"] == "`--"
+        if last:
+            elbows.append(offset + row.start("branch"))
+        else:
+            fork = True
+        last_child.append(last)
+        previous_directory = row["entry"].endswith("/")
+        offset += len(line)
+    return elbows if fork and all(last_child) else []
 
 
 def _fenced_powershell_source(
@@ -12297,6 +12366,7 @@ def _has_bounded_parse_exhaustion(
             check_runtime,
             complete_context=complete_context,
             word_apostrophes=word_apostrophes,
+            directory_tree_markers=word_apostrophes,
             shell_fence_ranges=shell_fence_ranges,
             hardware_apostrophe_ambiguity=hardware_apostrophe_ambiguity,
             hardware_apostrophe_locations=hardware_apostrophe_locations,
