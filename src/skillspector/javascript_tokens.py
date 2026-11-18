@@ -1836,6 +1836,133 @@ def _exported_markup_field(
     return None
 
 
+def _local_or_regex_call(
+    program: JavaScriptProgram, witness: Node, check_runtime: Callable[[], None]
+) -> bool:
+    if (
+        witness.type != "call_expression"
+        or (callee := witness.child_by_field_name("function")) is None
+    ):
+        return False
+    if callee.type == "member_expression":
+        obj = callee.child_by_field_name("object")
+        return (
+            obj is not None and obj.type == "regex" and _callable_member(program, callee) == "exec"
+        )
+    if callee.type != "identifier":
+        return False
+    scope = witness.parent
+    budget = _MAX_TOKENS
+    while scope is not None:
+        check_runtime()
+        if scope.type in {"statement_block", "program"}:
+            for stmt in scope.named_children:
+                check_runtime()
+                budget -= 1
+                if budget < 0:
+                    return False
+                if stmt.type != "lexical_declaration" or stmt.children[0].type != "const":
+                    continue
+                for binding in stmt.named_children:
+                    name, value = (
+                        binding.child_by_field_name("name"),
+                        binding.child_by_field_name("value"),
+                    )
+                    if (
+                        name is not None
+                        and value is not None
+                        and value.type == "arrow_function"
+                        and program.text(name) == program.text(callee)
+                    ):
+                        return True
+        scope = scope.parent
+    return False
+
+
+def _runtime_argument_call(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> Node | None:
+    """Find a call through a function argument or a directly constructed command."""
+    parameters: dict[int, set[str]] = {}
+    rebindings: dict[str, list[Node]] = {}
+    for part in program.nodes:
+        check_runtime()
+        target = None
+        if part.type in {"variable_declarator", "class_declaration", "function_declaration"}:
+            target = part.child_by_field_name("name")
+        elif part.type in {
+            "assignment_expression",
+            "augmented_assignment_expression",
+            "for_in_statement",
+        }:
+            target = part.child_by_field_name("left")
+        elif part.type == "update_expression":
+            target = part.child_by_field_name("argument")
+        elif part.type == "catch_clause":
+            target = part.child_by_field_name("parameter")
+        if target is not None:
+            for name in _pattern_binding_names(program, target, check_runtime):
+                rebindings.setdefault(name, []).append(part)
+    first_parameter = None
+    budget = _MAX_TOKENS * 4
+    for node in program.nodes:
+        check_runtime()
+        if node.type != "call_expression":
+            continue
+        callee = node.child_by_field_name("function")
+        args = node.child_by_field_name("arguments")
+        if (
+            callee is None
+            or callee.type != "identifier"
+            or args is None
+            or args.type != "arguments"
+        ):
+            continue
+        name = program.text(callee)
+        if name.casefold() in _SHELL_EXECUTION_CALLS and any(
+            arg.type == "template_string"
+            and any(part.type == "template_substitution" for part in arg.named_children)
+            for arg in args.named_children
+        ):
+            return node
+        if first_parameter is not None:
+            continue
+        scope = node.parent
+        while scope is not None:
+            check_runtime()
+            budget -= 1
+            if budget < 0:
+                return first_parameter
+            if scope.type in {
+                "function_declaration",
+                "arrow_function",
+                "function_expression",
+                "method_definition",
+            }:
+                if scope.id not in parameters:
+                    formals = scope.child_by_field_name("parameters") or scope.child_by_field_name(
+                        "parameter"
+                    )
+                    parameters[scope.id] = (
+                        _pattern_binding_names(program, formals, check_runtime)
+                        if formals is not None
+                        else set()
+                    )
+                if name in parameters[scope.id]:
+                    rebound = rebindings.get(name, ())
+                    budget -= len(rebound)
+                    if budget < 0:
+                        return first_parameter
+                    if not any(
+                        scope.start_byte < binding.start_byte < scope.end_byte
+                        for binding in rebound
+                    ):
+                        first_parameter = node
+                    break
+            scope = scope.parent
+    return first_parameter
+
+
 def _code_evaluation_witness(
     program: JavaScriptProgram, check_runtime: Callable[[], None]
 ) -> Node | None:
@@ -1933,6 +2060,8 @@ def javascript_template_spans(
                 # The witness is the unresolved callable, which may precede or
                 # follow an ordinary template elsewhere in the same module.
                 witness = _code_evaluation_witness(program, check_runtime)
+                if witness is None and _local_or_regex_call(program, execution_node, check_runtime):
+                    witness = _runtime_argument_call(program, check_runtime)
                 if (
                     witness is None
                     and generated_markup is not None

@@ -1425,3 +1425,19 @@ def test_markup_parameter_preserves_dynamic_calls_and_tracks_multiple_attributes
         assert other is not None and other.check != tm.ParserCheck.GENERATED_HTML_MARKUP
     clean = tm.bounded_parse_diagnostic(export, lambda: None, file_type="javascript")
     assert clean is None
+
+
+def test_local_helper_and_regex_do_not_mask_runtime_call_locations():
+    sources = [
+        (
+            "function first(helper) { return helper(x); } function more() { const helper = x => [x]; helper(1); } const msg = `ok ${x}`;",
+            "helper(x)",
+        ),
+        (
+            "other(/x/); /r/.exec(value); function work(id, data) { return run(id, `item ${data}`); }",
+            "run(id,",
+        ),
+    ]
+    for source, location in sources:
+        d = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+        assert d is not None and d.start == source.index(location)
