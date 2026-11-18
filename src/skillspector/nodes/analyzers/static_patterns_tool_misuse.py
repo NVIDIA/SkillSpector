@@ -9361,38 +9361,62 @@ _MARKDOWN_EXAMPLE_CELL = re.compile(
 )
 
 
-_MAKE_SIMPLE_TARGET = re.compile(r"(?:[a-zA-Z0-9_./-]+|\$\([A-Z_][A-Z0-9_]*\)):(?![=:])")
+_MAKE_SIMPLE_TARGET = re.compile(
+    r"([a-zA-Z0-9_./-]+|\$\([A-Za-z_][A-Za-z0-9_]*\)|\$\{[A-Za-z_][A-Za-z0-9_]*\}):"
+    r"(?![=:])"
+)
+_MAKE_RECIPE_VALUE = re.compile(
+    r"\$\$[A-Za-z_][A-Za-z0-9_]*|\$[@A-Za-z]|\$\([A-Za-z_][A-Za-z0-9_]*\)|"
+    r"\$\{[A-Za-z_][A-Za-z0-9_]*\}"
+)
 _MAKE_ECHO_RECIPE = re.compile(
-    r'\t@?echo +"(?:[a-zA-Z0-9_./: -]++|\$@|\$\([A-Z_][A-Z0-9_]*\))+"'
+    rf'\t@?echo +"(?:[a-zA-Z0-9_./: -]++|{_MAKE_RECIPE_VALUE.pattern})+"'
     r" +>{1,2} +[a-zA-Z0-9_./-]+[ \t]*"
 )
 _MAKE_LAYOUT_OVERRIDE = re.compile(
-    r"^[ \t]*(?:(?:-?include|sinclude|define|override|load)\b|\.ONESHELL[ \t]*:)|"
+    r"^[ \t]*(?:(?:-?include|sinclude|define|load)\b|"
+    r"override\b(?![ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*[:?+!]?=)|\.ONESHELL[ \t]*:)|"
     r"(?<!\w)(?:\.RECIPEPREFIX|\.SHELLFLAGS|SHELL)[ \t]*[:?+!]*=|\$[({]eval[ \t]",
     re.M,
 )
 
 
-def _make_output_recipe_ranges(
+def _make_output_recipes(
     source: str, check_runtime: Callable[[], None]
-) -> list[tuple[int, int]]:
-    """Prove physical, uncontinued output records in a conventional Make recipe."""
+) -> Iterator[tuple[int, int, StaticParserDiagnostic | None]]:
+    """Separate the physical recipe line from substitutions which can change its shell syntax."""
     if _MAKE_LAYOUT_OVERRIDE.search(source):
-        return []
-    result = []
+        return
     offset = 0
-    in_rule = continued = False
+    target = None
+    continued = False
     for line in source.splitlines(keepends=True):
         check_runtime()
         raw = line.rstrip("\r\n")
         if raw.startswith("\t"):
-            if in_rule and not continued and len(raw) <= 1024 and _MAKE_ECHO_RECIPE.fullmatch(raw):
-                result.append((offset, offset + len(raw)))
+            if target and not continued and len(raw) <= 1024 and _MAKE_ECHO_RECIPE.fullmatch(raw):
+                diagnostic = None
+                for ref in _MAKE_RECIPE_VALUE.finditer(raw):
+                    # Make expands before shell parsing. A shell variable from
+                    # $$NAME stays within the quotes; a Make variable may inject
+                    # quote or command syntax even when its file default is literal.
+                    if ref[0].startswith("$$") or (
+                        ref[0] == "$@" and not target[1].startswith(("$", "."))
+                    ):
+                        continue
+                    diagnostic = StaticParserDiagnostic(
+                        ParserCause.RUNTIME_DEPENDENT,
+                        ParserCheck.COMMAND_STRING_RUNTIME,
+                        offset + ref.start(),
+                        offset + ref.end(),
+                        ParserUncheckedScope.COMMAND_STRING,
+                    )
+                    break
+                yield offset, offset + len(raw), diagnostic
         elif raw and not raw.startswith(("#", " ")):
-            in_rule = _MAKE_SIMPLE_TARGET.match(raw) is not None
+            target = _MAKE_SIMPLE_TARGET.match(raw)
         continued = raw.endswith("\\")
         offset += len(line)
-    return result
 
 
 _WAVEFORM_AXIS = re.compile(r"^[ \t]*\|(?:[ \t]+\|){2,}[ \t]*\r?$", re.M)
@@ -9991,9 +10015,10 @@ def _markdown_shell_text(
                 ):
                     shell_fence_ranges.extend(
                         (fence_body_start + lo, fence_body_start + hi)
-                        for lo, hi in _make_output_recipe_ranges(
+                        for lo, hi, diagnostic in _make_output_recipes(
                             content[fence_body_start:offset], check_runtime
                         )
+                        if diagnostic is None
                     )
                 if shell_fence_start is not None and shell_fence_ranges is not None:
                     shell_fence_ranges.append((shell_fence_start, offset))
@@ -12751,6 +12776,15 @@ def bounded_parse_diagnostic(
                     if detail is not None:
                         return detail.shifted(start)
                     break
+        if complete_context:
+            for start, end, language in fenced:
+                if language not in {"make", "makefile", "gmake"} or end >= len(content):
+                    continue
+                for _, _, diagnostic in _make_output_recipes(content[start:end], check_runtime):
+                    if diagnostic and (
+                        original is None or start + diagnostic.start < original.start
+                    ):
+                        return diagnostic.shifted(start)
         return original
     exhausted = _has_bounded_parse_exhaustion(
         content,

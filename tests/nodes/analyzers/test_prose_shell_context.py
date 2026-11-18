@@ -971,10 +971,10 @@ def test_timing_diagram_requires_axis_and_plain_signal_row():
 
 
 def test_single_make_recipe_output_owns_its_source_quotes():
-    recipe = '\t@echo "$@ $(LOGS)/$@.log" >> runs.txt'
-    source = "LOGS=log\nrun: input\n" + recipe + "\n"
-    ranges = tm._make_output_recipe_ranges(source, lambda: None)
-    assert [source[lo:hi] for lo, hi in ranges] == [recipe]
+    recipe = '\t@echo "$@ $$LOGS/$@.log" >> runs.txt'
+    source = "run: input\n" + recipe + "\n"
+    ranges = list(tm._make_output_recipes(source, lambda: None))
+    assert [(source[lo:hi], diagnostic) for lo, hi, diagnostic in ranges] == [(recipe, None)]
     wrapped = "```makefile\n" + source + "```\n"
     assert tm.bounded_parse_diagnostic(wrapped, lambda: None, file_type="markdown") is None
     assert tm.bounded_parse_diagnostic(
@@ -996,7 +996,37 @@ def test_single_make_recipe_output_owns_its_source_quotes():
     ],
 )
 def test_unproved_make_recipes_retain_original_boundaries(source):
-    assert tm._make_output_recipe_ranges(source, lambda: None) == []
+    assert list(tm._make_output_recipes(source, lambda: None)) == []
+
+
+@pytest.mark.parametrize(
+    ("setup", "target", "expansion"),
+    [
+        ("", "all", "$(VALUE)"),
+        ("VALUE := output", "all", "$(VALUE)"),
+        ("VALUE ?= output", "all", "${VALUE}"),
+        ('VALUE = "; $$PROGRAM; echo "', "all", "$(VALUE)"),
+        ('override VALUE := "; $$PROGRAM; echo "', "all", "$(VALUE)"),
+        ('Q := "; $$PROGRAM; echo "', "all", "$Q"),
+        ('all: VALUE = "; $$PROGRAM; echo "', "all", "$(VALUE)"),
+        ("TARGETS ?= one", "$(TARGETS)", "$@"),
+        ("", ".DEFAULT", "$@"),
+    ],
+)
+def test_make_substitution_can_change_the_shell_recipe(setup, target, expansion):
+    source = f'# é\n```make\n{setup}\n{target}:\n\t@echo "{expansion}" > out\n```\n'
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.cause is tm.ParserCause.RUNTIME_DEPENDENT
+    assert diagnostic.check is tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert source[diagnostic.start : diagnostic.end] == expansion
+
+
+def test_make_substitution_preserves_earlier_runtime_command():
+    source = '```sh\nsh -c "$CALLER"\n```\n```make\nall:\n\t@echo "$(VALUE)" > out\n```\n'
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.start < source.index("```make")
 
 
 def test_documented_stdout_substitution_must_be_a_placeholder() -> None:
