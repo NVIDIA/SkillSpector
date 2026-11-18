@@ -11889,6 +11889,41 @@ def _markdown_split_command_diagnostic(
     return None
 
 
+_VERILOG_DIRECTIVE_LABEL = re.compile(
+    r" `(?:(?:define|undef|ifdef|ifndef|elsif)(?: [A-Za-z_][A-Za-z0-9_]*\*?)?|else|endif|celldefine|endcelldefine) "
+)
+
+
+def _markdown_backtick_label(content: str, start: int, end: int) -> bool:
+    """Recognize a documented key or directive in an already paired code span."""
+    if content[start - 2 : start] != "``" or content.startswith("```", end):
+        return False
+    # A label is local to the two delimiters and its identifying prose.
+    # Keep executable examples and unrecognized expressions with the shell reader.
+    if content.startswith(" ` ", start) and end == start + 3:
+        return (
+            re.search(r"\bbacktick[ \t\r\n(]*``$", content[max(0, start - 32) : start], re.I)
+            is not None
+        )
+    if end - start > 128 or not _VERILOG_DIRECTIVE_LABEL.fullmatch(content, start, end):
+        return False
+    # Require a descriptive phrase on both sides. A utility may take a
+    # similar-looking string as its argument, e.g. in an inline example.
+    before = content[max(0, start - 32) : start - 2]
+    if (
+        re.search(
+            r"\b(?:an?|the|is|are|verilog|systemverilog|active|inactive|plus)[ \t]+$", before, re.I
+        )
+        is None
+    ):
+        return False
+    after = content[end + 2 : end + 40]
+    return (
+        re.match(r"[ \t\r\n]+(?:directives?|branches|lines?|list|at lines?|models?)\b", after, re.I)
+        is not None
+    )
+
+
 def _markdown_owned_commands_diagnostic(
     content: str,
     check_runtime: Callable[[], None],
@@ -11973,6 +12008,11 @@ def _markdown_owned_commands_diagnostic(
         return diagnostic
     for start, end in ranges:
         check_runtime()
+        # The structure pass above has checked the enclosing document. This
+        # standalone label has no closing shell substitution. Keep checking
+        # every other body and any shell operand that crosses a delimiter.
+        if _markdown_backtick_label(content, start, end):
+            continue
         diagnostic = _owned_inline_command_diagnostic(
             content[start:end],
             check_runtime,
