@@ -231,6 +231,7 @@ _POWERSHELL_COMMAND_REBINDING_RE = re.compile(
 # Perl's ``eval BLOCK`` runs already-compiled statements and traps exceptions.
 # Only ``eval EXPR`` (a string, variable, or quote operator) reparses source.
 _PERL_EVAL_BLOCK_RE = re.compile(r"\s*+\{")
+_PERL_HEADER_LINE_RE = re.compile(r"[ \t]*+(?:#[^\r\n]*+)?(?:\r\n?|\n)")
 # Outside string and comment tokens, valid Python ends a shell word at
 # whitespace or a shell control character. A backslash-newline is a line
 # continuation in both languages, so it does not end the word.
@@ -3737,12 +3738,10 @@ def _has_shell_command_word_exhaustion(
         content, check_runtime
     )
 
-    # Before the first Perl statement, a line beginning with # is a native
-    # comment. Later lines may belong to heredocs, regexes or quote operators.
-    perl_comment_prefix = (
-        re.match(r"(?:[ \t]*+(?:#[^\r\n]*+)?(?:\r\n?|\n))*+", content)
-        if file_type == "perl" and complete_context
-        else None
+    # A Perl comment before the first statement owns only its physical line.
+    # Later # characters may belong to heredocs, regexes or quote operators.
+    perl_header = (
+        _PERL_HEADER_LINE_RE.match(content) if file_type == "perl" and complete_context else None
     )
     parsed_through = 0
     # A word that spans lines may pair a heredoc, comment or prose quote with
@@ -4235,11 +4234,10 @@ def _has_shell_command_word_exhaustion(
         )
         if operand_diagnostic is not None:
             comment = python_source.comment(start) if python_source is not None else None
-            if perl_comment_prefix is not None and start < perl_comment_prefix.end():
-                begin = max(content.rfind("\n", 0, start), content.rfind("\r", 0, start)) + 1
-                newline = LOGICAL_LINE_BREAK.search(content, start, perl_comment_prefix.end())
-                end = newline.start() if newline is not None else perl_comment_prefix.end()
-                comment = (begin, end)
+            while perl_header is not None and start >= perl_header.end():
+                perl_header = _PERL_HEADER_LINE_RE.match(content, perl_header.end())
+            if perl_header is not None:
+                comment = perl_header.span()
             if comment is None:
                 if _quoted_candidate_is_complete(
                     content, start, quote_limits, check_runtime, quoted_printf_allowed
