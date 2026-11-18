@@ -9376,7 +9376,7 @@ def _markdown_shell_text(
     whose quote ownership can be checked independently of surrounding prose.
     """
     output = list(content)
-    prose_punctuation: set[int] = set()
+    prose_apostrophes: set[int] = set()
     inline_possessives: set[int] = set()
     runs: list[tuple[int, int]] = []
     list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
@@ -9448,7 +9448,7 @@ def _markdown_shell_text(
                     or re.match(r"[\w'/]", content[close_end + 2]) is None
                 )
             ):
-                prose_punctuation.add(close_end)
+                prose_apostrophes.add(close_end)
                 inline_possessives.add(close_end)
             if (
                 literal_label_positions is not None
@@ -9656,7 +9656,7 @@ def _markdown_shell_text(
                 and len(closing_fence[1]) >= fence[1]
             ):
                 if tree_fence_start == fence_body_start:
-                    prose_punctuation.update(
+                    prose_apostrophes.update(
                         _directory_tree_elbows(content, fence_body_start, offset, check_runtime)
                     )
                 tree_fence_start = None
@@ -9899,7 +9899,7 @@ def _markdown_shell_text(
                                 for word in _MARKDOWN_WORD_APOSTROPHE_RE.finditer(stripped)
                             ]
                             if len(apostrophes) == stripped.count("'"):
-                                prose_punctuation.update(apostrophes)
+                                prose_apostrophes.update(apostrophes)
                 elif not separator and not empty_list_item:
                     prose_leading = leading
                     inline_runtime_guard = False
@@ -9930,7 +9930,7 @@ def _markdown_shell_text(
                         # The restrictive grammar excludes code delimiters and
                         # shell syntax. Fences, indented code, HTML, tables, and
                         # pending multiline inline spans never reach this rule.
-                        prose_punctuation.add(offset + prefix + prose.start("apostrophe"))
+                        prose_apostrophes.add(offset + prefix + prose.start("apostrophe"))
                     elif (
                         word_apostrophes
                         and complete_context
@@ -9964,7 +9964,7 @@ def _markdown_shell_text(
                             check_runtime()
                             apostrophes.append(offset + prefix + word.start("apostrophe"))
                         if len(apostrophes) == prose_leading.count("'"):
-                            prose_punctuation.update(apostrophes)
+                            prose_apostrophes.update(apostrophes)
                     pending_inline = bool(runs)
                     for match in backtick_runs.finditer(line):
                         check_runtime()
@@ -10014,15 +10014,15 @@ def _markdown_shell_text(
                         for word in _MARKDOWN_WORD_APOSTROPHE_RE.finditer(prose)
                     ]
                     if len(apostrophes) == prose.count("'"):
-                        prose_punctuation.update(apostrophes)
-    if prose_punctuation or quoted_code:
+                        prose_apostrophes.update(apostrophes)
+    if prose_apostrophes or quoted_code:
         # A prose-looking line can still be inside an earlier shell word, such
         # as a multiline bash -c string. Reuse the shell parser to preserve that
         # ownership before masking prose punctuation. Unresolved words retain all
         # remaining bytes; this pass never grants ownership past a parse limit.
         cursor = 0
         next_runtime_check = 0
-        last_candidate = max(prose_punctuation | quoted_code.keys())
+        last_candidate = max(prose_apostrophes | quoted_code.keys())
         parameter_ends: dict[int, _ParameterExpansionEnd] = {}
         substitution_ends: dict[int, int | None] = {}
         backtick_ends: dict[int, int | None] = {}
@@ -10036,7 +10036,7 @@ def _markdown_shell_text(
                 output[close:end] = " " * (end - close)
                 cursor = end
                 continue
-            if cursor in prose_punctuation:
+            if cursor in prose_apostrophes:
                 output[cursor] = " "
                 if inline_possessive_apostrophes is not None and cursor in inline_possessives:
                     inline_possessive_apostrophes.add(cursor)
