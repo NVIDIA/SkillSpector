@@ -1866,3 +1866,46 @@ def test_printed_legacy_substitution_does_not_skip_enclosing_binding_effects(bin
 def test_printed_legacy_substitution_keeps_raw_destructive_commands():
     source = 'echo "values (`xargs <<< "$(rm -rf /)"`)"\n'
     assert any(finding.rule_id == "TM1" for finding in tm.analyze(source, "example.sh", "shell"))
+
+
+def test_later_array_expansion_keeps_the_bounds_of_an_earlier_quoted_argument() -> None:
+    source = (
+        '#!/usr/bin/env bash\necho "λ rm -rf $OUT/$NAME"\n'
+        'printf "%s" "${OPTIONS[@]+"${OPTIONS[@]}"}"\n'
+    )
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    for suffix in ("$TOOL -rf /\n", 'eval "$TOOL -rf /"\n'):
+        assert tm.has_bounded_parse_exhaustion(source + suffix, lambda: None)
+    assert any(
+        finding.rule_id == "TM1"
+        for finding in tm.analyze(source + "rm -rf /\n", "example.sh", "shell")
+    )
+
+
+@pytest.mark.parametrize("first", ["#!/bin/fish", "#!/usr/bin/env zsh", "#!bad"])
+def test_bash_quote_proof_requires_a_shell_it_can_parse(first: str) -> None:
+    source = (
+        f'{first}\necho "λ rm -rf $OUT/$NAME"\nprintf "%s" "${{OPTIONS[@]+"${{OPTIONS[@]}}"}}"\n'
+    )
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None)
+
+
+def test_shell_fence_stops_comment_punctuation_before_later_markdown() -> None:
+    body = "send_data # cannot open `/data/log'\n"
+    source = f"```bash\n{body}```\n" + "a" * 8400 + " rm -rf /\n"
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+    for risky in ("# $TOOL -rf /\n", "$TOOL -rf /\n"):
+        value = source.replace(body, body + risky)
+        diagnostic = tm.bounded_parse_diagnostic(value, lambda: None, file_type="markdown")
+        assert diagnostic is not None and diagnostic.start == value.index("$TOOL")
+
+
+@pytest.mark.parametrize(
+    "specimen", ["echo $(unclosed", 'rm "unclosed', "OUTPUT=<path>\necho $(unclosed"]
+)
+def test_malformed_example_cannot_supply_a_shell_fence_boundary(specimen: str) -> None:
+    source = "```sh\n" + specimen + "\n```\n" + "a" * 8400 + " rm -rf /\n"
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="markdown")

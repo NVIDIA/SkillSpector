@@ -42,6 +42,7 @@ from skillspector.artifacts import (
     security_text_views,
 )
 from skillspector.baseline_tokens import baseline_rule_scalar_roles
+from skillspector.bash_syntax import bash_syntax, complete_shell_fences
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
     LedgerReason,
@@ -3609,6 +3610,7 @@ def _has_shell_command_word_exhaustion(
     _startup_diagnostics: list[StaticParserDiagnostic] | None = None,
     _xargs_contexts: tuple[tuple[str, list[bool | None]], ...] = (),
     complete_context: bool = True,
+    shell_fences: tuple[tuple[int, int], ...] = (),
     native_argument_spans: tuple[tuple[int, int], ...] = (),
     native_argument_work: list[int] | None = None,
 ) -> StaticParserDiagnostic | None:
@@ -3686,6 +3688,7 @@ def _has_shell_command_word_exhaustion(
 
     complete_comments: set[tuple[int, int]] = set()
     word_diagnostics: list[StaticParserDiagnostic] = []
+    fence_index = 0
     native_argument_index = 0
     native_argument_through = 0
     # Short text without shell-expansion openers cannot trigger these shell-word
@@ -3812,17 +3815,27 @@ def _has_shell_command_word_exhaustion(
         )
         native_backticks: set[tuple[int, int]] | None = set() if value_span else None
         word_caches = (parameter_end_cache, substitution_end_cache, backtick_end_cache)
-        if value_span is not None:
+        while fence_index < len(shell_fences) and shell_fences[fence_index][1] <= start:
+            fence_index += 1
+        fence = (
+            shell_fences[fence_index]
+            if fence_index < len(shell_fences) and shell_fences[fence_index][0] <= start
+            else None
+        )
+        source_span = value_span or fence
+        if source_span is not None:
             # Endpoints cached against a different EOF cannot prove this value.
-            scoped_caches = native_caches.get(value_span[0])
+            scoped_caches = native_caches.get(source_span[0])
             if scoped_caches is None:
                 scoped_caches = ({}, {}, {})
-                native_caches[value_span[0]] = scoped_caches
+                native_caches[source_span[0]] = scoped_caches
             word_caches = scoped_caches
-        word_limit = value_span[1] if value_span is not None else len(content)
+        word_limit = source_span[1] if source_span is not None else len(content)
         reader_options = (
             {"backtick_closures": native_backticks, "source_end": word_limit}
             if native_backticks is not None
+            else {"source_end": word_limit}
+            if fence is not None
             else {}
         )
         if _has_quoted_assignment_prefix(content, start):
@@ -3968,7 +3981,7 @@ def _has_shell_command_word_exhaustion(
             # Do not charge that value to an earlier unmatched Markdown tick.
             next_json = bisect_right(json_openers, start)
             unresolved_end = (
-                json_openers[next_json] if next_json < len(json_openers) else len(content)
+                json_openers[next_json] if next_json < len(json_openers) else word_limit
             )
             if powershell is not None:
                 unresolved_end = min(unresolved_end, powershell.next_boundary(start, len(content)))
@@ -4106,6 +4119,8 @@ def _has_shell_command_word_exhaustion(
                     if value_span is not None
                     and (bounds := native_operand_bounds.get(value_span[0])) is not None
                     and (boundary := bounds.source_end(start, parsed.end)) is not None
+                    else {"source_end": fence[1]}
+                    if fence is not None
                     else {}
                 ),
             )
@@ -12134,6 +12149,38 @@ def bounded_parse_diagnostic(
         python_import_check=python_import_check,
         python_stdlib_check=python_stdlib_check,
     )
+    if (
+        file_type == "shell"
+        and complete_context
+        and (source_view is None or source_view.name == "raw")
+        and exhausted is not None
+        and exhausted.check
+        in {
+            ParserCheck.COMMAND_ARGUMENT_BOUNDARY,
+            ParserCheck.COMMAND_WORD_BOUNDARY,
+            ParserCheck.EXPANSION_BOUNDARY,
+        }
+    ):
+        syntax = bash_syntax(content, check_runtime)
+        if syntax is not None:
+            projected = list(content)
+            for start, end in syntax.comments:
+                check_runtime()
+                comment = content[start:end]
+                if "`" in comment:
+                    # Comments can document real commands. Only project Markdown
+                    # delimiters; their full contents and operands remain visible.
+                    projected[start:end] = _blank_line_local_paired_backticks(comment)
+            projected_text = "".join(projected)
+            if projected_text != content or syntax.quote_limits:
+                exhausted = _has_bounded_parse_exhaustion(
+                    projected_text,
+                    check_runtime,
+                    file_type=file_type,
+                    source_view=source_view,
+                    prepared_analysis=prepared_analysis,
+                    bash_quote_limits=syntax.quote_limits,
+                )
     if exhausted is not None and not complete_context:
         exhausted = replace(exhausted, full_input_checked=False)
     if file_type == "yaml" and complete_context:
@@ -12228,6 +12275,7 @@ def _has_bounded_parse_exhaustion(
     python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
     native_argument_spans: tuple[tuple[int, int], ...] = (),
     native_argument_work: list[int] | None = None,
+    bash_quote_limits: dict[int, int] | None = None,
 ) -> StaticParserDiagnostic | None:
     # PowerShell source can invoke another shell with an executable command
     # string. Apply the same bounded checks to those strings; benign PowerShell
@@ -12460,6 +12508,9 @@ def _has_bounded_parse_exhaustion(
         quote_limits = _shell_quoted_candidate_limits(
             content, check_runtime, quote_closers=structural_quote_closers
         )
+        if bash_quote_limits:
+            quote_limits = bash_quote_limits | quote_limits
+
     elif file_type == "markdown" and complete_context:
         quote_limits = {}
         for start, end in shell_fence_ranges:
@@ -12488,6 +12539,11 @@ def _has_bounded_parse_exhaustion(
         file_type=file_type,
         source_commands=source_commands if file_type == "shell" and complete_context else None,
         complete_context=complete_context,
+        **(
+            {"shell_fences": complete_shell_fences(content, shell_fence_ranges, check_runtime)}
+            if word_apostrophes and shell_fence_ranges
+            else {}
+        ),
         **(
             {
                 "native_argument_spans": native_argument_spans,
