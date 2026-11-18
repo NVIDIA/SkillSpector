@@ -193,13 +193,17 @@ def python_fstring_literal_spans(
     start: int,
     end: int,
     check_runtime: Callable[[], None],
+    *,
+    owners: PythonLiteralSpans | None = None,
+    field_ends: dict[int, int] | None = None,
 ) -> PythonLiteralSpans | None:
     """Return exact constant-text runs of one proven outer f-string token.
 
     Replacement expressions and their format specifications never gain literal
     ownership. Doubled braces keep both original source bytes in their run.
     """
-    owners = python_literal_spans(content, check_runtime)
+    if owners is None:
+        owners = python_literal_spans(content, check_runtime)
     if owners is None:
         return None
     owner_index = bisect_right(owners[0], start) - 1
@@ -211,6 +215,8 @@ def python_fstring_literal_spans(
     ends: list[int] = []
     template_depth = field_depth = 0
     complete = False
+    field_start = 0
+    fields: dict[int, int] = {}
 
     def offset(position: tuple[int, int]) -> int:
         return start + line_starts[position[0] - 1] + position[1]
@@ -231,9 +237,13 @@ def python_fstring_literal_spans(
                     complete = offset(token.end) == end and field_depth == 0
             elif template_depth == 1 and token.type == tokenize.OP:
                 if token.string == "{":
+                    if not field_depth:
+                        field_start = offset(token.start)
                     field_depth += 1
                 elif token.string == "}":
                     field_depth -= 1
+                    if not field_depth:
+                        fields[field_start] = offset(token.end)
             elif template_depth == 1 and not field_depth and token.type == tokenize.FSTRING_MIDDLE:
                 literal_start, literal_end = offset(token.start), offset(token.end)
                 if (
@@ -253,7 +263,72 @@ def python_fstring_literal_spans(
         return None
     if not complete or template_depth or field_depth:
         return None
+    if field_ends is not None:
+        field_ends.update(fields)
     return tuple(starts), tuple(ends)
+
+
+def python_literal_field_text(field: str, *, raw: bool, limit: int) -> str | None:
+    """Render one bounded native replacement with no user-provided conversion hooks."""
+    if len(field) > limit or not re.match(
+        r"""\{\s*(?:[rubRUB]{0,2}['"]|[0-9.(+-]|(?:True|False|None)\b)""", field
+    ):
+        return None
+    # The caller has already proved the extent of this outer field. Parsing it
+    # as a complete f-string preserves Python's conversion and format grammar.
+    delimiter = '"""'
+    try:
+        joined = ast.parse(("rf" if raw else "f") + delimiter + field + delimiter, mode="eval").body
+    except (ValueError, SyntaxError, RecursionError):
+        return None
+    if not isinstance(joined, ast.JoinedStr) or len(joined.values) != 1:
+        return None
+    part = joined.values[0]
+    if not isinstance(part, ast.FormattedValue):
+        return None
+    if isinstance(part.value, ast.Constant):
+        value = part.value.value
+    elif (
+        isinstance(part.value, ast.UnaryOp)
+        and isinstance(part.value.op, (ast.UAdd, ast.USub))
+        and isinstance(part.value.operand, ast.Constant)
+        and type(part.value.operand.value) in (int, float)
+    ):
+        number = part.value.operand.value
+        value = -number if isinstance(part.value.op, ast.USub) else number
+    else:
+        return None
+    if type(value) not in (str, int, bool, float, bytes, type(None)):
+        return None
+    if isinstance(value, int) and value.bit_length() > limit:
+        return None
+    spec = ""
+    if part.format_spec is not None:
+        if not isinstance(part.format_spec, ast.JoinedStr) or any(
+            not isinstance(chunk, ast.Constant) or not isinstance(chunk.value, str)
+            for chunk in part.format_spec.values
+        ):
+            return None
+        spec = "".join(
+            chunk.value for chunk in part.format_spec.values if isinstance(chunk, ast.Constant)
+        )
+    if (
+        len(spec) > 64
+        or spec.endswith("n")  # Depends on the caller's locale.
+        or any(len(digits) > 4 or int(digits) > limit for digits in re.findall(r"\d+", spec))
+    ):
+        return None
+    try:
+        if part.conversion == ord("r"):
+            value = repr(value)
+        elif part.conversion == ord("s"):
+            value = str(value)
+        elif part.conversion == ord("a"):
+            value = ascii(value)
+        result = format(value, spec)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if len(result) <= limit else None
 
 
 def _browser_html_fields(
