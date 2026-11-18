@@ -1016,9 +1016,10 @@ def sourced_eval_argument(
         return None
     directories: set[bytes] = set()
     assigned: set[bytes] = set()
-    definitions: dict[bytes, tuple[str, Node]] = {}
+    definitions: dict[bytes, dict[str, Node]] = {}
     all_sources_script_relative = True
-    loaded: set[str] = set()
+    imported_count = 0
+    loaded: dict[str, dict[bytes, Node]] = {}
     for node in root.children:
         check_runtime()
         if time.monotonic() >= deadline:
@@ -1056,7 +1057,8 @@ def sourced_eval_argument(
         if name == b":" and not args and node.named_child_count == 1:
             continue
         if name in {b"source", b"."}:
-            if len(loaded) >= 12 or len(args) != 1:
+            imported_count += 1
+            if imported_count > 12 or len(args) != 1:
                 return None
             ref = re.fullmatch(
                 rb'"\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})/([\w./-]+)"', args[0].text
@@ -1068,40 +1070,64 @@ def sourced_eval_argument(
             elif literal and literal.startswith("./"):
                 suffix = literal[2:]
             else:
-                return None
+                # An unknown source can change previous bindings or leave them
+                # intact. It supplies no candidate definition of its own.
+                all_sources_script_relative = False
+                continue
             source_path = bundled_script_sibling(path, suffix)
-            if source_path is None:
-                return None
-            if not script_relative and suffix != source_path and suffix in sources:
-                return None
+            if source_path is None or (
+                not script_relative and suffix != source_path and suffix in sources
+            ):
+                all_sources_script_relative = False
+                continue
             library = sources.get(source_path)
-            if source_path in loaded or library is None:
-                return None
-            imported = parse(library)
-            if imported is None or imported.child_count > 512:
-                return None
-            loaded.add(source_path)
-            # A working-directory-relative source may replace any binding in the
-            # current shell, including an earlier helper or the next include root.
+            if library is None:
+                all_sources_script_relative = False
+                continue
             all_sources_script_relative = all_sources_script_relative and script_relative
-            for item in imported.children:
-                check_runtime()
-                if item.type in {"comment", ";"}:
-                    continue
-                symbol = item.child_by_field_name("name")
-                body = item.child_by_field_name("body")
-                if item.type != "function_definition" or symbol is None or body is None:
+            if source_path not in loaded:
+                imported = parse(library)
+                if imported is None or imported.child_count > 512:
                     return None
-                if not re.fullmatch(rb"[A-Za-z_]\w*", symbol.text) or symbol.text in {
-                    b"source",
-                    b"eval",
-                    b"cd",
-                    b"dirname",
-                    b"pwd",
-                    b"local",
-                }:
-                    return None
-                definitions[symbol.text] = (source_path, body)
+                local: dict[bytes, Node] = {}
+                for item in imported.children:
+                    check_runtime()
+                    if item.type in {"comment", ";"}:
+                        continue
+                    symbol = item.child_by_field_name("name")
+                    body = item.child_by_field_name("body")
+                    if (
+                        item.type != "function_definition"
+                        or symbol is None
+                        or body is None
+                        or not re.fullmatch(rb"[A-Za-z_]\w*", symbol.text)
+                        or symbol.text
+                        in {
+                            b"source",
+                            b"eval",
+                            b"cd",
+                            b"dirname",
+                            b"pwd",
+                            b"local",
+                        }
+                    ):
+                        if all_sources_script_relative:
+                            return None
+                        # The runtime source may be different. Its opaque effects
+                        # cannot prove any new definition or discard an older one.
+                        local.clear()
+                        break
+                    # Later definitions in one declarative source always win
+                    # when that source is loaded.
+                    local[symbol.text] = body
+                loaded[source_path] = local
+            for symbol_name, body in loaded[source_path].items():
+                candidates = definitions.setdefault(symbol_name, {})
+                if all_sources_script_relative:
+                    candidates.clear()
+                # An uncertain load can replace the old function or leave it
+                # bound. Keep both candidates until a proven replacement.
+                candidates[source_path] = body
             continue
         if (
             name not in definitions
@@ -1109,29 +1135,31 @@ def sourced_eval_argument(
             or not all(_single_argv_slot(arg) for arg in args)
         ):
             return None
-        source_path, body = definitions[name]
-        reached = _forwarded_eval(body, args, check_runtime)
-        if reached is not None:
-            slot, sink = reached
-            if slot <= len(args):
-                argument = args[slot - 1]
-                var = re.fullmatch(rb'"\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})"', argument.text)
-                if var and (var[1] or var[2]) not in assigned:
-                    raw = caller.encode()
-                    source_raw = sources[source_path].encode()
-                    witness = argument if all_sources_script_relative else node.named_children[0]
-                    return SourcedEval(
-                        (
-                            len(raw[: witness.start_byte].decode()),
-                            len(raw[: witness.end_byte].decode()),
-                        ),
-                        source_path,
-                        (
-                            len(source_raw[: sink.start_byte].decode()),
-                            len(source_raw[: sink.end_byte].decode()),
-                        ),
-                        all_sources_script_relative,
-                    )
+        for source_path, body in definitions[name].items():
+            reached = _forwarded_eval(body, args, check_runtime)
+            if reached is not None:
+                slot, sink = reached
+                if slot <= len(args):
+                    argument = args[slot - 1]
+                    var = re.fullmatch(rb'"\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})"', argument.text)
+                    if var and (var[1] or var[2]) not in assigned:
+                        raw = caller.encode()
+                        source_raw = sources[source_path].encode()
+                        witness = (
+                            argument if all_sources_script_relative else node.named_children[0]
+                        )
+                        return SourcedEval(
+                            (
+                                len(raw[: witness.start_byte].decode()),
+                                len(raw[: witness.end_byte].decode()),
+                            ),
+                            source_path,
+                            (
+                                len(source_raw[: sink.start_byte].decode()),
+                                len(source_raw[: sink.end_byte].decode()),
+                            ),
+                            all_sources_script_relative,
+                        )
         # An intervening function may change the current shell's bindings.
         return None
     return None
