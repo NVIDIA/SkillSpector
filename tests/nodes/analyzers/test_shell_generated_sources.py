@@ -81,7 +81,11 @@ def test_each_consumer_uses_its_current_assignment_without_cache_poisoning(rever
 
 @pytest.mark.parametrize(
     ("assignment", "operand", "destructive"),
-    [("cmd='printf ready'", '"$cmd"', False), ("cmd='rm -rf /'", '"${cmd}"', True)],
+    [
+        ("cmd='printf ready'", '"$cmd"', False),
+        ("cmd='rm -rf /'", '"${cmd}"', True),
+        ("flag=-rf", '"rm $flag /"', True),
+    ],
 )
 def test_literal_command_binding_is_inspected_at_its_consumer(assignment, operand, destructive):
     caller = f"{assignment}\nsh -c {operand}\n"
@@ -112,6 +116,7 @@ def test_literal_command_binding_is_inspected_at_its_consumer(assignment, operan
         'cmd=safe && false || sh -c "$cmd"',
         "cmd=safe\nsh -c $cmd",
         'cmd=safe\nsh -c "$1"',
+        'cmd=safe\nsh -c "$cmd $INPUT"',
         'cmd=safe\nread cmd\nsh -c "$cmd"',
     ],
 )

@@ -852,7 +852,11 @@ class ShellSourceResolver:
     def literal_command_binding(self, index: int, start: int, end: int) -> bool:
         """Recognize an immediately preceding plain assignment used by sh/bash -c."""
         raw = self.content
-        use = re.fullmatch(r'"\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})"', raw[start:end], re.ASCII)
+        use = re.fullmatch(
+            r'"[^"$`\\]*\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})[^"$`\\]*"',
+            raw[start:end],
+            re.ASCII,
+        )
         if not use or not index:
             return False
         command = self.commands[index]
