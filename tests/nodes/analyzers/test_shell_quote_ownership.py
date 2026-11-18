@@ -2442,3 +2442,189 @@ def test_executable_backticks_remain_visible_after_a_normalized_comment() -> Non
     assert detail["check"] is tm.ParserCheck.EXPANSION_BOUNDARY
     assert source[detail["source_start_offset"] : detail["source_end_offset"]].startswith('`"')
     assert any(f.rule_id == "TM1" for f in result["findings"])
+
+
+_SOURCED_EVAL_LIB = """#!/bin/bash
+route() {
+  local program="$1" mode="${2:-print}"
+  case "$mode" in
+    shell) (eval "$program");;
+    print) printf '%s' "$program";;
+  esac
+}
+"""
+_SOURCE_RELATIVE = """#!/bin/bash
+base="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${base}/actions.sh"
+"""
+
+
+def test_sourced_function_reports_runtime_operand_in_the_caller(tmp_path: Path) -> None:
+    source = _SOURCE_RELATIVE + '# non-ASCII α\nroute "$REQUEST" shell\n'
+    state = _forwarder_context(tmp_path, {"main.sh": source, "actions.sh": _SOURCED_EVAL_LIB})
+    rows = {row["path"]: row for row in tm.node(state)["inspection_ledger"]}
+    assert set(rows) == {"actions.sh", "main.sh"}
+    assert rows["actions.sh"]["outcome"] == rows["main.sh"]["outcome"] == LedgerOutcome.PARTIAL
+    diagnostic = rows["main.sh"]["parser_diagnostic"]
+    assert diagnostic["check"] == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert (
+        source[diagnostic["source_start_offset"] : diagnostic["source_end_offset"]] == '"$REQUEST"'
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        _SOURCE_RELATIVE + 'route "$REQUEST" print',
+        _SOURCE_RELATIVE + 'route "$REQUEST"',
+        _SOURCE_RELATIVE + "route 'pwd' shell",
+        _SOURCE_RELATIVE + 'other "$REQUEST" shell',
+        _SOURCE_RELATIVE + 'route "$@" "$REQUEST" shell',
+        _SOURCE_RELATIVE + 'rebind() { eval "$1"; }\nrebind "$INIT"\nroute "$REQUEST" shell',
+        _SOURCE_RELATIVE + 'unset -f route\nroute "$REQUEST" shell',
+        _SOURCE_RELATIVE + 'REQUEST=pwd\nroute "$REQUEST" shell',
+        _SOURCE_RELATIVE + 'route() { printf "%s" "$1"; }\nroute "$REQUEST" shell',
+        _SOURCE_RELATIVE + 'if false; then route "$REQUEST" shell; fi',
+        _SOURCE_RELATIVE + 'return 0\nroute "$REQUEST" shell',
+    ],
+)
+def test_sourced_eval_needs_exact_binding_and_selected_arm(source: str) -> None:
+    sources = {"main.sh": source, "actions.sh": _SOURCED_EVAL_LIB}
+    assert tm.sourced_callable_diagnostic("main.sh", source, sources, lambda: None) is None
+
+
+def test_sourced_eval_confirms_original_library_location() -> None:
+    source = _SOURCE_RELATIVE + 'route "$input" shell'
+    library = _SOURCED_EVAL_LIB.replace("route()", "# λ\nroute()")
+    state = {"main.sh": source, "actions.sh": library}
+    result = tm.sourced_eval_argument(source, "main.sh", state, lambda: None)
+    assert result is not None
+    assert source[slice(*result.caller_span)] == '"$input"'
+    assert result.definition_path == "actions.sh"
+    assert library[slice(*result.eval_span)] == '"$program"'
+    assert tm.sourced_eval_argument(source, "main.sh", {"main.sh": source}, lambda: None) is None
+
+
+def test_sourced_eval_honors_later_library_replacement(tmp_path: Path) -> None:
+    source = _SOURCE_RELATIVE + 'source "${base}/overrides.sh"\nroute "$program" shell'
+    sources = {
+        "main.sh": source,
+        "actions.sh": _SOURCED_EVAL_LIB,
+        "overrides.sh": 'route() { printf "%s" "$1"; }',
+    }
+    assert tm.sourced_eval_argument(source, "main.sh", sources, lambda: None) is None
+    state = _forwarder_context(tmp_path, sources)
+    rows = {row["path"]: row for row in tm.node(state)["inspection_ledger"]}
+    assert rows["main.sh"]["outcome"] == LedgerOutcome.COMPLETED
+    assert rows["actions.sh"]["outcome"] == LedgerOutcome.PARTIAL
+
+
+@pytest.mark.parametrize(
+    "derive",
+    [
+        'base=$( cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P )',
+        'base="$( cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+    ],
+)
+def test_sourced_eval_script_directory_follows_native_words(derive: str) -> None:
+    source = derive + '\nsource "$base/actions.sh"\nroute "$REQUEST" shell'
+    state = {"main.sh": source, "actions.sh": _SOURCED_EVAL_LIB}
+    diag = tm.sourced_callable_diagnostic("main.sh", source, state, lambda: None)
+    assert diag and diag.check == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert source[diag.start : diag.end] == '"$REQUEST"'
+
+
+def test_working_directory_relative_source_reports_uncertain_callee_identity() -> None:
+    source = 'source ./actions.sh\nroute "$REQUEST" shell'
+    state = {"main.sh": source, "actions.sh": _SOURCED_EVAL_LIB}
+    diag = tm.sourced_callable_diagnostic("main.sh", source, state, lambda: None)
+    assert diag and diag.check == tm.ParserCheck.COMMAND_IDENTITY
+    assert source[diag.start : diag.end] == "route"
+
+
+@pytest.mark.parametrize("loader", ["source\t", ".\t"])
+def test_sourced_eval_retains_an_earlier_caller_before_a_later_eval(
+    tmp_path: Path, loader: str
+) -> None:
+    source = (
+        _SOURCE_RELATIVE.replace("source ", loader) + ':\nroute "$REQUEST" shell\neval "$LATER"\n'
+    )
+    state = _forwarder_context(tmp_path, {"main.sh": source, "actions.sh": _SOURCED_EVAL_LIB})
+    rows = {row["path"]: row for row in tm.node(state)["inspection_ledger"]}
+    d = rows["main.sh"]["parser_diagnostic"]
+    assert d["check"] == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert source[d["source_start_offset"] : d["source_end_offset"]] == '"$REQUEST"'
+
+
+def test_unresolved_earlier_eval_keeps_its_own_diagnostic(tmp_path: Path) -> None:
+    source = _SOURCE_RELATIVE + 'eval "$EARLIER"\nroute "$REQUEST" shell'
+    state = _forwarder_context(tmp_path, {"main.sh": source, "actions.sh": _SOURCED_EVAL_LIB})
+    row = next(r for r in tm.node(state)["inspection_ledger"] if r["path"] == "main.sh")
+    d = row["parser_diagnostic"]
+    assert source[d["source_start_offset"] : d["source_end_offset"]].strip() == '"$EARLIER"'
+
+
+@pytest.mark.parametrize("order", ["before", "after"])
+def test_conditional_library_can_change_other_sourced_bindings(order: str) -> None:
+    directory, fixed, _ = _SOURCE_RELATIVE.rsplit("\n", 2)
+    relative = "source ./extras.sh"
+    statements = [relative, fixed] if order == "before" else [fixed, relative]
+    source = "\n".join([directory, *statements, 'route "$REQUEST" shell'])
+    sources = {
+        "main.sh": source,
+        "actions.sh": _SOURCED_EVAL_LIB,
+        "extras.sh": "other() { :; }",
+    }
+    diagnostic = tm.sourced_callable_diagnostic("main.sh", source, sources, lambda: None)
+    assert diagnostic and diagnostic.check == tm.ParserCheck.COMMAND_IDENTITY
+    assert source[diagnostic.start : diagnostic.end] == "route"
+
+
+@pytest.mark.parametrize("extra", ["other() { :; }", "base=/different", "source() { :; }"])
+def test_uncertain_later_source_may_leave_original_evaluator_bound(
+    tmp_path: Path, extra: str
+) -> None:
+    source = (
+        _SOURCE_RELATIVE + 'source ./extras.sh\nsource "$base/replace.sh"\nroute "$REQUEST" shell'
+    )
+    state = _forwarder_context(
+        tmp_path,
+        {
+            "main.sh": source,
+            "actions.sh": _SOURCED_EVAL_LIB,
+            "extras.sh": extra,
+            "replace.sh": 'route() { printf "%s" "$1"; }',
+        },
+    )
+    rows = {row["path"]: row for row in tm.node(state)["inspection_ledger"]}
+    assert rows["actions.sh"]["outcome"] == LedgerOutcome.PARTIAL
+    assert rows["main.sh"]["outcome"] == LedgerOutcome.PARTIAL
+    diagnostic = rows["main.sh"]["parser_diagnostic"]
+    assert diagnostic["check"] == tm.ParserCheck.COMMAND_IDENTITY
+    assert source[diagnostic["source_start_offset"] : diagnostic["source_end_offset"]] == "route"
+
+
+@pytest.mark.parametrize("extra", ['source "$EXTERNAL"', "source ./missing.sh"])
+def test_unknown_source_can_leave_a_previous_evaluator_bound(extra: str) -> None:
+    source = _SOURCE_RELATIVE + extra + '\nroute "$input" shell'
+    state = {"main.sh": source, "actions.sh": _SOURCED_EVAL_LIB}
+    d = tm.sourced_callable_diagnostic("main.sh", source, state, lambda: None)
+    assert d and d.check == tm.ParserCheck.COMMAND_IDENTITY
+    assert source[d.start : d.end] == "route"
+
+
+def test_conditional_load_does_not_restore_a_previously_replaced_evaluator() -> None:
+    source = _SOURCE_RELATIVE + 'source "$base/safe.sh"\nsource ./extra.sh\nroute "$input" shell'
+    state = {
+        "main.sh": source,
+        "actions.sh": _SOURCED_EVAL_LIB,
+        "safe.sh": "route() { :; }",
+        "extra.sh": "info() { :; }",
+    }
+    assert tm.sourced_callable_diagnostic("main.sh", source, state, lambda: None) is None
+
+
+def test_one_conditional_module_exposes_its_final_definition_only() -> None:
+    source = 'source ./actions.sh\nroute "$input" shell'
+    state = {"main.sh": source, "actions.sh": _SOURCED_EVAL_LIB + "route() { :; }"}
+    assert tm.sourced_callable_diagnostic("main.sh", source, state, lambda: None) is None
