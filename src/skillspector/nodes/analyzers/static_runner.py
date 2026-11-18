@@ -3785,11 +3785,17 @@ def _scan_all_views_with_parser_diagnostics(
                             prepared_analysis=parser_analyses.get(id(module)),
                         )
                     )
+            prior = parser_diagnostics[0] if parser_diagnostics else None
             if (
-                not parser_diagnostics
-                and not bounded_parse_limited
-                and parser_file_type == "shell"
+                parser_file_type == "shell"
                 and source_cache is not None
+                and (
+                    prior is None
+                    and not bounded_parse_limited
+                    or prior is not None
+                    and prior.cause == ParserCause.RUNTIME_DEPENDENT
+                    and prior.location_precision == "source_span"
+                )
             ):
                 for module in modules_for_windows:
                     extra = _explicit_analysis_hook(module, "sourced_callable_diagnostic")
@@ -3801,8 +3807,10 @@ def _scan_all_views_with_parser_diagnostics(
                         source_cache.validated(finding_budget.check_runtime),
                         finding_budget.check_runtime,
                     )
-                    if isinstance(diagnostic, StaticParserDiagnostic):
-                        parser_diagnostics.append(diagnostic)
+                    if isinstance(diagnostic, StaticParserDiagnostic) and (
+                        prior is None or diagnostic.start < prior.start
+                    ):
+                        parser_diagnostics.insert(0, diagnostic)
                         bounded_parse_limited = True
                         break
         except _StaticResourceLimitError as exc:

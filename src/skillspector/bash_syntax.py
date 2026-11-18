@@ -980,7 +980,7 @@ def sourced_eval_argument(
     if (
         len(caller) > 131_072
         or sources.get(path) != caller
-        or not ("source " in caller or ". " in caller)
+        or not re.search(r"(?m)(?:^|;)[ \t]*(?:source|\.)[ \t]", caller)
     ):
         return None
     deadline = time.monotonic() + 0.3
@@ -1052,6 +1052,8 @@ def sourced_eval_argument(
         following = node.next_sibling
         if following is not None and following.type == "&":
             return None
+        if name == b":" and not args and node.named_child_count == 1:
+            continue
         if name in {b"source", b"."}:
             if len(loaded) >= 12 or len(args) != 1:
                 return None

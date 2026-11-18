@@ -2537,3 +2537,25 @@ def test_working_directory_relative_source_reports_uncertain_callee_identity() -
     diag = tm.sourced_callable_diagnostic("main.sh", source, state, lambda: None)
     assert diag and diag.check == tm.ParserCheck.COMMAND_IDENTITY
     assert source[diag.start : diag.end] == "route"
+
+
+@pytest.mark.parametrize("loader", ["source\t", ".\t"])
+def test_sourced_eval_retains_an_earlier_caller_before_a_later_eval(
+    tmp_path: Path, loader: str
+) -> None:
+    source = (
+        _SOURCE_RELATIVE.replace("source ", loader) + ':\nroute "$REQUEST" shell\neval "$LATER"\n'
+    )
+    state = _forwarder_context(tmp_path, {"main.sh": source, "actions.sh": _SOURCED_EVAL_LIB})
+    rows = {row["path"]: row for row in tm.node(state)["inspection_ledger"]}
+    d = rows["main.sh"]["parser_diagnostic"]
+    assert d["check"] == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert source[d["source_start_offset"] : d["source_end_offset"]] == '"$REQUEST"'
+
+
+def test_unresolved_earlier_eval_keeps_its_own_diagnostic(tmp_path: Path) -> None:
+    source = _SOURCE_RELATIVE + 'eval "$EARLIER"\nroute "$REQUEST" shell'
+    state = _forwarder_context(tmp_path, {"main.sh": source, "actions.sh": _SOURCED_EVAL_LIB})
+    row = next(r for r in tm.node(state)["inspection_ledger"] if r["path"] == "main.sh")
+    d = row["parser_diagnostic"]
+    assert source[d["source_start_offset"] : d["source_end_offset"]].strip() == '"$EARLIER"'
