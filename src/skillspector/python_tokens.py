@@ -23,6 +23,7 @@ from collections.abc import Callable
 from html.parser import HTMLParser
 from threading import Lock
 
+from skillspector.javascript_ast import parse_javascript_source
 from skillspector.javascript_tokens import browser_escaped_list_shell_text, browser_markup_witness
 from skillspector.python_ast import MAX_PYTHON_AST_SOURCE_CHARS, parse_python_source
 
@@ -192,13 +193,17 @@ def python_fstring_literal_spans(
     start: int,
     end: int,
     check_runtime: Callable[[], None],
+    *,
+    owners: PythonLiteralSpans | None = None,
+    field_ends: dict[int, int] | None = None,
 ) -> PythonLiteralSpans | None:
     """Return exact constant-text runs of one proven outer f-string token.
 
     Replacement expressions and their format specifications never gain literal
     ownership. Doubled braces keep both original source bytes in their run.
     """
-    owners = python_literal_spans(content, check_runtime)
+    if owners is None:
+        owners = python_literal_spans(content, check_runtime)
     if owners is None:
         return None
     owner_index = bisect_right(owners[0], start) - 1
@@ -210,6 +215,8 @@ def python_fstring_literal_spans(
     ends: list[int] = []
     template_depth = field_depth = 0
     complete = False
+    field_start = 0
+    fields: dict[int, int] = {}
 
     def offset(position: tuple[int, int]) -> int:
         return start + line_starts[position[0] - 1] + position[1]
@@ -230,9 +237,13 @@ def python_fstring_literal_spans(
                     complete = offset(token.end) == end and field_depth == 0
             elif template_depth == 1 and token.type == tokenize.OP:
                 if token.string == "{":
+                    if not field_depth:
+                        field_start = offset(token.start)
                     field_depth += 1
                 elif token.string == "}":
                     field_depth -= 1
+                    if not field_depth:
+                        fields[field_start] = offset(token.end)
             elif template_depth == 1 and not field_depth and token.type == tokenize.FSTRING_MIDDLE:
                 literal_start, literal_end = offset(token.start), offset(token.end)
                 if (
@@ -252,7 +263,72 @@ def python_fstring_literal_spans(
         return None
     if not complete or template_depth or field_depth:
         return None
+    if field_ends is not None:
+        field_ends.update(fields)
     return tuple(starts), tuple(ends)
+
+
+def python_literal_field_text(field: str, *, raw: bool, limit: int) -> str | None:
+    """Render one bounded native replacement with no user-provided conversion hooks."""
+    if len(field) > limit or not re.match(
+        r"""\{\s*(?:[rubRUB]{0,2}['"]|[0-9.(+-]|(?:True|False|None)\b)""", field
+    ):
+        return None
+    # The caller has already proved the extent of this outer field. Parsing it
+    # as a complete f-string preserves Python's conversion and format grammar.
+    delimiter = '"""'
+    try:
+        joined = ast.parse(("rf" if raw else "f") + delimiter + field + delimiter, mode="eval").body
+    except (ValueError, SyntaxError, RecursionError):
+        return None
+    if not isinstance(joined, ast.JoinedStr) or len(joined.values) != 1:
+        return None
+    part = joined.values[0]
+    if not isinstance(part, ast.FormattedValue):
+        return None
+    if isinstance(part.value, ast.Constant):
+        value = part.value.value
+    elif (
+        isinstance(part.value, ast.UnaryOp)
+        and isinstance(part.value.op, (ast.UAdd, ast.USub))
+        and isinstance(part.value.operand, ast.Constant)
+        and type(part.value.operand.value) in (int, float)
+    ):
+        number = part.value.operand.value
+        value = -number if isinstance(part.value.op, ast.USub) else number
+    else:
+        return None
+    if type(value) not in (str, int, bool, float, bytes, type(None)):
+        return None
+    if isinstance(value, int) and value.bit_length() > limit:
+        return None
+    spec = ""
+    if part.format_spec is not None:
+        if not isinstance(part.format_spec, ast.JoinedStr) or any(
+            not isinstance(chunk, ast.Constant) or not isinstance(chunk.value, str)
+            for chunk in part.format_spec.values
+        ):
+            return None
+        spec = "".join(
+            chunk.value for chunk in part.format_spec.values if isinstance(chunk, ast.Constant)
+        )
+    if (
+        len(spec) > 64
+        or spec.endswith("n")  # Depends on the caller's locale.
+        or any(len(digits) > 4 or int(digits) > limit for digits in re.findall(r"\d+", spec))
+    ):
+        return None
+    try:
+        if part.conversion == ord("r"):
+            value = repr(value)
+        elif part.conversion == ord("s"):
+            value = str(value)
+        elif part.conversion == ord("a"):
+            value = ascii(value)
+        result = format(value, spec)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if len(result) <= limit else None
 
 
 def _browser_html_fields(
@@ -976,6 +1052,129 @@ def python_browser_template_shell_text(content: str, check_runtime: Callable[[],
                         output[lower:upper] = " " * (upper - lower)
     check_runtime()
     return content if output is None else "".join(output)
+
+
+def python_text_assignment_script(
+    content: str, start: int, end: int, check_runtime: Callable[[], None]
+) -> tuple[tuple[int, int], str] | None:
+    """Find the constant JavaScript text assignment owning exact f-string bytes."""
+    if start < 1 or content[start - 1] != "`" or content[end : end + 1] != "`":
+        return None
+    spans = python_literal_spans(content, check_runtime)
+    if spans is None:
+        return None
+    index = bisect_right(spans[0], start) - 1
+    if index < 0 or end >= spans[1][index]:
+        return None
+    owner = spans[0][index], spans[1][index]
+    literal_runs = python_fstring_literal_spans(content, *owner, check_runtime)
+    if literal_runs is None:
+        return None
+    index = bisect_right(literal_runs[0], start - 1) - 1
+    if index < 0 or end >= literal_runs[1][index]:
+        return None
+    # A complete script inside a single constant-text run has exactly
+    # one source transformation here: Python collapses doubled braces.
+    run_start, run_end = literal_runs[0][index], literal_runs[1][index]
+    opening = content.rfind("<script>", run_start, start)
+    closing = content.find("</script>", end, run_end)
+    if opening < 0 or closing < 0:
+        return None
+    script_start = opening + len("<script>")
+    raw = content[script_start:closing]
+    if "\\" in raw or "<script>" in raw or "</script>" in raw:
+        return None
+
+    def decoded(text: str) -> str:
+        return text.replace("{{", "{").replace("}}", "}")
+
+    js_source = decoded(raw)
+    script = parse_javascript_source(js_source, check_runtime)
+    if script is None:
+        return None
+    at = len(decoded(content[script_start : start - 1]))
+    stop = at + len(decoded(content[start - 1 : end + 1]))
+    for node in script.nodes:
+        check_runtime()
+        if node.type != "template_string" or script.span(node) != (at, stop):
+            continue
+        parent = node.parent
+        if (
+            parent is None
+            or parent.type != "assignment_expression"
+            or parent.child_by_field_name("right") != node
+        ):
+            return None
+        left = parent.child_by_field_name("left")
+        if left is None or left.type != "member_expression":
+            return None
+        prop = left.child_by_field_name("property")
+        receiver = left.child_by_field_name("object")
+        if (
+            receiver is None
+            or receiver.type != "identifier"
+            or prop is None
+            or prop.type != "property_identifier"
+            or script.text(prop) != "textContent"
+        ):
+            return None
+        # A text setter can receive the result of arbitrary code. Keep the JS
+        # expression as the witness for calls, computed properties, updates,
+        # nesting, and every field outside simple display formatting.
+        fields = [child for child in node.named_children if child.type == "template_substitution"]
+        if not fields or any(
+            not re.fullmatch(
+                r"\$\{[ \t]*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){0,8}(?:\.toLocaleString\(\))?[ \t]*\}",
+                script.text(child),
+            )
+            for child in fields
+        ):
+            return None
+        break
+    else:
+        return None
+
+    return owner, js_source
+
+
+def html_template_contains_script(
+    template: ast.JoinedStr, script: str, check_runtime: Callable[[], None]
+) -> bool:
+    """Check the literal document layout. Dynamic fields keep the output uncertain."""
+    parts = [
+        part.value if isinstance(part, ast.Constant) and isinstance(part.value, str) else "\ufffc"
+        for part in template.values
+    ]
+    html = "".join(parts)
+    if not html.lstrip().lower().startswith(
+        "<!doctype html>"
+    ) or not html.rstrip().lower().endswith("</html>"):
+        return False
+
+    class Document(HTMLParser):
+        active = False
+        count = 0
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            self.active = tag == "script" and not attrs
+
+        def handle_endtag(self, tag: str) -> None:
+            self.active = False
+
+        def handle_data(self, data: str) -> None:
+            check_runtime()
+            if self.active and data == script:
+                self.count += 1
+
+    if html.count(script) != 1:
+        return False
+    parser = Document(convert_charrefs=False)
+    try:
+        parser.feed(html)
+        parser.close()
+    except (AssertionError, ValueError):
+        return False
+    return parser.count == 1
 
 
 class PythonStringClosers:
