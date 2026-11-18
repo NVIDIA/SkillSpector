@@ -10667,7 +10667,7 @@ def prepare_source_analysis(
         return None
     values: dict[tuple[int, int], ShellSourceValue] = {}
     total_chars = 0
-    for command in resolver.commands:
+    for index, command in enumerate(resolver.commands):
         check_runtime()
         spans: list[tuple[int, int]] = []
         recognized, literal = _command_string_from_clause(
@@ -10679,7 +10679,11 @@ def prepare_source_analysis(
         value = resolver.word(start, end)
         if (
             value is None
-            or value.kind != "code"
+            or not (
+                value.kind == "code"
+                or value.kind == "literal"
+                and resolver.literal_command_binding(index, start, end)
+            )
             or not _source_path_arguments_safe(value, check_runtime)
         ):
             continue

@@ -79,6 +79,43 @@ def test_each_consumer_uses_its_current_assignment_without_cache_poisoning(rever
     assert observed[caller.rindex('"$helper"')] == "second"
 
 
+@pytest.mark.parametrize(
+    ("assignment", "operand", "destructive"),
+    [("cmd='printf ready'", '"$cmd"', False), ("cmd='rm -rf /'", '"${cmd}"', True)],
+)
+def test_literal_command_binding_is_inspected_at_its_consumer(assignment, operand, destructive):
+    caller = f"{assignment}\nsh -c {operand}\n"
+    prepared = _prepare(caller)
+    assert prepared is not None
+    findings = list(
+        prepared.analyze_source_commands(
+            content=caller,
+            file_path="scripts/caller.sh",
+            file_type="shell",
+            source_view=SecurityTextView("raw", caller),
+        )
+    )
+    assert any(f.rule_id == "TM1" and f.location.start_line == 2 for f in findings) == destructive
+    assert not prepared.has_bounded_parse_exhaustion()
+
+
+@pytest.mark.parametrize(
+    "caller",
+    [
+        'cmd="$INPUT"\nsh -c "$cmd"',
+        'cmd=$(read_command)\nsh -c "$cmd"',
+        'if ready; then cmd=safe; fi\nsh -c "$cmd"',
+        'cmd=safe > /missing/file\nsh -c "$cmd"',
+        'cmd=safe && false || sh -c "$cmd"',
+        "cmd=safe\nsh -c $cmd",
+        'cmd=safe\nsh -c "$1"',
+        'cmd=safe\nread cmd\nsh -c "$cmd"',
+    ],
+)
+def test_uncertain_shell_command_binding_stays_unresolved(caller):
+    assert _prepare(caller) is None
+
+
 def test_unknown_reassignment_does_not_erase_an_earlier_known_value() -> None:
     caller = 'helper=first\nprintf "%s" "$helper"\nhelper="$runtime"\nprintf "%s" "$helper"\n'
     assert _expanded_values(_value_resolver(caller), "helper") == ["first", None]
