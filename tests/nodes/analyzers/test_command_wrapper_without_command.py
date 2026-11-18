@@ -77,6 +77,31 @@ def test_markdown_table_cell_naming_a_wrapper_is_complete(wrapper: str) -> None:
     assert not _exhausted(content + _PADDING, "markdown")
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_text_diagram_arrow_is_not_a_shell_redirection(newline: str) -> None:
+    diagram = "```text\n|          |\n|      |  timeout ---->|\n```\n".replace("\n", newline)
+
+    assert not _exhausted(diagram, "markdown")
+    assert not _exhausted(_PADDING + diagram + _PADDING, "markdown")
+    assert _exhausted(diagram, "markdown", complete_context=False)
+    assert not _exhausted(diagram + "```sh\nsudo rm -rf /\n```\n", "markdown")
+    findings = tm_module.analyze(diagram + "```sh\nsudo rm -rf /\n```\n", "SKILL.md", "markdown")
+    assert any(finding.rule_id == "TM1" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "```sh\n|      |  timeout ---->|\n```\n",
+        "```text\n|      |  timeout ---->|\n",
+        '```text\n|      |  timeout ---->|"$DEST"\n```\n',
+        '```text\n|      |  timeout ---->|\nsudo >log "$CMD"\n```\n',
+    ],
+)
+def test_diagram_projection_preserves_unproven_command_boundaries(source: str) -> None:
+    assert _exhausted(source, "markdown")
+
+
 def test_markdown_api_parameter_table_is_complete() -> None:
     content = (
         "| Name | Type | Default | Description |\n"

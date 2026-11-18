@@ -9326,6 +9326,13 @@ def _blank_line_local_paired_backticks(line: str) -> str:
     return "".join(chars)
 
 
+# In a text sequence diagram the arrow meets the destination lifeline (>|).
+# Require the whole row so shell operands and redirect targets stay visible.
+_SEQUENCE_DIAGRAM_ARROW = re.compile(
+    r"^(?:[ \t]*\|){2,}[ \t]+[A-Za-z][A-Za-z0-9_]*[ \t]+-{2,}(>)\|[ \t]*\r?$", re.M
+)
+
+
 def _markdown_shell_text(
     content: str,
     check_runtime: Callable[[], None],
@@ -9640,6 +9647,12 @@ def _markdown_shell_text(
                     and fence[3] in {"powershell", "pwsh", "ps1"}
                 ):
                     powershell_blocks.append((fence_body_start, offset))
+                if complete_context and fence[3] == "text":
+                    for arrow in _SEQUENCE_DIAGRAM_ARROW.finditer(
+                        content, fence_body_start, offset
+                    ):
+                        check_runtime()
+                        output[arrow.start(1)] = " "
                 if shell_fence_start is not None and shell_fence_ranges is not None:
                     shell_fence_ranges.append((shell_fence_start, offset))
                 shell_fence_start = None
