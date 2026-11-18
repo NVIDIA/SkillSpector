@@ -1046,3 +1046,115 @@ def test_generated_text_rejects_mismatched_or_nonraw_source_views() -> None:
         )
         assert diagnostic is not None
         assert diagnostic.check is not ParserCheck.GENERATED_TEXT_DESTINATION
+
+
+_PRINT_HELPER = r"""show() { printf '%s\n' "$1"; }"""
+_PRINT_HEAD = r"""show "$(printf '%s' "$line" | head -1)" """
+_PRINT_MATCH = r"""printf 'MATCH=%s\n' "$(printf '%s\n' "$line" | grep -Eqi 'some|other' && echo yes || echo no)" """
+
+
+@pytest.mark.parametrize("line", [_PRINT_HEAD, _PRINT_MATCH])
+def test_fixed_shell_output_filter_has_no_unknown_command_word(line: str) -> None:
+    script = _PRINT_HELPER + "\n" + line.strip()
+    assert tm.bounded_parse_diagnostic(script, lambda: None, file_type="shell") is None
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        _PRINT_HEAD + "| sh",
+        _PRINT_HEAD + "> generated.sh",
+        _PRINT_HEAD.replace("head -1", "head -1 source"),
+        _PRINT_MATCH.replace("echo yes", 'eval "$cmd"'),
+        _PRINT_MATCH.replace("grep -Eqi", 'grep "$flags"'),
+    ],
+)
+def test_shell_output_filter_keeps_unsafe_or_unknown_consumers(line: str) -> None:
+    assert (
+        tm.bounded_parse_diagnostic(
+            _PRINT_HELPER + "\n" + line.strip(), lambda: None, file_type="shell"
+        )
+        is not None
+    )
+
+
+def _remote_filter_source() -> str:
+    return (
+        "import subprocess\n"
+        "def send(server, program):\n"
+        "    args = ['ssh', '-o', 'BatchMode=yes', server, program]\n"
+        "    return subprocess.run(args)\n"
+        "def build():\n"
+        "    return r'''\n" + _PRINT_MATCH.strip() + "\n'''\n"
+        "def scan(config):\n"
+        "    return send(config.server, build())\n"
+    )
+
+
+def test_remote_filter_identifies_unterminated_ssh_destination() -> None:
+    source = _remote_filter_source()
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert detail and detail.check is ParserCheck.SSH_ARGUMENTS
+    assert source[detail.start : detail.end] == "server"
+    assert source[: detail.start].count("\n") == 2
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("'BatchMode=yes', server", "'BatchMode=yes', '--', server"),
+        ("'BatchMode=yes', server", "'BatchMode=yes', 'fixed-host', server"),
+        (
+            "return send(config.server, build())",
+            'return send(config.server, build().replace("printf", "eval"))',
+        ),
+        ("return subprocess.run(args)", "return print(args)"),
+        ("subprocess.run(args)", "subprocess.run(args, shell=True)"),
+        ("subprocess.run(args)", "subprocess.run(args, executable='replacement')"),
+        ("    return subprocess.run(args)", "    args.clear()\n    return subprocess.run(args)"),
+        ("def build():", "subprocess = Other()\ndef build():"),
+        ("grep -Eqi 'some|other'", 'grep -f "$patterns"'),
+        ("def send(server, program):", "@decorated\ndef send(server, program):"),
+    ],
+)
+def test_unproven_ssh_relation_stays_unresolved(old: str, new: str) -> None:
+    source = _remote_filter_source().replace(old, new)
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert detail and detail.check is not ParserCheck.SSH_ARGUMENTS
+
+
+def _remote_stdin_source() -> str:
+    return (
+        "import subprocess\n"
+        "class Remote:\n"
+        "    def execute(self, program, fields):\n"
+        "        return subprocess.run(['ssh', self.server, 'sh', '-s', '--', *map(str, fields)], input=program)\n"
+        "SOURCE = r'''\n" + _PRINT_HELPER + "\n" + _PRINT_HEAD.strip() + "\n'''\n"
+        "def scan(fields):\n    worker = Remote()\n    return worker.execute(SOURCE, fields)\n"
+    )
+
+
+def test_remote_stdin_reports_reinterpreted_argv() -> None:
+    source = _remote_stdin_source()
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert detail and detail.check is ParserCheck.SSH_ARGUMENTS
+    assert source[detail.start : detail.end] == "*map(str, fields)"
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("map(str, fields)", "map(quote, fields)"),
+        ("worker = Remote()", "worker = Another()"),
+        ("input=program", "input=other"),
+        ("SOURCE, fields)", 'SOURCE.replace("show", "eval"), fields)'),
+        ("show() { printf", "show() { eval"),
+        ("'sh', '-s', '--'", "'echo', 'sh', '--'"),
+    ],
+)
+def test_ssh_stdin_witness_requires_original_script_and_unquoted_remote_argv(
+    old: str, new: str
+) -> None:
+    source = _remote_stdin_source().replace(old, new)
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert detail and detail.check is not ParserCheck.SSH_ARGUMENTS
