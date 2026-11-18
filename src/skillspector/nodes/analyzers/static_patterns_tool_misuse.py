@@ -61,6 +61,7 @@ from skillspector.inspection_ledger import (
     ResourceMeasurements,
     StaticParserDiagnostic,
 )
+from skillspector.javascript_ast import ParseFailure
 from skillspector.javascript_tokens import JavaScriptTemplateSpans, assertion_template_shell_text
 from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
 from skillspector.json_tokens import JSONSourceOwnership, prepare_json_source
@@ -79,6 +80,7 @@ from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.python_string_constants import python_constant_string_fields
 from skillspector.python_tokens import (
     PythonLiteralSpans,
+    generated_script_markup_span,
     python_browser_template_shell_text,
     python_string_value_bounds_allowed,
 )
@@ -3781,7 +3783,9 @@ def _has_shell_command_word_exhaustion(
             # Proven native matching patterns have no shell-word semantics.
             # This candidate owns no later host code or raw finding input.
             continue
-        if powershell is not None and powershell.owns(start):
+        if powershell is not None and (
+            powershell.owns(start) or start in powershell.assignment_targets
+        ):
             continue
         if start in powershell_here_closers:
             # This quote closes a proven host literal. Its body remains visible,
@@ -6753,12 +6757,17 @@ class _PythonSourceOwnership:
 class _JavaScriptTemplateOwnership:
     """Lazily proven ownership of template literal bytes in complete JavaScript."""
 
-    def __init__(self, content: str, check_runtime: Callable[[], None]) -> None:
+    def __init__(
+        self, content: str, check_runtime: Callable[[], None], dialect: str = "javascript"
+    ) -> None:
+        self._dialect = dialect
         self._content = content
         self._check_runtime = check_runtime
         self._spans: JavaScriptTemplateSpans | None = None
         self._spans_computed = False
         self._unresolved_executables: list[int] = []
+        self._parse_failures: list[ParseFailure] = []
+        self._generated_markup: list[tuple[int, int]] = []
         self._regex_literals: list[tuple[int, int]] = []
         self._regex_starts: list[int] = []
 
@@ -6767,8 +6776,11 @@ class _JavaScriptTemplateOwnership:
             self._spans = _javascript_template_spans(
                 self._content,
                 self._check_runtime,
+                dialect=self._dialect,
                 unresolved_executables=self._unresolved_executables,
+                parse_failures=self._parse_failures,
                 regex_literals=self._regex_literals,
+                generated_markup=self._generated_markup,
             )
             self._regex_starts = [start for start, _ in self._regex_literals]
             self._spans_computed = True
@@ -6777,6 +6789,22 @@ class _JavaScriptTemplateOwnership:
     def unresolved_execution_diagnostic(self) -> StaticParserDiagnostic | None:
         """Keep dynamic execution incomplete even when raw shell text is short."""
         self._owned_spans()
+        if self._parse_failures:
+            return StaticParserDiagnostic(
+                ParserCause(self._parse_failures[0]),
+                ParserCheck.JAVASCRIPT_SYNTAX,
+                0,
+                len(self._content),
+                ParserUncheckedScope.REMAINING_INPUT,
+                full_input_checked=self._parse_failures[0] == "malformed_input",
+            )
+        if self._generated_markup:
+            return StaticParserDiagnostic(
+                ParserCause.RUNTIME_DEPENDENT,
+                ParserCheck.GENERATED_HTML_MARKUP,
+                *self._generated_markup[0],
+                ParserUncheckedScope.EXPRESSION,
+            )
         if not self._unresolved_executables:
             return None
         return StaticParserDiagnostic(
@@ -6899,6 +6927,7 @@ def _bounded_shell_tokens(
     current_leading_tilde_unquoted = False
     source_word_has_content = False
     expect_redirection_target = False
+    redirection_start = body_start
     quote: str | None = None
     ansi_c_quote = False
     boundary_incomplete = False
@@ -7273,6 +7302,7 @@ def _bounded_shell_tokens(
             flush()
             source_word_has_content = False
             expect_redirection_target = True
+            redirection_start = cursor
             if cursor + 1 < limit and content[cursor + 1] == character:
                 cursor += 1
             if cursor + 1 < limit and content[cursor + 1] in "&|":
@@ -7290,6 +7320,7 @@ def _bounded_shell_tokens(
             flush()
             source_word_has_content = False
             expect_redirection_target = True
+            redirection_start = cursor
             cursor += 1
             if cursor + 1 < limit and content[cursor + 1] == ">":
                 cursor += 1
@@ -7322,6 +7353,19 @@ def _bounded_shell_tokens(
     ) or known_terminator
     flush(complete=complete)
     if not complete:
+        if expect_redirection_target and limit == source_limit and source_end is not None:
+            # The native carrier established the end of this command. Point
+            # to the redirection missing an operand, rather than its earlier
+            # argument, which may legitimately contain variable expansion.
+            _note_parser_diagnostic(
+                diagnostics,
+                ParserCause.BOUNDARY_UNRESOLVED,
+                ParserCheck.COMMAND_REDIRECTION_TARGET,
+                redirection_start,
+                limit,
+                ParserUncheckedScope.COMMAND_ARGUMENTS,
+                full_input_checked=True,
+            )
         if limit < source_limit and neutral_state:
             _note_parser_diagnostic(
                 diagnostics,
@@ -10164,6 +10208,7 @@ def _fenced_powershell_source(
     clause_starts: set[int] = set()
     continuations: list[tuple[int, int]] = []
     invocations: list[tuple[int, int]] = []
+    assignment_targets: set[int] = set()
     for start, end in blocks:
         check_runtime()
         unresolved: list[int] = []
@@ -10187,9 +10232,16 @@ def _fenced_powershell_source(
             for string in source.strings
         )
         clause_starts.update(start + position for position in source.clause_starts)
+        assignment_targets.update(start + position for position in source.assignment_targets)
         continuations.extend((start + begin, start + end) for begin, end in source.continuations)
         invocations.extend((start + begin, start + end) for begin, end in source.invocations)
-    if not starts and not strings and not continuations and not invocations:
+    if (
+        not starts
+        and not strings
+        and not continuations
+        and not invocations
+        and not assignment_targets
+    ):
         return None
     source = PowerShellSource(tuple(starts), tuple(ends), tuple(strings), ())
     # Preserve the ordinary shell traversal outside the proven host spans.
@@ -10218,6 +10270,7 @@ def _fenced_powershell_source(
         tuple(sorted(clause_starts)),
         tuple(continuations),
         tuple(invocations),
+        frozenset(assignment_targets),
     )
 
 
@@ -10819,7 +10872,7 @@ def prepare_source_analysis(
         return None
     values: dict[tuple[int, int], ShellSourceValue] = {}
     total_chars = 0
-    for command in resolver.commands:
+    for index, command in enumerate(resolver.commands):
         check_runtime()
         spans: list[tuple[int, int]] = []
         recognized, literal = _command_string_from_clause(
@@ -10831,7 +10884,11 @@ def prepare_source_analysis(
         value = resolver.word(start, end)
         if (
             value is None
-            or value.kind != "code"
+            or not (
+                value.kind == "code"
+                or value.kind == "literal"
+                and resolver.literal_command_binding(index, start, end)
+            )
             or not _source_path_arguments_safe(value, check_runtime)
         ):
             continue
@@ -12588,10 +12645,10 @@ def _has_bounded_parse_exhaustion(
         python_source = _PythonSourceOwnership(
             content, check_runtime, python_import_check, python_stdlib_check
         )
-    if file_type == "javascript" and complete_context:
+    if file_type in {"javascript", "typescript", "tsx"} and complete_context:
         # Modern host syntax owns literal delimiters only after a bounded,
         # complete parse. Unresolved executable interpolations keep their bounds.
-        javascript_source = _JavaScriptTemplateOwnership(content, check_runtime)
+        javascript_source = _JavaScriptTemplateOwnership(content, check_runtime, file_type)
         diagnostic = javascript_source.unresolved_execution_diagnostic()
         if diagnostic is not None:
             return diagnostic
@@ -12867,6 +12924,20 @@ def _has_bounded_parse_exhaustion(
         **json_word_roles,
     )
     if diagnostic is not None:
+        if (
+            file_type == "python"
+            and complete_context
+            and diagnostic.unchecked_scope == ParserUncheckedScope.COMMAND_WORD
+            and content.startswith("${", diagnostic.start)
+        ):
+            markup = generated_script_markup_span(content, diagnostic.start, check_runtime)
+            if markup is not None:
+                return StaticParserDiagnostic(
+                    ParserCause.RUNTIME_DEPENDENT,
+                    ParserCheck.GENERATED_HTML_MARKUP,
+                    *markup,
+                    ParserUncheckedScope.EXPRESSION,
+                )
         return diagnostic
     json_starts = [start for start, _ in json_operand_spans]
     native_backtick_starts = sorted(native_backtick_bounds)
