@@ -118,6 +118,7 @@ ANALYZER_ID = "static_patterns_tool_misuse"
 USES_RUNTIME_CHECK = True
 USES_PYTHON_IMPORT_BOUNDS = True
 USES_PREPARED_PARSER_ANALYSIS = True
+USES_SOLE_ORIGINAL_SHELL = True
 ANALYZE_USES_POSTPROCESS = True
 POSTPROCESS_USES_PYTHON_AST = True
 POSTPROCESS_USES_RUNTIME_BUDGET = True
@@ -10881,6 +10882,7 @@ class _YamlParserAnalysis:
 class _FiniteShellSource:
     content: str
     scopes: tuple[tuple[int, int], ...]
+    sole_original_shell: bool = False
 
     def owns(
         self,
@@ -10912,7 +10914,11 @@ class _FiniteShellSource:
 
 
 def prepare_parser_analysis(
-    content: str, file_type: str, check_runtime: Callable[[], None]
+    content: str,
+    file_type: str,
+    check_runtime: Callable[[], None],
+    *,
+    sole_original_shell: bool = False,
 ) -> JSONSourceOwnership | _YamlParserAnalysis | _FiniteShellSource | None:
     if file_type in {"shell", "markdown"} and may_have_formatted_loop(content):
         ranges = []
@@ -10921,12 +10927,12 @@ def prepare_parser_analysis(
         else:
             _markdown_shell_text(content, check_runtime, shell_fence_ranges=ranges)
         if 0 < len(ranges) <= 64 and sum(end - start for start, end in ranges) <= 1_000_000:
-            return _FiniteShellSource(content, tuple(ranges))
+            return _FiniteShellSource(content, tuple(ranges), sole_original_shell)
     if file_type == "shell" and (
         (len(content) <= 131_072 and "-c" in content and "$" in content)
         or (len(content) <= 1_000_000 and content.startswith("#!") and "`" in content)
     ):
-        return _FiniteShellSource(content, ())
+        return _FiniteShellSource(content, (), sole_original_shell)
     if file_type == "json":
         return prepare_json_source(content, check_runtime)
     if file_type != "yaml":
@@ -12274,8 +12280,20 @@ def _forwarded_shell_diagnostic(
         if nested is not None:
             candidate = nested.enclosed(caller.start, caller.end)
             break
-    if candidate is None and not proof.closed:
-        return diagnostic
+    if candidate is None:
+        # A top-level function survives sourcing, even when this script calls it
+        # only with literal arguments. The complete input inventory is needed
+        # before claiming these are all callers in the submitted artifact.
+        sole_original = (
+            isinstance(prepared_analysis, _FiniteShellSource)
+            and prepared_analysis.sole_original_shell
+            and (
+                prepared_analysis.content == content
+                or (source_view is not None and source_view.name == "normalized")
+            )
+        )
+        if not (proof.closed and sole_original):
+            return diagnostic
     start, end = proof.argument
     # This diagnostic pass replaces only the positional argument in the
     # declaration. Finding collection and caller inspection retain every byte.

@@ -8,10 +8,12 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from skillspector.cli import app
+from skillspector.cli import FormatChoice, _scan_state, app
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.nodes.analyzers import static_runner
+from skillspector.nodes.build_context import build_context
+from skillspector.nodes.resolve_input import resolve_input
 
 
 @pytest.mark.parametrize("word", ["rm", "del", "erase", "/bin/rm"])
@@ -2205,6 +2207,15 @@ def test_numeric_argv_locates_the_unresolved_format_or_runtime_arithmetic() -> N
 _FORWARD = 'invoke() { bash -c "$1"; }\n'
 
 
+def _forwarder_context(root: Path, files: dict[str, str]):
+    for path, source in files.items():
+        (root / path).write_text(source, encoding="utf-8")
+    state = _scan_state(str(root), FormatChoice.json, no_llm=True)
+    state.update(resolve_input(state))
+    state.update(build_context(state))
+    return state
+
+
 @pytest.mark.parametrize(
     ("definition", "calls"),
     [
@@ -2219,13 +2230,78 @@ _FORWARD = 'invoke() { bash -c "$1"; }\n'
         (_FORWARD, 'result="$(invoke pwd)"\n'),
     ],
 )
-def test_native_forwarder_inspects_fixed_direct_programs(definition: str, calls: str) -> None:
+def test_native_forwarder_inspects_fixed_direct_programs(
+    tmp_path: Path, definition: str, calls: str
+) -> None:
     # Normalization changes the unrelated comment and its offset.
     source = "#!/bin/bash\n# Ｍａｎｕａｌ…\n" + definition + calls
-    ledger = static_runner.run_static_patterns_with_ledger(
-        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
-    )["inspection_ledger"]
-    assert ledger[0]["outcome"] is LedgerOutcome.COMPLETED
+    state = _forwarder_context(tmp_path, {"example.sh": source})
+    ledger = tm.node(state)["inspection_ledger"]
+    assert len(ledger) == 1 and ledger[0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "loader",
+    [
+        ". ./example.sh",
+        "source ./example.sh",
+        'source "$lib"',
+        "BASH_ENV=./example.sh bash -c 'invoke \"$REMOTE\"'",
+    ],
+)
+def test_forwarder_exposed_to_other_artifacts_remains_partial(tmp_path: Path, loader: str) -> None:
+    source = "#!/bin/bash\n# Ｍａｎｕａｌ…\n" + _FORWARD + "invoke pwd\n"
+    state = _forwarder_context(
+        tmp_path,
+        {
+            "example.sh": source,
+            "consumer.sh": loader + '\ninvoke "$REMOTE"\n',
+        },
+    )
+    ledger = {row["path"]: row for row in tm.node(state)["inspection_ledger"]}
+    assert set(ledger) == {"example.sh", "consumer.sh"}
+    row = ledger["example.sh"]
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    diag = row["parser_diagnostic"]
+    assert diag["check"] == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert source[diag["source_start_offset"] : diag["source_end_offset"]] == 'bash -c "$1"'
+
+
+def test_sourced_subshell_does_not_establish_caller_isolation(tmp_path: Path) -> None:
+    source = "#!/bin/bash\n(\n" + _FORWARD + "invoke pwd\n)\n"
+    state = _forwarder_context(
+        tmp_path,
+        {
+            "example.sh": source,
+            "consumer.sh": 'bash() { unset -f bash; invoke "$REMOTE"; }\nsource ./example.sh\n',
+        },
+    )
+    ledger = {row["path"]: row for row in tm.node(state)["inspection_ledger"]}
+    assert ledger["example.sh"]["outcome"] is LedgerOutcome.PARTIAL
+    assert (
+        ledger["example.sh"]["parser_diagnostic"]["check"] == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    )
+
+
+@pytest.mark.parametrize("corruption", ["inventory", "bytes", "other", "ledger", "plan"])
+def test_incomplete_source_cannot_close_top_level_forwarder(
+    tmp_path: Path, corruption: str
+) -> None:
+    source = _FORWARD + "invoke pwd\n"
+    state = _forwarder_context(tmp_path, {"example.sh": source})
+    if corruption == "inventory":
+        state.pop("artifact_inventory")
+    elif corruption == "bytes":
+        state["raw_file_cache"]["example.sh"] = b"unrelated"
+    elif corruption == "other":
+        state["artifact_inventory"].append({"path": "other.sh", "disposition": "omitted"})
+    elif corruption == "ledger":
+        state["inspection_ledger"] = [{"path": "other.sh", "outcome": "partial"}]
+    else:
+        state["components"].append("other.sh")
+    row = next(r for r in tm.node(state)["inspection_ledger"] if r["path"] == "example.sh")
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["parser_diagnostic"]["check"] == tm.ParserCheck.COMMAND_STRING_RUNTIME
 
 
 @pytest.mark.parametrize(
