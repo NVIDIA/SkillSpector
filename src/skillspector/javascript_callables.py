@@ -742,7 +742,7 @@ def _external_option_callback(
                     target = pair.child_by_field_name("value")
                     if pair.type == "pair" and target is not None and target.type == "identifier":
                         exported.add(program.text(target))
-    candidates: dict[str, tuple[Node, Node]] = {}
+    candidates: dict[str, tuple[Node, Node, Node | None]] = {}
     calls: dict[str, list[Node]] = {}
 
     def public(fn: Node) -> bool:
@@ -758,6 +758,7 @@ def _external_option_callback(
         check_runtime()
         if node.type == "object_pattern":
             owner = node.parent
+            value = None
             if owner.type == "variable_declarator":
                 value = owner.child_by_field_name("value")
                 function = owner.parent.parent.parent
@@ -785,7 +786,7 @@ def _external_option_callback(
                     else binding
                 )
                 if field is not None and field.type == "shorthand_property_identifier_pattern":
-                    candidates[program.text(field)] = (field, function)
+                    candidates[program.text(field)] = (field, function, value)
         elif node.type in {
             "identifier",
             "shorthand_property_identifier_pattern",
@@ -793,7 +794,20 @@ def _external_option_callback(
         }:
             calls.setdefault(program.text(node), []).append(node)
     budget = _MAX_BINDING_VISITS
-    for name, (field, function) in candidates.items():
+    for name, (field, function, options) in candidates.items():
+        if options is not None:
+            inputs = calls.get(program.text(options), ())
+            budget -= len(inputs)
+            if budget < 0:
+                return None
+            params = function.child_by_field_name("parameters")
+            # Any additional reference can rebind, mutate, or expose the options
+            # before destructuring. Direct parameter patterns require no alias.
+            if any(
+                ref != options and params.end_byte <= ref.start_byte < function.end_byte
+                for ref in inputs
+            ):
+                continue
         actual = None
         for ref in calls.get(name, ()):
             check_runtime()
@@ -919,27 +933,23 @@ def _forwarded_stage_call(
             ref != stages and params.end_byte <= ref.start_byte < owner.end_byte for ref in uses
         ):
             continue
-        budget -= loop.descendant_count
+        references = stage_uses.get(program.text(stage), ())
+        budget -= len(references)
         if budget < 0:
-            break
-        pending = [loop.child_by_field_name("body")]
-        while pending:
+            return None
+        selected = None
+        for ref in references:
             check_runtime()
-            node = pending.pop()
-            if node is None or node.type in {
-                "function_declaration",
-                "arrow_function",
-                "function_expression",
-                "method_definition",
-            }:
+            if ref == stage or not loop.start_byte <= ref.start_byte < loop.end_byte:
                 continue
-            call = node.parent
-            if (
-                node.type == "identifier"
-                and program.text(node) == program.text(stage)
-                and _direct_js_call(node) == call
-                and call.parent.type == "await_expression"
-            ):
-                return call
-            pending.extend(node.named_children)
+            direct = _direct_js_call(ref)
+            if direct is None:
+                # A nested declaration, escape or reassignment cannot establish
+                # that an invocation selected the original iteration binding.
+                break
+            if direct.type == "call_expression" and direct.parent.type == "await_expression":
+                selected = direct
+        else:
+            if selected is not None:
+                return selected
     return None

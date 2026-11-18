@@ -1547,6 +1547,8 @@ def test_import_fallback_preserves_live_caller_stage_attribution():
     assert hit and hit.start == source.index("stage(items)")
     for variant in [
         source.replace("of stages", "of local"),
+        source.replace("v=await stage(items)", "{const stage=()=>1;v=await stage(items)}"),
+        source.replace("v=await stage(items)", "consume(stage);v=await stage(items)"),
         source.replace("{pipeline}", "{}"),
         source + " execFileSync(selected, []);",
         source.replace("for(const stage", "stages=[];for(const stage"),
@@ -1629,3 +1631,19 @@ def test_generated_script_witness_rejects_shadowed_or_escaped_fs_bindings(varian
     source = "import fs from 'node:fs/promises';" + variant
     hit = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
     assert hit is not None and hit.check != tm.ParserCheck.GENERATED_HTML_MARKUP
+
+
+@pytest.mark.parametrize(
+    "mutation", ["options={cb:local};", "options.cb=local;", "alter(options);"]
+)
+def test_external_option_witness_requires_unchanged_source(mutation):
+    from skillspector.javascript_ast import parse_javascript_source
+    from skillspector.javascript_callables import _external_option_callback
+
+    source = "export function start(options){const {cb}=options;return cb(2)}"
+    parsed = parse_javascript_source(source, lambda: None)
+    assert parsed is not None and _external_option_callback(parsed, lambda: None) is not None
+    changed = parse_javascript_source(
+        source.replace("const {cb}", mutation + "const {cb}"), lambda: None
+    )
+    assert changed is not None and _external_option_callback(changed, lambda: None) is None
