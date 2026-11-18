@@ -120,8 +120,11 @@ def _written_script_field(
     if len(args) < 2 or args[1].type != "identifier":
         return None
     data = program.text(args[1])
+    if data == fs:
+        return None
     template = None
-    imported = False
+    imported = None
+    receiver_refs = []
     for node in program.nodes:
         check_runtime()
         if node.type == "import_statement":
@@ -129,12 +132,33 @@ def _written_script_field(
             if source is None or _is_shell_execution_module(program.text(source)):
                 return None
             if program.text(source)[1:-1] in {"node:fs", "node:fs/promises", "fs", "fs/promises"}:
-                imported = imported or any(
-                    descendant.type == "identifier" and program.text(descendant) == fs
-                    for clause in node.named_children
-                    if clause.type == "import_clause"
-                    for descendant in clause.named_children
-                )
+                for clause in node.named_children:
+                    if clause.type != "import_clause":
+                        continue
+                    for binding in clause.named_children:
+                        if binding.type == "identifier" and program.text(binding) == fs:
+                            if imported is not None:
+                                return None
+                            imported = binding
+        elif node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            name = program.text(node)
+            if name == fs:
+                receiver_refs.append(node)
+            elif name == data:
+                parent = node.parent
+                if (
+                    parent.type == "variable_declarator"
+                    and parent.child_by_field_name("name") == node
+                ):
+                    continue
+                # Only ordinary argument/return values can consume the immutable
+                # string here. A second lexical binding or a write stays unknown.
+                if parent.type not in {"arguments", "return_statement"}:
+                    return None
         elif node.type == "variable_declarator":
             name, value = node.child_by_field_name("name"), node.child_by_field_name("value")
             if name is not None and name.type == "identifier" and program.text(name) == data:
@@ -156,8 +180,23 @@ def _written_script_field(
                 or (_callable_member(program, selector) or "").casefold() in _SHELL_EXECUTION_CALLS
             ):
                 return None
-    if not imported or template is None or template.end_byte - template.start_byte > 32768:
+    if imported is None or template is None or template.end_byte - template.start_byte > 32768:
         return None
+    for ref in receiver_refs:
+        check_runtime()
+        if ref == imported:
+            continue
+        member = ref.parent
+        if (
+            member.type != "member_expression"
+            or member.child_by_field_name("object") != ref
+            or (
+                _callable_member(program, member)
+                not in {"readFile", "readFileSync", "writeFile", "writeFileSync"}
+            )
+            or _direct_js_call(member) is None
+        ):
+            return None
     scope = template.parent.parent.parent
     if not scope.start_byte <= call.start_byte < scope.end_byte:
         return None

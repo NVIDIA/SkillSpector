@@ -1613,3 +1613,19 @@ def test_regex_rule_proof_requires_closed_bindings_and_a_string_receiver(
 def test_regex_binding_cannot_cover_an_unrelated_scope() -> None:
     source = "{const capture = /known/;} capture.exec(`value ${arg}`);"
     assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is not None
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "export function custom(fs,body){const doc=`<script>${body}</script>`;fs.writeFile(dest,doc)}",
+        "const doc=`<script>${body}</script>`;export function custom(doc){fs.writeFile(dest,doc)}",
+        "const doc=`<script>${body}</script>`;const custom=(doc)=>fs.writeFile(dest,doc);",
+        "const doc=`<script>${body}</script>`;expose(fs);fs.writeFile(dest,doc)",
+        "const doc=`<script>${body}</script>`;fs.writeFile=other;fs.writeFile(dest,doc)",
+    ],
+)
+def test_generated_script_witness_rejects_shadowed_or_escaped_fs_bindings(variant):
+    source = "import fs from 'node:fs/promises';" + variant
+    hit = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert hit is not None and hit.check != tm.ParserCheck.GENERATED_HTML_MARKUP
