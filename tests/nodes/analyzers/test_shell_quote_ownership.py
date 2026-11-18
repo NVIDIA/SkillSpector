@@ -8,10 +8,12 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from skillspector.cli import app
+from skillspector.cli import FormatChoice, _scan_state, app
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
 from skillspector.nodes.analyzers import static_runner
+from skillspector.nodes.build_context import build_context
+from skillspector.nodes.resolve_input import resolve_input
 
 
 @pytest.mark.parametrize("word", ["rm", "del", "erase", "/bin/rm"])
@@ -148,6 +150,67 @@ printf 'Created %s\\n' "$root"
 """.replace("\n", newline)
 
     assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell")
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("options", ["", " -0", " --"])
+def test_commandless_external_xargs_stops_at_its_physical_line(options, newline) -> None:
+    source = f'printf values | xargs{options}{newline}sh -c "$BODY"{newline}'
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None)
+
+    assert diagnostic is not None
+    assert diagnostic.start == source.index("sh -c")
+    assert tm.bounded_parse_diagnostic(source[: diagnostic.start], lambda: None) is None
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [' \\\n sh -c "$BODY"\n', " -n\n", ' "$UTILITY"\n', ""],
+)
+def test_unresolved_or_incomplete_xargs_keeps_its_warning(suffix) -> None:
+    assert tm.bounded_parse_diagnostic("xargs" + suffix, lambda: None) is not None
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "The value can be stale (cached state). Compare both values",
+        "Read the configured setting (`INPUT_FILE`). Verify the name",
+    ],
+)
+def test_prose_period_does_not_source_a_file_into_an_xargs_example(sentence) -> None:
+    source = sentence + "\n\n```sh\nprintf values | xargs\nrm -rf /\n```\n"
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+    assert any(item.rule_id == "TM1" for item in tm.analyze(source, "SKILL.md", "markdown"))
+
+
+@pytest.mark.parametrize(
+    "binding", [". helpers", "alias xargs=bash", 'case "$MODE" in one). helpers ;; esac']
+)
+def test_separate_shell_example_keeps_xargs_binding_uncertain(binding) -> None:
+    source = (
+        f"```sh\n{binding}\n```\n\n"
+        "The value can be stale (cached state). Compare both values\n\n"
+        "```sh\nprintf values | xargs\n```\n"
+    )
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.start == source.rindex("xargs")
+
+
+@pytest.mark.parametrize("command", ["env VALUE=<value> tool", "sudo <command> --list"])
+def test_unresolved_wrapper_points_to_the_ambiguous_operand(command: str) -> None:
+    source = f"Example\n\n```sh\n{command}\n```\n"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    check, span = tm.ParserCheck.COMMAND_WORD_BOUNDARY, "<"
+    if command.startswith("sudo ") and "DOCUMENTED_COMMAND_OPERAND" in tm.ParserCheck.__members__:
+        check, span = tm.ParserCheck["DOCUMENTED_COMMAND_OPERAND"], "<command>"
+    assert diagnostic is not None and diagnostic.check is check
+    assert diagnostic.cause is tm.ParserCause.BOUNDARY_UNRESOLVED
+    assert (diagnostic.start, diagnostic.end) == (
+        source.index(span),
+        source.index(span) + len(span),
+    )
 
 
 @pytest.mark.parametrize("operator", ["<<<", "<<< "])
@@ -1902,3 +1965,516 @@ def test_native_paragraph_quotes_preserve_offsets_and_field_contents():
     assert tm.bounded_parse_diagnostic(long_source, lambda: None, file_type="other") is None
     runtime = head + paragraph + '<m:p><m:r><m:t>bash -c "$cmd"</m:t></m:r></m:p>' + padding + tail
     assert tm.bounded_parse_diagnostic(runtime, lambda: None, file_type="other") is not None
+
+
+def test_later_array_expansion_keeps_the_bounds_of_an_earlier_quoted_argument() -> None:
+    source = (
+        '#!/usr/bin/env bash\necho "λ rm -rf $OUT/$NAME"\n'
+        'printf "%s" "${OPTIONS[@]+"${OPTIONS[@]}"}"\n'
+    )
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    for suffix in ("$TOOL -rf /\n", 'eval "$TOOL -rf /"\n'):
+        assert tm.has_bounded_parse_exhaustion(source + suffix, lambda: None)
+    assert any(
+        finding.rule_id == "TM1"
+        for finding in tm.analyze(source + "rm -rf /\n", "example.sh", "shell")
+    )
+
+
+@pytest.mark.parametrize("first", ["#!/bin/fish", "#!/usr/bin/env zsh", "#!bad"])
+def test_bash_quote_proof_requires_a_shell_it_can_parse(first: str) -> None:
+    source = (
+        f'{first}\necho "λ rm -rf $OUT/$NAME"\nprintf "%s" "${{OPTIONS[@]+"${{OPTIONS[@]}}"}}"\n'
+    )
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None)
+
+
+def test_shell_fence_stops_comment_punctuation_before_later_markdown() -> None:
+    body = "send_data # cannot open `/data/log'\n"
+    source = f"```bash\n{body}```\n" + "a" * 8400 + " rm -rf /\n"
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+    for risky in ("# $TOOL -rf /\n", "$TOOL -rf /\n"):
+        value = source.replace(body, body + risky)
+        diagnostic = tm.bounded_parse_diagnostic(value, lambda: None, file_type="markdown")
+        assert diagnostic is not None and diagnostic.start == value.index("$TOOL")
+
+
+@pytest.mark.parametrize(
+    "specimen", ["echo $(unclosed", 'rm "unclosed', "OUTPUT=<path>\necho $(unclosed"]
+)
+def test_malformed_example_cannot_supply_a_shell_fence_boundary(specimen: str) -> None:
+    source = "```sh\n" + specimen + "\n```\n" + "a" * 8400 + " rm -rf /\n"
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="markdown")
+
+
+def test_documented_keyboard_backtick_keeps_raw_shell_execution_context() -> None:
+    label = "Press backtick\n(`` ` ``) or tilde (`~`)."
+    positions: set[int] = set()
+    projected = tm._markdown_shell_text(label, lambda: None, literal_label_positions=positions)
+    index = label.index(" ` ") + 1
+    assert positions == {index} and projected[index] == "`"
+    assert tm.bounded_parse_diagnostic(label, lambda: None, file_type="markdown") is None
+    for text in (label + "\n$TOOL -rf /\n", "sh -c 'echo \"" + label + "\"; $TOOL -rf /'\n"):
+        diagnostic = tm.bounded_parse_diagnostic(text, lambda: None, file_type="markdown")
+        assert diagnostic is not None and diagnostic.check in {
+            tm.ParserCheck.COMMAND_IDENTITY,
+            tm.ParserCheck.COMMAND_ARGUMENT_BOUNDARY,
+        }
+        assert diagnostic.start == text.index("$TOOL")
+
+
+@pytest.mark.parametrize(
+    "macro", ['uvm_info("STATUS", ..., UVM_NONE)', 'uvm_error("STATUS", "failed")']
+)
+def test_literal_report_macros_own_only_their_printed_prefix(macro: str) -> None:
+    source = "The message is emitted with `` `" + macro + " `` in the testbench."
+    positions: set[int] = set()
+    projected = tm._markdown_shell_text(source, lambda: None, literal_label_positions=positions)
+    start = source.index(" `" + macro) + 1
+    assert positions == {start} and projected[start] == "`"
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+    for replacement in ('uvm_error("STATUS", "$(run)")', 'uvm_error("STATUS", value())'):
+        other = source.replace(macro, replacement)
+        positions.clear()
+        tm._markdown_shell_text(other, lambda: None, literal_label_positions=positions)
+        assert not positions
+        assert tm.has_bounded_parse_exhaustion(other, lambda: None, file_type="markdown")
+
+
+_READ_LOOP = (
+    "for i in $(seq 0 7); do sudo inspect /dev/sample $(printf 0x%x $((0x100 + i*8))); done\n"
+)
+_NESTED_READ_LOOP = (
+    "device=/dev/sample\nfor row in $(seq 0 5); do address=$((0x200 + row*8))\n"
+    ' echo "row $row: $(for col in 0 4; do /usr/bin/inspect $device $(printf 0x%x $((address+col))); '
+    "done | tr '\\n' ' ')\"; done\n"
+)
+
+
+@pytest.mark.parametrize("body", [_READ_LOOP, _NESTED_READ_LOOP])
+@pytest.mark.parametrize("kind", ["markdown", "shell"])
+def test_numeric_loops_keep_formatted_operands_in_data_role(body: str, kind: str) -> None:
+    source = f"```bash\n{body}```\n" if kind == "markdown" else body
+    result = static_runner.run_static_patterns_with_ledger(
+        {
+            "components": [path := "example." + ("md" if kind == "markdown" else "sh")],
+            "file_cache": {path: source},
+        },
+        [tm],
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("seq 0 7", 'seq 0 "$end"'),
+        ("seq 0 7", "seq 0 512"),
+        ("seq 0 7", "seq -w 0 7"),
+        ("seq 0 7", "seq 0 7; echo data"),
+        ("$(seq 0 7)", "0 01x"),
+        ("+ i*8", "+ unknown*8"),
+        ("+ i*8", "+ array[i]"),
+        ("+ i*8", "+ i++"),
+        ("+ i*8", "+ i*2147483647"),
+        ("printf 0x%x", 'printf "$fmt"'),
+        ("do sudo", 'do i="$input"; sudo'),
+        ("do sudo", "do declare -a i; sudo"),
+        ("sudo inspect /dev/sample ", ""),
+        ("sudo inspect /dev/sample ", "sudo inspect >"),
+        ("sudo inspect /dev/sample ", "sh -c "),
+        ("sudo inspect /dev/sample ", "sudo inspect /dev/sample x"),
+        ("do sudo", "do sudo \\\n"),
+        ("$(printf 0x%x", "$(printf -v slot 0x%x"),
+        ("0x100 + i*8)))", "0x100 + i*8)) & )"),
+    ],
+)
+def test_numeric_argv_needs_a_bounded_value_and_complete_data_operand(old: str, new: str) -> None:
+    assert not tm.finite_numeric_operands(_READ_LOOP.replace(old, new), lambda: None)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "seq() { evil; }",
+        "printf() { echo rm; }",
+        "PATH=/other",
+        "LD_AUDIT=/other",
+        "DYLD_INSERT_LIBRARIES=/other",
+        "IFS=x",
+        'BASH_ENV="$file"',
+        "declare -A i",
+        "readonly i=other",
+        "i=(other)",
+        "alias seq=unknown",
+        "hash -p /tmp/other seq",
+        "read -a i",
+        "mapfile -t i",
+        "time read -a i",
+        "if read -a i\nthen true\nfi",
+        "r''ead -a i",
+        "a" * 8000 + "() { evil; }",
+        'eval "$setup"',
+    ],
+)
+@pytest.mark.parametrize("separate", [False, True])
+def test_numeric_argv_retains_rebinding_and_shell_state(prefix: str, separate: bool) -> None:
+    if separate:
+        source = f"```bash\n{prefix}\n```\n```bash\n{_READ_LOOP}```\n"
+        kind = "markdown"
+    else:
+        source, kind = prefix + "\n" + _READ_LOOP, "shell"
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type=kind) is not None
+
+
+def test_numeric_loops_survive_normalization_only_in_original_shell_scopes() -> None:
+    # Fullwidth text creates a second inspection view and shifts its source
+    # coordinates. A shell control that changes under normalization cannot
+    # acquire the proof associated with another spelling.
+    for body, expected in [(_READ_LOOP, True), (_READ_LOOP.replace("seq", "ｓｅｑ"), False)]:
+        source = "Ｍａｎｕａｌ…\n\n```bash\n" + body + "```\n"
+        result = static_runner.run_static_patterns_with_ledger(
+            {"components": ["example.md"], "file_cache": {"example.md": source}}, [tm]
+        )
+        assert (result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED) is expected
+
+
+def test_numeric_operand_proof_never_completes_a_dynamic_command_or_hides_a_finding() -> None:
+    source = "```bash\n" + _READ_LOOP + "```\n```bash\n$runner -rf /\nrm -rf /\n```\n"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.md"], "file_cache": {"example.md": source}}, [tm]
+    )
+    assert any(row["outcome"] is not LedgerOutcome.COMPLETED for row in result["inspection_ledger"])
+    assert any(row.rule_id == "TM1" for row in result["findings"])
+
+
+@pytest.mark.parametrize(
+    "scalar",
+    [
+        "$(printf %d $((i+1)))",
+        """$(printf '%i' "$i")""",
+        '$(printf "%u" ${i})',
+        "$(printf %x 12)",
+        "$(printf 0X%08X $((i*8)))",
+        '''"$( printf '%#08x' "${i}" )"''',
+        '''"$(printf '%032u' "$((i+1))")"''',
+        "$(printf %o $i)",
+        "$(printf 0%02o $i)",
+        "$(printf '%#04o' $i)",
+        "$(\n printf '%04d' $i; \n)",
+    ],
+)
+def test_literal_integer_formats_are_whole_data_operands(scalar: str) -> None:
+    body = f"for\ti in $( seq 0 7 ); do /usr/bin/readreg /dev/unit {scalar}; done\n"
+    spans = tm.finite_numeric_operands(body, lambda: None)
+    assert [body[start:end] for start, end in spans] == [scalar]
+    markdown = "Ｆｏｒｍａｔ…\n\n```bash\n" + body + "```\n"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["notes.md"], "file_cache": {"notes.md": markdown}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "scalar",
+    [
+        '$(printf "$fmt" "$i")',
+        "$(printf '%s' $i)",
+        "$(printf '%n' side)",
+        "$(printf '-%u' $i)",
+        "$(printf '%8d' $i)",
+        "$(printf '%033d' $i)",
+        "$(printf '%*d' $i)",
+        "$(printf '%+d' $i)",
+        "$(printf '%-08d' $i)",
+        "$(printf '%#u' $i)",
+        "$(printf '%d %i' $i)",
+        "$(printf '%d;' $i)",
+        "$(printf '%d' ${i:-bad})",
+        "$(printf '%d' ${foreign})",
+        "$(printf '%d' $((i + external)))",
+        "$(printf -v result '%u' $i)",
+        "$(printf '%d' $i $i)",
+        "$( printf '%d' $i & )",
+        '"prefix$(printf %u $i)"',
+        '"$(printf %u $i)$tail"',
+        '"$(printf %u $i)"other',
+    ],
+)
+def test_integer_format_proof_rejects_expanding_or_composite_words(scalar: str) -> None:
+    body = f"for i in 0 1; do /usr/bin/readreg /dev/unit {scalar}; done\n"
+    assert not tm.finite_numeric_operands(body, lambda: None)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "$(printf '%08X' $i) /dev/unit",
+        "sudo readreg /dev/unit $(printf '%n' dest)",
+        'sudo readreg /dev/unit "$(printf "$fmt" $i)"',
+        'sudo sh -c "$(printf %u $i)"',
+        "sudo readreg /dev/unit >$(printf %u $i)",
+    ],
+)
+def test_formatted_data_proof_preserves_runtime_command_diagnostics(command: str) -> None:
+    body = f"for i in 0 1; do {command}; done\n"
+    diagnostic = tm.bounded_parse_diagnostic(body, lambda: None, file_type="shell")
+    assert diagnostic is not None and diagnostic.check is tm.ParserCheck.PRINTF_FORMAT
+
+
+def test_numeric_argv_locates_the_unresolved_format_or_runtime_arithmetic() -> None:
+    operand = "$(printf %x $((external)))"
+    source = f'for i in 0 1; do sudo readreg /dev/unit "{operand}"; done\n'
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell")
+    check, cause, span = tm.ParserCheck.PRINTF_FORMAT, tm.ParserCause.UNSUPPORTED_SYNTAX, operand
+    if "SHELL_ARITHMETIC" in tm.ParserCheck.__members__:
+        check = tm.ParserCheck["SHELL_ARITHMETIC"]
+        cause, span = tm.ParserCause.RUNTIME_DEPENDENT, "$((external))"
+    assert diagnostic is not None and diagnostic.check is check and diagnostic.cause is cause
+    assert (diagnostic.start, diagnostic.end) == (
+        source.index(span),
+        source.index(span) + len(span),
+    )
+
+
+_FORWARD = 'invoke() { bash -c "$1"; }\n'
+
+
+def _forwarder_context(root: Path, files: dict[str, str]):
+    for path, source in files.items():
+        (root / path).write_text(source, encoding="utf-8")
+    state = _scan_state(str(root), FormatChoice.json, no_llm=True)
+    state.update(resolve_input(state))
+    state.update(build_context(state))
+    return state
+
+
+@pytest.mark.parametrize(
+    ("definition", "calls"),
+    [
+        (_FORWARD, 'invoke pwd\ninvoke "uname -a"\n'),
+        ('function invoke { /bin/sh -c "${1}"; }\n', "invoke 'pwd'\n"),
+        ('invoke() { sh -c "$2"; }\n', 'invoke "$data" "pwd"\n'),
+        ('invoke() { timeout 3s sh -c "$1"; }\n', 'invoke "pwd"\n'),
+        (
+            'invoke() { timeout -s KILL "${2:-5}" /bin/bash -c "$1" 2>/dev/null; }\n',
+            "invoke 'pwd'\ninvoke 'uname -a' 8\n",
+        ),
+        (_FORWARD, 'result="$(invoke pwd)"\n'),
+    ],
+)
+def test_native_forwarder_inspects_fixed_direct_programs(
+    tmp_path: Path, definition: str, calls: str
+) -> None:
+    # Normalization changes the unrelated comment and its offset.
+    source = "#!/bin/bash\n# Ｍａｎｕａｌ…\n" + definition + calls
+    state = _forwarder_context(tmp_path, {"example.sh": source})
+    ledger = tm.node(state)["inspection_ledger"]
+    assert len(ledger) == 1 and ledger[0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "loader",
+    [
+        ". ./example.sh",
+        "source ./example.sh",
+        'source "$lib"',
+        "BASH_ENV=./example.sh bash -c 'invoke \"$REMOTE\"'",
+    ],
+)
+def test_forwarder_exposed_to_other_artifacts_remains_partial(tmp_path: Path, loader: str) -> None:
+    source = "#!/bin/bash\n# Ｍａｎｕａｌ…\n" + _FORWARD + "invoke pwd\n"
+    state = _forwarder_context(
+        tmp_path,
+        {
+            "example.sh": source,
+            "consumer.sh": loader + '\ninvoke "$REMOTE"\n',
+        },
+    )
+    ledger = {row["path"]: row for row in tm.node(state)["inspection_ledger"]}
+    assert set(ledger) == {"example.sh", "consumer.sh"}
+    row = ledger["example.sh"]
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    diag = row["parser_diagnostic"]
+    assert diag["check"] == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert source[diag["source_start_offset"] : diag["source_end_offset"]] == 'bash -c "$1"'
+
+
+def test_sourced_subshell_does_not_establish_caller_isolation(tmp_path: Path) -> None:
+    source = "#!/bin/bash\n(\n" + _FORWARD + "invoke pwd\n)\n"
+    state = _forwarder_context(
+        tmp_path,
+        {
+            "example.sh": source,
+            "consumer.sh": 'bash() { unset -f bash; invoke "$REMOTE"; }\nsource ./example.sh\n',
+        },
+    )
+    ledger = {row["path"]: row for row in tm.node(state)["inspection_ledger"]}
+    assert ledger["example.sh"]["outcome"] is LedgerOutcome.PARTIAL
+    assert (
+        ledger["example.sh"]["parser_diagnostic"]["check"] == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    )
+
+
+@pytest.mark.parametrize("corruption", ["inventory", "bytes", "other", "ledger", "plan"])
+def test_incomplete_source_cannot_close_top_level_forwarder(
+    tmp_path: Path, corruption: str
+) -> None:
+    source = _FORWARD + "invoke pwd\n"
+    state = _forwarder_context(tmp_path, {"example.sh": source})
+    if corruption == "inventory":
+        state.pop("artifact_inventory")
+    elif corruption == "bytes":
+        state["raw_file_cache"]["example.sh"] = b"unrelated"
+    elif corruption == "other":
+        state["artifact_inventory"].append({"path": "other.sh", "disposition": "omitted"})
+    elif corruption == "ledger":
+        state["inspection_ledger"] = [{"path": "other.sh", "outcome": "partial"}]
+    else:
+        state["components"].append("other.sh")
+    row = next(r for r in tm.node(state)["inspection_ledger"] if r["path"] == "example.sh")
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["parser_diagnostic"]["check"] == tm.ParserCheck.COMMAND_STRING_RUNTIME
+
+
+@pytest.mark.parametrize(
+    "caller,span",
+    [
+        ('invoke "echo $external"', "$external"),
+        ('invoke "echo ${external}"', "${external}"),
+        ('if invoke "ls $(choose)"; then echo done; fi', "$(choose)"),
+        ('result=$(invoke "echo $external")', "$external"),
+        ('invoke "cat $external" >"$output"', "$external"),
+    ],
+)
+def test_native_forwarder_locates_the_unresolved_caller_operand(caller: str, span: str) -> None:
+    source = "#!/bin/bash\n# Ｍａｎｕａｌ…\n" + _FORWARD + 'invoke "pwd"\n' + caller + "\n"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None)
+    assert diagnostic is not None and diagnostic.check is tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert diagnostic.location_precision == "source_span"
+    assert (diagnostic.start, diagnostic.end) == (
+        source.index(span),
+        source.index(span) + len(span),
+    )
+    ledger = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )["inspection_ledger"]
+    assert ledger[0]["outcome"] is LedgerOutcome.PARTIAL
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        _FORWARD,
+        _FORWARD + "invoke $parts\n",
+        _FORWARD + 'invoke "$@"\n',
+        _FORWARD + 'invoke "${parts[@]}"\n',
+        _FORWARD.replace("$1", "$2") + "invoke $parts pwd\n",
+        _FORWARD.replace("$1", "$2") + 'invoke "$@" pwd\n',
+        _FORWARD + 'invoke pwd >"$out"\n',
+        _FORWARD + 'invoke pwd "$(foreign)"\n',
+        _FORWARD.replace("$1", "$2") + 'invoke "$(foreign)" pwd\n',
+        _FORWARD.replace("$1", "$2") + 'invoke "$((variable++))" pwd\n',
+        _FORWARD + 'source external\ninvoke "$data"\n',
+        _FORWARD + 'eval "$setup"\ninvoke "$data"\n',
+        _FORWARD + "hash -p ./other bash\ninvoke pwd\n",
+        _FORWARD + "export -f invoke\ninvoke pwd\n",
+        _FORWARD + 'command eval "$setup"\ninvoke pwd\n',
+        _FORWARD + "alias invoke=other\ninvoke pwd\n",
+        _FORWARD + "bash() { other; }\ninvoke pwd\n",
+        _FORWARD + "BASH_ENV=other\ninvoke pwd\n",
+        _FORWARD + "LD_PRELOAD=other\ninvoke pwd\n",
+        _FORWARD + "BASH_ENV=$(invoke pwd)\n",
+        _FORWARD + "prefix=anything invoke pwd\n",
+        _FORWARD.replace("; }", '; } >"$out"') + "invoke pwd\n",
+        _FORWARD.replace('";', '" >"$out";') + "invoke pwd\n",
+        _FORWARD.replace("bash -c", 'timeout "${2:-5}" bash -c') + 'invoke pwd "$seconds"\n',
+        "#!/bin/bash --rcfile /external\n" + _FORWARD + "invoke pwd\n",
+        _FORWARD + "invoke 'eval \"$user_program\"'\n",
+    ],
+)
+def test_native_forwarder_keeps_unresolved_programs_or_binding_changes_visible(source: str) -> None:
+    assert tm.bounded_parse_diagnostic(source, lambda: None) is not None
+
+
+def test_native_forwarder_preserves_earlier_limits_and_destructive_findings() -> None:
+    source = _FORWARD + "invoke 'rm -rf /'\n" + 'invoke "exec $later"\n'
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None)
+    assert diagnostic is not None and diagnostic.check is tm.ParserCheck.COMMAND_STRING_EFFECTS
+    assert source[diagnostic.start : diagnostic.end] == "'rm -rf /'"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+    source = _FORWARD + 'sh -c "$earlier"\ninvoke "echo $later"\n'
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None)
+    assert diagnostic is not None and "$earlier" in source[diagnostic.start : diagnostic.end]
+
+
+def test_transformed_control_syntax_cannot_acquire_physical_shell_forwarding_proof() -> None:
+    source = _FORWARD + 'invoke "ｅｃｈｏ data"\n'
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+
+
+_COMMENT_EXAMPLE = (
+    "#!/bin/bash\n# Ｍ…\n"
+    "# The example continues across two comment lines: `tool\n"
+    "# <option>` --force.\n"
+    "# Compare `exit 1` against /tmp.\n"
+)
+
+
+def test_normalized_bash_comment_delimiters_do_not_capture_later_code() -> None:
+    source = _COMMENT_EXAMPLE + "rm -rf /\n"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert any(f.rule_id == "TM1" for f in result["findings"])
+
+    source = _COMMENT_EXAMPLE + 'sh -c "$program"\n'
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    detail = result["inspection_ledger"][0]["parser_diagnostic"]
+    assert detail["check"] is tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert source[detail["source_start_offset"] : detail["source_end_offset"]] == 'sh -c "$program"'
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("#!/bin/bash", "#!/usr/bin/python"),
+        ("# Compare", "＃ Compare"),
+        ("# Compare", "# Ｆoo Compare"),
+        ("# Compare `exit 1` against /tmp.", "echo '# Compare `exit 1` against /tmp.'"),
+        ("# Compare `exit 1` against /tmp.", "cat <<'END'\n# Compare `exit 1` against /tmp.\nEND"),
+    ],
+)
+def test_cross_view_backtick_requires_the_same_physical_bash_comment(old: str, new: str) -> None:
+    source = _COMMENT_EXAMPLE.replace(old, new)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    detail = result["inspection_ledger"][0]["parser_diagnostic"]
+    assert detail["check"] is tm.ParserCheck.EXPANSION_BOUNDARY
+    assert source[detail["source_start_offset"] :].startswith("` against /tmp.")
+
+
+def test_executable_backticks_remain_visible_after_a_normalized_comment() -> None:
+    source = _COMMENT_EXAMPLE + 'echo "`rm -rf /`"\n'
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["example.sh"], "file_cache": {"example.sh": source}}, [tm]
+    )
+    detail = result["inspection_ledger"][0]["parser_diagnostic"]
+    assert detail["check"] is tm.ParserCheck.EXPANSION_BOUNDARY
+    assert source[detail["source_start_offset"] : detail["source_end_offset"]].startswith('`"')
+    assert any(f.rule_id == "TM1" for f in result["findings"])

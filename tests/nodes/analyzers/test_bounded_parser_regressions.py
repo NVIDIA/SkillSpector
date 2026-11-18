@@ -418,6 +418,54 @@ def test_brace_limits_describe_the_exact_counter_that_stopped(
     assert diagnostic.observed_is_lower_bound is lower_bound
 
 
+@pytest.mark.parametrize("word", ["{field},", "prefix,{field}", "a{field}b,c", "{},"])
+def test_comma_outside_single_braces_is_literal(word: str) -> None:
+    diagnostics = []
+    assert tm._static_brace_expansions(word, diagnostics) == (word,)
+    assert diagnostics == []
+
+
+def test_literal_brace_argument_preserves_following_dynamic_command() -> None:
+    command = "$value, $mapping{$field}, next"
+    assert tm.bounded_parse_diagnostic(command, lambda: None, file_type="perl") is None
+    diagnostic = tm.bounded_parse_diagnostic(
+        command + "\n$tool -rf /", lambda: None, file_type="perl"
+    )
+    assert diagnostic is not None
+    assert diagnostic.check is ParserCheck.COMMAND_IDENTITY
+
+
+@pytest.mark.parametrize("word", ["{1..3},", "{a,b"])
+def test_unsupported_brace_forms_keep_diagnostics(word: str) -> None:
+    diagnostics = []
+    assert tm._static_brace_expansions(word, diagnostics) is None
+    assert diagnostics[0].check is ParserCheck.BRACE_SYNTAX
+
+
+@pytest.mark.parametrize(
+    ("inner", "cause", "check"),
+    [
+        ("printf '%q' \"$value\"", ParserCause.RUNTIME_DEPENDENT, ParserCheck.PRINTF_FORMAT),
+        ("printf '%s' \"x|$value\"", ParserCause.RUNTIME_DEPENDENT, ParserCheck.PRINTF_FORMAT),
+        ("printf '%s' x | head -1", ParserCause.UNSUPPORTED_SYNTAX, ParserCheck.PRINTF_INVOCATION),
+        ("printf '%d' 3", ParserCause.UNSUPPORTED_SYNTAX, ParserCheck.PRINTF_FORMAT),
+        ("printf '%s' *", ParserCause.UNSUPPORTED_SYNTAX, ParserCheck.PRINTF_FORMAT),
+    ],
+)
+def test_quoted_printf_reports_the_unresolved_operation(
+    inner: str, cause: ParserCause, check: ParserCheck
+) -> None:
+    source = "$(" + inner + ")"
+    diagnostics = []
+    assert (
+        tm._static_printf_substitution(
+            source, 0, len(source), quoted_result=True, diagnostics=diagnostics
+        )
+        is None
+    )
+    assert (diagnostics[0].cause, diagnostics[0].check) == (cause, check)
+
+
 def test_unsupported_brace_grammar_has_no_fabricated_resource_measurements() -> None:
     diagnostics = []
     assert tm._static_brace_expansions("{a,b{c}}", diagnostics) is None
@@ -769,6 +817,422 @@ def test_output_reconciliation_only_clears_resolved_output_incompleteness(
 
 
 @pytest.mark.parametrize(
+    "source",
+    [
+        """printf '%s\\n' "name $(printf '%q' "$name")" """,
+        """[[ "$(printf '%s' "$word" | tr 'A-F' 'a-f')" == "$target" ]]""",
+    ],
+)
+def test_printf_substitution_in_known_shell_data_operand(source: str) -> None:
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell") is None
+    assert (
+        tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell", complete_context=False)
+        is not None
+    )
+    assert tm.bounded_parse_diagnostic(source + "\n$tool -rf /", lambda: None) is not None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """eval "$(printf '%s' "$name")" """,
+        """printf '%s' "$(printf '%s' "$name")" | sh""",
+        """printf '%s' "$(printf '%s' "$name")" > script""",
+        """printf '%d' "$(printf '%s' "$name")" """,
+        """printf -v cmd '%s' "$(printf '%s' "$name")" """,
+        """printf "$(printf '%s' "$name")" """,
+        """echo "$(printf '%s' "$name")" """,
+        """out=$(printf '%s' "$(printf '%s' "$name")"\n)\n"$out" """,
+        """{\nprintf '%s' "$(printf '%s' "$name")"\n} | sh""",
+        """[[ "$(printf '%s' "$name" | tr 'A-Z' 'a-z')" -eq "$target" ]]""",
+        """tr() { eval "$1"; }\n[[ "$(printf '%s' "$name" | tr 'A-Z' 'a-z')" == "$target" ]]""",
+        """printf() { eval "$1"; }\nprintf '%s' "$(printf '%s' "$name")" """,
+        """PATH=/tmp/bin\n[[ "$(printf '%s' "$name" | tr 'A-Z' 'a-z')" == "$target" ]]""",
+        """printf '%s' "$(printf '%s' "$(other)")" """,
+    ],
+)
+def test_printf_substitution_without_known_data_ownership_keeps_uncertainty(source: str) -> None:
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell") is not None
+
+
+def test_python_cross_literal_command_still_checks_actual_operands() -> None:
+    source = 'note("readable text.", keys=[row["key"]])\n' + 'note("TEAM/RM plain text.")'
+    start = source.index("text.")
+    end = source.index("/RM") + len("/RM")
+    owner = tm._PythonSourceOwnership(source, lambda: None)
+    assert owner.crosses_literal_prose(start, end)
+    for replacement in ("-rf /", "$flags /", "unknown " + "\\x24" + "HOME"):
+        dangerous = source.replace("plain text.", replacement)
+        assert not tm._PythonSourceOwnership(dangerous, lambda: None).crosses_literal_prose(
+            start, end
+        )
+    extended = source.replace('plain text.")', 'plain text." + value)')
+    assert not tm._PythonSourceOwnership(extended, lambda: None).crosses_literal_prose(start, end)
+
+
+def test_perl_header_comment_cannot_charge_operands_to_another_line() -> None:
+    header = "# It's an owner's note and no shell is involved\n"
+    source = header + "my $data = 'example';\n" + "# note\n" * 1500 + "my $example = '-rf /';\n"
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="perl") is None
+    assert tm.bounded_parse_diagnostic(source + "$tool -rf /", lambda: None, file_type="perl")
+
+
+@pytest.mark.parametrize("separator", ["$()", "$( )", "`$()`", "$( $( ) )"])
+def test_empty_command_substitution_preserves_surrounding_command(separator: str) -> None:
+    command = "r" + separator + "m -rf /"
+    assert list(tm._destructive_command_words(command)) == [(0, 2 + len(separator))]
+    assert list(tm._destructive_command_effects(command))
+    assert (
+        tm.bounded_parse_diagnostic(
+            '"""The notation `$()` describes an empty value."""', lambda: None, file_type="python"
+        )
+        is None
+    )
+
+
+def test_native_operand_boundary_points_to_the_missing_redirection_target() -> None:
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+
+    source = 'python3 "${ROOT}/task.py" --id <identifier>` trailing text'
+    end = source.index("`")
+    diagnostics = []
+    _, _, limited = tm._bounded_shell_tokens(
+        source, 0, len("python3"), source_end=end, diagnostics=diagnostics
+    )
+    assert limited and diagnostics[0].check == tm.ParserCheck.COMMAND_REDIRECTION_TARGET
+    assert source[diagnostics[0].start : diagnostics[0].end] == ">"
+    valid = 'python3 "${ROOT}/task.py" --id "<identifier>" > report.txt'
+    assert tm._bounded_shell_tokens(valid, 0, len("python3"), source_end=len(valid))[2] is False
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "unknown"),
+    [
+        ("""printf '%s' "$value" | head -1""", '"$value"'),
+        ("""printf '%s' "$value" | tr 'A-Z' 'a-z'""", '"$value"'),
+        ("""printf '%s' "$value" | grep -i -m1 ready""", '"$value"'),
+        ("""printf '%s' "$value" | grep -vxF "$omit" | sed 's/:$//'""", '"$omit"'),
+        ("""printf '%s\\n' "$rows" | grep -Eqi 'a.*(x|y)' && echo yes || echo no""", '"$rows"'),
+    ],
+)
+def test_symbolic_printf_pipeline_reports_the_runtime_argument(pipeline: str, unknown: str) -> None:
+    source = "text $( " + pipeline + " ) suffix"
+    diagnostics = []
+    assert (
+        tm._static_printf_substitution(source, 5, len(source) - 7, diagnostics=diagnostics) is None
+    )
+    assert len(diagnostics) == 1
+    detail = diagnostics[0]
+    assert (detail.cause, detail.check) == (
+        ParserCause.RUNTIME_DEPENDENT,
+        ParserCheck.SHELL_FILTER_ARGUMENT
+        if unknown == '"$omit"'
+        else ParserCheck.PRINTF_INVOCATION,
+    )
+    assert source[detail.start : detail.end] == unknown
+
+
+@pytest.mark.parametrize(
+    "pipeline",
+    [
+        """printf '%s' "$value" | sh""",
+        """printf '%s' "$value" | head -1 program""",
+        """printf '%s' "$value" | grep -f patterns""",
+        """printf '%s' "$value" | sed 's/ok/other/e'""",
+        """printf '%s' "$value" | grep -v ok && eval "$action" || echo no""",
+    ],
+)
+def test_pipeline_with_additional_effects_preserves_unsupported_scope(pipeline: str) -> None:
+    source = "$(" + pipeline + ")"
+    diagnostics = []
+    assert tm._static_printf_substitution(source, 0, len(source), diagnostics=diagnostics) is None
+    assert diagnostics[0].cause is ParserCause.UNSUPPORTED_SYNTAX
+
+
+@pytest.mark.parametrize(
+    ("setup", "expected"),
+    [
+        ("def render(value):\n", True),
+        ("def render(options):\n    value = options.label\n", True),
+        ('def render():\n    value = "fixed"\n', False),
+        ('def render(value):\n    value = "fixed"\n', False),
+        ("def render(options):\n    if options.flag:\n        value = options.label\n", False),
+        ("def render(options):\n    options = Fixed()\n    value = options.label\n", False),
+    ],
+)
+def test_format_uncertainty_points_to_the_runtime_value(setup: str, expected: bool) -> None:
+    source = setup + """    label = "print '{}'".format(value)\n"""
+    owner = tm._PythonSourceOwnership(source, lambda: None)
+    diagnostic = owner.runtime_format_argument(source.index("'{}"), len(source))
+    if expected:
+        assert diagnostic is not None
+        assert diagnostic.check is ParserCheck.COMMAND_STRING_RUNTIME
+        assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+        assert source[diagnostic.start : diagnostic.end] == "value"
+    else:
+        assert diagnostic is None
+
+
+@pytest.mark.parametrize(
+    "operand", ["08", "-1", "0x80000000", "$((1+2))", "$((08+idx))", "$((a[cmd]))"]
+)
+def test_hex_printf_unsupported_and_rebound_invocations_stay_partial(operand: str) -> None:
+    # A shell function or alias may replace printf. Never grant its use in
+    # a command word a fixed hexadecimal result on the basis of its spelling.
+    source = "printf() { echo rm; }; $(printf 0x%x " + operand + ") -rf /"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None)
+    assert diagnostic is not None
+    assert diagnostic.check is not ParserCheck.SHELL_ARITHMETIC
+
+
+def test_hex_printf_runtime_arithmetic_points_to_expression() -> None:
+    source = "tool device $(printf 0x%x $((base + index*16)))"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None)
+    assert diagnostic is not None
+    assert diagnostic.check is ParserCheck.SHELL_ARITHMETIC
+    assert source[diagnostic.start : diagnostic.end] == "$((base + index*16))"
+
+
+_HTML_REPORT = (
+    "def render(destination, value):\n"
+    "    page = f'''<!doctype html><html>{value}<script>\n"
+    "let count = 1; label.textContent = `${{count.toLocaleString()}} rows`;\n"
+    "</script></html>'''\n"
+    "    destination.write_text(page)\n"
+)
+
+
+@pytest.mark.parametrize("window", [False, True])
+def test_generated_text_reports_caller_selected_write_destination(window: bool) -> None:
+    source = "# initial line\n" + _HTML_REPORT
+    origin = source.index("def ") if window else 0
+    view = static_runner._absolute_source_view(
+        tm.SecurityTextView("raw", source[origin:]), source_start=origin
+    )
+    diagnostic = tm.bounded_parse_diagnostic(
+        source[origin:],
+        lambda: None,
+        file_type="python",
+        complete_context=not window,
+        prepared_analysis=tm.prepare_parser_analysis(source, "python", lambda: None),
+        source_view=view,
+    )
+    assert diagnostic is not None
+    assert diagnostic.check is ParserCheck.GENERATED_TEXT_DESTINATION
+    assert diagnostic.cause is ParserCause.RUNTIME_DEPENDENT
+    assert not diagnostic.full_input_checked
+    assert source[origin + diagnostic.start : origin + diagnostic.end] == "destination"
+    assert source[: origin + diagnostic.start].count("\n") == 5
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("label.textContent", "label.innerHTML"),
+        ("label.textContent", "obtainNode().textContent"),
+        ("count.toLocaleString()", "eval(input)"),
+        ("count.toLocaleString()", "record[next()]"),
+        ("<script>", "<!-- <script>"),
+        ("label.textContent", "label[textContent]"),
+        ("<script>", "<script type='text/plain'>"),
+        ("count.toLocaleString()", "{value}"),
+        ("destination.write_text(page)", "run(page)"),
+        ("    page = ", "    destination = Fixed()\n    page = "),
+        ("    page = ", "    import other as destination\n    page = "),
+    ],
+)
+def test_unproven_generated_js_does_not_borrow_write_target(old: str, new: str) -> None:
+    source = _HTML_REPORT.replace(old, new)
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert diagnostic is None or diagnostic.check is not ParserCheck.GENERATED_TEXT_DESTINATION
+
+
+def test_generated_text_rejects_mismatched_or_nonraw_source_views() -> None:
+    prepared = tm.prepare_parser_analysis(_HTML_REPORT, "python", lambda: None)
+    for view in (
+        tm.SecurityTextView("decoded", _HTML_REPORT),
+        tm.SecurityTextView("raw", " " + _HTML_REPORT),
+    ):
+        diagnostic = tm.bounded_parse_diagnostic(
+            _HTML_REPORT,
+            lambda: None,
+            file_type="python",
+            complete_context=False,
+            prepared_analysis=prepared,
+            source_view=view,
+        )
+        assert diagnostic is not None
+        assert diagnostic.check is not ParserCheck.GENERATED_TEXT_DESTINATION
+
+
+def test_rendered_browser_markup_reports_the_dynamic_write_at_its_source():
+    from skillspector.python_tokens import generated_script_markup_span
+
+    script = "const d = PLACEHOLDER; const o = document.createElement('option'); o.textContent = `${d.name}`; el.innerHTML = `<b>${d.html}</b>`;"
+    source = f'PAGE = r"""<!doctype html><html>\n<!-- 🚀 -->\n<script>{script}</script></html>"""\np.write_text(PAGE.replace("PLACEHOLDER", data))\n'
+    offset = source.index("${d.name}")
+    span = generated_script_markup_span(source, offset, lambda: None)
+    assert span is not None
+    assert source[slice(*span)] == "el.innerHTML = `<b>${d.html}</b>`"
+    for change in (
+        source + "shell(PAGE)",
+        source.replace("write_text", "run"),
+        source.replace('r"""', '"""'),
+        source.replace("el.innerHTML", "el.textContent"),
+        source.replace("createElement('option')", "createElement('script')"),
+        source.replace("createElement('option')", "getElementById('option')"),
+        source.replace("o.textContent", "o.innerHTML"),
+        source.replace("const d =", "document.createElement = custom; const d ="),
+        source.replace("<script>", "<!-- <script>").replace("</script>", "</script> -->"),
+        source.replace("PLACEHOLDER;", "SOMETHING;"),
+    ):
+        assert generated_script_markup_span(change, change.index("${d.name}"), lambda: None) is None
+
+
+_PRINT_HELPER = r"""show() { printf '%s\n' "$1"; }"""
+_PRINT_HEAD = r"""show "$(printf '%s' "$line" | head -1)" """
+_PRINT_MATCH = r"""printf 'MATCH=%s\n' "$(printf '%s\n' "$line" | grep -Eqi 'some|other' && echo yes || echo no)" """
+
+
+@pytest.mark.parametrize("line", [_PRINT_HEAD, _PRINT_MATCH])
+def test_fixed_shell_output_filter_has_no_unknown_command_word(line: str) -> None:
+    script = _PRINT_HELPER + "\n" + line.strip()
+    assert tm.bounded_parse_diagnostic(script, lambda: None, file_type="shell") is None
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        _PRINT_HEAD + "| sh",
+        _PRINT_HEAD + "> generated.sh",
+        _PRINT_HEAD.replace("head -1", "head -1 source"),
+        _PRINT_MATCH.replace("echo yes", 'eval "$cmd"'),
+        _PRINT_MATCH.replace("grep -Eqi", 'grep "$flags"'),
+    ],
+)
+def test_shell_output_filter_keeps_unsafe_or_unknown_consumers(line: str) -> None:
+    assert (
+        tm.bounded_parse_diagnostic(
+            _PRINT_HELPER + "\n" + line.strip(), lambda: None, file_type="shell"
+        )
+        is not None
+    )
+
+
+def _remote_filter_source() -> str:
+    return (
+        "import subprocess\n"
+        "def send(server, program):\n"
+        "    args = ['ssh', '-o', 'BatchMode=yes', server, program]\n"
+        "    return subprocess.run(args)\n"
+        "def build():\n"
+        "    return r'''\n" + _PRINT_MATCH.strip() + "\n'''\n"
+        "def scan(config):\n"
+        "    return send(config.server, build())\n"
+    )
+
+
+def test_remote_filter_identifies_unterminated_ssh_destination() -> None:
+    source = _remote_filter_source()
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert detail and detail.check is ParserCheck.SSH_ARGUMENTS
+    assert source[detail.start : detail.end] == "server"
+    assert source[: detail.start].count("\n") == 2
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("'BatchMode=yes', server", "'BatchMode=yes', '--', server"),
+        ("'BatchMode=yes', server", "'BatchMode=yes', 'fixed-host', server"),
+        (
+            "return send(config.server, build())",
+            'return send(config.server, build().replace("printf", "eval"))',
+        ),
+        ("return subprocess.run(args)", "return print(args)"),
+        ("subprocess.run(args)", "subprocess.run(args, shell=True)"),
+        ("subprocess.run(args)", "subprocess.run(args, executable='replacement')"),
+        ("    return subprocess.run(args)", "    change(args)\n    return subprocess.run(args)"),
+        ("    args = ['ssh'", "    program = replaced()\n    args = ['ssh'"),
+        ("    return subprocess.run(args)", "    args.clear()\n    return subprocess.run(args)"),
+        ("def scan(config):", "send = other\ndef scan(config):"),
+        ("def scan(config):", "def scan(config, send):"),
+        ("def build():", "@replaced\ndef build():"),
+        ("def build():", "subprocess = Other()\ndef build():"),
+        ("grep -Eqi 'some|other'", 'grep -f "$patterns"'),
+        ("def send(server, program):", "@decorated\ndef send(server, program):"),
+    ],
+)
+def test_unproven_ssh_relation_stays_unresolved(old: str, new: str) -> None:
+    source = _remote_filter_source().replace(old, new)
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert detail and detail.check is not ParserCheck.SSH_ARGUMENTS
+
+
+def _remote_stdin_source() -> str:
+    return (
+        "import subprocess\n"
+        "class Remote:\n"
+        "    def execute(self, program, fields):\n"
+        "        return subprocess.run(['ssh', self.server, 'sh', '-s', '--', *map(str, fields)], input=program)\n"
+        "SOURCE = r'''\n" + _PRINT_HELPER + "\n" + _PRINT_HEAD.strip() + "\n'''\n"
+        "def scan(fields):\n    worker = Remote()\n    return worker.execute(SOURCE, fields)\n"
+    )
+
+
+def test_remote_stdin_reports_reinterpreted_argv() -> None:
+    source = _remote_stdin_source()
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert detail and detail.check is ParserCheck.SSH_ARGUMENTS
+    assert source[detail.start : detail.end] == "*map(str, fields)"
+
+
+def test_python_method_and_its_parameter_have_separate_bindings() -> None:
+    source = _remote_stdin_source().replace("execute", "program")
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert detail and detail.check is ParserCheck.SSH_ARGUMENTS
+    assert source[detail.start : detail.end] == "*map(str, fields)"
+
+
+def test_ssh_stdin_resolves_literal_option_tuple() -> None:
+    source = (
+        _remote_stdin_source()
+        .replace("class Remote:", "FLAGS = ('-o', 'BatchMode=yes')\nclass Remote:")
+        .replace("'ssh', self.server", "'ssh', *FLAGS, self.server")
+    )
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert detail and detail.check is ParserCheck.SSH_ARGUMENTS
+    detail = tm.bounded_parse_diagnostic(
+        source + "FLAGS = dynamic()\n", lambda: None, file_type="python"
+    )
+    assert detail and detail.check is not ParserCheck.SSH_ARGUMENTS
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("map(str, fields)", "map(quote, fields)"),
+        ("class Remote:", "map = custom\nclass Remote:"),
+        ("class Remote:", "class Remote(Custom):"),
+        ("SOURCE = ", "Remote.execute = other\nSOURCE = "),
+        ("'ssh', self.server", "'ssh', *unknown_options, self.server"),
+        ("'ssh', self.server", "'ssh', 'early-destination', self.server"),
+        ("worker = Remote()", "worker = Another()"),
+        ("input=program", "input=other"),
+        ("SOURCE, fields)", 'SOURCE.replace("show", "eval"), fields)'),
+        ("show() { printf", "show() { eval"),
+        ("'sh', '-s', '--'", "'echo', 'sh', '--'"),
+    ],
+)
+def test_ssh_stdin_witness_requires_original_script_and_unquoted_remote_argv(
+    old: str, new: str
+) -> None:
+    source = _remote_stdin_source().replace(old, new)
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert detail and detail.check is not ParserCheck.SSH_ARGUMENTS
+
+
+@pytest.mark.parametrize(
     "command",
     [
         "sudo <tool-name> --list",
@@ -828,3 +1292,188 @@ def test_fenced_redirect_refines_the_nominated_command_only():
     diag = tm.bounded_parse_diagnostic(later_fault, lambda: None, file_type="markdown")
     assert diag and diag.check is ParserCheck.DOCUMENTED_COMMAND_OPERAND
     assert later_fault[diag.start : diag.end] == "<tool>"
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        """parts+=("$(printf '%q' "$input")")""",
+        """hint="tool $(printf '%q' "$root/run") ${parts[*]}" """.rstrip(),
+        """hint="tool $(printf '%q' "${files[0]}")" """.rstrip(),
+    ],
+)
+def test_escaped_printf_assignment_keeps_runtime_value_as_data(assignment: str) -> None:
+    source = assignment + '\nprintf "%s\\n" "$hint"\n'
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell") is None
+
+
+@pytest.mark.parametrize(
+    ("assignment", "consumer", "expected"),
+    [
+        ("parts+=", 'eval "${parts[*]}"', ParserCheck.COMMAND_STRING_RUNTIME),
+        ("parts+=", '"${parts[@]}" -rf /', ParserCheck.COMMAND_IDENTITY),
+        ("hint=", 'eval "$hint"', ParserCheck.COMMAND_STRING_RUNTIME),
+        ("hint=", 'source "$hint"', ParserCheck.SHELL_SCRIPT_PATH),
+        ("hint=", 'bash "$hint"', ParserCheck.SHELL_SCRIPT_PATH),
+        ("hint=", '"$hint" -rf /', ParserCheck.COMMAND_IDENTITY),
+    ],
+)
+def test_escaped_printf_preserves_runtime_execution_consumer(
+    assignment: str, consumer: str, expected: ParserCheck
+) -> None:
+    value = """ "$(printf '%q' "$input")" """.strip()
+    if assignment.endswith("+="):
+        value = "(" + value + ")"
+    source = assignment + value + "\n" + consumer
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell")
+    assert detail and detail.check is expected
+    if expected is ParserCheck.SHELL_SCRIPT_PATH:
+        assert source[detail.start : detail.end] == '"$hint"'
+
+
+@pytest.mark.parametrize("command", ["php -r", "lua -e", "busybox sh -c"])
+def test_stored_scalar_retains_interpreter_argument(command: str) -> None:
+    source = """hint="$(printf '%q' "$input")"\n""" + command + ' "$hint"'
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell")
+    assert detail and detail.check is ParserCheck.COMMAND_STRING_RUNTIME
+    assert source[detail.start : detail.end] == '"$hint"'
+
+
+def test_escaped_assignment_cannot_authorize_a_different_source_binding() -> None:
+    source = """parts+=("$(printf '%q' "$input")")
+parts=(other)
+source "${parts[0]}" """
+    detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell")
+    assert detail and detail.check is not ParserCheck.SHELL_SCRIPT_PATH
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'printf "%s" "${parts[*]}" | sh',
+        'printf "%s" "${parts[*]}" >runner.sh\nbash runner.sh',
+        'next="${parts[0]}"\nsource "$next"',
+        'load() { source "$1"; }\nload "${parts[0]}"',
+        'cat >"${parts[0]}"',
+        'parallel "${parts[0]}"',
+        'declare -n alias=parts\nsource "${alias[0]}"',
+        'which=parts\nsource "${!which}"',
+        'env sh -c "${parts[0]}"',
+        'php -r "${parts[0]}"',
+        'busybox sh -c "${parts[0]}"',
+        'lua -e "${parts[0]}"',
+        'unknown_interpreter -r "${parts[0]}"',
+        'load_script module "${parts[0]}"',
+        """alias printf='other'\necho "${parts[0]}" """.strip(),
+        'enable -n printf\necho "${parts[0]}"',
+        'find . -exec sh -c "${parts[0]}"',
+    ],
+)
+def test_escaped_data_does_not_complete_unresolved_file_and_pipe_consumers(body: str) -> None:
+    source = """parts+=("$(printf '%q' "$input")")\n""" + body
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell") is not None
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        """PROMPT_COMMAND+=("$(printf '%q' "$input")")""",
+        """declare -ai parts\nparts+=("$(printf '%q' "$input")")""",
+        """parts+=("$(printf '%q' "$input")")\nlet 'parts[0]'""",
+        """parts+=("$(printf '%q' "$input")")\ncoproc "${parts[0]}" """,
+        """parts+=("$(printf '%q' "$input")")\npython3.13 "${parts[0]}" """,
+        """parts+=("$(printf '%q' "$input")")\nrunner "${parts[0]}" """,
+        """parts+=("$(printf '%q' "$input")")\ncopy="${parts[0]}"\nrunner "$copy" """,
+        """parts+=("$(printf '%q' "$input")")\n{\nprintf '%s' "${parts[0]}"\n} | sh""",
+        """parts+=("$(printf '%q' "$input")")\nresult=$(\nprintf '%s' "${parts[0]}"\n)\n"$result" """,
+        """parts+=("$(printf '%q' "$input")")\nexec >runner\nprintf '%s' "${parts[0]}"\nbash runner""",
+    ],
+)
+def test_printf_storage_requires_a_proven_data_consumer(script: str) -> None:
+    assert tm.bounded_parse_diagnostic(script, lambda: None, file_type="shell") is not None
+
+
+def test_plain_array_binding_and_literal_output_remain_inspectable() -> None:
+    source = """declare -a parts\nparts+=("$(printf '%q' "$input")")\nprintf '%s' "${parts[0]}" """
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="shell") is None
+
+
+_FILTER_DATA = """$(printf '%s' "$ref" | tr 'A-F' 'a-f')"""
+
+
+@pytest.mark.parametrize("rhs", ['"{}"', '"{}"*', '*"{}"', '*"{}"*'])
+def test_string_comparison_uses_quoted_filter_as_data(rhs: str) -> None:
+    source = '[[ "$version" == ' + rhs.format(_FILTER_DATA) + " ]]"
+    assert tm.bounded_parse_diagnostic(source, lambda: None) is None
+    detail = tm.bounded_parse_diagnostic(source + '\n"$tool" -rf /', lambda: None)
+    assert detail and detail.check is ParserCheck.COMMAND_IDENTITY
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '[[ "$version" -eq "{}" ]]',
+        '[[ "$version" =~ "{}" ]]',
+        '[[ "$version" == "{}"$(other) ]]',
+        'sh -c "{}"',
+        'tr() {{ eval "$1"; }}; [[ "$version" == "{}"* ]]',
+        'PATH="$elsewhere"; [[ "$version" == "{}"* ]]',
+    ],
+)
+def test_runtime_filter_roles_preserve_binding_and_execution_controls(source: str) -> None:
+    assert tm.bounded_parse_diagnostic(source.format(_FILTER_DATA), lambda: None)
+
+
+def _filtered_selector() -> str:
+    return """SCRIPTS="${CALLER_ROOT:-/tmp/plugins}"
+valid() {
+    [[ "${1:-}" =~ ^[0-9a-fA-F]{40}$ ]]
+}
+fail() {
+    exit 1
+}
+select_ref() {
+    local key="$1"
+    local metadata="${2:-}"
+    [[ -n "$metadata" ]] && bash "$metadata" "$key"
+    printf '%s' "$key" > output
+}
+use() {
+    local ref="$1"
+    valid "$ref" || fail
+    select_ref "%FILTER%"
+}
+use "$1"
+source "${SCRIPTS}/helper.sh"
+""".replace("%FILTER%", _FILTER_DATA)
+
+
+def test_guarded_filter_points_at_runtime_loaded_source() -> None:
+    source = _filtered_selector()
+    detail = tm.bounded_parse_diagnostic(source, lambda: None)
+    assert detail and detail.check is ParserCheck.COMMAND_IDENTITY
+    assert source[detail.start : detail.end] == '"${SCRIPTS}/helper.sh"'
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ('[[ "${1:-}" =~ ^[0-9a-fA-F]{40}$ ]]', "return 0"),
+        ("exit 1", "return 0"),
+        ('valid "$ref" || fail', 'valid "$ref" || true'),
+        ('select_ref "%FILTER%"', 'eval "%FILTER%"'),
+        ('select_ref "%FILTER%"', 'select_ref "%FILTER%" extra'),
+        ('local metadata="${2:-}"', 'local metadata="$1"'),
+        ('[[ -n "$metadata" ]] && bash', "bash"),
+        ("printf '%s' \"$key\" > output", 'eval "$key"'),
+        ('source "${SCRIPTS}/helper.sh"', '# source "${SCRIPTS}/helper.sh"'),
+        ('source "${SCRIPTS}/helper.sh"', "cat <<'DATA'\nsource \"${SCRIPTS}/helper.sh\"\nDATA"),
+        ('source "${SCRIPTS}/helper.sh"', 'SCRIPTS=/fixed\nsource "${SCRIPTS}/helper.sh"'),
+    ],
+)
+def test_guarded_filter_retains_unverified_execution_or_source(before: str, after: str) -> None:
+    before, after = (part.replace("%FILTER%", _FILTER_DATA) for part in (before, after))
+    assert before in _filtered_selector()
+    source = _filtered_selector().replace(before, after)
+    detail = tm.bounded_parse_diagnostic(source, lambda: None)
+    assert detail and source[detail.start : detail.end] != '"${SCRIPTS}/helper.sh"'
