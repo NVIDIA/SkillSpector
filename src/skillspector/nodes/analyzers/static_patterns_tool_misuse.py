@@ -31,6 +31,7 @@ import sys
 import time
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from itertools import pairwise
@@ -72,6 +73,7 @@ from skillspector.python_tokens import (
     PythonLiteralSpans,
     html_template_contains_script,
     python_browser_template_shell_text,
+    python_fstring_literal_spans,
     python_string_value_bounds_allowed,
     python_text_assignment_script,
 )
@@ -246,7 +248,7 @@ _PYTHON_FORMAT_NAME_RE = re.compile(r"\.format\([ \t]*([A-Za-z_][A-Za-z0-9_]*)[ 
 # Python operators that can still extend or rewrite a string value.
 _PYTHON_STRING_EXTENSION_OPERATORS = frozenset({"+", "%", ".", "*", "["})
 # One brace opens an f-string replacement field; a doubled brace is literal.
-_PYTHON_REPLACEMENT_FIELD_RE = re.compile(r"\{\{|(\{)")
+_PYTHON_REPLACEMENT_FIELD_RE = re.compile(r"\{\{|\}\}|(\{)")
 _PRINTF_FORMAT_CONVERSION_RE = re.compile(r"%[-+ #0-9.*']*[A-Za-z%]")
 _SHELL_ROOT_TARGET_ESCAPE_RE = re.compile(
     r"\\(?:[/~*?]|x(?:2[fF]|7[eE]|2[aA]|3[fF])|"
@@ -794,6 +796,7 @@ class _ShellToken:
     has_quoted_content: bool
     brace_expansion: bool
     leading_tilde_unquoted: bool
+    unresolved_brace: bool
 
 
 @dataclass(frozen=True)
@@ -4468,6 +4471,7 @@ def _has_shell_command_word_exhaustion(
     may_have_destructive_outer_operands = _may_have_destructive_outer_operands(content) or any(
         string.decoded for string in powershell_strings.values()
     )
+    has_python_fields = python_source is not None and "{" in content
     json_openers = sorted(structural_quote_openers or ())
     backtick_values = tuple(
         span for span in json_value_spans if content.find("`", span[0] + 1, span[1] - 1) >= 0
@@ -4921,6 +4925,8 @@ def _has_shell_command_word_exhaustion(
                 check_runtime,
                 powershell_strings=powershell_strings,
                 quoted_printf_allowed=quoted_printf_allowed,
+                # Raw Python has not yet resolved replacement fields or concatenation.
+                unresolved_braces=None if file_type == "python" else frozenset(),
                 **(
                     {"source_end": boundary}
                     if value_span is not None
@@ -4932,7 +4938,10 @@ def _has_shell_command_word_exhaustion(
             if parsed.dynamic and may_have_destructive_outer_operands
             else None
         )
-        if operand_diagnostic is not None:
+        # Adjacent Python literals can contribute fields and operands that
+        # belong to a single command even when each raw source word is benign.
+        verify_python_value = parsed.dynamic and has_python_fields
+        if operand_diagnostic is not None or verify_python_value:
             comment = python_source.comment(start) if python_source is not None else None
             while perl_header is not None and start >= perl_header.end():
                 perl_header = _PERL_HEADER_LINE_RE.match(content, perl_header.end())
@@ -4949,19 +4958,34 @@ def _has_shell_command_word_exhaustion(
                 # concatenated with it. A value that code can still extend,
                 # for example with ``%`` or ``.format``, stays partial.
                 value_source_range: list[int] = []
+                unknown_fields: set[int] = set()
                 value = (
-                    python_source.string_value(start, parsed.end, source_range=value_source_range)
+                    python_source.string_value(
+                        start,
+                        parsed.end,
+                        source_range=value_source_range,
+                        unknown_fields=unknown_fields,
+                    )
                     if python_source is not None
                     else None
                 )
                 if value is None:
+                    if operand_diagnostic is None:
+                        continue
                     if python_source is not None:
                         runtime_field = python_source.runtime_format_argument(start, parsed.end)
                         if runtime_field is not None:
                             return runtime_field
                     return operand_diagnostic
+                if operand_diagnostic is None and (
+                    not unknown_fields or not _may_have_destructive_outer_operands(value[0])
+                ):
+                    continue
                 value_diagnostic = _has_runtime_command_operand_exhaustion(
-                    *value, check_runtime, quoted_printf_allowed=quoted_printf_allowed
+                    *value,
+                    check_runtime,
+                    quoted_printf_allowed=quoted_printf_allowed,
+                    unresolved_braces=unknown_fields,
                 )
                 if value_diagnostic is not None:
                     return value_diagnostic.enclosed(*value_source_range)
@@ -4970,7 +4994,7 @@ def _has_shell_command_word_exhaustion(
             # named in it can take operands only from the same comment, never
             # from later host code. Recheck that comment as standalone shell
             # text.
-            if comment not in complete_comments:
+            if operand_diagnostic is not None and comment not in complete_comments:
                 diagnostic = _has_shell_command_word_exhaustion(
                     content[comment[0] : comment[1]],
                     check_runtime,
@@ -5106,6 +5130,7 @@ def _has_runtime_command_operand_exhaustion(
     powershell_strings: Mapping[int, PowerShellString] | None = None,
     quoted_printf_allowed: bool = True,
     source_end: int | None = None,
+    unresolved_braces: AbstractSet[int] | None = frozenset(),
 ) -> StaticParserDiagnostic | None:
     """Return whether a runtime-selected command's operands are undecidable."""
     diagnostics: list[StaticParserDiagnostic] = []
@@ -5118,6 +5143,11 @@ def _has_runtime_command_operand_exhaustion(
         quoted_printf_allowed=quoted_printf_allowed,
         diagnostics=diagnostics,
         **({"source_end": source_end} if source_end is not None else {}),
+        **(
+            {"unresolved_braces": unresolved_braces}
+            if unresolved_braces is None or unresolved_braces
+            else {}
+        ),
     )
     if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
         # Earlier prose (for example "row-first") cannot supply this
@@ -7306,6 +7336,9 @@ def _python_literal_operands(
     start: int,
     end: int,
     constant_fields: tuple[tuple[int, int, str], ...] = (),
+    unknown_fields: set[int] | None = None,
+    projected_start: int = 0,
+    literal_runs: PythonLiteralSpans | None = None,
 ) -> str:
     """Return string literal body text from ``start`` that a shell reads as operands.
 
@@ -7317,12 +7350,34 @@ def _python_literal_operands(
     if not {"f", "t"} & set(content[token[0] : body_start].lower()):
         return text
 
-    def unknown_fields(value: str) -> str:
-        return _PYTHON_REPLACEMENT_FIELD_RE.sub(
-            lambda field: field[0] if field[1] is None else " -rf {", value
-        )
-
     pieces: list[str] = []
+
+    def append_fields(begin: int, stop: int) -> None:
+        nonlocal projected_start
+        cursor = begin
+        while match := _PYTHON_REPLACEMENT_FIELD_RE.search(content, cursor, stop):
+            pieces.append(content[cursor : match.start()])
+            projected_start += match.start() - cursor
+            rendered = match[0]
+            cursor = match.end()
+            if match[1] is not None:
+                rendered = " -rf {"
+                if unknown_fields is not None:
+                    unknown_fields.add(projected_start + len(rendered) - 1)
+            elif literal_runs is not None:
+                index = bisect_right(literal_runs[0], match.start()) - 1
+                if index >= 0 and match.end() <= literal_runs[1][index]:
+                    rendered = rendered[0]
+                else:
+                    # A replacement's closing brace can precede a doubled
+                    # literal closer. Reconsider the second brace in its own run.
+                    cursor = match.start() + 1
+                    rendered = content[match.start() : cursor]
+            pieces.append(rendered)
+            projected_start += len(rendered)
+        pieces.append(content[cursor:stop])
+        projected_start += stop - cursor
+
     cursor = start
     index = bisect_left(constant_fields, start, key=lambda field: field[0])
     while index < len(constant_fields):
@@ -7330,11 +7385,12 @@ def _python_literal_operands(
         if field_start >= end:
             break
         if field_end <= end:
-            pieces.append(unknown_fields(content[cursor:field_start]))
+            append_fields(cursor, field_start)
             pieces.append(value)
+            projected_start += len(value)
             cursor = field_end
         index += 1
-    pieces.append(unknown_fields(content[cursor:end]))
+    append_fields(cursor, end)
     return "".join(pieces)
 
 
@@ -7363,6 +7419,7 @@ class _PythonSourceOwnership:
         self._python_import_check = python_import_check
         self._python_stdlib_check = python_stdlib_check
         self._constant_fields: tuple[tuple[int, int, str], ...] | None = None
+        self._literal_runs: dict[tuple[int, int], PythonLiteralSpans | None] = {}
         self._content = content
         self._check_runtime = check_runtime
         self._spans: PythonLiteralSpans | None = None
@@ -7415,7 +7472,12 @@ class _PythonSourceOwnership:
         return not start <= position < end
 
     def string_value(
-        self, start: int, end: int, *, source_range: list[int] | None = None
+        self,
+        start: int,
+        end: int,
+        *,
+        source_range: list[int] | None = None,
+        unknown_fields: set[int] | None = None,
     ) -> tuple[str, int, int] | None:
         """Return the proven string value that holds a shell word, and its span.
 
@@ -7458,12 +7520,36 @@ class _PythonSourceOwnership:
             origin -= 1
         # The operand tokenizer reads at most this much after the word.
         limit = word_end + _ROOT_GLOB_COMMAND_CHARS + 1
-        pieces = [
-            content[origin:word_end],
-            _python_literal_operands(
-                content, owner, word_end, min(body_end, limit), self._constant_fields
-            ),
-        ]
+        pieces = [content[origin:word_end]]
+        projected_end = word_end - origin
+
+        def append_literal(token: tuple[int, int], begin: int, stop: int) -> None:
+            nonlocal projected_end
+            # Collapse doubled braces only in proven Python literal text. Inside
+            # replacement expressions (and across token boundaries) they may
+            # instead be Python syntax.
+            if (
+                token not in self._literal_runs
+                and token[1] - token[0] <= _ROOT_GLOB_COMMAND_CHARS
+                and ("{{" in content[begin:stop] or "}}" in content[begin:stop])
+            ):
+                self._literal_runs[token] = python_fstring_literal_spans(
+                    content, *token, self._check_runtime
+                )
+            part = _python_literal_operands(
+                content,
+                token,
+                begin,
+                stop,
+                self._constant_fields or (),
+                unknown_fields,
+                projected_end,
+                self._literal_runs.get(token),
+            )
+            pieces.append(part)
+            projected_end += len(part)
+
+        append_literal(owner, word_end, min(body_end, limit))
         remaining = limit - body_end
         starts, ends = spans
         index = bisect_right(starts, start) - 1
@@ -7495,11 +7581,7 @@ class _PythonSourceOwnership:
                 if source_range is not None:
                     source_range[1] = literal[1]
                 literal_start, literal_end = _python_string_body(content, *literal)
-                pieces.append(
-                    _python_literal_operands(
-                        content, literal, literal_start, literal_end, self._constant_fields
-                    )
-                )
+                append_literal(literal, literal_start, literal_end)
                 remaining -= literal_end - literal_start
                 continue
             # A parenthesized value, as in ``("$TOOL ") + "-rf /"``, can
@@ -8004,6 +8086,7 @@ def _bounded_shell_tokens(
     quoted_printf_allowed: bool = True,
     diagnostics: list[StaticParserDiagnostic] | None = None,
     source_end: int | None = None,
+    unresolved_braces: AbstractSet[int] | None = frozenset(),
 ) -> tuple[tuple[_ShellToken, ...], int, bool]:
     """Return argument words from one security-view-bounded shell command."""
     runtime_check = check_runtime or (lambda: None)
@@ -8016,6 +8099,7 @@ def _bounded_shell_tokens(
     current_can_collapse_to_root_glob = True
     current_has_quoted_content = False
     current_unquoted_brace_open = False
+    current_unresolved_brace = False
     current_unquoted_brace_close = False
     current_unquoted_brace_comma = False
     current_leading_tilde_unquoted = False
@@ -8096,7 +8180,7 @@ def _bounded_shell_tokens(
         nonlocal current_has_unquoted_star
         nonlocal current_can_collapse_to_root_glob
         nonlocal current_has_quoted_content
-        nonlocal current_unquoted_brace_open
+        nonlocal current_unquoted_brace_open, current_unresolved_brace
         nonlocal current_unquoted_brace_close
         nonlocal current_unquoted_brace_comma
         nonlocal source_word_has_content
@@ -8110,6 +8194,8 @@ def _bounded_shell_tokens(
         )
         current_has_quoted_content = current_has_quoted_content or quoted
         if unquoted_brace_syntax:
+            if piece == "{" and (unresolved_braces is None or cursor in unresolved_braces):
+                current_unresolved_brace = True
             current_unquoted_brace_open = current_unquoted_brace_open or "{" in piece
             current_unquoted_brace_close = current_unquoted_brace_close or "}" in piece
             current_unquoted_brace_comma = current_unquoted_brace_comma or "," in piece
@@ -8124,7 +8210,7 @@ def _bounded_shell_tokens(
         nonlocal current_has_unquoted_star
         nonlocal current_can_collapse_to_root_glob
         nonlocal current_has_quoted_content
-        nonlocal current_unquoted_brace_open
+        nonlocal current_unquoted_brace_open, current_unresolved_brace
         nonlocal current_unquoted_brace_close
         nonlocal current_unquoted_brace_comma
         nonlocal current_leading_tilde_unquoted
@@ -8140,6 +8226,7 @@ def _bounded_shell_tokens(
                         and current_unquoted_brace_close
                         and current_unquoted_brace_comma,
                         current_leading_tilde_unquoted,
+                        current_unresolved_brace,
                     )
                 )
             current.clear()
@@ -8149,6 +8236,7 @@ def _bounded_shell_tokens(
             current_can_collapse_to_root_glob = True
             current_has_quoted_content = False
             current_unquoted_brace_open = False
+            current_unresolved_brace = False
             current_unquoted_brace_close = False
             current_unquoted_brace_comma = False
             current_leading_tilde_unquoted = False
@@ -8727,6 +8815,17 @@ def _brace_expansion_diagnostic(
 ) -> StaticParserDiagnostic | None:
     for token in tokens:
         if token.brace_expansion:
+            if token.unresolved_brace:
+                # A host field supplies operand bytes before the shell sees the
+                # word. Its value is neither a literal brace nor a Bash alternative.
+                return StaticParserDiagnostic(
+                    ParserCause.UNSUPPORTED_SYNTAX,
+                    ParserCheck.BRACE_SYNTAX,
+                    start,
+                    max(start + 1, end),
+                    ParserUncheckedScope.COMMAND_ARGUMENTS,
+                    location_precision="enclosing_expression",
+                )
             diagnostics: list[StaticParserDiagnostic] = []
             if _static_brace_expansions(token.text, diagnostics) is None:
                 return diagnostics[0].enclosed(start, max(start + 1, end))
