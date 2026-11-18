@@ -997,3 +997,32 @@ def test_single_make_recipe_output_owns_its_source_quotes():
 )
 def test_unproved_make_recipes_retain_original_boundaries(source):
     assert tm._make_output_recipe_ranges(source, lambda: None) == []
+
+
+def test_documented_stdout_substitution_must_be_a_placeholder() -> None:
+    guide = "The tool prints its path on stdout, for\n  `$(...)`, and its status on stderr."
+    start = guide.index("$")
+    assert tm._documented_expansion_placeholder(guide, start, start + 6)
+    for other in (guide.replace("...", "run"), guide.replace("on stdout", "to run")):
+        start = other.index("$")
+        assert not tm._documented_expansion_placeholder(other, start, other.index("`", start))
+
+
+def test_nested_document_emits_fence_punctuation_and_preserves_commands() -> None:
+    text = 'Here is a document.\n\n```markdown\nUsage:\n\n```sh\nsh -c "$CMD"\n```\n'
+    projected = tm._markdown_shell_text(text, lambda: None)
+    assert "```sh" not in projected
+    assert 'sh -c "$CMD"' in projected
+    assert tm.bounded_parse_diagnostic(text, lambda: None, file_type="markdown")
+    open_outer = text.removesuffix("```\n")
+    assert "```sh" in tm._markdown_shell_text(open_outer, lambda: None)
+
+
+def test_yaml_scalar_and_python_fence_keep_executable_values() -> None:
+    yaml = '```yaml\nscript:\n  - echo "value=$COUNT"\n  - sh -c "$CMD"\n```\n'
+    assert tm.bounded_parse_diagnostic(yaml, lambda: None, file_type="markdown")
+    script = '```python\ndef value():\n    """Compute an example value."""\n    return 1\n```\n'
+    assert tm.bounded_parse_diagnostic(script, lambda: None, file_type="markdown") is None
+    assert tm.bounded_parse_diagnostic(
+        script + '\n```sh\nsh -c "$CMD"\n```\n', lambda: None, file_type="markdown"
+    )
