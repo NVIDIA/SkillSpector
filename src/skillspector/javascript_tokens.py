@@ -27,7 +27,9 @@ from skillspector.javascript_callables import (
     _forwarded_stage_call,
     _is_shell_execution_module,
     _module_wrapper_markup,
+    _ordinary_array_map,
     _pattern_binding_names,
+    _private_arrow_barrier,
     _private_callable_uses,
     _written_script_field,
 )
@@ -1799,9 +1801,10 @@ def _runtime_argument_call(
     external = _external_option_callback(program, check_runtime) or _forwarded_stage_call(
         program, check_runtime
     )
+    implicit: dict[int, Node] = {}
     proven = (
         _promise_settlers(program, check_runtime)
-        | _private_callable_uses(program, check_runtime)[0]
+        | _private_callable_uses(program, check_runtime, implicit)[0]
     )
     first_parameter = None
     budget = _MAX_TOKENS * 4
@@ -1872,7 +1875,7 @@ def _runtime_argument_call(
                         first_parameter = node
                     break
             scope = scope.parent
-    return external or first_parameter
+    return external or first_parameter or next(iter(implicit.values()), None)
 
 
 def _code_evaluation_witness(
@@ -2534,7 +2537,7 @@ def _promise_settlers(program: JavaScriptProgram, check_runtime: Callable[[], No
 
 
 def _numeric_local_identifiers(
-    program: JavaScriptProgram, check_runtime: Callable[[], None]
+    program: JavaScriptProgram, check_runtime: Callable[[], None], implicit: dict[int, Node]
 ) -> set[int]:
     """Resolve exact references to immutable local arithmetic helpers.
 
@@ -2616,8 +2619,18 @@ def _numeric_local_identifiers(
             candidates.append((binding, node, declaration.parent))
     owned: set[int] = set()
     budget = _MAX_TOKENS * 4
+
+    plain_map = _ordinary_array_map(program, check_runtime)
+
+    def spend(count: int) -> bool:
+        nonlocal budget
+        check_runtime()
+        budget -= count
+        return budget >= 0
+
     for binding, declaration, scope in candidates:
         identifiers = {binding.id}
+        calls: list[Node] = []
         for reference in references[program.text(binding)]:
             budget -= 1
             if budget < 0:
@@ -2638,7 +2651,29 @@ def _numeric_local_identifiers(
             ):
                 break
             identifiers.add(reference.id)
+            calls.append(reference)
         else:
+            arrow = declaration.child_by_field_name("value")
+            owned.add(binding.id)
+            if arrow is None or not calls:
+                continue
+            result_used = any(
+                (direct := ref.parent) is None
+                or (use := direct.parent) is None
+                or use.type != "expression_statement"
+                for ref in calls
+            )
+            barrier = _private_arrow_barrier(
+                program,
+                arrow,
+                calls,
+                references,
+                spend,
+                result_used=result_used,
+                plain_map=plain_map,
+            )
+            if barrier is not None:
+                implicit.update((ref.id, barrier) for ref in calls)
             owned.update(identifiers)
     return owned
 
@@ -2747,8 +2782,10 @@ def _has_shell_execution_call(
     program: JavaScriptProgram, check_runtime: Callable[[], None]
 ) -> Node | None:
     scalar_identifiers = _scalar_template_identifiers(program, check_runtime)
-    ordinary_identifiers = _numeric_local_identifiers(program, check_runtime)
-    private_calls, namespace_aliases = _private_callable_uses(program, check_runtime)
+    implicit: dict[int, Node] = {}
+    numeric_inputs: dict[int, Node] = {}
+    ordinary_identifiers = _numeric_local_identifiers(program, check_runtime, numeric_inputs)
+    private_calls, namespace_aliases = _private_callable_uses(program, check_runtime, implicit)
     ordinary_identifiers.update(private_calls)
     ordinary_identifiers.update(_promise_settlers(program, check_runtime))
     native_members, native_calls, native_paths = _ordinary_native_calls(program, check_runtime)
@@ -2971,10 +3008,14 @@ def _has_shell_execution_call(
             ):
                 return node
     if any(hook in program.content for hook in ("Proxy", "toString", "valueOf", "toPrimitive")):
-        return _implicit_template_callback(
+        hook = _implicit_template_callback(
             program, uncertain_bindings | imported_callables, check_runtime
         )
-    return None
+        if hook is not None:
+            return hook
+    # A local arithmetic function has a known target. Prefer a separately
+    # witnessed runtime consumer before an unproved conversion in its operands.
+    return next(iter(implicit.values()), None) or next(iter(numeric_inputs.values()), None)
 
 
 def _callable_values(
