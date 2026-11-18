@@ -267,6 +267,63 @@ def plain_shell_neighbor(content: str, check_runtime: Callable[[], None]) -> boo
 
 
 _NATURAL = re.compile(rb"(?:0|[1-9][0-9]{0,8}|0[xX][0-9A-Fa-f]{1,8})")
+# Space padding can split an unquoted result into words. A literal numeric
+# prefix, the radix flag and up to 32 zero-padded digits produce one operand.
+_INTEGER_FORMAT = re.compile(
+    rb"(?P<prefix>0[xX]?)?%(?P<radix>#)?(?:0(?:[1-9]|[12][0-9]|3[0-2]))?(?P<conversion>[diuxXo])"
+)
+
+
+def may_have_formatted_loop(content: str) -> bool:
+    """Cheap trigger only; the complete native shell tree proves the role."""
+    return len(content) <= 1_000_000 and all(
+        marker in content for marker in ("for", "$(", "printf", "%")
+    )
+
+
+def _integer_format(node: Node) -> bool:
+    raw = node.text
+    if node.type in {"raw_string", "string"}:
+        quote = b"'" if node.type == "raw_string" else b'"'
+        if not (raw.startswith(quote) and raw.endswith(quote)):
+            return False
+        raw = raw[1:-1]
+    elif node.type != "word":
+        return False
+    match = _INTEGER_FORMAT.fullmatch(raw)
+    if match is None:
+        return False
+    prefix, radix, conversion = match.groups()
+    if prefix and radix:
+        return False
+    if prefix in (b"0x", b"0X"):
+        return conversion in (b"x", b"X")
+    if prefix == b"0":
+        return conversion == b"o"
+    return not radix or conversion in (b"x", b"X", b"o")
+
+
+def _unquote_expansion(node: Node) -> Node:
+    if node.type == "string" and node.named_child_count == 1:
+        inner = node.named_children[0]
+        if node.text == b'"' + inner.text + b'"':
+            return inner
+    return node
+
+
+def _bounded_integer_operand(node: Node, bounds: dict[bytes, tuple[int, int]]) -> bool:
+    operand = _unquote_expansion(node)
+    if operand.type in {"simple_expansion", "expansion"} and operand.named_child_count == 1:
+        name = operand.named_children[0]
+        return (
+            name.type == "variable_name"
+            and name.text in bounds
+            and operand.text in (b"$" + name.text, b"${" + name.text + b"}")
+        )
+    return (
+        operand.type in {"arithmetic_expansion", "number"}
+        and _numeric_range(operand, bounds) is not None
+    )
 
 
 def _numeric_range(
@@ -299,14 +356,31 @@ def _numeric_range(
     return (lo, hi) if 0 <= lo <= hi <= 0x7FFFFFFF else None
 
 
+def _substitution_command(node: Node) -> Node | None:
+    if node.type != "command_substitution" or node.child_count not in (3, 4):
+        return None
+    opener, command, *terminator, closer = node.children
+    if opener.type != "$(" or closer.type != ")" or (terminator and terminator[0].type != ";"):
+        return None
+    return command if command.type == "command" else None
+
+
 def _loop_domain(node: Node) -> tuple[int, int] | None:
     values = node.children_by_field_name("value")
     if len(values) == 1 and values[0].type == "command_substitution":
-        match = re.fullmatch(
-            rb"\$\(seq[ \t]+(0|[1-9][0-9]{0,6})[ \t]+(0|[1-9][0-9]{0,6})\)", values[0].text
-        )
-        if match:
-            low, high = int(match[1]), int(match[2])
+        command = _substitution_command(values[0])
+        if command is None or command.named_child_count != 3:
+            return None
+        head, first, last = command.named_children
+        if (
+            head.type == "command_name"
+            and head.text == b"seq"
+            and all(
+                part.type == "number" and re.fullmatch(rb"0|[1-9][0-9]{0,6}", part.text)
+                for part in (first, last)
+            )
+        ):
+            low, high = int(first.text), int(last.text)
             if 0 <= high - low < 128:
                 return low, high
     elif 0 < len(values) <= 128 and all(
@@ -325,9 +399,8 @@ def finite_numeric_operands(
 ) -> list[tuple[int, int]]:
     """Prove formatted numeric argv in a complete, bounded sequence of display/read loops."""
     if (
-        "$(printf" not in content
-        or "for " not in content
-        or len(content) > 16_384
+        len(content) > 16_384
+        or not may_have_formatted_loop(content)
         or not content.isascii()
         or (content.startswith("#!") and _SHEBANG.match(content) is None)
     ):
@@ -441,18 +514,15 @@ def finite_numeric_operands(
             or (path.type == "simple_expansion" and path.text[1:] in paths)
         ):
             return False
-        if scalar.type != "command_substitution" or scalar.named_child_count != 1:
+        command = _substitution_command(_unquote_expansion(scalar))
+        if command is None or command.named_child_count != 3:
             return False
-        command = scalar.named_children[0]
         parts = command.named_children
         if (
-            command.type != "command"
-            or scalar.text != b"$(" + command.text + b")"
-            or len(parts) != 3
+            parts[0].type != "command_name"
             or parts[0].text != b"printf"
-            or parts[1].text != b"0x%x"
-            or parts[2].type != "arithmetic_expansion"
-            or _numeric_range(parts[2], bounds) is None
+            or not _integer_format(parts[1])
+            or not _bounded_integer_operand(parts[2], bounds)
         ):
             return False
         operands.append((scalar.start_byte, scalar.end_byte))

@@ -2105,3 +2105,78 @@ def test_numeric_operand_proof_never_completes_a_dynamic_command_or_hides_a_find
     )
     assert any(row["outcome"] is not LedgerOutcome.COMPLETED for row in result["inspection_ledger"])
     assert any(row.rule_id == "TM1" for row in result["findings"])
+
+
+@pytest.mark.parametrize(
+    "scalar",
+    [
+        "$(printf %d $((i+1)))",
+        """$(printf '%i' "$i")""",
+        '$(printf "%u" ${i})',
+        "$(printf %x 12)",
+        "$(printf 0X%08X $((i*8)))",
+        '''"$( printf '%#08x' "${i}" )"''',
+        '''"$(printf '%032u' "$((i+1))")"''',
+        "$(printf %o $i)",
+        "$(printf 0%02o $i)",
+        "$(printf '%#04o' $i)",
+        "$(\n printf '%04d' $i; \n)",
+    ],
+)
+def test_literal_integer_formats_are_whole_data_operands(scalar: str) -> None:
+    body = f"for\ti in $( seq 0 7 ); do /usr/bin/readreg /dev/unit {scalar}; done\n"
+    spans = tm.finite_numeric_operands(body, lambda: None)
+    assert [body[start:end] for start, end in spans] == [scalar]
+    markdown = "Ｆｏｒｍａｔ…\n\n```bash\n" + body + "```\n"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["notes.md"], "file_cache": {"notes.md": markdown}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "scalar",
+    [
+        '$(printf "$fmt" "$i")',
+        "$(printf '%s' $i)",
+        "$(printf '%n' side)",
+        "$(printf '-%u' $i)",
+        "$(printf '%8d' $i)",
+        "$(printf '%033d' $i)",
+        "$(printf '%*d' $i)",
+        "$(printf '%+d' $i)",
+        "$(printf '%-08d' $i)",
+        "$(printf '%#u' $i)",
+        "$(printf '%d %i' $i)",
+        "$(printf '%d;' $i)",
+        "$(printf '%d' ${i:-bad})",
+        "$(printf '%d' ${foreign})",
+        "$(printf '%d' $((i + external)))",
+        "$(printf -v result '%u' $i)",
+        "$(printf '%d' $i $i)",
+        "$( printf '%d' $i & )",
+        '"prefix$(printf %u $i)"',
+        '"$(printf %u $i)$tail"',
+        '"$(printf %u $i)"other',
+    ],
+)
+def test_integer_format_proof_rejects_expanding_or_composite_words(scalar: str) -> None:
+    body = f"for i in 0 1; do /usr/bin/readreg /dev/unit {scalar}; done\n"
+    assert not tm.finite_numeric_operands(body, lambda: None)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "$(printf '%08X' $i) /dev/unit",
+        "sudo readreg /dev/unit $(printf '%n' dest)",
+        'sudo readreg /dev/unit "$(printf "$fmt" $i)"',
+        'sudo readreg /dev/unit "$(printf %x $((external)))"',
+        'sudo sh -c "$(printf %u $i)"',
+        "sudo readreg /dev/unit >$(printf %u $i)",
+    ],
+)
+def test_formatted_data_proof_preserves_runtime_command_diagnostics(command: str) -> None:
+    body = f"for i in 0 1; do {command}; done\n"
+    diagnostic = tm.bounded_parse_diagnostic(body, lambda: None, file_type="shell")
+    assert diagnostic is not None and diagnostic.check is tm.ParserCheck.PRINTF_FORMAT

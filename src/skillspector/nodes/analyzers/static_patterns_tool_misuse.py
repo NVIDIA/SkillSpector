@@ -46,6 +46,7 @@ from skillspector.bash_syntax import (
     bash_syntax,
     complete_shell_fences,
     finite_numeric_operands,
+    may_have_formatted_loop,
     plain_shell_neighbor,
 )
 from skillspector.inspection_ledger import (
@@ -10911,7 +10912,7 @@ class _FiniteShellSource:
 def prepare_parser_analysis(
     content: str, file_type: str, check_runtime: Callable[[], None]
 ) -> JSONSourceOwnership | _YamlParserAnalysis | _FiniteShellSource | None:
-    if file_type in {"shell", "markdown"} and "$(printf" in content and "0x%x" in content:
+    if file_type in {"shell", "markdown"} and may_have_formatted_loop(content):
         ranges = []
         if file_type == "shell":
             ranges.append((0, len(content)))
@@ -12629,8 +12630,7 @@ def _has_bounded_parse_exhaustion(
     if (
         complete_context
         and file_type in {"shell", "markdown"}
-        and "$(printf" in native_shell_input
-        and "0x%x" in native_shell_input
+        and may_have_formatted_loop(native_shell_input)
     ):
         ranges = shell_fence_ranges if file_type == "markdown" else [(0, len(content))]
         # A setting in an earlier example can change later command bindings
