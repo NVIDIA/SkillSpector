@@ -10371,17 +10371,21 @@ def _markdown_shell_text(
         substitution_ends: dict[int, int | None] = {}
         backtick_ends: dict[int, int | None] = {}
         fence_index = 0
+        punctuation = sorted(prose_apostrophes)
         while cursor <= last_candidate:
             while fence_index < len(closed_fences) and closed_fences[fence_index][1] <= cursor:
                 fence_index += 1
             if fence_index < len(closed_fences):
                 fence_start, fence_end = closed_fences[fence_index]
                 if fence_start <= cursor < fence_end:
-                    # Punctuation inside a closed source block cannot consume
-                    # later, separately owned Markdown prose. The block keeps
-                    # its raw content for the independent execution checks.
-                    cursor = fence_end
-                    continue
+                    # Only punctuation already owned by the block's native
+                    # syntax can be masked here. Its other bytes keep their
+                    # original source for the independent execution checks.
+                    index = bisect_left(punctuation, cursor)
+                    if index == len(punctuation) or punctuation[index] >= fence_end:
+                        cursor = fence_end
+                        continue
+                    cursor = punctuation[index]
             if cursor >= next_runtime_check:
                 check_runtime()
                 next_runtime_check = cursor + 4096
