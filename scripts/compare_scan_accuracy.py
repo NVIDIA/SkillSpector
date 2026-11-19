@@ -29,6 +29,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from urllib.request import url2pathname
 
 SCHEMA_VERSION = 2
 REQUIRED_CLASSIFICATIONS = frozenset({"maintained_benign", "approved_real_world"})
@@ -53,6 +54,21 @@ if __name__ == "__main__":
         sys.argv[0] = sys.argv[0][:-4]
     sys.exit(app())
 """
+
+
+def _path_from_file_url_path(path: str) -> Path:
+    """Convert a local ``file:`` URL path without duplicating Windows drives."""
+    local_path = url2pathname(path)
+    if os.name == "nt" and len(local_path) >= 3 and local_path[0] == "\\":
+        local_path = local_path.lstrip("\\")
+    return Path(local_path)
+
+
+def _is_owned_by_current_user(path: Path) -> bool:
+    """Check ownership where the platform exposes POSIX user IDs."""
+    if hasattr(os, "geteuid"):
+        return path.lstat().st_uid == os.geteuid()
+    return True
 _RUNTIME_IDENTITY_PROBE = r"""
 import hashlib
 import importlib.metadata
@@ -61,6 +77,7 @@ import os
 import platform
 import sys
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 MAX_DEPENDENCY_FILES = 200_000
@@ -72,6 +89,12 @@ EDITABLE_IGNORED_PARTS = {
 
 total_files = 0
 total_bytes = 0
+
+def path_from_file_url_path(path):
+    local_path = urllib.request.url2pathname(path)
+    if os.name == "nt" and len(local_path) >= 3 and local_path[0] == "\\":
+        local_path = local_path.lstrip("\\")
+    return Path(local_path)
 
 def hash_file(digest, label, path):
     global total_files, total_bytes
@@ -178,7 +201,9 @@ for distribution in importlib.metadata.distributions():
             parsed = urllib.parse.urlsplit(raw_url)
             if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
                 raise RuntimeError(f"editable dependency is not a local file target: {normalized_name}")
-            editable_root = Path(urllib.parse.unquote(parsed.path)).resolve(strict=True)
+            editable_root = path_from_file_url_path(
+                urllib.parse.unquote(parsed.path)
+            ).resolve(strict=True)
             if not editable_root.is_dir():
                 raise RuntimeError(f"editable dependency target is not a directory: {normalized_name}")
             for editable_path in sorted(editable_root.rglob("*")):
@@ -458,7 +483,7 @@ def _fresh_owned_home() -> Iterator[Path]:
     try:
         home.chmod(0o700)
         before = home.lstat()
-        if home.is_symlink() or not home.is_dir() or before.st_uid != os.geteuid():
+        if home.is_symlink() or not home.is_dir() or not _is_owned_by_current_user(home):
             raise RuntimeError("Could not create a private owned accuracy-gate HOME")
         if any(home.iterdir()):
             raise RuntimeError("Accuracy-gate HOME was not empty at creation")
@@ -666,7 +691,7 @@ def _accuracy_snapshots(
     with tempfile.TemporaryDirectory(prefix="skillspector-accuracy-snapshot-") as temporary:
         snapshot_root = Path(temporary)
         snapshot_root.chmod(0o700)
-        if snapshot_root.lstat().st_uid != os.geteuid() or any(snapshot_root.iterdir()):
+        if not _is_owned_by_current_user(snapshot_root) or any(snapshot_root.iterdir()):
             raise RuntimeError("Could not create a private empty accuracy snapshot root")
         corpus_snapshot = snapshot_root / "corpus"
         _copy_corpus_snapshot(corpus_root, cases, corpus_snapshot)
@@ -1865,7 +1890,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output:
-        args.output.write_text(rendered, encoding="utf-8")
+        args.output.write_text(rendered, encoding="utf-8", newline="\n")
     else:
         print(rendered, end="")
     return 0 if result["passed"] else 1

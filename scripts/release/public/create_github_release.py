@@ -20,10 +20,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import tomllib
 from pathlib import Path
 from urllib.parse import quote
+
+
+def _gh_command() -> str:
+    """Use a PATH-resolved Windows command shim when one is available."""
+    if shutil.which("gh.cmd"):
+        return "gh.cmd"
+    return "gh"
 
 
 def _project_version(path: Path) -> str:
@@ -40,7 +48,7 @@ def _release_notes_path(version: str) -> Path:
 def _github_api_json(endpoint: str) -> dict[str, object] | None:
     """Return a GitHub API object, or ``None`` when *endpoint* is absent."""
     result = subprocess.run(
-        ["gh", "api", endpoint],
+        [_gh_command(), "api", endpoint],
         check=False,
         capture_output=True,
         text=True,
@@ -102,7 +110,7 @@ def _create_tag_ref(repository: str, tag: str, target: str) -> bool:
     escaped_repository = quote(repository, safe="/")
     result = subprocess.run(
         [
-            "gh",
+            _gh_command(),
             "api",
             "--method",
             "POST",
@@ -144,7 +152,7 @@ def _release_exists(repository: str, tag: str) -> bool:
     """Report whether GitHub has a published or draft release for *tag*."""
     result = subprocess.run(
         [
-            "gh",
+            _gh_command(),
             "release",
             "view",
             tag,
@@ -182,7 +190,7 @@ def _reconcile_existing_release(
     if asset_paths:
         subprocess.run(
             [
-                "gh",
+                _gh_command(),
                 "release",
                 "upload",
                 tag,
@@ -195,7 +203,7 @@ def _reconcile_existing_release(
         )
     subprocess.run(
         [
-            "gh",
+            _gh_command(),
             "release",
             "edit",
             tag,
@@ -249,7 +257,7 @@ def main() -> None:
 
     subprocess.run(
         [
-            "gh",
+            _gh_command(),
             "release",
             "create",
             tag,
