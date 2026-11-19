@@ -22,6 +22,7 @@ import posixpath
 import re
 import sys
 from bisect import bisect_right
+from collections.abc import Callable
 from contextvars import ContextVar
 
 from skillspector.logging_config import get_logger
@@ -32,6 +33,7 @@ from skillspector.python_ast import (
     peek_python_ast,
     peek_python_ast_any_content,
 )
+from skillspector.python_tokens import python_literal_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
@@ -52,6 +54,12 @@ logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_privilege_escalation"
 USES_PYTHON_SOURCE_TYPE = True
+USES_RUNTIME_CHECK = True
+
+
+def _no_runtime_check() -> None:
+    """Stand in for the runner deadline when analyze() is called directly."""
+
 
 # Scan-scoped handle on the runner's shared Python AST cache, published by
 # node() for the analyze() calls the runner makes on its behalf.  This module
@@ -1139,14 +1147,132 @@ def _python_setting_literal_spans(
     return sorted(spans)
 
 
+def _python_inert_string_spans(
+    content: str, file_path: str, python_ast: ParsedPythonFile | None
+) -> list[tuple[int, int]]:
+    """Return character spans of bare string statements (docstrings and the like).
+
+    A string literal that stands alone as a statement is never passed to a
+    file API: module, class, and function docstrings, plus the bare-string
+    block-comment idiom. Only the literal text is inert. Replacement fields
+    of a bare f-string still execute, so their contents keep their findings,
+    as do the operands of any other expression the statement happens to hold.
+    Positions resolve through the scan's shared parse when available, the
+    same way ``_python_setting_literal_spans`` does; unparseable or
+    out-of-fragment text yields no spans and keeps every finding.
+    """
+    if python_ast is None:
+        cache_key = _scan_python_ast_cache_key.get()
+        if cache_key is not None:
+            python_ast = peek_python_ast(cache_key, content, file_path)
+            if python_ast is None:
+                python_ast = peek_python_ast_any_content(cache_key, file_path)
+        if python_ast is None:
+            python_ast = parse_python_source(content, file_path)
+    if python_ast.tree is None:
+        return []
+    fragment_start = python_ast.content.find(content)
+    if fragment_start < 0:
+        return []
+    # Python's AST counts only universal newlines. str.splitlines() also
+    # splits literal form feeds and Unicode separators inside Python strings.
+    byte_starts = [0] + [
+        match.end() for match in re.finditer(rb"\r\n?|\n", python_ast.source_bytes)
+    ]
+
+    def character_offset(line: int, column: int | None) -> int | None:
+        if column is None or not 1 <= line <= len(byte_starts):
+            return None
+        absolute_byte = byte_starts[line - 1] + column
+        non_ascii_count = bisect_right(python_ast.non_ascii_byte_ends, absolute_byte)
+        return absolute_byte - python_ast.non_ascii_extra_bytes[non_ascii_count] - fragment_start
+
+    spans: list[tuple[int, int]] = []
+    for node in ast.walk(python_ast.tree):
+        if not isinstance(node, ast.Expr):
+            continue
+        pending: list[ast.AST] = [node.value]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, ast.Constant) and isinstance(current.value, str):
+                if not isinstance(current.end_lineno, int):
+                    continue
+                start = character_offset(current.lineno, current.col_offset)
+                end = character_offset(current.end_lineno, current.end_col_offset)
+                if start is not None and end is not None and 0 <= start <= end <= len(content):
+                    spans.append((start, end))
+            elif isinstance(current, ast.JoinedStr):
+                pending.extend(current.values)
+            elif isinstance(current, ast.BinOp):
+                pending.extend((current.left, current.right))
+            elif isinstance(current, ast.FormattedValue):
+                # Only the format specification is literal text; the value
+                # itself is executed code and keeps its findings.
+                if current.format_spec is not None:
+                    pending.append(current.format_spec)
+    return sorted(spans)
+
+
+class _PythonPe3Prose:
+    """Lazily proven Python string and comment spans for PE3 filtering.
+
+    Docstrings, bare string statements, and comments never execute, so a PE3
+    match wholly inside one is documentation, not credential access. A prose
+    phrase (``access the credentials`` and kin) inside any other string
+    literal is a message, not an instruction to read a credential file; the
+    path itself still fires through the code patterns, so a literal that
+    reaches a file API stays visible. Source that cannot be proven (a
+    windowed fragment, a malformed module, or a polyglot shebang) keeps every
+    finding: unproven text is never treated as prose.
+    """
+
+    def __init__(
+        self,
+        content: str,
+        file_path: str,
+        python_ast: ParsedPythonFile | None,
+        check_runtime: Callable[[], None],
+    ) -> None:
+        self._content = content
+        self._file_path = file_path
+        self._python_ast = python_ast
+        self._check_runtime = check_runtime
+        self._literal_starts: tuple[int, ...] = ()
+        self._literal_ends: tuple[int, ...] = ()
+        self._inert_starts: tuple[int, ...] = ()
+        self._inert_ends: tuple[int, ...] = ()
+        self._computed = False
+
+    def suppresses(self, match: re.Match[str], is_prose: bool) -> bool:
+        """Return whether *match* is prose in a Python string or comment."""
+        if not self._computed:
+            self._computed = True
+            spans = python_literal_spans(self._content, self._check_runtime)
+            if spans is not None:
+                self._literal_starts, self._literal_ends = spans
+                inert = _python_inert_string_spans(self._content, self._file_path, self._python_ast)
+                self._inert_starts = tuple(start for start, _ in inert)
+                self._inert_ends = tuple(end for _, end in inert)
+        index = bisect_right(self._literal_starts, match.start()) - 1
+        if index >= 0 and match.end() <= self._literal_ends[index]:
+            if self._content[self._literal_starts[index]] == "#":
+                return True
+            if is_prose:
+                return True
+        index = bisect_right(self._inert_starts, match.start()) - 1
+        return index >= 0 and match.end() <= self._inert_ends[index]
+
+
 def analyze(
     content: str,
     file_path: str,
     file_type: str,
     python_ast: ParsedPythonFile | None = None,
+    check_runtime: Callable[[], None] | None = None,
 ) -> list[AnalyzerFinding]:
     """Analyze content for privilege escalation patterns (PE1–PE5)."""
     findings: list[AnalyzerFinding] = []
+    check_runtime = check_runtime or _no_runtime_check
     line_starts, line_ends = _source_line_metadata(content)
     content_lines = content.splitlines()
     fence_ranges = _markdown_fence_ranges(content) if file_type in {"markdown", "text"} else None
@@ -1225,16 +1351,21 @@ def analyze(
                     complete_match=match.group(0),
                 )
             )
+    python_prose: _PythonPe3Prose | None = None
     for pattern, confidence in PE3_PATTERNS:
+        is_prose = (pattern, confidence) in PE3_PROSE_PATTERNS
         matches = (
-            static_runner.iter_paragraph_matches
-            if (pattern, confidence) in PE3_PROSE_PATTERNS
-            else static_runner.iter_pattern_matches
+            static_runner.iter_paragraph_matches if is_prose else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             if match.group(0).casefold() == "keyring":
                 setting_index = bisect_right(setting_starts, match.start()) - 1
                 if setting_index >= 0 and match.end() <= setting_spans[setting_index][1]:
+                    continue
+            if file_type == "python":
+                if python_prose is None:
+                    python_prose = _PythonPe3Prose(content, file_path, python_ast, check_runtime)
+                if python_prose.suppresses(match, is_prose):
                     continue
             if _is_bare_credential_store_noun(
                 content, match, file_type, fence_ranges, line_starts, line_ends

@@ -223,10 +223,13 @@ class TestCredentialTypeLabelIsDisclosure:
         line = "**Credential Type(s):** [Other [Perforce access credentials" + " x" * 3000 + "]]"
         assert _pe3_lines(f"{line}\n") == [1]
 
-    @pytest.mark.parametrize("path", ["scripts/card.py", "config/card.yaml"])
-    def test_label_in_non_markdown_file_keeps_pe3(self, path: str) -> None:
+    # The disclosure-label exemption is markdown-only, so the same label line
+    # still fires in a YAML file. In a Python file the line is a comment, and
+    # #1144 silences PE3 matches in Python comments; see
+    # test_pe3_python_docstring_comment.py for that case.
+    def test_label_in_yaml_file_keeps_pe3(self) -> None:
         content = "# **Credential Type(s):** [Other [Perforce access credentials]]\n"
-        assert _pe3_lines(content, path)
+        assert _pe3_lines(content, "config/card.yaml")
 
     def test_only_the_instruction_line_is_reported(self) -> None:
         content = _SKILL_CARD + "\nAccess the credentials in ~/.p4tickets before running.\n"
