@@ -1006,7 +1006,9 @@ _HTML_MARKDOWN_TAG_NAME_RE = re.compile(r"</?([A-Za-z][A-Za-z0-9-]*)(?=[ \t/>]|$
 _HTML_MARKDOWN_CLOSE_TAG_RE = re.compile(r"</[A-Za-z][A-Za-z0-9-]*[ \t]*>")
 
 
-def _markdown_html_block(raw: str) -> tuple[bool, re.Pattern[str] | None]:
+def markdown_html_block(
+    raw: str, *, paragraph_open: bool = False
+) -> tuple[bool, re.Pattern[str] | None]:
     """Recognize HTML block starts without treating angle-bracket autolinks as tags."""
     if not raw.startswith("<"):
         return False, None
@@ -1019,6 +1021,9 @@ def _markdown_html_block(raw: str) -> tuple[bool, re.Pattern[str] | None]:
         return True, re.compile(">")
     if _HTML_BLOCK_TAG_RE.match(raw):
         return True, None
+    if paragraph_open:
+        # A type-7 custom tag cannot interrupt a CommonMark paragraph.
+        return False, None
     name = _HTML_MARKDOWN_TAG_NAME_RE.match(raw)
     if name is not None and name[1].lower() not in {"script", "pre", "style", "textarea"}:
         complete = raw.rstrip(" \t")
@@ -1123,7 +1128,7 @@ def _markdown_inline_closers(content: str, check_runtime: Callable[[], None]) ->
         # Type-7 HTML starts are treated conservatively even when their
         # ability to interrupt an existing paragraph has not been proved.
         raw = body.lstrip()
-        html_start, html_terminator = _markdown_html_block(raw)
+        html_start, html_terminator = markdown_html_block(raw)
         if html_start:
             html_end = html_terminator
             html_context = context
