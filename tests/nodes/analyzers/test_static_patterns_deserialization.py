@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for static_patterns_deserialization: multi-language deserialization (DS1–DS4)."""
+"""Tests for static_patterns_deserialization: multi-language deserialization (DS1–DS5)."""
 
 from __future__ import annotations
 
@@ -75,6 +75,70 @@ class TestJavaScript:
     def test_json_parse_no_finding(self):
         findings = _run("const obj = JSON.parse(userInput);\n", "handler.js")
         assert not any(f.rule_id.startswith("DS") for f in findings)
+
+
+class TestJava:
+    def test_object_input_stream_produces_ds5(self):
+        code = (
+            "ObjectInputStream ois = new ObjectInputStream(socket.getInputStream());\n"
+            "Object obj = ois.readObject();\n"
+        )
+        findings = _run(code, "loader.java")
+        ds5 = [f for f in findings if f.rule_id == "DS5"]
+        assert len(ds5) == 2
+        assert all(f.severity == "HIGH" for f in ds5)
+
+    def test_read_object_call_alone_produces_ds5(self):
+        findings = _run("Object obj = ois.readObject();\n", "loader.java")
+        assert any(f.rule_id == "DS5" for f in findings)
+
+    def test_xml_decoder_produces_ds5(self):
+        code = 'XMLDecoder decoder = new XMLDecoder(new FileInputStream("data.xml"));\n'
+        findings = _run(code, "loader.java")
+        assert any(f.rule_id == "DS5" for f in findings)
+
+    def test_xstream_from_xml_produces_ds5(self):
+        findings = _run("Object obj = xstream.fromXML(untrustedXml);\n", "loader.java")
+        assert any(f.rule_id == "DS5" for f in findings)
+
+    def test_jackson_default_typing_produces_ds5(self):
+        code = "mapper.enableDefaultTyping(ObjectMapper.DefaultTyping.NON_FINAL);\n"
+        findings = _run(code, "config.java")
+        assert any(f.rule_id == "DS5" for f in findings)
+
+    def test_jackson_activate_default_typing_produces_ds5(self):
+        code = "mapper.activateDefaultTyping(ptv, ObjectMapper.DefaultTyping.NON_FINAL);\n"
+        findings = _run(code, "config.java")
+        assert any(f.rule_id == "DS5" for f in findings)
+
+    def test_snakeyaml_unsafe_constructor_produces_ds5(self):
+        code = "Yaml yaml = new Yaml(new Constructor());\nObject obj = yaml.load(input);\n"
+        findings = _run(code, "config.java")
+        assert any(f.rule_id == "DS5" for f in findings)
+
+    def test_jackson_read_value_no_finding(self):
+        code = (
+            "ObjectMapper mapper = new ObjectMapper();\n"
+            "MyObj obj = mapper.readValue(json, MyObj.class);\n"
+        )
+        findings = _run(code, "handler.java")
+        assert not any(f.rule_id.startswith("DS") for f in findings)
+
+    def test_snakeyaml_safe_constructor_no_finding(self):
+        code = "Yaml yaml = new Yaml(new SafeConstructor(new LoaderOptions()));\n"
+        findings = _run(code, "config.java")
+        assert not any(f.rule_id == "DS5" for f in findings)
+
+    def test_read_object_declaration_alone_no_finding(self):
+        # A custom `readObject(ObjectInputStream)` hook declaration is not a
+        # deserialization call; only the empty-parens call form matches.
+        code = "private void readObject(ObjectInputStream in) throws IOException {}\n"
+        findings = _run(code, "model.java")
+        assert not any(f.rule_id == "DS5" for f in findings)
+
+    def test_java_pattern_does_not_fire_on_python(self):
+        findings = _run("x = ObjectInputStream(data)\n", "script.py")
+        assert findings == []
 
 
 class TestLanguageGating:
