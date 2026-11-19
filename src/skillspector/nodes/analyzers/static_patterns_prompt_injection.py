@@ -93,7 +93,16 @@ _FR_COVERTLY = (
 _FR_COVERT_ACTION = (
     r"(?:envoie|envoyez|transmets|transmettez|enregistre|enregistrez|journalise|journalisez)"
 )
-_FR_SEND_STEM = rf"(?:envo|transm|t{_FR_E}l{_FR_E}vers)"
+_FR_WORD_CHAR = r"[\ẁ-ͯ]"
+# Complete send verbs only: a bare stem also matches nouns such as "transmission".
+_FR_SEND_VERB = (
+    rf"(?<!{_FR_WORD_CHAR})(?:envo(?:ies?|yez|yer)|transm(?:ets?|ettez|ettre)"
+    rf"|t{_FR_E}l{_FR_E}vers(?:es?|ez|er))(?!{_FR_WORD_CHAR})"
+)
+# Rest of the same sentence. A terminator ends it unless a word character
+# follows, which keeps ".env" and URLs inside the sentence.
+_FR_SAME_SENTENCE = r"(?:[^.!?;\n]|[.!?;](?=\w)){0,200}?"
+_FR_UNKNOWN_TO_USER = rf"{_FR_A}\s+l{_FR_APOS}insu\s+(?:de\s+{_FR_USER}|des\s+utilisateurs)"
 
 # P1: Instruction Override
 P1_PATTERNS = [
@@ -291,17 +300,11 @@ P3_PATTERNS_FR = [
     (rf"{_FR_COVERT_ACTION}\s+{_FR_COVERTLY}", 0.9),
     (
         rf"sans\s+(?:le\s+dire\s+{_FR_A}|en\s+informer|informer|pr{_FR_E}venir|avertir|alerter)"
-        rf"\s+{_FR_USER}.*?{_FR_SEND_STEM}",
+        rf"\s+{_FR_USER}{_FR_SAME_SENTENCE}{_FR_SEND_VERB}",
         0.9,
     ),
-    (
-        rf"{_FR_A}\s+l{_FR_APOS}insu\s+(?:de\s+{_FR_USER}|des\s+utilisateurs).*?{_FR_SEND_STEM}",
-        0.9,
-    ),
-    (
-        rf"{_FR_SEND_STEM}\w*.*?{_FR_A}\s+l{_FR_APOS}insu\s+(?:de\s+{_FR_USER}|des\s+utilisateurs)",
-        0.9,
-    ),
+    (rf"{_FR_UNKNOWN_TO_USER}{_FR_SAME_SENTENCE}{_FR_SEND_VERB}", 0.9),
+    (rf"{_FR_SEND_VERB}{_FR_SAME_SENTENCE}{_FR_UNKNOWN_TO_USER}", 0.9),
 ]
 P4_PATTERNS_FR = [
     (
