@@ -720,14 +720,6 @@ class TestLP4GoCapabilityPatterns:
                 id="glob",
             ),
             pytest.param(
-                "file_read: config.json",
-                "file_read",
-                'package main\n\nimport "io"\n\n'
-                "func readAll(r io.Reader) ([]byte, error) {\n"
-                "\treturn io.ReadAll(r)\n}\n",
-                id="readall",
-            ),
-            pytest.param(
                 "file_write: out.json",
                 "file_write",
                 'package main\n\nimport "os"\n\nfunc main() {\n'
@@ -796,6 +788,114 @@ class TestLP4GoCapabilityPatterns:
         assert len(lp1_write) == 1, (
             f"Expected one LP1 for undeclared file_write, got: "
             f"{[(f.rule_id, f.message) for f in findings]}"
+        )
+
+    @pytest.mark.parametrize(
+        "go_code",
+        [
+            pytest.param(
+                'package main\n\nimport (\n\t"bytes"\n\t"io"\n)\n\nfunc main() {\n'
+                '\tdata, _ := io.ReadAll(bytes.NewBufferString("x"))\n\t_ = data\n}\n',
+                id="in_memory_buffer",
+            ),
+            pytest.param(
+                'package main\n\nimport (\n\t"io"\n\t"net/http"\n)\n\nfunc main() {\n'
+                '\tresp, _ := http.Get("https://example.com")\n'
+                "\tdata, _ := io.ReadAll(resp.Body)\n\t_, _ = resp, data\n}\n",
+                id="network_response_body",
+            ),
+        ],
+    )
+    def test_go_readall_on_arbitrary_reader_is_not_file_read(self, go_code):
+        """io.ReadAll consumes any io.Reader, so it proves nothing about
+        file access: a declared file_read permission stays over-declared
+        (LP4) and no LP1 fires for file_read."""
+        state = self._go_state(["file_read: config.json"], go_code)
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp4 = self._lp4_for_category(findings, "file_read")
+        assert len(lp4) == 1, (
+            f"Expected one LP4 for file_read, got: {[(f.rule_id, f.message) for f in findings]}"
+        )
+        lp1_read = [f for f in findings if f.rule_id == "LP1" and "file_read" in (f.message or "")]
+        assert lp1_read == [], (
+            f"Expected no LP1 for file_read, got: {[(f.rule_id, f.message) for f in findings]}"
+        )
+
+    def test_go_readall_after_os_open_still_satisfies_via_open(self):
+        """Reading a file opened with os.Open still counts as file_read,
+        through os.Open itself rather than through io.ReadAll."""
+        state = self._go_state(
+            ["file_read: config.json"],
+            'package main\n\nimport (\n\t"io"\n\t"os"\n)\n\nfunc main() {\n'
+            '\tf, _ := os.Open("config.json")\n\tdata, _ := io.ReadAll(f)\n\t_, _ = f, data\n}\n',
+        )
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp4 = self._lp4_for_category(findings, "file_read")
+        assert lp4 == [], (
+            f"os.Open should satisfy file_read, got: {[(f.rule_id, f.message) for f in findings]}"
+        )
+
+    def test_python_write_only_os_open_is_not_file_read(self):
+        """Python os.open with write-only flags must not count as read
+        evidence: the Go os.Open pattern applies to Go files only. The
+        declared file_read permission stays over-declared (LP4)."""
+        code = 'import os\nfd = os.open("out.bin", os.O_WRONLY | os.O_CREAT)\n'
+        state: dict = {
+            "manifest": {
+                "name": "py-skill",
+                "permissions": ["file_read: config.json"],
+                "triggers": [],
+            },
+            "file_cache": {"agent.py": code},
+            "component_metadata": [
+                {
+                    "path": "agent.py",
+                    "type": "python",
+                    "executable": True,
+                    "lines": len(code.splitlines()),
+                    "size_bytes": len(code),
+                },
+            ],
+            "has_executable_scripts": True,
+            "components": ["agent.py"],
+        }
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp4 = [f for f in findings if f.rule_id == "LP4" and "(file_read)" in (f.message or "")]
+        assert len(lp4) == 1, (
+            f"Expected one LP4 for file_read, got: {[(f.rule_id, f.message) for f in findings]}"
+        )
+
+    def test_python_write_only_os_open_fires_no_lp1(self):
+        """A Python write-only os.open call with an unrelated declaration
+        fires no LP1 for file_read."""
+        code = 'import os\nfd = os.open("out.bin", os.O_WRONLY | os.O_CREAT)\n'
+        state: dict = {
+            "manifest": {
+                "name": "py-skill",
+                "permissions": ["env: MY_TOOL_CONFIG"],
+                "triggers": [],
+            },
+            "file_cache": {"agent.py": code},
+            "component_metadata": [
+                {
+                    "path": "agent.py",
+                    "type": "python",
+                    "executable": True,
+                    "lines": len(code.splitlines()),
+                    "size_bytes": len(code),
+                },
+            ],
+            "has_executable_scripts": True,
+            "components": ["agent.py"],
+        }
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp1_read = [f for f in findings if f.rule_id == "LP1" and "file_read" in (f.message or "")]
+        assert lp1_read == [], (
+            f"Expected no LP1 for file_read, got: {[(f.rule_id, f.message) for f in findings]}"
         )
 
     def test_python_and_js_detection_unchanged(self):
