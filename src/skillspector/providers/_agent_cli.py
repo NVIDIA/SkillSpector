@@ -53,6 +53,7 @@ import plistlib
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1221,9 +1222,24 @@ def _check_opencode_system_directory(system_dir: str) -> None:
     directory means no machine-wide source exists and this part passes.
     A directory that cannot be listed, or a system config file that
     cannot be read or parsed, fails closed.
+
+    The config filenames and plugin directory names are probed as
+    canonical pathnames, never matched against the directory listing:
+    ``os.listdir`` returns on-disk casing, so ``"opencode.json" in
+    entries`` is a case-sensitive string comparison, while OpenCode
+    opens the fixed pathname ``path.join(directory, name)`` through
+    the filesystem (pinned ``config.ts`` ``loadDirectory`` over
+    ``discovery.ts`` ``names``). On Windows and case-insensitive macOS
+    volumes that resolves a differently cased on-disk file, so the
+    listing check skipped a config OpenCode would load. Probing the
+    canonical pathname with :func:`os.stat` defers to the filesystem's
+    own case semantics, so the gate sees exactly the file the child
+    would open; a stat failure other than "not present" fails closed.
+    The listing itself is still read once as the access probe: a
+    directory that cannot be listed fails closed.
     """
     try:
-        entries = os.listdir(system_dir)
+        os.listdir(system_dir)
     except FileNotFoundError:
         return
     except OSError as exc:
@@ -1231,16 +1247,30 @@ def _check_opencode_system_directory(system_dir: str) -> None:
             f"OpenCode system configuration directory {system_dir!r} could not be listed: {exc}"
         ) from exc
     for filename in ("opencode.json", "opencode.jsonc"):
-        if filename not in entries:
-            continue
         path = os.path.join(system_dir, filename)
+        try:
+            mode = os.stat(path).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise AgentCLIError(
+                f"OpenCode system configuration {path!r} could not be checked: {exc}"
+            ) from exc
+        if not stat.S_ISREG(mode):
+            continue
         config = _load_opencode_system_config(path)
         _refuse_opencode_managed_config(config, path, "system configuration")
     for subdir in ("plugin", "plugins"):
-        if subdir not in entries:
-            continue
         plugin_dir = os.path.join(system_dir, subdir)
-        if not os.path.isdir(plugin_dir):
+        try:
+            mode = os.stat(plugin_dir).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise AgentCLIError(
+                f"OpenCode system plugin directory {plugin_dir!r} could not be checked: {exc}"
+            ) from exc
+        if not stat.S_ISDIR(mode):
             continue
         try:
             installed = os.listdir(plugin_dir)

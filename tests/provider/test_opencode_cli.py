@@ -1433,6 +1433,111 @@ class TestOpencodeSystemSources:
         with pytest.raises(AgentCLIError, match="could not be decoded"):
             _check_opencode_system_sources()
 
+    @pytest.fixture
+    def _case_insensitive_system_dir(
+        self, _system_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> Path:
+        # Review round 7 (#1086): the host filesystem is case-sensitive,
+        # so a differently cased file on disk would not resolve under its
+        # canonical name here. Emulate a case-insensitive volume
+        # (Windows, default macOS) by resolving path lookups under the
+        # system directory case-insensitively, the way the volume would,
+        # so the gate is exercised against the names OpenCode itself
+        # would open.
+        real_stat = os.stat
+        real_listdir = os.listdir
+        real_open = open
+
+        def _resolve(path: str) -> str:
+            try:
+                rel = os.path.relpath(path, str(_system_dir))
+            except ValueError:
+                return path
+            if rel.startswith("..") or os.path.isabs(rel):
+                return path
+            current = str(_system_dir)
+            for part in Path(rel).parts:
+                if part in (".", ""):
+                    continue
+                match = next(
+                    (
+                        entry
+                        for entry in real_listdir(current)
+                        if entry.casefold() == part.casefold()
+                    ),
+                    None,
+                )
+                if match is None:
+                    return path
+                current = os.path.join(current, match)
+            return current
+
+        def fake_stat(path, *args, **kwargs):
+            if isinstance(path, (str, os.PathLike)):
+                path = _resolve(os.fspath(path))
+            return real_stat(path, *args, **kwargs)
+
+        def fake_listdir(path, *args, **kwargs):
+            if isinstance(path, (str, os.PathLike)):
+                path = _resolve(os.fspath(path))
+            return real_listdir(path, *args, **kwargs)
+
+        def fake_open(file, *args, **kwargs):
+            if isinstance(file, (str, os.PathLike)):
+                file = _resolve(os.fspath(file))
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(os, "stat", fake_stat)
+        monkeypatch.setattr(os, "listdir", fake_listdir)
+        monkeypatch.setattr(_agent_cli, "open", fake_open, raising=False)
+        return _system_dir
+
+    @pytest.mark.parametrize("filename", ["OpenCode.JSON", "OPENCODE.JSONC"])
+    def test_differently_cased_config_filename_refuses(
+        self, _case_insensitive_system_dir: Path, filename: str
+    ) -> None:
+        # Review round 7 (#1086): on a case-insensitive volume OpenCode
+        # opens the fixed pathname opencode.json/opencode.jsonc through
+        # the filesystem, so a differently cased on-disk file is the
+        # system config it loads. The gate must refuse its allow before
+        # auth, preflight, or inference starts.
+        (_case_insensitive_system_dir / filename).write_text(
+            json.dumps(
+                {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_differently_cased_plugin_dir_refuses(self, _case_insensitive_system_dir: Path) -> None:
+        # Same bypass through the plugin directory: OpenCode scans
+        # <system dir>/plugin and <system dir>/plugins, so a differently
+        # cased directory on a case-insensitive volume is still a
+        # configured system plugin.
+        plugins_dir = _case_insensitive_system_dir / "Plugins"
+        plugins_dir.mkdir()
+        (plugins_dir / "marker-plugin").write_text(
+            "top-level code writes a marker on import", encoding="utf-8"
+        )
+        with pytest.raises(AgentCLIError, match="is not empty"):
+            _check_opencode_system_sources()
+
+    def test_differently_cased_config_filename_passes_on_case_sensitive_fs(
+        self, _system_dir: Path
+    ) -> None:
+        # Control for the cases above: on a case-sensitive filesystem a
+        # differently cased name is a different file, one OpenCode never
+        # opens, so the gate correctly passes. The refusal applies only
+        # where the filesystem resolves the canonical name to it.
+        (_system_dir / "OpenCode.JSON").write_text(
+            json.dumps(
+                {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
     def test_scrub_env_keeps_programdata(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Review round 4 (#1086): the system-directory gate derives its
         # path from ProgramData, so the scrubbed child environment must
