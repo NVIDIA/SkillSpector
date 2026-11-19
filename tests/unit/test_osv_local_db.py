@@ -190,6 +190,117 @@ def test_missing_corrupt_and_malformed_are_not_clean(tmp_path: Path) -> None:
     assert partial.limitations[0].error_class == "InvalidOsvRecord"
 
 
+@pytest.mark.parametrize(
+    ("ecosystem", "other_ecosystem", "content", "filename", "coordinate"),
+    [
+        (
+            "npm",
+            "PyPI",
+            '{"dependencies": {"lodash": "4.17.20"}}',
+            "package.json",
+            ("lodash", "4.17.20"),
+        ),
+        ("PyPI", "npm", "requests==2.30.0\n", "requirements.txt", ("requests", "2.30.0")),
+    ],
+)
+def test_wrong_ecosystem_snapshot_keeps_analyzer_fallback(
+    tmp_path: Path,
+    ecosystem: str,
+    other_ecosystem: str,
+    content: str,
+    filename: str,
+    coordinate: tuple[str, str],
+) -> None:
+    snapshot(
+        tmp_path,
+        ecosystem,
+        advisory("WRONG-ECOSYSTEM", other_ecosystem, "demo", versions=["1.0.0"]),
+    )
+    result = query_batch([coordinate], ecosystem)
+    assert result == [[]]
+    assert result.local_checked == frozenset()
+    assert {limit.error_class for limit in result.limitations} == {"OsvSnapshotEcosystemMismatch"}
+    assert not osv_client.is_available()
+
+    findings, limits, _ = static_patterns_supply_chain._analyze_dependencies_detailed(
+        content, filename
+    )
+    sc4 = [finding for finding in findings if finding.rule_id == "SC4"]
+    assert sc4 and "static fallback" in sc4[0].explanation
+    assert any(limit.error_class == "OsvSnapshotEcosystemMismatch" for limit in limits)
+
+
+@pytest.mark.parametrize(
+    "withdrawn",
+    [
+        True,
+        False,
+        None,
+        1,
+        "",
+        "not a timestamp",
+        "2025-02-30T00:00:00Z",
+        "2025-01-01",
+        "2025-01-01T00:00:00",
+        "2025-01-01T00:00:00+01:00",
+        ["2025-01-01T00:00:00Z"],
+        {"date": "2025-01-01T00:00:00Z"},
+    ],
+)
+def test_invalid_withdrawn_keeps_analyzer_fallback(tmp_path: Path, withdrawn: object) -> None:
+    malformed = advisory("MALFORMED", "PyPI", "requests", versions=["2.30.0"])
+    malformed["withdrawn"] = withdrawn
+    snapshot(
+        tmp_path,
+        "PyPI",
+        malformed,
+        advisory("VALID", "PyPI", "unrelated", versions=["1.0"]),
+    )
+    result = query_batch([("requests", "2.30.0"), ("unrelated", "2.0")], "PyPI")
+    assert result == [[], []]
+    assert result.local_checked == frozenset()
+    assert {limit.error_class for limit in result.limitations} == {"InvalidOsvRecord"}
+
+    findings, limits, _ = static_patterns_supply_chain._analyze_dependencies_detailed(
+        "requests==2.30.0\n", "requirements.txt"
+    )
+    sc4 = [finding for finding in findings if finding.rule_id == "SC4"]
+    assert sc4 and "static fallback" in sc4[0].explanation
+    assert any(limit.error_class == "InvalidOsvRecord" for limit in limits)
+
+
+@pytest.mark.parametrize("withdrawn", ["2025-01-01T00:00:00Z", "2025-01-01T00:00:00.123456Z"])
+def test_valid_withdrawal_only_snapshot_has_complete_coverage(
+    tmp_path: Path, withdrawn: str
+) -> None:
+    record = advisory("WITHDRAWN", "PyPI", "requests", versions=["2.30.0"])
+    record["withdrawn"] = withdrawn
+    snapshot(tmp_path, "PyPI", record)
+    result = query_batch([("requests", "2.30.0"), ("unrelated", "1.0")], "PyPI")
+    assert result == [[], []]
+    assert result.local_checked == {0, 1}
+    assert not result.limitations
+
+    findings, limits, _ = static_patterns_supply_chain._analyze_dependencies_detailed(
+        "requests==2.30.0\n", "requirements.txt"
+    )
+    assert not any(finding.rule_id == "SC4" for finding in findings)
+    assert not limits
+
+
+def test_mixed_ecosystem_snapshot_can_complete_an_unmatched_query(tmp_path: Path) -> None:
+    snapshot(
+        tmp_path,
+        "PyPI",
+        advisory("NPM", "npm", "demo", versions=["1.0.0"]),
+        advisory("PYPI", "PyPI", "demo", versions=["1.0"]),
+    )
+    result = query_batch([("unrelated", "1.0")], "PyPI")
+    assert result == [[]]
+    assert result.local_checked == {0}
+    assert not result.limitations
+
+
 def test_index_reuse_and_archive_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

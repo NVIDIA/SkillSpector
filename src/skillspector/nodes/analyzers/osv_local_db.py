@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import zipfile
 import zlib
 from collections import defaultdict
@@ -32,6 +33,9 @@ _MAX_ARCHIVE_MEMBERS = 500_000
 _MAX_INDEX_ENTRIES = 1_000_000
 _MAX_EXPANDED_BYTES = 768 * 1024 * 1024
 _MAX_RECORD_BYTES = 2 * 1024 * 1024
+_WITHDRAWN_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z"
+)
 
 SNAPSHOT_ERRORS = (
     OSError,
@@ -108,6 +112,17 @@ def _entries(record: dict) -> list[dict]:
     return entries
 
 
+def _is_withdrawn(record: dict) -> bool:
+    if "withdrawn" not in record:
+        return False
+    value = record["withdrawn"]
+    # OSV withdrawals must be RFC3339 timestamps in UTC, ending in Z.
+    if not isinstance(value, str) or not _WITHDRAWN_TIMESTAMP.fullmatch(value):
+        raise ValueError("invalid withdrawal timestamp")
+    datetime.fromisoformat(value)
+    return True
+
+
 @dataclass
 class SnapshotIndex:
     """Package-to-member index tied to one opened snapshot, shared within a scan."""
@@ -118,12 +133,15 @@ class SnapshotIndex:
     mtime_ns: int
     members: dict[str, list[zipfile.ZipInfo]] = field(default_factory=lambda: defaultdict(list))
     malformed: bool = False
+    ecosystem_mismatch: bool = False
     limitation: SnapshotLimitation | None = None
     timed_out: bool = False
 
     def build(self, remaining_seconds: Callable[[], float]) -> None:
         expanded_bytes = 0
         index_entries = 0
+        has_records = False
+        recognized_ecosystem = False
         for member in self.archive.infolist():
             if remaining_seconds() <= 0:
                 self.timed_out = True
@@ -138,19 +156,23 @@ class SnapshotIndex:
                 break
             try:
                 record = _read_record(self.archive, member)
-                if record.get("withdrawn"):
+                has_records = True
+                withdrawn = _is_withdrawn(record)
+                # Withdrawn records may omit affected entirely. When present,
+                # their coordinates still identify the snapshot ecosystem.
+                entries = _entries(record) if not withdrawn or "affected" in record else []
+                names = {
+                    _affected_package(entry, self.metadata["ecosystem"]) for entry in entries
+                } - {None}
+                recognized_ecosystem |= bool(names)
+                if withdrawn:
                     continue
-                packages = {
-                    _affected_package(entry, self.metadata["ecosystem"])
-                    for entry in _entries(record)
-                }
             except SnapshotLimitError as exc:
                 self.limitation = exc.limitation
                 continue
             except SNAPSHOT_ERRORS:
                 self.malformed = True
                 continue
-            names = packages - {None}
             index_entries += len(names)
             if index_entries > _MAX_INDEX_ENTRIES:
                 self.limitation = SnapshotLimitation(
@@ -159,6 +181,14 @@ class SnapshotIndex:
                 break
             for name in names:
                 self.members[name].append(member)
+        # An empty ZIP is usable, but records from a different ecosystem are
+        # not evidence of a clean lookup. Other read failures already explain
+        # why an index cannot establish complete coverage.
+        self.ecosystem_mismatch = (
+            has_records
+            and not recognized_ecosystem
+            and not (self.malformed or self.limitation or self.timed_out)
+        )
 
     def unchanged(self) -> bool:
         stat = os.fstat(self.source.fileno())

@@ -638,8 +638,19 @@ def _query_snapshot(
         return frozenset()
     if not _snapshot_unchanged(snapshot, budget):
         return frozenset()
-    complete_index = not (snapshot.malformed or snapshot.limitation or snapshot.timed_out)
+    complete_index = not (
+        snapshot.malformed
+        or snapshot.ecosystem_mismatch
+        or snapshot.limitation
+        or snapshot.timed_out
+    )
     budget.query_ok = complete_index
+    if snapshot.ecosystem_mismatch:
+        budget.note(
+            OsvQueryLimitation(
+                LedgerReason.DEPENDENCY_PARSE_ERROR, error_class="OsvSnapshotEcosystemMismatch"
+            )
+        )
     if snapshot.malformed:
         budget.note(
             OsvQueryLimitation(LedgerReason.DEPENDENCY_PARSE_ERROR, error_class="InvalidOsvRecord")

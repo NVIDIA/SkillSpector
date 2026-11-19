@@ -1113,7 +1113,9 @@ time in `metadata.osv_lookup`. File modification time reflects the local file,
 which may differ from the OSV publication date.
 
 Missing, malformed, unsupported, or truncated data is reported as incomplete
-coverage. The built-in list is used for unchecked coordinates. Unresolved
+coverage. This includes archives with records but no recognized entries for the
+requested ecosystem, and records with invalid withdrawal timestamps. The built-in
+list is used for unchecked coordinates. Unresolved
 versions may show advisory history and remain unchecked. Set
 `SKILLSPECTOR_OSV_TIMEOUT` to adjust the lookup timeout, subject to the scan's
 shared deadline. The snapshot setting only controls SC4, independently of the
