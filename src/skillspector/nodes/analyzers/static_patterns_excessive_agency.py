@@ -245,6 +245,11 @@ _EA5_SHELL_FENCE_LANGUAGES = {"bash", "console", "sh", "shell", "zsh"}
 _EA5_LEADING_OPTION = re.compile(r"--?[A-Za-z0-9]")
 # POSIX shell, PowerShell and CMD line continuations.
 _EA5_LINE_CONTINUATION = re.compile(r"[\\`^][ \t]*$")
+# Shell operators that end one command and start another on the same logical line.
+_EA5_COMMAND_SEPARATORS = {"&&", "||", ";", "|", "|&", "&"}
+# A carried executable only needs its name to be classified; capping it keeps every
+# continued line's parse bounded by that line's own length.
+_EA5_MAX_EXECUTABLE_CHARS = 64
 _EA5_MODEL_VALUE = re.compile(
     r"^(?:claude|gpt|gemini|deepseek|kimi|glm|minimax|mistral|llama)"
     r"(?:$|[-_./:0-9])",
@@ -299,8 +304,64 @@ def _is_model_switch_command(command: str) -> bool:
     return False
 
 
-def _command_span(line: str, *, continued: bool = False) -> tuple[int, int] | None:
-    """Return the model-switch command span for an actionable instruction line."""
+def _continued_executable(line: str, executable: str | None) -> str | None:
+    """Return the executable whose arguments continue onto the next line.
+
+    ``executable`` is the one this line itself continues, if any. Returns None when
+    the line does not continue a command, or ends in an operator so the next line
+    starts a new command.
+    """
+    match = _EA5_LINE_CONTINUATION.search(line)
+    if match is None:
+        return None
+    body = line[: match.start()]
+    marker = line[match.start()]
+    # Each host escapes its own marker by doubling it ("\\", "^^", "``"), so a
+    # marker preceded by an odd run of the same marker is literal, not a continuation.
+    if (len(body) - len(body.rstrip(marker))) % 2 == 1:
+        return None
+    # A PowerShell continuation backtick follows whitespace. One closing a Markdown
+    # inline-code span ("Use `notes.md`") does not, and pairs with an earlier one.
+    if marker == "`" and body[-1:] not in {"", " ", "\t"} and line.count("`") % 2 == 0:
+        return None
+
+    candidate = body.strip()
+    if candidate.startswith(("$", ">")):
+        candidate = candidate[1:].lstrip(" \t")
+    imperative = _EA5_IMPERATIVE_PREFIX.match(candidate)
+    if imperative is not None:
+        candidate = candidate[imperative.end() :]
+    candidate = candidate.strip("`")
+    # Non-POSIX mode keeps quotes on tokens, so a quoted "#" is not read as a comment.
+    lexer = shlex.shlex(candidate, posix=False, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        tokens = candidate.split()
+    # The continuation marker sits inside a shell comment, so it continues nothing.
+    if any(token.startswith("#") for token in tokens):
+        return None
+
+    separators = [index for index, token in enumerate(tokens) if token in _EA5_COMMAND_SEPARATORS]
+    if separators:
+        tokens = tokens[separators[-1] + 1 :]
+        if not tokens:
+            return None
+    elif executable is not None:
+        return executable
+    if not tokens:
+        return ""
+    return tokens[0].strip("\"'").rsplit("/", 1)[-1].lower()[:_EA5_MAX_EXECUTABLE_CHARS]
+
+
+def _command_span(line: str, *, executable: str | None = None) -> tuple[int, int] | None:
+    """Return the model-switch command span for an actionable instruction line.
+
+    ``executable`` is set when the previous line continues a command, and names
+    the executable that command started with.
+    """
     # Inline code is handled separately so surrounding prose and punctuation do
     # not become part of the command span (or create a duplicate finding).
     if "`" in line:
@@ -317,9 +378,10 @@ def _command_span(line: str, *, continued: bool = False) -> tuple[int, int] | No
     # A line that starts with an option names no executable. Help output lists
     # options this way ("-m, --model   Claude model to use"), so such a line is
     # only part of a command when the previous line continues one.
-    if not continued and _EA5_LEADING_OPTION.match(command):
+    if executable is None and _EA5_LEADING_OPTION.match(command):
         return None
-    if _is_model_switch_command(command):
+    # A continued line holds only arguments, so read it after its executable.
+    if _is_model_switch_command(f"{shlex.quote(executable)} {command}" if executable else command):
         start = line.find(command, leading)
         return start, start + len(command)
 
@@ -383,7 +445,7 @@ def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
     cursor = body_start
     fence_marker: str | None = None
     fence_language = ""
-    continued = False
+    continued_executable: str | None = None
     for line in content[body_start:].splitlines(keepends=True):
         line_text = line.rstrip("\r\n")
         fence = _EA5_FENCE.match(line_text)
@@ -398,7 +460,7 @@ def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
             cursor += len(line)
             # A fence line ends any command, so a continuation on the line before it
             # does not carry into the fence.
-            continued = False
+            continued_executable = None
             continue
 
         candidates: list[tuple[int, int]] = []
@@ -407,7 +469,7 @@ def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
             or fence_language in _EA5_SHELL_FENCE_LANGUAGES
             or not fence_language
         ):
-            direct = _command_span(line_text, continued=continued)
+            direct = _command_span(line_text, executable=continued_executable)
             if direct is not None:
                 candidates.append(direct)
         for inline in _EA5_INLINE_CODE.finditer(line_text):
@@ -435,7 +497,7 @@ def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
                     evidence={"selection_surface": "command"},
                 )
             )
-        continued = _EA5_LINE_CONTINUATION.search(line_text) is not None
+        continued_executable = _continued_executable(line_text, continued_executable)
         cursor += len(line)
     return findings
 
