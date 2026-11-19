@@ -339,18 +339,37 @@ def resolve_dynamic_import_call(
     return f"{module_name}.{func.attr}"
 
 
+_INSTANCE_NAMES = ("self", "cls")
+
+
+def _instance_attribute(node: ast.expr) -> str | None:
+    """Return ``"self.attr"`` for a ``self.attr`` / ``cls.attr`` target, else ``None``."""
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in _INSTANCE_NAMES
+    ):
+        return f"{node.value.id}.{node.attr}"
+    return None
+
+
 def build_type_map(
     tree: ast.Module, import_aliases: dict[str, str] | None = None
 ) -> dict[str, str]:
     """Infer variable types from constructor calls.
 
-    Scans assignments (``var = Type(...)``) and ``with`` statements
-    (``with Type() as var``) and records ``{var: "fully.qualified.Type"}``.
+    Scans assignments (``var = Type(...)``, ``self.attr = Type(...)``) and
+    ``with`` / ``async with`` statements (``with Type() as var``) and records
+    ``{var: "fully.qualified.Type"}``, keying attributes as ``"self.attr"``.
     Import aliases are resolved so ``from pathlib import Path; p = Path(x)``
     maps ``p`` → ``"pathlib.Path"``.
+
+    Attributes are keyed per file, not per class, so an attribute assigned
+    different constructors (``self.client`` in two classes) is left untyped.
     """
     import_aliases = build_import_aliases(tree) if import_aliases is None else import_aliases
     type_map: dict[str, str] = {}
+    attribute_types: dict[str, set[str]] = {}
 
     def _resolve_ctor(call_node: ast.Call) -> str | None:
         raw = resolve_dotted_name(call_node.func)
@@ -367,7 +386,9 @@ def build_type_map(
                 for target in node.targets:
                     if isinstance(target, ast.Name):
                         type_map[target.id] = ctor
-        elif isinstance(node, ast.With):
+                    elif (attribute := _instance_attribute(target)) is not None:
+                        attribute_types.setdefault(attribute, set()).add(ctor)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
             for item in node.items:
                 if (
                     isinstance(item.context_expr, ast.Call)
@@ -378,6 +399,9 @@ def build_type_map(
                     if ctor:
                         type_map[item.optional_vars.id] = ctor
 
+    for attribute, ctors in attribute_types.items():
+        if len(ctors) == 1:
+            type_map[attribute] = next(iter(ctors))
     return type_map
 
 
@@ -389,7 +413,8 @@ def resolve_call_name_typed(
     """Like ``resolve_call_name`` but consults *type_map* for instance methods.
 
     For ``sock.recv(1024)`` where *type_map* maps ``sock`` → ``socket.socket``,
-    this returns ``"socket.socket.recv"`` instead of ``"sock.recv"``.
+    this returns ``"socket.socket.recv"`` instead of ``"sock.recv"``. Attributes
+    resolve the same way: ``self.sock.recv(1024)`` looks up ``"self.sock"``.
 
     When *aliases* (from :func:`build_import_aliases`) is supplied, import-aliased and
     ``from``-imported names are also normalized, so ``import subprocess as sp; sp.run``
@@ -407,6 +432,9 @@ def resolve_call_name_typed(
         plain = apply_import_aliases(plain, aliases)
     if type_map is not None and "." in plain:
         root, _, rest = plain.partition(".")
+        if root in _INSTANCE_NAMES and "." in rest:
+            attribute, _, rest = rest.partition(".")
+            root = f"{root}.{attribute}"
         inferred = type_map.get(root)
         if inferred is not None:
             plain = f"{inferred}.{rest}"
