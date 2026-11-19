@@ -240,6 +240,18 @@ _AST4_FIXED_ARGV_REMEDIATION = (
     "Keep the explicit argument vector and shell=False. Validate the executable, its resolved path, "
     "and any dynamic arguments before launch; do not switch to shell=True."
 )
+_AST4_BATCH_FILE_EXPLANATION = (
+    "Fixed argument vector for a Windows batch target: subprocess names a .cmd/.bat file with "
+    "literal arguments and shell=False. CPython documents that Windows may launch these files "
+    "through the system command shell regardless of the shell flag, so those argument values can "
+    "still be subject to shell parsing. This call starts an external process but does not prove "
+    "that shell parsing is impossible."
+)
+_AST4_BATCH_FILE_REMEDIATION = (
+    "Keep shell=False, but do not treat it as proof that a .cmd/.bat target cannot be parsed by "
+    "the system shell. Resolve the batch file to a trusted path and avoid passing untrusted "
+    "arguments, or launch a non-batch executable or explicit interpreter instead."
+)
 _AST4_SHELL_BUILD_EXPLANATION = (
     "Shell command construction: subprocess runs a command string with shell=True, so "
     "concatenated input and shell metacharacters can change the invocation or inject additional "
@@ -445,16 +457,36 @@ _CMD_INTERPRETERS = frozenset({"cmd", "cmd.exe"})
 _POWERSHELL_INTERPRETERS = frozenset({"powershell", "powershell.exe", "pwsh", "pwsh.exe"})
 
 
+_BATCH_FILE_EXTENSIONS = (".bat", ".cmd")
+
+
+def _executable_basename(executable: str) -> str:
+    """Return the lower-cased final path component of *executable*."""
+    return executable.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+
+
 def _is_shell_interpreter_name(executable: str | None) -> bool:
     """Return whether *executable* names a known shell interpreter."""
     if executable is None:
         return False
-    basename = executable.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+    basename = _executable_basename(executable)
     return (
         basename in _SHELL_INTERPRETERS
         or basename in _CMD_INTERPRETERS
         or basename in _POWERSHELL_INTERPRETERS
     )
+
+
+def _is_batch_file_name(executable: str | None) -> bool:
+    """Return whether *executable* names a Windows batch file.
+
+    CPython documents that Windows may run ``.cmd``/``.bat`` files through the
+    system command shell even when ``shell=False``, so a fixed argument vector
+    does not prove that shell parsing cannot occur.
+    """
+    if executable is None:
+        return False
+    return _executable_basename(executable).endswith(_BATCH_FILE_EXTENSIONS)
 
 
 def _literal_inline_shell_command(
@@ -575,6 +607,8 @@ def _ast4_guidance(node: ast.Call, attr: str) -> tuple[str, str]:
         return _AST4_SHELL_STRING_EXPLANATION, _AST4_SHELL_STRING_REMEDIATION
     if _is_shell_interpreter_name(executable.name):
         return _AST4_SHELL_STRING_EXPLANATION, _AST4_SHELL_STRING_REMEDIATION
+    if _is_batch_file_name(executable.name):
+        return _AST4_BATCH_FILE_EXPLANATION, _AST4_BATCH_FILE_REMEDIATION
     if _is_fixed_argv(command):
         return _AST4_FIXED_ARGV_EXPLANATION, _AST4_FIXED_ARGV_REMEDIATION
     return _AST4_UNKNOWN_EXPLANATION, _AST4_UNKNOWN_REMEDIATION

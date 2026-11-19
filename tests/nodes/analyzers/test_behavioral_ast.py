@@ -327,6 +327,59 @@ class TestSubprocessGuidance:
         assert "shell expansion is disabled" in explanation
         assert "shell command string" not in explanation
 
+    @pytest.mark.parametrize(
+        ("target", "shell_argument"),
+        [
+            ("build.cmd", ", shell=False"),
+            ("build.bat", ", shell=False"),
+            ("C:\\tools\\build.cmd", ", shell=False"),
+            ("BUILD.CMD", ""),
+        ],
+    )
+    def test_batch_file_target_uses_platform_qualified_guidance(self, target, shell_argument):
+        """Windows may run .cmd/.bat files through the system shell despite shell=False."""
+        code = f"import subprocess\nsubprocess.run([{target!r}, 'release']{shell_argument})\n"
+        finding = next(f for f in _run(code) if f.rule_id == "AST4")
+
+        explanation = (finding.explanation or "").lower()
+        remediation = (finding.remediation or "").lower()
+
+        assert "windows batch target" in explanation
+        assert "system command shell" in explanation
+        assert "shell expansion is disabled" not in explanation
+        assert "does not prove that shell parsing is impossible" in explanation
+        assert "shell=false" in remediation
+        assert "do not treat it as proof" in remediation
+
+    def test_ordinary_executable_keeps_fixed_argv_guidance(self):
+        """A non-batch executable must keep the unconditional fixed-argv guidance."""
+        code = 'import subprocess\nsubprocess.run(["build.exe", "release"], shell=False)\n'
+        finding = next(f for f in _run(code) if f.rule_id == "AST4")
+
+        explanation = (finding.explanation or "").lower()
+
+        assert "fixed argument vector" in explanation
+        assert "shell expansion is disabled" in explanation
+        assert "windows batch target" not in explanation
+        assert "system command shell" not in explanation
+
+    def test_literal_batch_file_executable_override_uses_platform_qualified_guidance(self):
+        """A known literal executable override to a .cmd target must be qualified too."""
+        code = (
+            "import subprocess\n"
+            "subprocess.run(['placeholder', 'release'], "
+            "executable=r'C:\\tools\\build.cmd', shell=False)\n"
+        )
+        finding = next(f for f in _run(code) if f.rule_id == "AST4")
+
+        explanation = (finding.explanation or "").lower()
+        remediation = (finding.remediation or "").lower()
+
+        assert "windows batch target" in explanation
+        assert "system command shell" in explanation
+        assert "shell expansion is disabled" not in explanation
+        assert "do not treat it as proof" in remediation
+
     def test_popen_positional_shell_executable_uses_shell_guidance(self):
         """`Popen` accepts `executable` as its third positional argument."""
         code = (
