@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -981,3 +983,191 @@ def test_prose_ownership_checks_cancellation_after_word_jumps(
     content += "\n\n" + prefix + "The interface doesn't match the spec.\n"
     with pytest.raises(TimeoutError, match="cancelled"):
         tm._markdown_shell_text(content, cancel)
+
+
+def test_quoted_fence_markers_need_an_explicit_matching_close():
+    from skillspector.markdown_tokens import quoted_list_spans
+
+    closed = "> ```text\n> status\n> ```\n"
+    open_only = "> ```text\n> status\n"
+    for source, expected in [(closed, ["```", "```"]), (open_only, [])]:
+        spans = quoted_list_spans(source, lambda: None)
+        assert spans is not None
+        assert [source[a:b] for a, b in spans.fence_markers] == expected
+
+
+@pytest.mark.parametrize("name", ["gen2's", "2's"])
+def test_alphanumeric_possessive_in_documentation(name: str):
+    source = f"Use {name} ordinary output.\n\n> Read `guide.md` in this guide.\n"
+    assert "'" not in tm._markdown_shell_text(source, lambda: None, word_apostrophes=True)
+
+
+def test_nested_markdown_example_keeps_executing_inline_and_fenced_sinks():
+    safe = "````markdown\n- **State:** the `READY_FLAG` value.\n````\n"
+    harmful = safe.replace("the `READY_FLAG` value", 'the `sh -c "$CMD"` command')
+    actual = safe + "\n```sh\nsudo rm -rf /\n```\n"
+
+    assert tm.bounded_parse_diagnostic(safe, lambda: None, file_type="markdown") is None
+    assert tm.bounded_parse_diagnostic(harmful, lambda: None, file_type="markdown") is not None
+    assert any(f.rule_id == "TM1" for f in tm.analyze(actual, "example.md", "markdown"))
+
+
+def test_documentation_can_quote_a_path_in_console_output():
+    message = "tool: error: cannot open `/tmp/output'\n"
+    closed = "```console\n" + message + "```\n"
+    as_shell = "```sh\n" + message + "```\n"
+    assert " /tmp/output " in tm._markdown_shell_text(closed, lambda: None)
+    for source in ["```console\n" + message, as_shell, closed.replace("/tmp/output", "$TARGET")]:
+        assert "`" in tm._markdown_shell_text(source, lambda: None)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "- `` ```chart `` blocks → native charts.\n",
+        "No line starts with\n`command (`.\n".lower(),
+        'The output is wrapped as `{"<key>": "<value>", "result": <code>}`.\n',
+        "```\n[ ] Uses `core`, not `extension`.\n[ ] Data types match.\n```\n",
+        '| Signature (grep -E) | Name |\n|---|---|\n| `Value="[^"]+"` | Example |\n',
+    ],
+)
+def test_native_reference_examples_preserve_other_executable_scopes(content):
+    assert tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown") is None
+    assert tm.bounded_parse_diagnostic(
+        content + '\n```sh\neval "$CMD"\n```\n', lambda: None, file_type="markdown"
+    )
+
+
+def test_regular_expression_quotes_are_owned_only_by_the_proved_column():
+    source = '| Command | Pattern (grep -E) |\n|---|---|\n| `Value="[^"]+"` | `Value="[^"]+"` |\n'
+    projected = tm._markdown_shell_text(source, lambda: None)
+    assert projected.splitlines()[-1].count('[^"]') == 1
+    assert source.index('[^"]') == projected.index('[^"]')
+
+
+def test_directory_tree_keeps_unproved_command_and_incomplete_fence():
+    source = (
+        '```text\n├── record.json  # ["<name>", …] — output\n└── runner # `sh -c "$payload"`\n```\n'
+    )
+    projected = tm._markdown_shell_text(source, lambda: None)
+    assert '"<name>"' not in projected
+    assert '`sh -c "$payload"`' in projected
+    assert '"<name>"' in tm._markdown_shell_text(source[:-4], lambda: None)
+
+
+def test_timing_diagram_requires_axis_and_plain_signal_row():
+    row = "clock     ___|```|___|````|\n"
+    axis = "          |   |   |   |\n"
+
+    def projection(body: str) -> str:
+        return tm._markdown_shell_text("```text\n" + body + "```\n", lambda: None)
+
+    assert "`" not in projection(axis + row)
+    assert row in projection(row)
+    assert row.rstrip() + "$CMD" in projection(axis + row.rstrip() + "$CMD\n")
+
+
+def test_single_make_recipe_output_owns_its_source_quotes():
+    recipe = '\t@echo "$@ $$LOGS/$@.log" >> runs.txt'
+    source = "run: input\n" + recipe + "\n"
+    ranges = list(tm._make_output_recipes(source, lambda: None))
+    assert [(source[lo:hi], diagnostic) for lo, hi, diagnostic in ranges] == [(recipe, None)]
+    wrapped = "```makefile\n" + source + "```\n"
+    assert tm.bounded_parse_diagnostic(wrapped, lambda: None, file_type="markdown") is None
+    assert tm.bounded_parse_diagnostic(
+        wrapped + '\n```sh\nsh -c "$CMD"\n```\n', lambda: None, file_type="markdown"
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '\t@echo "$@" > output\n',
+        'all:\n\t@echo "$@" > "$DEST"\n',
+        'all:\n\t@echo "$(shell touch /tmp/work)" > output\n',
+        'all:\n\t@sh -c "$@" > output\n',
+        '.ONESHELL:\nall:\n\t@echo "$@" > output\n',
+        'all: SHELL := custom\n\t@echo "$@" > output\n',
+        'include options.mk\nall:\n\t@echo "$@" > output\n',
+        'all:\n\t@echo one \\\n\t@echo "$@" > output\n',
+    ],
+)
+def test_unproved_make_recipes_retain_original_boundaries(source):
+    assert list(tm._make_output_recipes(source, lambda: None)) == []
+
+
+@pytest.mark.parametrize(
+    ("setup", "target", "expansion"),
+    [
+        ("", "all", "$(VALUE)"),
+        ("VALUE := output", "all", "$(VALUE)"),
+        ("VALUE ?= output", "all", "${VALUE}"),
+        ('VALUE = "; $$PROGRAM; echo "', "all", "$(VALUE)"),
+        ('override VALUE := "; $$PROGRAM; echo "', "all", "$(VALUE)"),
+        ('# SHELL = configurable\nVALUE := "; $$PROGRAM; echo "', "all", "$(VALUE)"),
+        ("SHELL := /bin/sh\nVALUE ?= output", "all", "$(VALUE)"),
+        ("include settings.mk", "all", "$(VALUE)"),
+        ("ifdef OTHER\noverride VALUE := output\nendif", "all", "$(VALUE)"),
+        ('Q := "; $$PROGRAM; echo "', "all", "$Q"),
+        ('all: VALUE = "; $$PROGRAM; echo "', "all", "$(VALUE)"),
+        ("TARGETS ?= one", "$(TARGETS)", "$@"),
+        ("", ".DEFAULT", "$@"),
+    ],
+)
+def test_make_substitution_can_change_the_shell_recipe(setup, target, expansion):
+    source = f'# é\n```make\n{setup}\n{target}:\n\t@echo "{expansion}" > out\n```\n'
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.cause is tm.ParserCause.RUNTIME_DEPENDENT
+    assert diagnostic.check is tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert source[diagnostic.start : diagnostic.end] == expansion
+
+
+def test_make_substitution_preserves_earlier_runtime_command():
+    source = '```sh\nsh -c "$CALLER"\n```\n```make\nall:\n\t@echo "$(VALUE)" > out\n```\n'
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.start < source.index("```make")
+
+
+def test_make_unconditional_forced_literal_value_can_be_inspected():
+    source = '```make\noverride VALUE := fixed-path\nall:\n\t@echo "$(VALUE)" > out\n```\n'
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="markdown") is None
+
+
+def test_adjacent_shell_variables_in_an_unmatched_make_recipe_finish():
+    script = r"""
+from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+line = '\t@echo "' + '$$Letters' * 70 + '%" > out\n'
+assert list(tm._make_output_recipes("all:\n" + line, lambda: None)) == []
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=15)
+
+
+def test_documented_stdout_substitution_must_be_a_placeholder() -> None:
+    guide = "The tool prints its path on stdout, for\n  `$(...)`, and its status on stderr."
+    start = guide.index("$")
+    assert tm._documented_expansion_placeholder(guide, start, start + 6)
+    for other in (guide.replace("...", "run"), guide.replace("on stdout", "to run")):
+        start = other.index("$")
+        assert not tm._documented_expansion_placeholder(other, start, other.index("`", start))
+
+
+def test_nested_document_emits_fence_punctuation_and_preserves_commands() -> None:
+    text = 'Here is a document.\n\n```markdown\nUsage:\n\n```sh\nsh -c "$CMD"\n```\n'
+    projected = tm._markdown_shell_text(text, lambda: None)
+    assert "```sh" not in projected
+    assert 'sh -c "$CMD"' in projected
+    assert tm.bounded_parse_diagnostic(text, lambda: None, file_type="markdown")
+    open_outer = text.removesuffix("```\n")
+    assert "```sh" in tm._markdown_shell_text(open_outer, lambda: None)
+
+
+def test_yaml_scalar_and_python_fence_keep_executable_values() -> None:
+    yaml = '```yaml\nscript:\n  - echo "value=$COUNT"\n  - sh -c "$CMD"\n```\n'
+    assert tm.bounded_parse_diagnostic(yaml, lambda: None, file_type="markdown")
+    script = '```python\ndef value():\n    """Compute an example value."""\n    return 1\n```\n'
+    assert tm.bounded_parse_diagnostic(script, lambda: None, file_type="markdown") is None
+    assert tm.bounded_parse_diagnostic(
+        script + '\n```sh\nsh -c "$CMD"\n```\n', lambda: None, file_type="markdown"
+    )
