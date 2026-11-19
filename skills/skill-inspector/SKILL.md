@@ -37,7 +37,7 @@ Do not rely on the numeric score alone. A low score can miss semantic risk, and 
 
    Name the install channel (git tag or commit, publish branch, package registry tarball, or release binary) and fetch from that channel at the exact version the install pins, for example `git clone --branch <tag> <url>` or `npm pack <pkg>@<version>`, never a default-branch clone. If the user gives only a repository URL with no pinned version, ask which tag, commit, or release will be installed before reviewing. Record the resolved version or commit in the report's Source line, and make every line reference in the report point at that artefact.
 
-   When the target writes skill or instruction files at run time, locate the generator and review the rendered text, above all its trigger `description`: a file-based scan never sees text that only exists after the first run.
+   When the target writes skill or instruction files at run time, locate the generator and review the rendered text, above all its trigger `description`: a file-based scan never sees text that only exists after the first run. Do not run the generator to obtain that text. When the rendered text depends on runtime inputs (configuration chosen on first run, environment values, or user selections), reconstruct it statically from the generator source by listing every input it branches on and reviewing each resulting variant, or ask for a rendered artifact produced outside this review and review that instead. If neither path yields the final text, record the missing coverage in the report and cap the verdict at `CAUTION`: the verdict does not cover the generated instruction text.
 
    When installed hooks or scripts execute code outside the installed path (a globally installed CLI, a self-updater), list that code and either review it or state plainly that the verdict does not cover it.
 
@@ -96,8 +96,8 @@ Do not rely on the numeric score alone. A low score can miss semantic risk, and 
 
    Use this rubric:
 
-   - `APPROVE`: no HIGH or CRITICAL findings, no unexplained sensitive behavior, and the source matches the stated purpose.
-   - `CAUTION`: sensitive behavior exists, but it is documented, necessary, bounded, and controllable by the user.
+   - `APPROVE`: no HIGH or CRITICAL findings, no unexplained sensitive behavior, the source matches the stated purpose, and any runtime-generated instruction text was either reconstructed statically or reviewed as a supplied rendered artifact.
+   - `CAUTION`: sensitive behavior exists, but it is documented, necessary, bounded, and controllable by the user. Use `CAUTION` as well when runtime-generated instruction text could not be obtained within the operating rules, and name the uncovered text in the report.
    - `REJECT`: malicious or deceptive behavior, unexplained HIGH or CRITICAL findings, hidden prompt injection, credential theft, unknown exfiltration, obfuscated execution, persistence, or a clear mismatch between description and behavior.
 
 ## Score Interpretation

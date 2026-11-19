@@ -44,6 +44,23 @@ def test_step_1_covers_runtime_generated_skill_text() -> None:
     assert "trigger `description`" in text
 
 
+def test_step_1_records_unavailable_runtime_generated_text_as_missing_coverage() -> None:
+    text = _skill_text()
+
+    assert "Do not run the generator" in text
+    assert "reconstruct it statically" in text
+    assert "rendered artifact" in text
+    assert "cap the verdict at `CAUTION`" in text
+    assert "verdict does not cover the generated instruction text" in text
+
+
+def test_verdict_rubric_gates_approve_on_runtime_generated_text() -> None:
+    text = _skill_text()
+
+    assert "reconstructed statically or reviewed as a supplied rendered artifact" in text
+    assert "could not be obtained within the operating rules" in text
+
+
 def test_step_1_covers_code_outside_the_installed_path() -> None:
     text = _skill_text()
 
