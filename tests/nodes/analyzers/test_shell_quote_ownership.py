@@ -1931,6 +1931,42 @@ def test_printed_legacy_substitution_keeps_raw_destructive_commands():
     assert any(finding.rule_id == "TM1" for finding in tm.analyze(source, "example.sh", "shell"))
 
 
+def test_native_paragraph_quotes_preserve_offsets_and_field_contents():
+    from skillspector.wordprocessingml import paragraph_contractions
+
+    head = '<m:document xmlns:m="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><m:body>'
+    tail = "</m:body></m:document>"
+    paragraph = "<m:p><m:r><m:t>We don</m:t></m:r><m:r><m:t>'t split prose.</m:t></m:r></m:p>"
+    text = head + "<!-- résumé -->" + paragraph + tail
+    normalized = paragraph_contractions(text, lambda: None)
+    assert normalized == text.replace("'t split", "_t split")
+    assert paragraph_contractions(text[:-1], lambda: None) == text[:-1]
+    for change in (
+        paragraph.replace("<m:t>'t split prose.", "<m:t>'t split ${tool}"),
+        paragraph.replace("<m:t>'t split", "<m:instrText>'t split").replace(
+            "prose.</m:t>", "prose.</m:instrText>"
+        ),
+    ):
+        source = head + change + tail
+        assert paragraph_contractions(source, lambda: None) == source
+    with_dtd = '<!DOCTYPE document [<!ENTITY x "anything">]>' + text
+    assert paragraph_contractions(with_dtd, lambda: None) == with_dtd
+
+    # A BOM and a long native closing section must not turn a contraction
+    # into an unterminated shell word. Runtime commands elsewhere stay visible.
+    padding = "<m:p><m:r><m:t>Ordinary text.</m:t></m:r></m:p>" * 300
+    long_source = (
+        "\ufeff"
+        + head
+        + paragraph.replace("We don</m:t></m:r><m:r><m:t>", "We don")
+        + padding
+        + tail
+    )
+    assert tm.bounded_parse_diagnostic(long_source, lambda: None, file_type="other") is None
+    runtime = head + paragraph + '<m:p><m:r><m:t>bash -c "$cmd"</m:t></m:r></m:p>' + padding + tail
+    assert tm.bounded_parse_diagnostic(runtime, lambda: None, file_type="other") is not None
+
+
 def test_later_array_expansion_keeps_the_bounds_of_an_earlier_quoted_argument() -> None:
     source = (
         '#!/usr/bin/env bash\necho "λ rm -rf $OUT/$NAME"\n'
