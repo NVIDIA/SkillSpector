@@ -35,8 +35,10 @@ from __future__ import annotations
 import io
 import json
 import os
+import plistlib
 import subprocess
 import sys
+import tempfile
 import textwrap
 from dataclasses import replace
 from pathlib import Path
@@ -56,14 +58,24 @@ from skillspector.providers._agent_cli import (
     _OPENCODE_AGENT_PREFIX,
     _OPENCODE_DENY_ALL,
     _OPENCODE_SUPPORTED_VERSIONS,
+    _OPENCODE_SUPPORTED_VERSIONS_V2,
     AgentCLIError,
     _build_opencode_argv,
+    _check_opencode_system_sources,
     _is_supported_opencode_version,
+    _is_supported_opencode_version_v2,
     _opencode_auth_check,
+    _opencode_config_2x,
+    _opencode_managed_preference_paths,
+    _opencode_system_config_dir,
+    _parse_opencode_debug_agents,
     _parse_opencode_output,
     _parse_opencode_version,
+    _preflight_opencode_policy,
     _prepare_opencode_env,
     _run_bounded,
+    _scrub_env,
+    _strip_opencode_jsonc_comments,
     get_spec,
     run_agent_cli,
 )
@@ -95,6 +107,15 @@ def _probe_results(auth_stdout: bytes = _AUTH_LIST_OK) -> list[SimpleNamespace]:
 
 
 class TestBuildOpencodeArgv:
+    @pytest.fixture(autouse=True)
+    def _pin_probe_version_1x(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The builder probes the real binary for its version. Pin the probe
+        # to 1.18.33 so the 1.x expectations below do not depend on which
+        # binary (if any) a developer has installed: with a supported 2.x
+        # binary on PATH the unmocked builder omits --pure and the exact
+        # shape assertions fail even though the builder is correct.
+        monkeypatch.setattr(_agent_cli, "_probe_opencode_version", lambda _binary: (1, 18, 33))
+
     def test_argv_is_plain_list_of_str(self) -> None:
         argv = _build_opencode_argv(OPENCODE_BINARY, "", 0)
         assert isinstance(argv, list), "argv must be a list (ensures shell=False)"
@@ -115,6 +136,28 @@ class TestBuildOpencodeArgv:
 
     def test_argv_disables_external_plugins(self) -> None:
         assert "--pure" in _build_opencode_argv(OPENCODE_BINARY, "", 0)
+
+    @pytest.mark.parametrize("version", [(2, 2, 6), (2, 2, 7)])
+    def test_argv_2x_omits_pure_and_uses_standalone(
+        self, monkeypatch: pytest.MonkeyPatch, version: tuple[int, int, int]
+    ) -> None:
+        # The 2.x branch is pinned explicitly: --pure is unknown on 2.x,
+        # and --standalone keeps the run on a private server instead of
+        # the background service on the fixed channel port.
+        monkeypatch.setattr(_agent_cli, "_probe_opencode_version", lambda _binary: version)
+        argv = _build_opencode_argv(OPENCODE_BINARY, "", 0)
+        assert "--pure" not in argv
+        assert "--standalone" in argv
+        assert argv[argv.index("--agent") + 1].startswith(f"{_OPENCODE_AGENT_PREFIX}-")
+        assert "--format" in argv and argv[argv.index("--format") + 1] == "json"
+
+    def test_argv_unknown_version_keeps_1x_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # An unknowable version keeps the 1.x shape; the preflight then
+        # fails closed on version before any inference runs.
+        monkeypatch.setattr(_agent_cli, "_probe_opencode_version", lambda _binary: None)
+        argv = _build_opencode_argv(OPENCODE_BINARY, "", 0)
+        assert "--pure" in argv
+        assert "--standalone" not in argv
 
     def test_argv_selects_unguessable_per_invocation_agent(self) -> None:
         first = _build_opencode_argv(OPENCODE_BINARY, "", 0)
@@ -198,6 +241,17 @@ def test_hostile_prompt_roundtrips_byte_exact(prompt: str) -> None:
 
 class TestOpencodeAuthCheck:
     @pytest.fixture(autouse=True)
+    def _pin_probe_version_1x(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # These tests mock subprocess.run but the Popen-based version
+        # probes in _build_opencode_argv and _prepare_opencode_env are
+        # real: pin the probe to 1.18.33 so the 1.x expectations below do
+        # not depend on which binary (if any) a developer has installed.
+        # With a supported 2.x binary on PATH the unmocked probe omits
+        # OPENCODE_DISABLE_PROJECT_CONFIG and the flag assertions fail
+        # even though the probe is correct.
+        monkeypatch.setattr(_agent_cli, "_probe_opencode_version", lambda _binary: (1, 18, 33))
+
+    @pytest.fixture(autouse=True)
     def _binary_on_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Probe tests focus on probe behavior; the lookup itself is covered
         # by test_lookup_receives_passed_binary below.
@@ -241,6 +295,10 @@ class TestOpencodeAuthCheck:
         assert env["OPENCODE_PERMISSION"] == _OPENCODE_DENY_ALL
         assert env["OPENCODE_PURE"] == "1"
         assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["share"] == "disabled"
+        # The 1.x probe keeps OPENCODE_DISABLE_PROJECT_CONFIG: the version
+        # probe is pinned to 1.18.33 (see _pin_probe_version_1x), so the
+        # environment keeps the 1.x shape.
+        assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_shell_is_false_and_bounded(self, mock_run: MagicMock) -> None:
@@ -297,6 +355,14 @@ class TestOpencodeAuthCheck:
 
 
 class TestOpencodeVersionRange:
+    @pytest.fixture(autouse=True)
+    def _pin_probe_version_1x(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # These tests mock subprocess.run but the Popen-based version
+        # probes in _build_opencode_argv and _prepare_opencode_env are
+        # real: pin the probe to 1.18.33 so the 1.x auth path below does
+        # not depend on which binary a developer has installed.
+        monkeypatch.setattr(_agent_cli, "_probe_opencode_version", lambda _binary: (1, 18, 33))
+
     def test_supported_versions_are_an_explicit_verified_set(self) -> None:
         assert _OPENCODE_SUPPORTED_VERSIONS == frozenset(
             {
@@ -369,7 +435,198 @@ class TestOpencodeVersionRange:
         mock_run.assert_called_once()
 
 
+class TestOpencodeVersionRangeV2:
+    @pytest.fixture(autouse=True)
+    def _pin_probe_version_2x(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        # These tests mock subprocess.run but the Popen-based version
+        # probes in _build_opencode_argv and _prepare_opencode_env are
+        # real: pin the probe to 2.2.6 so the whole auth check runs in a
+        # consistent 2.x world instead of depending on which binary a
+        # developer has installed. The mocked run version below agrees.
+        monkeypatch.setattr(_agent_cli, "_probe_opencode_version", lambda _binary: (2, 2, 6))
+        # The 2.x auth check runs the system-source gate before the
+        # mocked auth command, so point the gate at an empty temporary
+        # directory: on a developer machine with a configured system
+        # plugin the gate would otherwise refuse before the mock runs.
+        # The effective lookup is _opencode_system_config_dir, not the
+        # module constant: on Windows the helper derives the directory
+        # from the child environment passed to the gate, so patching the
+        # constant alone would still leave the auth check reading the
+        # host directory (review round 5, #1086).
+        empty_system_dir = tmp_path / "system"
+        empty_system_dir.mkdir()
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(empty_system_dir)
+        )
+
+    def test_supported_v2_versions_are_an_explicit_verified_set(self) -> None:
+        assert _OPENCODE_SUPPORTED_VERSIONS_V2 == frozenset({(2, 2, 6), (2, 2, 7)})
+
+    @pytest.mark.parametrize("version", ["2.2.6", "2.2.7"])
+    def test_parse_supported_v2_versions(self, version: str) -> None:
+        parsed = _parse_opencode_version(f"{version}\n".encode())
+        assert parsed is not None
+        assert _is_supported_opencode_version_v2(parsed)
+        assert not _is_supported_opencode_version(parsed)
+
+    @pytest.mark.parametrize("raw", [b"2.2.5\n", b"2.2.8\n", b"2.3.0\n", b"2.2.6-1\n"])
+    def test_parse_unsupported_v2_versions_rejected(self, raw: bytes) -> None:
+        parsed = _parse_opencode_version(raw)
+        assert not _is_supported_opencode_version_v2(parsed)
+
+    def _v2_probe_results(self, auth_stdout: bytes) -> list[SimpleNamespace]:
+        # The version probe is pinned to 2.2.6 (see _pin_probe_version_2x),
+        # so the mocked subprocess.run calls are the version check and
+        # auth list --format json only.
+        return [
+            _ok_result(b"2.2.6\n"),
+            _ok_result(auth_stdout),
+        ]
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_accepts_v2_with_connections(self, mock_run: MagicMock) -> None:
+        auth_json = (
+            b'[{"id": "anthropic", "name": "Anthropic", "connections": '
+            b'[{"type": "credential", "label": "API key"}]}]'
+        )
+        mock_run.side_effect = self._v2_probe_results(auth_json)
+        assert _opencode_auth_check(OPENCODE_BINARY) == (True, None)
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_uses_auth_list_format_json_on_v2(self, mock_run: MagicMock) -> None:
+        mock_run.side_effect = self._v2_probe_results(b"[]")
+        _opencode_auth_check(OPENCODE_BINARY)
+        assert mock_run.call_args[0][0] == [
+            OPENCODE_BINARY,
+            "auth",
+            "list",
+            "--standalone",
+            "--format",
+            "json",
+        ]
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_empty_v2_auth_list_is_fail_closed(self, mock_run: MagicMock) -> None:
+        mock_run.side_effect = self._v2_probe_results(b"[]")
+        ok, reason = _opencode_auth_check(OPENCODE_BINARY)
+        assert ok is False
+        assert "auth login" in (reason or "")
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_unparseable_v2_auth_list_is_fail_closed(self, mock_run: MagicMock) -> None:
+        mock_run.side_effect = self._v2_probe_results(b"not json")
+        ok, reason = _opencode_auth_check(OPENCODE_BINARY)
+        assert ok is False
+        assert "auth login" in (reason or "")
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_rejects_unverified_v2_version(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = _ok_result(b"2.2.8\n")
+        ok, reason = _opencode_auth_check(OPENCODE_BINARY)
+        assert ok is False
+        assert "2.2.6" in (reason or "") and "2.2.7" in (reason or "")
+        mock_run.assert_called_once()
+
+
+class TestParseOpencodeDebugAgents:
+    # Resolved permissions for the probe agent measured live on 2.2.6/2.2.7
+    # (#1084): defaults, then the agent-local deny, then the top-level deny,
+    # then the remaining default denies.
+    MEASURED_PERMS = [
+        {"action": "*", "resource": "*", "effect": "allow"},
+        {"action": "read", "resource": "*.env", "effect": "ask"},
+        {"action": "read", "resource": "*.env.*", "effect": "ask"},
+        {"action": "read", "resource": "*.env.example", "effect": "allow"},
+        {"action": "*", "resource": "*", "effect": "deny"},
+        {"action": "*", "resource": "*", "effect": "deny"},
+        {"action": "browser", "resource": "*", "effect": "deny"},
+        {"action": "skill", "resource": "browser", "effect": "deny"},
+    ]
+
+    def _agents_json(self, agent_name: str, perms: list[dict] | None) -> bytes:
+        agents = [
+            {"id": "build", "name": "Build", "mode": "primary", "permissions": []},
+            {"id": agent_name, "name": agent_name, "mode": "primary", "permissions": perms},
+        ]
+        return json.dumps(agents).encode()
+
+    def test_accepts_measured_deny_ending_list(self) -> None:
+        raw = self._agents_json("ssprobe", self.MEASURED_PERMS)
+        assert _parse_opencode_debug_agents(raw, "ssprobe") is None
+
+    def test_accepts_single_wildcard_deny(self) -> None:
+        raw = self._agents_json("ssprobe", [{"action": "*", "resource": "*", "effect": "deny"}])
+        assert _parse_opencode_debug_agents(raw, "ssprobe") is None
+
+    def test_rejects_missing_agent(self) -> None:
+        raw = self._agents_json("ssprobe", self.MEASURED_PERMS)
+        with pytest.raises(AgentCLIError, match="could not find the selected agent"):
+            _parse_opencode_debug_agents(raw, "other-agent")
+
+    def test_rejects_trailing_allow(self) -> None:
+        perms = self.MEASURED_PERMS + [{"action": "read", "resource": "*.env", "effect": "allow"}]
+        with pytest.raises(AgentCLIError, match="non-deny rule after the final wildcard deny"):
+            _parse_opencode_debug_agents(self._agents_json("ssprobe", perms), "ssprobe")
+
+    def test_rejects_trailing_ask(self) -> None:
+        perms = self.MEASURED_PERMS + [{"action": "read", "resource": "*.env", "effect": "ask"}]
+        with pytest.raises(AgentCLIError, match="non-deny rule after the final wildcard deny"):
+            _parse_opencode_debug_agents(self._agents_json("ssprobe", perms), "ssprobe")
+
+    def test_rejects_last_wildcard_allow(self) -> None:
+        perms = [dict(rule) for rule in self.MEASURED_PERMS]
+        perms[5] = {"action": "*", "resource": "*", "effect": "allow"}
+        with pytest.raises(AgentCLIError, match="last wildcard rule is not a deny"):
+            _parse_opencode_debug_agents(self._agents_json("ssprobe", perms), "ssprobe")
+
+    def test_rejects_malformed_json(self) -> None:
+        with pytest.raises(AgentCLIError, match="malformed JSON"):
+            _parse_opencode_debug_agents(b"not json", "ssprobe")
+
+    def test_rejects_non_list_output(self) -> None:
+        with pytest.raises(AgentCLIError, match="non-list agent set"):
+            _parse_opencode_debug_agents(b'{"id": "ssprobe"}', "ssprobe")
+
+    def test_rejects_missing_permissions(self) -> None:
+        raw = self._agents_json("ssprobe", None)
+        with pytest.raises(AgentCLIError, match="no resolved permissions"):
+            _parse_opencode_debug_agents(raw, "ssprobe")
+
+    def test_rejects_no_wildcard_rule(self) -> None:
+        perms = [{"action": "read", "resource": "*.env", "effect": "deny"}]
+        with pytest.raises(AgentCLIError, match="no wildcard rule"):
+            _parse_opencode_debug_agents(self._agents_json("ssprobe", perms), "ssprobe")
+
+    def test_rejects_malformed_rule(self) -> None:
+        perms = [{"action": "*", "resource": "*"}]
+        with pytest.raises(AgentCLIError, match="malformed permission rule"):
+            _parse_opencode_debug_agents(self._agents_json("ssprobe", perms), "ssprobe")
+
+
+class TestOpencodeConfig2x:
+    def test_project_policy_uses_agents_map_and_deny_lists(self) -> None:
+        config = json.loads(_opencode_config_2x("skillspector-deny-all-abc"))
+        assert "agent" not in config
+        agent = config["agents"]["skillspector-deny-all-abc"]
+        assert agent["mode"] == "primary"
+        assert agent["permissions"] == [{"action": "*", "resource": "*", "effect": "deny"}]
+        assert config["permissions"] == [{"action": "*", "resource": "*", "effect": "deny"}]
+
+
 class TestOpencodeDenyAllPolicy:
+    @pytest.fixture(autouse=True)
+    def _pin_probe_version_1x(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Every test in this class assumes the 1.x shape: the fake-binary
+        # tests use 1.x fakes and the preflight probes the version via
+        # Popen directly, not via _probe_opencode_version, so pinning the
+        # probe to 1.18.33 only fixes the argv/env shape and cannot hide
+        # a boundary version from the preflight. Without the pin,
+        # test_policy_overrides_hostile_ambient_configuration depends on
+        # which binary (if any) a developer has installed at
+        # /usr/bin/opencode: a supported 2.x binary omits
+        # OPENCODE_DISABLE_PROJECT_CONFIG and the flag assertion fails.
+        monkeypatch.setattr(_agent_cli, "_probe_opencode_version", lambda _binary: (1, 18, 33))
+
     def test_policy_overrides_hostile_ambient_configuration(self, tmp_path: Path) -> None:
         base = {
             "PATH": os.environ.get("PATH", ""),
@@ -393,6 +650,12 @@ class TestOpencodeDenyAllPolicy:
         assert config["share"] == "disabled"
         assert config["autoshare"] is False
         assert env["OPENCODE_AUTO_SHARE"] == "0"
+        # The version probe is pinned to 1.18.33 (see
+        # _pin_probe_version_1x), so the environment keeps the 1.x shape
+        # and the flag stays set: on 1.x it is the only thing stopping the
+        # ancestor configuration walk (verified live on real 1.19.4). On
+        # 2.x it must stay unset so the project opencode.jsonc policy
+        # is delivered (see TestOpencodeProjectConfigFlagVersionSpecific).
         assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
         # Internal plugins carry the OAuth logins (ChatGPT, Copilot, ...) and
         # register no tools; disabling them breaks the user's login (#809).
@@ -528,6 +791,1667 @@ class TestOpencodeDenyAllPolicy:
         with pytest.raises(AgentCLIError, match="only for versions 1.18.31"):
             run_agent_cli("opencode", "try a boundary runtime", model="")
         assert list(markers.iterdir()) == []
+
+
+class TestOpencodeDenyAllPolicyV2:
+    @pytest.fixture(autouse=True)
+    def _empty_system_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Every test here runs a 2.x fake binary through the real
+        # preflight, which runs the system-source gate before any server
+        # starts. Point the gate at an empty temporary directory so the
+        # results never depend on the host's real system directory; the
+        # dedicated configured-source cases below override this default
+        # with their own directory. The effective lookup is
+        # _opencode_system_config_dir: on Windows it derives from the
+        # child environment, so patching the module constant alone would
+        # not isolate the preflight (review round 5, #1086).
+        empty_system_dir = tmp_path / "system"
+        empty_system_dir.mkdir()
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(empty_system_dir)
+        )
+
+    @staticmethod
+    def _write_fake_opencode_v2(
+        binary: Path,
+        markers: Path,
+        *,
+        agents_mode: str = "ok",
+        version: str = "2.2.6",
+    ) -> None:
+        """Write a 2.x host simulator with the measured 2.2.6/2.2.7 shapes.
+
+        ``debug agents`` reads the project ``opencode.jsonc`` the preflight
+        wrote into the run directory and resolves the probe agent the way
+        the real 2.2.6 binary does: the built-in defaults, then the
+        agent-local deny, then the top-level deny, then the remaining
+        default denies. ``agents_mode`` perturbs that resolved list (or
+        the output shape) for the fail-closed cases. The ``run`` branch
+        records the invoked argv and the project policy, then performs a
+        marker side effect for any adapter not covered by the project
+        policy, mirroring the 1.x fake.
+        """
+        binary.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                if sys.argv[1:] == ["--version"]:
+                    print({version!r})
+                    raise SystemExit(0)
+
+                markers = Path({str(markers)!r})
+                defaults = [
+                    {{"action": "*", "resource": "*", "effect": "allow"}},
+                    {{"action": "read", "resource": "*.env", "effect": "ask"}},
+                    {{"action": "read", "resource": "*.env.*", "effect": "ask"}},
+                    {{"action": "read", "resource": "*.env.example", "effect": "allow"}},
+                    {{"action": "question", "resource": "*", "effect": "allow"}},
+                    {{"action": "browser", "resource": "*", "effect": "deny"}},
+                    {{"action": "skill", "resource": "browser", "effect": "deny"}},
+                ]
+
+                def probe_agent():
+                    project = Path.cwd() / "opencode.jsonc"
+                    if not project.exists():
+                        return None
+                    config = json.loads(project.read_text())
+                    agents = config.get("agents", {{}})
+                    if not agents:
+                        return None
+                    name = next(iter(agents))
+                    agent_perms = agents[name].get("permissions", [])
+                    top_perms = config.get("permissions", [])
+                    resolved = defaults[:4] + agent_perms + top_perms + defaults[5:]
+                    return {{"id": name, "name": name, "mode": "primary", "permissions": resolved}}
+
+                def probe_plugins():
+                    # The real 2.2.7 loads a configured system plugin (a
+                    # /etc/opencode/plugins directory plugin) when the
+                    # project policy does not deny it: `plugins: ["-*"]`
+                    # alone stops activation but not the import, so the
+                    # module's top-level code still runs in the server.
+                    # A `plugin.use` deny-all policy stops the load
+                    # entirely. Fail the probe when it is missing, the
+                    # way the preflight must fail closed.
+                    project = Path.cwd() / "opencode.jsonc"
+                    if not project.exists():
+                        return False
+                    config = json.loads(project.read_text())
+                    return any(
+                        policy.get("action") == "plugin.use"
+                        and policy.get("resource") == "*"
+                        and policy.get("effect") == "deny"
+                        for policy in config.get("policies", [])
+                    )
+
+                if sys.argv[1:] == ["debug", "config"]:
+                    print(json.dumps([{{"type": "directory", "path": str(Path.cwd())}}]))
+                    raise SystemExit(0)
+
+                if sys.argv[1:3] == ["debug", "agents"]:
+                    mode = {agents_mode!r}
+                    if "--standalone" in sys.argv:
+                        (markers / "agents-standalone").write_text("standalone")
+                    if not probe_plugins():
+                        print("a system plugin would load: no plugin.use deny-all policy", file=sys.stderr)
+                        raise SystemExit(1)
+                    probe = probe_agent()
+                    if mode == "garbage":
+                        print("not json")
+                        raise SystemExit(0)
+                    if mode == "non-list":
+                        print(json.dumps({{"id": "build"}}))
+                        raise SystemExit(0)
+                    agents = [
+                        {{"id": "build", "name": "Build", "mode": "primary", "permissions": defaults}},
+                    ]
+                    if probe is not None and mode != "missing":
+                        resolved = list(probe["permissions"])
+                        if mode == "trailing-allow":
+                            resolved.append({{"action": "read", "resource": "*.env", "effect": "allow"}})
+                        elif mode == "trailing-ask":
+                            resolved.append({{"action": "read", "resource": "*.env", "effect": "ask"}})
+                        elif mode == "last-wildcard-allow":
+                            for rule in reversed(resolved):
+                                if rule["action"] == "*" and rule["resource"] == "*":
+                                    rule["effect"] = "allow"
+                                    break
+                        elif mode == "no-wildcard":
+                            resolved = [
+                                rule
+                                for rule in resolved
+                                if not (rule["action"] == "*" and rule["resource"] == "*")
+                            ]
+                        probe["permissions"] = resolved
+                        agents.append(probe)
+                    print(json.dumps(agents))
+                    raise SystemExit(0)
+
+                selected = sys.argv[sys.argv.index("--agent") + 1]
+                (markers / "argv").write_text(json.dumps(sys.argv[1:]))
+                (markers / "env-flag").write_text(
+                    os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG", "absent")
+                )
+                project = Path.cwd() / "opencode.jsonc"
+                (markers / "jsonc").write_text(project.read_text() if project.exists() else "")
+                config = json.loads(project.read_text()) if project.exists() else {{}}
+                agent = config.get("agents", {{}}).get(selected, {{}})
+                denied = any(
+                    perm.get("action") == "*"
+                    and perm.get("resource") == "*"
+                    and perm.get("effect") == "deny"
+                    for perm in agent.get("permissions", [])
+                )
+                adapters = ["bash", "read", "edit", "webfetch", "websearch", "mcp_host", "skill", "future_host_tool"]
+                if not denied:
+                    for adapter in adapters:
+                        (markers / adapter).write_text("executed")
+                print(json.dumps({{"type": "text", "part": {{"type": "text", "text": "policy held:" + selected}}}}))
+                """
+            ),
+            encoding="utf-8",
+        )
+        binary.chmod(0o700)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_preflight_accepts_measured_permissions_and_run_holds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        response = run_agent_cli("opencode", "use every host tool", model="")
+        selected = response.removeprefix("policy held:")
+        assert response.startswith("policy held:")
+        assert selected.startswith(f"{_OPENCODE_AGENT_PREFIX}-")
+        assert sorted(path.name for path in markers.iterdir()) == [
+            "agents-standalone",
+            "argv",
+            "env-flag",
+            "jsonc",
+        ]
+        argv = json.loads((markers / "argv").read_text())
+        assert "--pure" not in argv
+        assert "--standalone" in argv
+        assert argv[argv.index("--agent") + 1] == selected
+        config = json.loads((markers / "jsonc").read_text())
+        assert config["agents"][selected]["permissions"] == [
+            {"action": "*", "resource": "*", "effect": "deny"}
+        ]
+        assert config["permissions"] == [{"action": "*", "resource": "*", "effect": "deny"}]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_project_config_denies_all_plugins(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Finding 1 (#1084): a configured system plugin (/etc/opencode/plugins)
+        # loads into the 2.x server unless the project policy denies it. The
+        # preflight writes that deny into the project opencode.jsonc, and the
+        # fake refuses the probe without it, so removing the policy fails
+        # this test the way the real binary would load the plugin.
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        response = run_agent_cli("opencode", "use every host tool", model="")
+        assert response.startswith("policy held:")
+        config = json.loads((markers / "jsonc").read_text())
+        assert {"action": "plugin.use", "resource": "*", "effect": "deny"} in config.get(
+            "policies", []
+        )
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_preflight_accepts_2_2_7(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers, version="2.2.7")
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        response = run_agent_cli("opencode", "use every host tool", model="")
+        assert response.startswith("policy held:")
+        assert sorted(path.name for path in markers.iterdir()) == [
+            "agents-standalone",
+            "argv",
+            "env-flag",
+            "jsonc",
+        ]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_argv_omits_pure_for_2x_binary(self, tmp_path: Path) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers)
+        argv = _build_opencode_argv(str(binary), "", 0)
+        assert "--pure" not in argv
+        assert "--standalone" in argv
+        assert "--agent" in argv
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    @pytest.mark.parametrize(
+        "agents_mode,match",
+        [
+            ("missing", "could not find the selected agent"),
+            ("trailing-allow", "non-deny rule after the final wildcard deny"),
+            ("trailing-ask", "non-deny rule after the final wildcard deny"),
+            ("last-wildcard-allow", "last wildcard rule is not a deny"),
+            ("garbage", "malformed JSON"),
+            ("non-list", "non-list agent set"),
+            ("no-wildcard", "no wildcard rule"),
+        ],
+    )
+    def test_2x_preflight_rejects_bad_resolved_policy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        agents_mode: str,
+        match: str,
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers, agents_mode=agents_mode)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        with pytest.raises(AgentCLIError, match=match):
+            run_agent_cli("opencode", "try a hostile runtime", model="")
+        # The probe ran (with --standalone) and failed closed; the run
+        # never started, so no run markers exist.
+        assert sorted(path.name for path in markers.iterdir()) == ["agents-standalone"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_rejects_unverified_version_before_inference(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers, version="2.2.8")
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        with pytest.raises(AgentCLIError, match="only for versions 1.18.31") as excinfo:
+            run_agent_cli("opencode", "try a newer runtime", model="")
+        assert "2.2.7" in str(excinfo.value)
+        assert list(markers.iterdir()) == []
+
+    @staticmethod
+    def _write_system_plugin_allow(system_dir: Path) -> None:
+        """System dir with an installed plugin plus a plugin.use allow.
+
+        The combination the project deny cannot outrank (verified live on
+        real 2.2.7, #1086): the allow lets the installed plugin load into
+        the server during startup, while the agent permission check still
+        passes.
+        """
+        (system_dir / "plugins").mkdir()
+        (system_dir / "plugins" / "marker-plugin").write_text(
+            "top-level code writes a marker on import", encoding="utf-8"
+        )
+        (system_dir / "opencode.json").write_text(
+            json.dumps(
+                {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _write_system_plugin_legacy_allow(system_dir: Path) -> None:
+        """System dir with only a legacy-form allow, no plugin listed.
+
+        P0 (review 5977061517, #1086): pinned policy.ts decodes a legacy
+        `integration.use` statement with a `plugin:` resource as
+        `plugin.use`, so this document allows an external plugin discovered
+        from another layer even though it lists zero plugins and installs
+        none itself. Deliberately no `plugins/` directory here: the
+        directory check would refuse on its own and hide whether the
+        policy decoder runs. The gate must refuse on the decoded allow
+        alone, before any 2.x server starts.
+        """
+        (system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "integration.use", "resource": "plugin:*", "effect": "allow"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_system_plugin_allow_fails_before_startup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # P0 (#1086): a system plugin with a system plugin.use allow
+        # outranks the project deny, so auth, preflight and inference
+        # must all fail closed before any 2.x server starts. No probe
+        # markers at all: the fake binary never runs a command, so no
+        # plugin code could have loaded. The autouse fixture already
+        # created this empty directory; the override below points the
+        # gate at the configured one.
+        system_dir = tmp_path / "system"
+        self._write_system_plugin_allow(system_dir)
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(system_dir)
+        )
+
+        # Preflight: the gate fires before `debug agents --standalone`.
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers)
+        argv = _build_opencode_argv(str(binary), "", 0)
+        env = _prepare_opencode_env({"PATH": os.environ.get("PATH", "")}, str(tmp_path), argv)
+        with pytest.raises(AgentCLIError, match="system"):
+            _preflight_opencode_policy(str(binary), argv, env, str(tmp_path))
+        assert list(markers.iterdir()) == []
+
+        # Inference: run_agent_cli fails in the preflight, never runs.
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+        with pytest.raises(AgentCLIError, match="system"):
+            run_agent_cli("opencode", "use every host tool", model="")
+        assert list(markers.iterdir()) == []
+
+        # Auth: the probe reports unavailable and never runs `auth list`.
+        auth_binary = tmp_path / "opencode-auth"
+        auth_markers = tmp_path / "auth-outside"
+        auth_markers.mkdir()
+        TestOpencodeAuthProbeIsolation._write_fake_auth_2x(auth_binary, auth_markers)
+        ok, reason = _opencode_auth_check(str(auth_binary))
+        assert ok is False
+        assert reason is not None and "system" in reason
+        assert list(auth_markers.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_system_plugin_legacy_allow_fails_before_startup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # P0 (review 5977061517, #1086): the pre-import marker regression
+        # for the legacy form. A system plugin with a legacy
+        # `integration.use` / `plugin:*` allow must fail closed before any
+        # 2.x server starts, exactly like the direct `plugin.use` allow:
+        # no probe markers at all, so no plugin code could have loaded.
+        system_dir = tmp_path / "system"
+        self._write_system_plugin_legacy_allow(system_dir)
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(system_dir)
+        )
+
+        # Preflight: the gate fires before `debug agents --standalone`.
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers)
+        argv = _build_opencode_argv(str(binary), "", 0)
+        env = _prepare_opencode_env({"PATH": os.environ.get("PATH", "")}, str(tmp_path), argv)
+        with pytest.raises(AgentCLIError, match="system"):
+            _preflight_opencode_policy(str(binary), argv, env, str(tmp_path))
+        assert list(markers.iterdir()) == []
+
+        # Inference: run_agent_cli fails in the preflight, never runs.
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+        with pytest.raises(AgentCLIError, match="system"):
+            run_agent_cli("opencode", "use every host tool", model="")
+        assert list(markers.iterdir()) == []
+
+        # Auth: the probe reports unavailable and never runs `auth list`.
+        auth_binary = tmp_path / "opencode-auth"
+        auth_markers = tmp_path / "auth-outside"
+        auth_markers.mkdir()
+        TestOpencodeAuthProbeIsolation._write_fake_auth_2x(auth_binary, auth_markers)
+        ok, reason = _opencode_auth_check(str(auth_binary))
+        assert ok is False
+        assert reason is not None and "system" in reason
+        assert list(auth_markers.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_system_plugin_without_allow_passes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A system config that denies plugin.use and only removes plugins
+        # configures no plugin source, so the gate passes and the project
+        # deny does the blocking: the fake refuses its probe without the
+        # project policy deny, and the run holds. The autouse fixture
+        # already created this empty directory; the override below points
+        # the gate at the configured one.
+        system_dir = tmp_path / "system"
+        (system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [{"action": "plugin.use", "resource": "*", "effect": "deny"}],
+                    "plugins": ["-*"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(system_dir)
+        )
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        response = run_agent_cli("opencode", "use every host tool", model="")
+        assert response.startswith("policy held:")
+        assert sorted(path.name for path in markers.iterdir()) == [
+            "agents-standalone",
+            "argv",
+            "env-flag",
+            "jsonc",
+        ]
+        config = json.loads((markers / "jsonc").read_text())
+        assert {"action": "plugin.use", "resource": "*", "effect": "deny"} in config.get(
+            "policies", []
+        )
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_no_system_sources_passes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No system directory at all, and an empty one, both pass: there
+        # is no machine-wide plugin source for the gate to refuse.
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(tmp_path / "absent")
+        )
+        response = run_agent_cli("opencode", "use every host tool", model="")
+        assert response.startswith("policy held:")
+
+        empty_dir = tmp_path / "empty-system"
+        empty_dir.mkdir()
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(empty_dir)
+        )
+        response = run_agent_cli("opencode", "use every host tool", model="")
+        assert response.startswith("policy held:")
+
+
+# ---------------------------------------------------------------------------
+# Review round 3 (#1086): pre-start system-source gate for OpenCode 2.x.
+# A system-level plugin.use allow outranks the project deny (verified live
+# on real 2.2.7), so the 2.x preflight and auth probe refuse to start when
+# the platform system directory configures plugins. The gate resolves the
+# directory through _opencode_system_config_dir, so the direct tests below
+# point the module constant at a temporary directory while the end-to-end
+# fixtures patch the helper.
+# ---------------------------------------------------------------------------
+
+
+class TestOpencodeSystemSources:
+    """Direct unit tests for the 2.x pre-start system-source gate.
+
+    These tests call the gate without a child environment, so the helper
+    returns the module constant ``_OPENCODE_SYSTEM_CONFIG_DIR`` and these
+    tests point it at a temporary directory. The end-to-end fake-binary
+    coverage lives in TestOpencodeDenyAllPolicyV2.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _system_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        system_dir = tmp_path / "system"
+        system_dir.mkdir()
+        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(system_dir))
+        return system_dir
+
+    def test_missing_system_dir_passes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(tmp_path / "absent"))
+        _check_opencode_system_sources()
+
+    def test_empty_system_dir_passes(self, _system_dir: Path) -> None:
+        _check_opencode_system_sources()
+
+    def test_system_allow_raises(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_system_ask_raises(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.jsonc").write_text(
+            json.dumps(
+                {"policies": [{"action": "plugin.use", "resource": "my-plugin", "effect": "ask"}]}
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_system_legacy_integration_use_plugin_allow_raises(self, _system_dir: Path) -> None:
+        # P0 (review 5977061517, #1086): pinned policy.ts decodes a legacy
+        # `integration.use` statement with a `plugin:` resource as
+        # `plugin.use`, so a managed allow in that form authorizes an
+        # external plugin even though the document lists zero `plugin.use`
+        # rules. The gate must refuse it exactly like a direct allow.
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "integration.use", "resource": "plugin:*", "effect": "allow"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_system_legacy_integration_use_named_plugin_allow_raises(
+        self, _system_dir: Path
+    ) -> None:
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {
+                            "action": "integration.use",
+                            "resource": "plugin:my-plugin",
+                            "effect": "allow",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_system_legacy_integration_use_plugin_deny_passes(self, _system_dir: Path) -> None:
+        # The decoder preserves the effect, so a legacy deny decodes to a
+        # `plugin.use` deny and configures no allow.
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "integration.use", "resource": "plugin:*", "effect": "deny"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_system_legacy_integration_use_bare_resource_passes(self, _system_dir: Path) -> None:
+        # Pinned policy.ts: a bare `integration.use` `*` has no separator,
+        # so it keeps its action and covers providers and accounts, not
+        # plugins. It must not be mistaken for a plugin allow.
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {"policies": [{"action": "integration.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_system_legacy_integration_use_unknown_prefix_passes(self, _system_dir: Path) -> None:
+        # Only the `mcp:`, `skill:`, and `plugin:` prefixes convert; any
+        # other prefix keeps the `integration.use` action.
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "integration.use", "resource": "other:foo", "effect": "allow"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_system_legacy_integration_use_mcp_and_skill_prefixes_pass(
+        self, _system_dir: Path
+    ) -> None:
+        # The decoder also converts `mcp:` and `skill:` prefixes, but to
+        # `mcp.use` and `skill.use`, which authorize no plugin, so the
+        # plugin gate passes on them.
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "integration.use", "resource": "mcp:server", "effect": "allow"},
+                        {"action": "integration.use", "resource": "skill:agent", "effect": "allow"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_system_legacy_integration_use_non_string_resource_fails_closed(
+        self, _system_dir: Path
+    ) -> None:
+        # The pinned schema requires a string resource before the decoder
+        # can run, so a non-string resource is ambiguous managed policy
+        # and must refuse rather than pass as a non-plugin rule.
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {"policies": [{"action": "integration.use", "resource": 7, "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="malformed policy rule"):
+            _check_opencode_system_sources()
+
+    def test_system_non_string_action_fails_closed(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.json").write_text(
+            json.dumps({"policies": [{"action": 7, "resource": "*", "effect": "allow"}]}),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="malformed policy rule"):
+            _check_opencode_system_sources()
+
+    def test_system_deny_passes(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.json").write_text(
+            json.dumps({"policies": [{"action": "plugin.use", "resource": "*", "effect": "deny"}]}),
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_system_plugin_listed_raises(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.json").write_text(
+            json.dumps({"plugins": ["some-plugin"]}),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="lists plugin"):
+            _check_opencode_system_sources()
+
+    def test_system_plugin_singular_key_raises(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.json").write_text(
+            json.dumps({"plugin": ["some-plugin"]}),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="lists plugin"):
+            _check_opencode_system_sources()
+
+    def test_removal_only_entries_pass(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.json").write_text(
+            json.dumps({"plugins": ["-*", "-old-plugin"]}),
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_installed_plugin_dir_entry_raises(self, _system_dir: Path) -> None:
+        (_system_dir / "plugins").mkdir()
+        (_system_dir / "plugins" / "marker-plugin").write_text(
+            "top-level code writes a marker on import", encoding="utf-8"
+        )
+        with pytest.raises(AgentCLIError, match="is not empty"):
+            _check_opencode_system_sources()
+
+    def test_installed_plugin_singular_dir_entry_raises(self, _system_dir: Path) -> None:
+        (_system_dir / "plugin").mkdir()
+        (_system_dir / "plugin" / "marker-plugin").write_text(
+            "top-level code writes a marker on import", encoding="utf-8"
+        )
+        with pytest.raises(AgentCLIError, match="is not empty"):
+            _check_opencode_system_sources()
+
+    def test_empty_plugin_dirs_pass(self, _system_dir: Path) -> None:
+        (_system_dir / "plugin").mkdir()
+        (_system_dir / "plugins").mkdir()
+        _check_opencode_system_sources()
+
+    def test_unparseable_system_config_raises(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.json").write_text(
+            '{"policies": [not json',
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="could not be parsed"):
+            _check_opencode_system_sources()
+
+    def test_jsonc_config_allow_raises(self, _system_dir: Path) -> None:
+        # Comments and trailing commas are tolerated, so the allow is
+        # still seen; a string holding a URL must survive stripping.
+        (_system_dir / "opencode.jsonc").write_text(
+            "{\n"
+            "  // system policy\n"
+            '  "homepage": "https://example.invalid/docs",\n'
+            '  "policies": [\n'
+            "    /* allow the plugin */\n"
+            '    {"action": "plugin.use", "resource": "*", "effect": "allow"},\n'
+            "  ],\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_jsonc_url_string_survives_and_deny_passes(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.jsonc").write_text(
+            "{\n"
+            '  "homepage": "https://example.invalid/docs",\n'
+            '  "policies": [\n'
+            '    {"action": "plugin.use", "resource": "*", "effect": "deny"},\n'
+            "  ],\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_missing_effect_fails_closed(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.json").write_text(
+            json.dumps({"policies": [{"action": "plugin.use", "resource": "*"}]}),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_malformed_policies_fail_closed(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.json").write_text(
+            json.dumps({"policies": {"action": "plugin.use"}}),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="non-list 'policies'"):
+            _check_opencode_system_sources()
+
+    def test_unlistable_system_dir_fails_closed(
+        self, _system_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_listdir = os.listdir
+
+        def denied_listdir(path: str, *args: object, **kwargs: object) -> list[str]:
+            if str(path) == str(_system_dir):
+                raise PermissionError("denied")
+            return real_listdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "listdir", denied_listdir)
+        with pytest.raises(AgentCLIError, match="could not be listed"):
+            _check_opencode_system_sources()
+
+    def test_jsonc_trailing_comma_before_block_comment_parses(self, _system_dir: Path) -> None:
+        # Review round 4 (#1086): a trailing comma before a block
+        # comment is still trailing once the comment is stripped, so
+        # `{"policies": [], /* note */}` must parse instead of leaving
+        # `{"policies": [], }` for json.loads to reject.
+        (_system_dir / "opencode.jsonc").write_text(
+            '{"policies": [], /* note */}\n',
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_jsonc_trailing_comma_before_line_comment_parses(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.jsonc").write_text(
+            '{\n  "policies": [], // system policy\n}\n',
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_jsonc_comma_before_comment_before_key_is_kept(self) -> None:
+        # The comment-skipping lookahead must not eat a real separator:
+        # a comma before a comment that precedes another key stays, and
+        # a comma before a comment that precedes a closer goes.
+        assert json.loads(
+            _strip_opencode_jsonc_comments(
+                '{"homepage": "https://example.invalid/docs", /* note */ "policies": []}'
+            )
+        ) == {"homepage": "https://example.invalid/docs", "policies": []}
+        assert json.loads(_strip_opencode_jsonc_comments('{"policies": [], /* note */}')) == {
+            "policies": []
+        }
+
+    def test_undecodable_system_config_fails_closed(self, _system_dir: Path) -> None:
+        # Review round 4 (#1086): invalid UTF-8 in a system config must
+        # fail closed as AgentCLIError, not escape the gate (and the auth
+        # check) as UnicodeDecodeError.
+        (_system_dir / "opencode.json").write_bytes(b'{"policies": [\xff\xfe]}')
+        with pytest.raises(AgentCLIError, match="could not be decoded"):
+            _check_opencode_system_sources()
+
+    @pytest.fixture
+    def _case_insensitive_system_dir(
+        self, _system_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> Path:
+        # Review round 7 (#1086): the host filesystem is case-sensitive,
+        # so a differently cased file on disk would not resolve under its
+        # canonical name here. Emulate a case-insensitive volume
+        # (Windows, default macOS) by resolving path lookups under the
+        # system directory case-insensitively, the way the volume would,
+        # so the gate is exercised against the names OpenCode itself
+        # would open.
+        real_stat = os.stat
+        real_listdir = os.listdir
+        real_open = open
+
+        def _resolve(path: str) -> str:
+            try:
+                rel = os.path.relpath(path, str(_system_dir))
+            except ValueError:
+                return path
+            if rel.startswith("..") or os.path.isabs(rel):
+                return path
+            current = str(_system_dir)
+            for part in Path(rel).parts:
+                if part in (".", ""):
+                    continue
+                match = next(
+                    (
+                        entry
+                        for entry in real_listdir(current)
+                        if entry.casefold() == part.casefold()
+                    ),
+                    None,
+                )
+                if match is None:
+                    return path
+                current = os.path.join(current, match)
+            return current
+
+        def fake_stat(path, *args, **kwargs):
+            if isinstance(path, (str, os.PathLike)):
+                path = _resolve(os.fspath(path))
+            return real_stat(path, *args, **kwargs)
+
+        def fake_listdir(path, *args, **kwargs):
+            if isinstance(path, (str, os.PathLike)):
+                path = _resolve(os.fspath(path))
+            return real_listdir(path, *args, **kwargs)
+
+        def fake_open(file, *args, **kwargs):
+            if isinstance(file, (str, os.PathLike)):
+                file = _resolve(os.fspath(file))
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(os, "stat", fake_stat)
+        monkeypatch.setattr(os, "listdir", fake_listdir)
+        monkeypatch.setattr(_agent_cli, "open", fake_open, raising=False)
+        return _system_dir
+
+    @pytest.mark.parametrize("filename", ["OpenCode.JSON", "OPENCODE.JSONC"])
+    def test_differently_cased_config_filename_refuses(
+        self, _case_insensitive_system_dir: Path, filename: str
+    ) -> None:
+        # Review round 7 (#1086): on a case-insensitive volume OpenCode
+        # opens the fixed pathname opencode.json/opencode.jsonc through
+        # the filesystem, so a differently cased on-disk file is the
+        # system config it loads. The gate must refuse its allow before
+        # auth, preflight, or inference starts.
+        (_case_insensitive_system_dir / filename).write_text(
+            json.dumps(
+                {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_differently_cased_plugin_dir_refuses(self, _case_insensitive_system_dir: Path) -> None:
+        # Same bypass through the plugin directory: OpenCode scans
+        # <system dir>/plugin and <system dir>/plugins, so a differently
+        # cased directory on a case-insensitive volume is still a
+        # configured system plugin.
+        plugins_dir = _case_insensitive_system_dir / "Plugins"
+        plugins_dir.mkdir()
+        (plugins_dir / "marker-plugin").write_text(
+            "top-level code writes a marker on import", encoding="utf-8"
+        )
+        with pytest.raises(AgentCLIError, match="is not empty"):
+            _check_opencode_system_sources()
+
+    def test_differently_cased_config_filename_passes_on_case_sensitive_fs(
+        self, _system_dir: Path
+    ) -> None:
+        # Control for the cases above: on a case-sensitive filesystem a
+        # differently cased name is a different file, one OpenCode never
+        # opens, so the gate correctly passes. The refusal applies only
+        # where the filesystem resolves the canonical name to it.
+        (_system_dir / "OpenCode.JSON").write_text(
+            json.dumps(
+                {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_scrub_env_keeps_programdata(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Review round 4 (#1086): the system-directory gate derives its
+        # path from ProgramData, so the scrubbed child environment must
+        # carry the same value or the child falls back to C:\ProgramData
+        # while the gate inspected another drive.
+        # Review round 6 (#1086): on Windows the key may come back as
+        # PROGRAMDATA, so match it case-insensitively instead of asking
+        # the plain dictionary for one exact casing.
+        monkeypatch.setenv("ProgramData", r"D:\ProgramData")
+        scrubbed = _scrub_env()
+        kept = [value for key, value in scrubbed.items() if key.upper() == "PROGRAMDATA"]
+        assert kept == [r"D:\ProgramData"]
+
+    def test_system_dir_derives_from_child_env_programdata(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 4 (#1086): on Windows the gate must inspect the
+        # directory from the environment passed to OpenCode, not the
+        # parent's. A system allow under the child's ProgramData is
+        # refused, while the same allow under another drive is not even
+        # inspected.
+        monkeypatch.setattr(sys, "platform", "win32")
+        program_data = tmp_path / "ProgramData"
+        system_dir = program_data / "opencode"
+        system_dir.mkdir(parents=True)
+        (system_dir / "opencode.json").write_text(
+            json.dumps(
+                {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        assert _opencode_system_config_dir({"ProgramData": str(program_data)}) == str(system_dir)
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources({"ProgramData": str(program_data)})
+        _check_opencode_system_sources({"ProgramData": str(tmp_path / "other-drive")})
+
+    def test_system_dir_falls_back_to_default_programdata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No ProgramData in the child environment: the child falls back
+        # to C:\ProgramData, and the gate inspects that same path.
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert _opencode_system_config_dir({}) == os.path.join(r"C:\ProgramData", "opencode")
+
+    def test_system_dir_lookup_is_case_insensitive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 5 (#1086): Python exposes PROGRAMDATA, but the
+        # scrubbed child environment is a plain dict, so asking for
+        # "ProgramData" missed it and the gate fell back to C: while
+        # OpenCode read D:. A system allow under the child's uppercase
+        # key must be refused.
+        monkeypatch.setattr(sys, "platform", "win32")
+        program_data = tmp_path / "ProgramData"
+        system_dir = program_data / "opencode"
+        system_dir.mkdir(parents=True)
+        (system_dir / "opencode.json").write_text(
+            json.dumps(
+                {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        assert _opencode_system_config_dir({"PROGRAMDATA": str(program_data)}) == str(system_dir)
+        assert _opencode_system_config_dir({"programdata": str(program_data)}) == str(system_dir)
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources({"PROGRAMDATA": str(program_data)})
+        _check_opencode_system_sources({"PROGRAMDATA": str(tmp_path / "other-drive")})
+
+    def test_system_dir_empty_programdata_falls_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Review round 5 (#1086): match OpenCode's `env.ProgramData ||
+        # "C:\\ProgramData"` (pinned discovery.ts): an empty value falls
+        # back to C:\ProgramData, it is not used as the directory.
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert _opencode_system_config_dir({"ProgramData": ""}) == os.path.join(
+            r"C:\ProgramData", "opencode"
+        )
+        assert _opencode_system_config_dir({"PROGRAMDATA": ""}) == os.path.join(
+            r"C:\ProgramData", "opencode"
+        )
+
+    def test_effective_lookup_is_the_helper_not_the_constant(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 5 (#1086): passing child_env makes the helper
+        # derive the directory from the child environment on Windows,
+        # bypassing _OPENCODE_SYSTEM_CONFIG_DIR, so patching the constant
+        # alone leaves the auth fixtures reading the host directory. The
+        # effective lookup is _opencode_system_config_dir: patching it
+        # isolates the gate even when the child env names a configured
+        # host directory.
+        monkeypatch.setattr(sys, "platform", "win32")
+        program_data = tmp_path / "ProgramData"
+        system_dir = program_data / "opencode"
+        system_dir.mkdir(parents=True)
+        (system_dir / "opencode.json").write_text(
+            json.dumps(
+                {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources({"PROGRAMDATA": str(program_data)})
+        empty_system_dir = tmp_path / "isolated-system"
+        empty_system_dir.mkdir()
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(empty_system_dir)
+        )
+        _check_opencode_system_sources({"PROGRAMDATA": str(program_data)})
+
+    @staticmethod
+    def _write_mdm_plist(path: Path, config: dict[str, object]) -> None:
+        with open(path, "wb") as handle:
+            plistlib.dump(config, handle)
+
+    def test_mdm_plist_allow_raises(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Review round 5 (#1086): an MDM plugin.use allow outranks the
+        # project deny exactly like a system-directory allow, so the gate
+        # must refuse when the macOS managed-preference plist allows it.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        plist = tmp_path / "ai.opencode.managed.plist"
+        self._write_mdm_plist(
+            plist,
+            {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]},
+        )
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_managed_preference_paths", lambda env=None: [str(plist)]
+        )
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_mdm_plist_plugin_entry_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 5 (#1086): a plugin listed in the MDM plist is a
+        # managed plugin source, so the gate must refuse it too.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        plist = tmp_path / "ai.opencode.managed.plist"
+        self._write_mdm_plist(plist, {"plugins": ["some-plugin"]})
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_managed_preference_paths", lambda env=None: [str(plist)]
+        )
+        with pytest.raises(AgentCLIError, match="lists plugin"):
+            _check_opencode_system_sources()
+
+    def test_mdm_plist_deny_passes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Review round 5 (#1086): an MDM plist that only denies plugin.use
+        # configures no plugin source, so the gate passes.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        plist = tmp_path / "ai.opencode.managed.plist"
+        self._write_mdm_plist(
+            plist,
+            {"policies": [{"action": "plugin.use", "resource": "*", "effect": "deny"}]},
+        )
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_managed_preference_paths", lambda env=None: [str(plist)]
+        )
+        _check_opencode_system_sources()
+
+    def test_mdm_plist_absent_passes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Review round 5 (#1086): no MDM plist deployed means no managed
+        # preference source, so the gate passes.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(
+            _agent_cli,
+            "_opencode_managed_preference_paths",
+            lambda env=None: [str(tmp_path / "absent.plist")],
+        )
+        _check_opencode_system_sources()
+
+    def test_mdm_plist_unparseable_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 5 (#1086): a present plist that cannot be parsed
+        # must fail closed, never be treated as an empty one.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        plist = tmp_path / "ai.opencode.managed.plist"
+        plist.write_bytes(b"not a plist")
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_managed_preference_paths", lambda env=None: [str(plist)]
+        )
+        with pytest.raises(AgentCLIError, match="could not be parsed"):
+            _check_opencode_system_sources()
+
+    def test_mdm_plist_first_present_wins(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 5 (#1086): only the first plist present loads
+        # (pinned discovery.ts), so a per-user deny plist wins over a
+        # machine-wide allow plist.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        user_plist = tmp_path / "user.plist"
+        machine_plist = tmp_path / "machine.plist"
+        self._write_mdm_plist(
+            user_plist,
+            {"policies": [{"action": "plugin.use", "resource": "*", "effect": "deny"}]},
+        )
+        self._write_mdm_plist(
+            machine_plist,
+            {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]},
+        )
+        monkeypatch.setattr(
+            _agent_cli,
+            "_opencode_managed_preference_paths",
+            lambda env=None: [str(user_plist), str(machine_plist)],
+        )
+        _check_opencode_system_sources()
+
+    def test_mdm_plist_ignored_off_darwin(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 5 (#1086): OpenCode loads managed preferences on
+        # macOS only, so the plist check is skipped elsewhere even when a
+        # plist path is configured.
+        # Review round 6 (#1086): set the platform explicitly. On macOS
+        # sys.platform stays darwin, the gate reads the allow-policy
+        # plist created above and raises, so the test would fail instead
+        # of exercising the off-Darwin branch.
+        monkeypatch.setattr(sys, "platform", "linux")
+        plist = tmp_path / "ai.opencode.managed.plist"
+        self._write_mdm_plist(
+            plist,
+            {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]},
+        )
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_managed_preference_paths", lambda env=None: [str(plist)]
+        )
+        _check_opencode_system_sources()
+
+    def test_mdm_plist_checked_when_system_dir_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 5 (#1086): a missing system directory must not skip
+        # the MDM check: the plist is a separate managed source.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(_agent_cli, "_OPENCODE_SYSTEM_CONFIG_DIR", str(tmp_path / "absent"))
+        plist = tmp_path / "ai.opencode.managed.plist"
+        self._write_mdm_plist(
+            plist,
+            {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]},
+        )
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_managed_preference_paths", lambda env=None: [str(plist)]
+        )
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_managed_preference_paths(self) -> None:
+        # Review round 5 (#1086): the per-user MDM plist comes first,
+        # then the machine-wide one (pinned discovery.ts preferencePaths).
+        # Review round 6 (#1086): build the expectations with
+        # os.path.join, like the helper does. On Windows the helper
+        # inserts backslashes, so fixed POSIX strings never match.
+        assert _opencode_managed_preference_paths("someuser") == [
+            os.path.join(
+                "/Library/Managed Preferences",
+                "someuser",
+                "ai.opencode.managed.plist",
+            ),
+            os.path.join("/Library/Managed Preferences", "ai.opencode.managed.plist"),
+        ]
+
+    def test_managed_preference_paths_use_child_env_user(self) -> None:
+        # Review round 6 (#1086): Bun resolves os.userInfo().username
+        # from USER, while getpass.getuser() prefers LOGNAME, so with
+        # LOGNAME alice and USER bob the guard must check Bob's plist,
+        # the one the OpenCode child loads, not Alice's.
+        assert _opencode_managed_preference_paths(env={"USER": "bob", "LOGNAME": "alice"}) == [
+            os.path.join("/Library/Managed Preferences", "bob", "ai.opencode.managed.plist"),
+            os.path.join("/Library/Managed Preferences", "ai.opencode.managed.plist"),
+        ]
+
+    def test_managed_preference_paths_ambiguous_identity_refuses(self) -> None:
+        # Review round 6 (#1086): without a usable USER in the child
+        # environment the child's effective identity cannot be
+        # established, so the gate refuses startup instead of guessing
+        # a user and possibly checking the wrong plist.
+        with pytest.raises(AgentCLIError, match="no usable USER"):
+            _opencode_managed_preference_paths(env={"LOGNAME": "alice"})
+        with pytest.raises(AgentCLIError, match="no usable USER"):
+            _opencode_managed_preference_paths(env={})
+        with pytest.raises(AgentCLIError, match="no usable USER"):
+            _opencode_managed_preference_paths(env={"USER": ""})
+        with pytest.raises(AgentCLIError, match="no usable USER"):
+            _opencode_managed_preference_paths(env={"USER": "   "})
+
+    def test_mdm_plist_checked_for_child_user_not_logname(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 6 (#1086): end to end, the gate reads the plist
+        # of the user named by the child environment, not LOGNAME. With
+        # LOGNAME alice and USER bob, Bob's allow refuses, while Alice's
+        # allow alone passes because OpenCode never loads her plist.
+        # The /Library paths do not exist on this host, so stand in
+        # isfile/open for exactly the two per-user plist paths.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        allow = io.BytesIO()
+        plistlib.dump(
+            {"policies": [{"action": "plugin.use", "resource": "*", "effect": "allow"}]},
+            allow,
+        )
+        allow_bytes = allow.getvalue()
+        bob_path = os.path.join("/Library/Managed Preferences", "bob", "ai.opencode.managed.plist")
+        alice_path = os.path.join(
+            "/Library/Managed Preferences", "alice", "ai.opencode.managed.plist"
+        )
+        present: set[str] = set()
+        real_isfile = os.path.isfile
+        real_open = open
+
+        def fake_isfile(path: str) -> bool:
+            if path in (bob_path, alice_path):
+                return path in present
+            return real_isfile(path)
+
+        def fake_open(path: str, *args: object, **kwargs: object) -> object:
+            if path in (bob_path, alice_path):
+                return io.BytesIO(allow_bytes)
+            return real_open(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os.path, "isfile", fake_isfile)
+        monkeypatch.setattr("builtins.open", fake_open)
+        child_env = {"USER": "bob", "LOGNAME": "alice"}
+        present.add(bob_path)
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources(child_env)
+        present.clear()
+        present.add(alice_path)
+        _check_opencode_system_sources(child_env)
+        with pytest.raises(AgentCLIError, match="no usable USER"):
+            _check_opencode_system_sources({"LOGNAME": "alice"})
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 (#1086): version-specific OPENCODE_DISABLE_PROJECT_CONFIG
+# and an isolated 2.x auth probe. Both findings were verified live:
+# real 1.19.4 writes a .gitignore into an ancestor .opencode project when
+# the flag is absent, and real 2.2.7 accepts `auth list --standalone`.
+# ---------------------------------------------------------------------------
+
+
+class TestOpencodeProjectConfigFlagVersionSpecific:
+    @pytest.mark.parametrize(
+        "version,flag_expected",
+        [
+            ((1, 18, 34), "1"),
+            ((1, 19, 4), "1"),
+            ((2, 2, 6), None),
+            ((2, 2, 7), None),
+            (None, "1"),
+        ],
+    )
+    def test_prepare_env_flag_is_version_specific(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        version: tuple[int, int, int] | None,
+        flag_expected: str | None,
+    ) -> None:
+        # The 2.x policy-delivery change must not leak into 1.x: the flag
+        # stays set for every 1.x runtime (and for an unknowable version,
+        # which keeps the 1.x shape) and is omitted only on 2.x.
+        monkeypatch.setattr(_agent_cli, "_probe_opencode_version", lambda _binary: version)
+        argv = _build_opencode_argv(OPENCODE_BINARY, "", 0)
+        env = _prepare_opencode_env({"PATH": os.environ.get("PATH", "")}, str(tmp_path), argv)
+        assert env.get("OPENCODE_DISABLE_PROJECT_CONFIG") == flag_expected
+
+
+class TestOpencodeAuthProbeIsolation:
+    @pytest.fixture(autouse=True)
+    def _empty_system_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The 2.x auth check runs the system-source gate before the
+        # probe starts a server, so point the gate at an empty temporary
+        # directory: on a developer machine with a configured system
+        # plugin the gate would otherwise refuse before the fake binary
+        # runs. The undecodable-config case below overrides this default
+        # with its own directory. The effective lookup is
+        # _opencode_system_config_dir: on Windows it derives from the
+        # child environment, so patching the module constant alone would
+        # not isolate the probe (review round 5, #1086).
+        empty_system_dir = tmp_path / "system"
+        empty_system_dir.mkdir()
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(empty_system_dir)
+        )
+
+    @staticmethod
+    def _write_fake_auth_2x(binary: Path, markers: Path) -> None:
+        """Fake modelling the 2.x auth probe boundary.
+
+        ``auth list`` fails when ``--standalone`` is absent (an ordinary
+        service occupies the fixed port) and when the working directory
+        holds no project policy denying ``plugin.use`` (a configured
+        project/system plugin would load). With both present it prints
+        the 2.x JSON shape with one connection.
+        """
+        binary.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                markers = Path({str(markers)!r})
+
+                if sys.argv[1:] == ["--version"]:
+                    print("2.2.7")
+                    raise SystemExit(0)
+
+                if sys.argv[1:3] == ["auth", "list"]:
+                    (markers / "argv").write_text(json.dumps(sys.argv[1:]))
+                    (markers / "cwd").write_text(os.getcwd())
+                    (markers / "env-flag").write_text(
+                        os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG", "absent")
+                    )
+                    project = Path.cwd() / "opencode.jsonc"
+                    (markers / "policy").write_text(
+                        project.read_text() if project.exists() else ""
+                    )
+                    if "--standalone" not in sys.argv:
+                        print("background service already occupies the fixed port", file=sys.stderr)
+                        raise SystemExit(1)
+                    if not project.exists():
+                        print("no project policy: a configured plugin would load", file=sys.stderr)
+                        raise SystemExit(1)
+                    config = json.loads(project.read_text())
+                    denied = any(
+                        policy.get("action") == "plugin.use"
+                        and policy.get("resource") == "*"
+                        and policy.get("effect") == "deny"
+                        for policy in config.get("policies", [])
+                    )
+                    if not denied:
+                        print("no plugin.use deny: a configured plugin would load", file=sys.stderr)
+                        raise SystemExit(1)
+                    print(json.dumps([{{"id": "anthropic", "connections": [{{"type": "credential"}}]}}]))
+                    raise SystemExit(0)
+
+                raise SystemExit(2)
+                """
+            ),
+            encoding="utf-8",
+        )
+        binary.chmod(0o700)
+
+    @staticmethod
+    def _write_fake_auth_1x(binary: Path, markers: Path) -> None:
+        """Fake modelling the 1.x auth probe boundary (counts output)."""
+        binary.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                markers = Path({str(markers)!r})
+
+                if sys.argv[1:] == ["--version"]:
+                    print("1.18.34")
+                    raise SystemExit(0)
+
+                if sys.argv[1:] == ["auth", "list"]:
+                    (markers / "argv").write_text(json.dumps(sys.argv[1:]))
+                    (markers / "cwd").write_text(os.getcwd())
+                    (markers / "env-flag").write_text(
+                        os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG", "absent")
+                    )
+                    print("1 credential\\n1 environment variable")
+                    raise SystemExit(0)
+
+                raise SystemExit(2)
+                """
+            ),
+            encoding="utf-8",
+        )
+        binary.chmod(0o700)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_auth_probe_uses_standalone_isolated_dir_policy_and_cleans_up(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_auth_2x(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        created: list[str] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def recording_mkdtemp(*args: object, **kwargs: object) -> str:
+            path = real_mkdtemp(*args, **kwargs)  # type: ignore[arg-type]
+            created.append(path)
+            return path
+
+        monkeypatch.setattr(tempfile, "mkdtemp", recording_mkdtemp)
+
+        assert _opencode_auth_check(str(binary)) == (True, None)
+        assert json.loads((markers / "argv").read_text()) == [
+            "auth",
+            "list",
+            "--standalone",
+            "--format",
+            "json",
+        ]
+        cwd = (markers / "cwd").read_text()
+        assert "skillspector_opencode_auth_" in cwd
+        assert cwd != os.getcwd()
+        policy = json.loads((markers / "policy").read_text())
+        assert {"action": "plugin.use", "resource": "*", "effect": "deny"} in policy.get(
+            "policies", []
+        )
+        assert (markers / "env-flag").read_text() == "absent"
+        assert created, "auth probe must create its isolated temp dir"
+        assert all(not os.path.exists(path) for path in created), "auth temp dir leaked"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_auth_probe_old_shape_fails_on_busy_port(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Pins the regression the fix addresses: without --standalone the
+        # probe resolves the default service, and an ordinary service
+        # already occupying the fixed port makes availability fail even
+        # with valid credentials.
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_auth_2x(binary, markers)
+        (tmp_path / "opencode.jsonc").write_text(
+            _opencode_config_2x("skillspector-deny-all-test"), encoding="utf-8"
+        )
+
+        old_argv = subprocess.run(
+            [str(binary), "auth", "list", "--format", "json"],
+            capture_output=True,
+            cwd=tmp_path,
+            timeout=30,
+        )
+        assert old_argv.returncode == 1
+        assert b"fixed port" in old_argv.stderr
+
+        new_argv = subprocess.run(
+            [str(binary), "auth", "list", "--standalone", "--format", "json"],
+            capture_output=True,
+            cwd=tmp_path,
+            timeout=30,
+        )
+        assert new_argv.returncode == 0
+        assert len(json.loads(new_argv.stdout.decode())) == 1
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_1x_auth_probe_keeps_flag_and_isolated_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_auth_1x(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        assert _opencode_auth_check(str(binary)) == (True, None)
+        assert json.loads((markers / "argv").read_text()) == ["auth", "list"]
+        assert "--standalone" not in json.loads((markers / "argv").read_text())
+        cwd = (markers / "cwd").read_text()
+        assert "skillspector_opencode_auth_" in cwd
+        assert cwd != os.getcwd()
+        assert (markers / "env-flag").read_text() == "1"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_auth_probe_undecodable_system_config_returns_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Review round 4 (#1086): invalid UTF-8 in a system config must
+        # surface as an unavailable-provider result, not escape the auth
+        # check as UnicodeDecodeError.
+        # The autouse fixture already created this empty directory.
+        system_dir = tmp_path / "system"
+        (system_dir / "opencode.json").write_bytes(b'{"policies": [\xff\xfe]}')
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(system_dir)
+        )
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_auth_2x(binary, markers)
+        ok, reason = _opencode_auth_check(str(binary))
+        assert ok is False
+        assert reason is not None and "could not be decoded" in reason
+        assert list(markers.iterdir()) == []
+
+
+class TestOpencodeAncestorProject:
+    @pytest.fixture(autouse=True)
+    def _empty_system_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The 2.x run here goes through the real preflight, which runs
+        # the system-source gate before any server starts: point the
+        # gate at an empty temporary directory so the result never
+        # depends on the host's real system directory. The effective
+        # lookup is _opencode_system_config_dir: on Windows it derives
+        # from the child environment, so patching the module constant
+        # alone would not isolate the preflight (review round 5, #1086).
+        empty_system_dir = tmp_path / "system"
+        empty_system_dir.mkdir()
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(empty_system_dir)
+        )
+
+    @pytest.fixture()
+    def project(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        # A repository containing .opencode, with the run/auth temp dirs
+        # placed beneath it: tempfile.tempdir is honoured by mkdtemp, so
+        # pointing it at the nested dir reproduces TMPDIR beneath a repo.
+        project = tmp_path / "project"
+        (project / ".opencode").mkdir(parents=True)
+        (project / ".opencode" / "opencode.json").write_text(
+            json.dumps({"plugin": ["some-system-plugin"]}), encoding="utf-8"
+        )
+        nested = project / "nested"
+        nested.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(nested))
+        monkeypatch.setenv("TMPDIR", str(nested))
+        return project
+
+    @staticmethod
+    def _write_fake_opencode_ancestor(binary: Path, markers: Path) -> None:
+        """1.x fake simulating config initialisation in an ancestor project.
+
+        With OPENCODE_DISABLE_PROJECT_CONFIG unset, a `debug config` or
+        `auth list` invocation walks up from its cwd, finds the ancestor
+        `.opencode` project, and writes a missing `.gitignore` there,
+        the way real 1.19.4 does before the preflight finishes.
+        """
+        binary.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                def ancestor_opencode():
+                    here = Path.cwd()
+                    for parent in [here, *here.parents]:
+                        if (parent / ".opencode").is_dir():
+                            return parent / ".opencode"
+                    return None
+
+                def maybe_touch_ancestor():
+                    if os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG") == "1":
+                        return
+                    found = ancestor_opencode()
+                    if found is not None:
+                        (found / ".gitignore").write_text("node_modules\\n")
+
+                if sys.argv[1:] == ["--version"]:
+                    print("1.18.34")
+                    raise SystemExit(0)
+
+                if sys.argv[1:] == ["debug", "config"]:
+                    maybe_touch_ancestor()
+                    print(json.dumps(json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])))
+                    raise SystemExit(0)
+
+                if sys.argv[1:] == ["auth", "list"]:
+                    maybe_touch_ancestor()
+                    print("1 credential\\n1 environment variable")
+                    raise SystemExit(0)
+
+                selected = sys.argv[sys.argv.index("--agent") + 1]
+                print(json.dumps({{"type": "text", "part": {{"type": "text", "text": "policy held:" + selected}}}}))
+                """
+            ),
+            encoding="utf-8",
+        )
+        binary.chmod(0o700)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_1x_run_beneath_project_leaves_ancestor_untouched(
+        self, tmp_path: Path, project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_ancestor(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        response = run_agent_cli("opencode", "use every host tool", model="")
+        assert response.startswith("policy held:")
+        assert not (project / ".opencode" / ".gitignore").exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_1x_auth_probe_beneath_project_leaves_ancestor_untouched(
+        self, tmp_path: Path, project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_ancestor(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        assert _opencode_auth_check(str(binary)) == (True, None)
+        assert not (project / ".opencode" / ".gitignore").exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_run_beneath_project_delivers_policy_and_omits_flag(
+        self, tmp_path: Path, project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        TestOpencodeDenyAllPolicyV2._write_fake_opencode_v2(binary, markers)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        response = run_agent_cli("opencode", "use every host tool", model="")
+        assert response.startswith("policy held:")
+        assert (markers / "env-flag").read_text() == "absent"
+        config = json.loads((markers / "jsonc").read_text())
+        assert {"action": "plugin.use", "resource": "*", "effect": "deny"} in config.get(
+            "policies", []
+        )
+        assert not (project / ".opencode" / ".gitignore").exists()
 
 
 # ---------------------------------------------------------------------------
