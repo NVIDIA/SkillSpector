@@ -288,6 +288,32 @@ def test_swapped_ids_fall_back_to_location_matching() -> None:
     assert by_id["ast1"].message == "ast1 assessment"
 
 
+def test_blank_assessment_keeps_the_findings_contextual_guidance() -> None:
+    """A confirmed assessment with no replacement text must not erase the finding's own guidance.
+
+    ``MetaAnalyzerFinding`` allows an empty ``explanation``/``remediation``; falling
+    back straight to the rule defaults would drop AST4's per-call text (fixed-argv
+    vs. shell expansion) from the final report.
+    """
+    finding = Finding(
+        rule_id="AST4",
+        message="static",
+        finding_id="ast4",
+        file="requirements.txt",
+        start_line=4,
+        explanation="Fixed argument vector: shell expansion is disabled.",
+        remediation="Keep the explicit argument vector.",
+    )
+    batch = Batch(file_path="requirements.txt", content="", findings=[finding])
+    items = [_llm_item("AST4", 4, finding_id="ast4", explanation="", remediation="")]
+
+    returned = _analyzer().apply_filter([finding], [(batch, items)])
+
+    assert returned[0].explanation == "Fixed argument vector: shell expansion is disabled."
+    assert returned[0].remediation == "Keep the explicit argument vector."
+    assert returned[0].message == "Fixed argument vector: shell expansion is disabled."
+
+
 def test_unknown_id_with_correct_location_still_binds() -> None:
     """A mistyped id should not turn a matching assessment into missing."""
     finding = _finding("SC4", 4)
