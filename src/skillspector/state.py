@@ -47,6 +47,17 @@ logger = get_logger(__name__)
 DEFAULT_MAX_WORKFLOW_SECONDS = 1080.0
 
 
+@dataclass(frozen=True)
+class PreparedReport:
+    """Immutable, serialized presentation snapshot, never live workflow state.
+
+    Renderers decode their own copies, so neither a renderer nor a consumer of
+    its output can change the assessment used by subsequent formats.
+    """
+
+    payload: bytes
+
+
 def _workflow_max_seconds_from_environment(value: str | None) -> float:
     """Return a positive finite workflow deadline or the safe default."""
     if value is None:
@@ -356,6 +367,7 @@ class SkillspectorState(TypedDict, total=False):
     # Output: report node writes formatted string here
     output_format: str
     report_body: str
+    prepared_report: PreparedReport
 
     # LLM: when False, LLM-based nodes (meta_analyzer, mcp_tool_poisoning's TP4,
     # and the semantic_* analyzers) return immediately without calling the LLM.

@@ -81,6 +81,7 @@ from skillspector.semantic_runtime import (
 from skillspector.state import (
     MAX_WORKFLOW_BYTES,
     MAX_WORKFLOW_SECONDS,
+    PreparedReport,
     SkillspectorState,
 )
 from skillspector.suppression import (
@@ -468,8 +469,13 @@ def _write_result(
 
 
 def _render_report(result: dict[str, object], format: FormatChoice) -> dict[str, object]:
-    """Reuse the existing report node, never the scan graph, for another format."""
-    return report(cast(SkillspectorState, {**result, "output_format": format.value}))
+    """Render only a finalized snapshot; never rerun report-time assessment."""
+    from skillspector.nodes.report import render_report
+
+    prepared = result.get("prepared_report")
+    if not isinstance(prepared, PreparedReport):
+        raise ValueError("Additional reports require a finalized report snapshot.")
+    return render_report(prepared, format.value)
 
 
 def _validate_additional_report(input_path: Path, output: Path) -> None:
@@ -2254,7 +2260,10 @@ def _scan_transitive(
             "transitive_truncated": False,
             "transitive_truncation_reasons": [],
         }
-        report_result.update(report(report_result))
+        if isinstance(initial_result.get("prepared_report"), PreparedReport):
+            report_result.update(_render_report(initial_result, format))
+        else:
+            report_result.update(report(report_result))
         return report_result
 
     if traversal is None:
@@ -2725,7 +2734,6 @@ def _scan_transitive(
         merged_result["execution_successful"] = completeness["execution_successful"]
         merged_result["effective_finding_ids"] = effective_ids
     report_result = {**merged_result, **report(merged_result)}
-    report_result["analysis_completeness"] = merged_result.get("analysis_completeness", {})
     report_result["meta_review_required"] = merged_meta_review_required
     report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
     active_findings = _coerce_findings_list(report_result.get("filtered_findings"))

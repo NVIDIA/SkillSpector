@@ -8,8 +8,10 @@ import os
 import sys
 import zipfile
 from copy import deepcopy
-from datetime import UTC, datetime
+from dataclasses import FrozenInstanceError
+from datetime import UTC, date, datetime
 from importlib import import_module
+from itertools import permutations
 from unittest.mock import Mock
 
 import pytest
@@ -216,6 +218,220 @@ def test_transitive_extra_reports_retain_runtime_edges(
     assert ("Accepted" in markdown) is show
     assert result == snapshot
     assert scan.call_count == depth
+
+
+@pytest.mark.parametrize("depth", [0, 1])
+@pytest.mark.parametrize("primary", list(cli.FormatChoice))
+@pytest.mark.parametrize("available", [False, True])
+def test_rendering_locks_assessment_across_runtime_changes(
+    tmp_path, monkeypatch, transitive_states, depth, primary, available
+):
+    """No format/order may reprobe credentials or re-finalize completed results."""
+    module = import_module("skillspector.nodes.report")
+    probe = Mock(
+        side_effect=[
+            (available, None if available else "Credential failure"),
+            AssertionError(
+                "Rendering must not refresh credentials or repeat provider availability."
+            ),
+        ]
+    )
+    monkeypatch.setattr(module, "is_llm_available", probe)
+    root, result, scan = transitive_states(primary, depth)
+    assert probe.call_count == 1
+    prepared = result["prepared_report"]
+    with pytest.raises(FrozenInstanceError):
+        prepared.payload = b"changed"
+    expected = {format: cli._render_report(result, format) for format in cli.FormatChoice}
+    expected_json = json.loads(expected[cli.FormatChoice.json]["report_body"])
+
+    # These are all assessment entry points, not formatting work. A deadline,
+    # changed analyzer registry or changed baseline must have no second chance
+    # to affect an already finalized report.
+    for name in (
+        "is_llm_available",
+        "transitive_remaining_seconds",
+        "semantic_runtime_intent",
+        "semantic_runtime_accounting",
+        "semantic_runtime_ledger_event",
+        "llm_runtime_available",
+        "finalize_ledger",
+        "partition_findings",
+        "deduplicate",
+        "_compute_risk_score",
+        "_build_metadata",
+        "_build_sarif",
+        "clear_python_ast_cache",
+    ):
+        monkeypatch.setattr(module, name, Mock(side_effect=AssertionError(name)))
+
+    class LaterDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            raise AssertionError("Rendering must reuse the completed scan timestamp.")
+
+    monkeypatch.setattr(module, "datetime", LaterDatetime)
+    # Mutate both original scan objects and the exposed report projection,
+    # including nested findings, suppression, component metadata and coverage.
+    root["findings"][0].severity = "CRITICAL"
+    result["findings"].clear()
+    result["component_metadata"].clear()
+    result["baseline"].fingerprints.clear()
+    result["llm_call_log"].clear()
+    result["analysis_completeness"]["is_complete"] = False
+    result["active_findings"][0].message = "changed"
+    result["suppressed_findings"][0].finding.message = "changed"
+    result["sarif_report"].clear()
+    result["risk_score"] = 100
+    result["workflow_deadline"] = 0
+    mutated = deepcopy(result)
+
+    for order in permutations(cli.FormatChoice):
+        for format in order:
+            rendered = cli._render_report(result, format)
+            assert rendered == expected[format]
+            # A downstream consumer cannot poison a later rendering either.
+            rendered["analysis_completeness"].clear()
+            rendered["active_findings"].clear()
+            rendered["sarif_report"].clear()
+        assert result == mutated
+
+    assert expected_json["risk_assessment"]["score"] == (19 if depth else 13)
+    assert expected_json["suppressed_count"] == 1
+    assert probe.call_count == 1
+    assert scan.call_count == depth
+
+
+def test_renderer_cannot_mutate_canonical_projection(monkeypatch, transitive_states):
+    module = import_module("skillspector.nodes.report")
+    _, result, _ = transitive_states(cli.FormatChoice.markdown, 0)
+    original = deepcopy(result)
+
+    def mutating_formatter(**kwargs):
+        kwargs["findings"][0].severity = "CRITICAL"
+        kwargs["suppressed"][0].finding.message = "changed"
+        kwargs["analysis_completeness"].clear()
+        kwargs["component_metadata"].clear()
+        kwargs["prepared_metadata"].clear()
+        return "mutating renderer"
+
+    monkeypatch.setattr(module, "_format_json", mutating_formatter)
+    rendered = cli._render_report(result, cli.FormatChoice.json)
+    assert rendered["report_body"] == "mutating renderer"
+    for key in ("active_findings", "suppressed_findings", "analysis_completeness", "risk_score"):
+        assert rendered[key] == original[key]
+    assert result == original
+    assert (
+        cli._render_report(result, cli.FormatChoice.markdown)["report_body"]
+        == (original["report_body"])
+    )
+
+
+def test_snapshot_excludes_nonpresentation_workflow_objects(transitive_states):
+    """Freezing reports must not require serializing arbitrary internal state."""
+    root, _, _ = transitive_states(cli.FormatChoice.markdown, 0)
+    root["manifest"]["released"] = date(2026, 11, 19)
+    root["component_metadata"][0]["internal_handle"] = object()
+    root["llm_call_log"][0]["internal_handle"] = object()
+    result = {**root, **report(root)}
+    for format in cli.FormatChoice:
+        rendered = cli._render_report(result, format)
+        assert rendered["report_body"]
+        assert rendered["risk_score"] == 13
+        assert len(rendered["suppressed_findings"]) == 1
+    payload = json.loads(cli._render_report(result, cli.FormatChoice.json)["report_body"])
+    assert payload["skill"]["name"] == "state-fixture"
+    assert payload["metadata"]["llm_calls_succeeded"] == len(root["llm_call_log"])
+    assert "internal_handle" not in result["prepared_report"].payload.decode()
+
+
+def test_additional_rendering_rejects_unfinalized_state(monkeypatch):
+    """Fail closed instead of silently running assessment again on a projection."""
+    node = Mock(side_effect=AssertionError("must not assess incomplete state"))
+    monkeypatch.setattr(cli, "report", node)
+    with pytest.raises(ValueError, match="finalized report snapshot"):
+        cli._render_report({"risk_score": 0}, cli.FormatChoice.json)
+    node.assert_not_called()
+
+
+@pytest.mark.parametrize("depth", [0, 1])
+def test_transitive_report_snapshot_lifecycle(monkeypatch, transitive_states, depth):
+    """Reuse a finished root, but never reuse its snapshot for merged findings."""
+    module = import_module("skillspector.nodes.report")
+    probe = Mock(return_value=(True, None))
+    monkeypatch.setattr(module, "is_llm_available", probe)
+    root, _, scan = transitive_states(cli.FormatChoice.markdown, 0)
+    # A real graph already returns a primary report. The CLI must not repeat
+    # its assessment when no transitive analysis is added.
+    root.update(report(root))
+    root_snapshot = root["prepared_report"]
+    probe.reset_mock()
+    result = cli._scan_transitive(
+        initial_result=root,
+        format=cli.FormatChoice.markdown,
+        no_llm=False,
+        max_depth=depth,
+        transitive_allow_prefix=[],
+        transitive_deny_prefix=[],
+        baseline=None,
+        show_suppressed=True,
+        visited=set(),
+    )
+    assert probe.call_count == depth
+    assert scan.call_count == depth
+    assert (result["prepared_report"] == root_snapshot) is (depth == 0)
+    payload = json.loads(cli._render_report(result, cli.FormatChoice.json)["report_body"])
+    assert payload["risk_assessment"]["score"] == (19 if depth else 13)
+    assert {finding["id"] for finding in payload["issues"]} == (
+        {"EXEC", "CHILD"} if depth else {"EXEC"}
+    )
+    assert probe.call_count == depth
+
+
+@pytest.mark.parametrize("primary", list(cli.FormatChoice))
+@pytest.mark.parametrize("recursive", [False, True])
+def test_cli_alternative_formats_probe_each_completed_skill_once(
+    tmp_path, monkeypatch, transitive_states, primary, recursive
+):
+    module = import_module("skillspector.nodes.report")
+    root = tmp_path / "skills"
+    paths = [root / "one", root / "two"] if recursive else [root]
+    for path in paths:
+        path.mkdir(parents=True)
+        (path / "SKILL.md").write_bytes(b"# Preserve input\r\n")
+    scans_completed = 0
+
+    def available(**kwargs):
+        # The second check for any completed child would fail, just as an
+        # expiring deadline or credential refresh would in production.
+        assert probe.call_count <= scans_completed
+        return True, None
+
+    probe = Mock(side_effect=available)
+    monkeypatch.setattr(module, "is_llm_available", probe)
+
+    def scan(**kwargs):
+        nonlocal scans_completed
+        scans_completed += 1
+        return transitive_states(primary, 0)[1]
+
+    scan_mock = Mock(side_effect=scan)
+    monkeypatch.setattr(cli, "_scan_skill", scan_mock)
+    destinations = {format: tmp_path / f"report.{format.value}" for format in cli.FormatChoice}
+    args = ["scan", str(root), "--no-llm", "-f", primary.value]
+    if recursive:
+        args.append("--recursive")
+    for format, destination in destinations.items():
+        args.extend(["--report", f"{format.value}={destination}"])
+    invocation = runner.invoke(cli.app, args)
+    assert invocation.exit_code == 0, invocation.output
+    assert probe.call_count == scan_mock.call_count == len(paths)
+    payload = json.loads(destinations[cli.FormatChoice.json].read_text())
+    children = payload["skills"] if recursive else [payload]
+    assert all(child["metadata"]["llm_available"] is True for child in children)
+    assert all(child["metadata"].get("llm_degraded", False) is False for child in children)
+    assert all(path.joinpath("SKILL.md").read_bytes() == b"# Preserve input\r\n" for path in paths)
+    validate_sarif_report(json.loads(destinations[cli.FormatChoice.sarif].read_text()))
 
 
 @pytest.fixture
