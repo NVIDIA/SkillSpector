@@ -41,7 +41,6 @@ from skillspector.inspection_ledger import (
     outcome_for_llm_batch_failure,
 )
 from skillspector.llm_analyzer_base import (
-    PROMPT_BYTE_SAFETY_MARGIN,
     Batch,
     LLMAnalyzerBase,
     LLMRuntimeLimitError,
@@ -51,7 +50,7 @@ from skillspector.llm_analyzer_base import (
     max_prompt_bytes,
     optional_positive_int_env,
 )
-from skillspector.llm_utils import run_async
+from skillspector.llm_utils import run_async, structured_output_instructions
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding, compute_match_fingerprint
 from skillspector.nodes.analyzers.static_runner import MAX_FINDINGS_PER_ANALYZER
@@ -1097,6 +1096,14 @@ def _bounded_utf8_prefix(text: str, max_bytes: int) -> tuple[str, int, bool]:
     return candidate, len(encoded), len(candidate) < len(text)
 
 
+def _tp4_serialized_bytes(prompt: str) -> int:
+    """UTF-8 bytes of a TP4 *prompt* as submitted, with language and schema instructions."""
+    serialized = append_output_language_instruction(prompt) + structured_output_instructions(
+        _TP4AnalysisResult
+    )
+    return len(serialized.encode("utf-8"))
+
+
 def _tp4_line_chunks(
     content: str, max_tokens: int, max_bytes: int | None = None
 ) -> Iterator[_TP4CodeChunk]:
@@ -1343,12 +1350,9 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
             header = f"### {candidate.path} ({candidate.language})\n"
             code_byte_budget: int | None = None
             if prompt_byte_cap is not None:
-                fixed_bytes = len(
-                    append_output_language_instruction(prefix + header + _TP4_PROMPT_SUFFIX).encode(
-                        "utf-8"
-                    )
-                )
-                code_byte_budget = max(0, prompt_byte_cap - fixed_bytes - PROMPT_BYTE_SAFETY_MARGIN)
+                # Same augmented text the shared preflight checks, so a chunk that fits is kept.
+                fixed_bytes = _tp4_serialized_bytes(prefix + header + _TP4_PROMPT_SUFFIX)
+                code_byte_budget = max(0, prompt_byte_cap - fixed_bytes)
             for chunk in _tp4_line_chunks(
                 candidate.content, code_token_budget, max_bytes=code_byte_budget
             ):
@@ -1411,7 +1415,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     )
                     continue
                 prompt_bytes = len(prompt.encode("utf-8"))
-                sent_bytes = len(append_output_language_instruction(prompt).encode("utf-8"))
+                sent_bytes = _tp4_serialized_bytes(prompt)
                 if prompt_byte_cap is not None and sent_bytes > prompt_byte_cap:
                     add_partial_once(
                         _tp4_partial_event(
