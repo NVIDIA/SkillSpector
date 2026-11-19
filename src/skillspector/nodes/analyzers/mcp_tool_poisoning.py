@@ -1222,6 +1222,31 @@ _TP4_GENERIC_FINITE_VERB_PATTERN = re.compile(
     r"(?=\s+(?!(?:and|or|but|that|which|who|whom|whose|without|to|in|for|of|from|on|at|by|with|over|under|via|through|after|before|during|against|into|onto|as|is|are|was|were|be|been|has|have|had|does|do|did|can|could|will|would|not|no|if|when|while|whereas|although|though|however|then|than|so|yet)\b)[a-z])"
 )
 
+# A modal plus base-form verb: capability descriptions also phrase
+# behavior as "can steal", "could transfer", "may collect", where the verb
+# is a base form, so neither the affirmative list nor the third-person
+# singular shape sees it. "The script can steal credentials without
+# consent" is affirmative behavior qualified by "without consent", not an
+# absence, so the modal phrase counts as a finite verb for the scope
+# checks below: it is affirmative evidence when it sits outside a
+# governing marker ("No user can access the admin panel" stays an absence
+# because the leading "no" governs it). A negated modal ("can not",
+# "must never") is not a verb phrase at all, and a modal plus an absence
+# verb ("may lack", "will fail to") still describes an omission, so both
+# are excluded. "cannot" is one word, so it never matches the modal slot,
+# and "can be" is a copula, not behavior. An optional adverb ("also",
+# "silently") may sit between the modal and the verb.
+_TP4_MODAL_AUXILIARY_ALTERNATION = r"can|could|may|might|will|would|shall|should|must"
+_TP4_MODAL_ADVERB_ALTERNATION = r"also|still|even|silently|automatically|directly|quickly|easily"
+_TP4_MODAL_VERB_PATTERN = re.compile(
+    rf"\b(?:{_TP4_MODAL_AUXILIARY_ALTERNATION})\s+"
+    rf"(?:(?:{_TP4_MODAL_ADVERB_ALTERNATION})\s+)?"
+    r"(?!(?:not|never|no)\b)"
+    r"(?!(?:lack|omit|fail|miss)(?:s|es|ed|ing)?\b)"
+    r"(?!(?:be|been|being)\b)"
+    r"[a-z][a-z\-]*\b"
+)
+
 # A subject-first affirmative clause after a comma ("the code sends
 # credentials in plaintext", "it uploads files"): a determiner or pronoun
 # subject, at most three words of subject noun phrase, then a capability
@@ -1246,6 +1271,23 @@ _TP4_SUBJECT_FIRST_GENERIC_PATTERN = re.compile(
     r"^(?:(?:it|they|he|she|this|that)\s+|(?:the|this|that|its|their)\s+"
     r"[a-z][a-z\-]*(?:\s+[a-z][a-z\-]*){0,2}\s+)"
     r"(?!(?:lacks|omits)\s)[a-z][a-z\-]*[a-z]s\s+"
+    r"(?!or\b|and\b)[a-z]"
+)
+
+# The same subject-first shape with a modal plus base-form verb: "the
+# script can steal credentials" is a main clause even though "steal" is a
+# base form outside the affirmative alternation. The same exclusions
+# apply: a negated modal and a modal plus an absence verb are not
+# affirmative evidence.
+_TP4_SUBJECT_FIRST_MODAL_PATTERN = re.compile(
+    rf"^(?:(?:it|they|he|she|this|that)\s+|(?:the|this|that|its|their)\s+"
+    rf"[a-z][a-z\-]*(?:\s+[a-z][a-z\-]*){{0,2}}\s+)"
+    rf"(?:{_TP4_MODAL_AUXILIARY_ALTERNATION})\s+"
+    rf"(?:(?:{_TP4_MODAL_ADVERB_ALTERNATION})\s+)?"
+    r"(?!(?:not|never|no)\b)"
+    r"(?!(?:lack|omit|fail|miss)(?:s|es|ed|ing)?\b)"
+    r"(?!(?:be|been|being)\b)"
+    r"[a-z][a-z\-]*\s+"
     r"(?!or\b|and\b)[a-z]"
 )
 
@@ -1295,7 +1337,10 @@ def _tp4_strip_leading_absence_modifier(clause: str) -> str:
     affirmative clause ("No support for TLS, the code sends credentials in
     plaintext"). The verb that opens the remainder need not be in the
     affirmative list ("No support for TLS, transfers source files"): an
-    ordinary finite verb is a main clause too. A list such as "No evidence
+    ordinary finite verb is a main clause too. A subject-first modal clause
+    ("No support for TLS, the script can steal credentials") is a main
+    clause too, as is a remainder that opens with a bare modal phrase
+    ("No support for TLS, can steal credentials"). A list such as "No evidence
     of network activity, file writes, or remote uploads" keeps its
     negation because the remainder opens with a noun, so the whole entry
     still describes absent behavior.
@@ -1318,10 +1363,12 @@ def _tp4_strip_leading_absence_modifier(clause: str) -> str:
     remainder_opens_with_verb = (
         _TP4_AFFIRMATIVE_VERB_PATTERN.match(remainder) is not None
         or _TP4_GENERIC_FINITE_VERB_PATTERN.match(remainder) is not None
+        or _TP4_MODAL_VERB_PATTERN.match(remainder) is not None
     )
     remainder_is_subject_first_clause = (
         _TP4_SUBJECT_FIRST_AFFIRMATIVE_PATTERN.match(remainder) is not None
         or _TP4_SUBJECT_FIRST_GENERIC_PATTERN.match(remainder) is not None
+        or _TP4_SUBJECT_FIRST_MODAL_PATTERN.match(remainder) is not None
     )
     if not (is_without_modifier or remainder_opens_with_verb or remainder_is_subject_first_clause):
         return clause
@@ -1331,21 +1378,25 @@ def _tp4_strip_leading_absence_modifier(clause: str) -> str:
 def _tp4_finite_verbs(clause: str) -> list[re.Match[str]]:
     """Return finite capability-verb matches in a clause.
 
-    Both the recognized affirmative verbs and the generic finite-verb
-    shape: the absence guard must treat an ordinary verb outside the
-    inventory ("transfers", "steals") as affirmative evidence, not as an
-    absence.
+    The recognized affirmative verbs, the generic finite-verb shape, and
+    a modal plus base-form verb: the absence guard must treat an ordinary
+    verb outside the inventory ("transfers", "steals") as affirmative
+    evidence, not as an absence, and a base-form verb after a modal
+    ("can steal") is a finite verb too, since neither the list nor the
+    third-person singular shape sees it.
     """
     return [
         *_TP4_AFFIRMATIVE_VERB_PATTERN.finditer(clause),
         *_TP4_GENERIC_FINITE_VERB_PATTERN.finditer(clause),
+        *_TP4_MODAL_VERB_PATTERN.finditer(clause),
     ]
 
 
 def _tp4_starts_with_affirmative_clause(segment: str) -> bool:
     """Return whether a segment opens with a finite affirmative clause.
 
-    Either a finite verb plus object ("steals credentials") or a subject
+    Either a finite verb plus object ("steals credentials"), a modal plus
+    base-form verb plus object ("can steal credentials"), or a subject
     plus finite verb plus object ("the code steals credentials"). Gerund
     and participle forms ("storing videos", "uploaded files") do not open
     a finite clause, so an "and"-joined gerund list stays an absence.
@@ -1354,11 +1405,16 @@ def _tp4_starts_with_affirmative_clause(segment: str) -> bool:
     if verb is not None and not verb.group(0).endswith(("ing", "ed")):
         if re.match(r"\s+[a-z]", segment[verb.end() :]) is not None:
             return True
+    modal = _TP4_MODAL_VERB_PATTERN.match(segment)
+    if modal is not None and re.match(r"\s+[a-z]", segment[modal.end() :]) is not None:
+        return True
     if _TP4_GENERIC_FINITE_VERB_PATTERN.match(segment) is not None:
         return True
     if _TP4_SUBJECT_FIRST_AFFIRMATIVE_PATTERN.match(segment) is not None:
         return True
-    return _TP4_SUBJECT_FIRST_GENERIC_PATTERN.match(segment) is not None
+    if _TP4_SUBJECT_FIRST_GENERIC_PATTERN.match(segment) is not None:
+        return True
+    return _TP4_SUBJECT_FIRST_MODAL_PATTERN.match(segment) is not None
 
 
 def _tp4_has_and_joined_affirmative(clause: str) -> bool:
@@ -1388,7 +1444,11 @@ def _tp4_clause_is_positive_absence(clause: str) -> bool:
     not an absence, a finite verb before the first marker is affirmative
     evidence, and "without" does not negate a following finite verb
     ("Without user consent uploads files" describes uploading), so a verb
-    after a leading "without" is affirmative evidence too. A negating
+    after a leading "without" is affirmative evidence too. A modal plus
+    base-form verb ("can steal") is a finite verb too: it is affirmative
+    evidence when it precedes the marker or follows a "without" that only
+    qualifies the action, and it stays governed when a leading marker
+    precedes it ("No user can access the admin panel"). A negating
     auxiliary ("does not", "cannot", "fails to") does govern the verb
     phrase after it, so "The code does not implement search" stays an
     absence.
@@ -1420,7 +1480,9 @@ def _tp4_mismatched_item_is_absence(item: str) -> bool:
     than suppressed. A finite verb outside the marker's scope is
     affirmative evidence whether or not it is in the affirmative verb
     list, so "Transfers source files without user consent" and "No support
-    for TLS. Steals credentials" are not absences, while "No evidence of
+    for TLS. Steals credentials" are not absences, and a modal plus
+    base-form verb is a finite verb too, so "The script can steal
+    credentials without consent" is not an absence either, while "No evidence of
     querying videos" and "The code does not implement search" still are:
     their verbs sit under the marker. Clauses split on contrast boundaries
     and sentence boundaries, so comma-separated enumerations stay under

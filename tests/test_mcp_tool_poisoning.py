@@ -1400,6 +1400,45 @@ class TestTP4FindingIssue1066:
 
             assert finding is None
 
+    def test_modal_affirmative_capability_emitted(self):
+        # Reviewer case (rng1995, 2026-11-19): a modal plus base-form verb
+        # ("can steal") is a finite verb too, so "without consent" only
+        # qualifies the action and must not suppress the finding. The
+        # pure-absence controls alongside it stay suppressed: a leading
+        # "cannot", a modal governed by a leading "no", and a modal plus
+        # an absence verb.
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        for item in (
+            "The script can steal credentials without consent.",
+            "The tool could transfer files without approval",
+        ):
+            finding = mcp_tool_poisoning._tp4_finding(
+                self._result(0.9, [item]),
+                batch,
+                "A local text utility",
+            )
+
+            assert finding is not None
+
+        for item in (
+            "Cannot steal credentials",
+            "No user can access the admin panel",
+            "The code may lack encryption",
+        ):
+            finding = mcp_tool_poisoning._tp4_finding(
+                self._result(0.9, [item]),
+                batch,
+                "A local text utility",
+            )
+
+            assert finding is None
+
     def test_affirmative_capability_containing_without_emitted(self):
         batch = mcp_tool_poisoning.Batch(
             file_path="scripts/tool.py",
@@ -1560,6 +1599,30 @@ class TestTP4FindingIssue1066:
             # negated verb phrase stay absences.
             ("No evidence of querying and storing videos", True),
             ("Does not encrypt and does not authenticate", True),
+            # Reviewer case (rng1995, 2026-11-19): a modal plus base-form
+            # verb ("can steal") is a finite verb, so "without consent"
+            # only qualifies the action. The same shape holds after a
+            # comma, as a bare modal remainder, as an "and"-joined phrase,
+            # and after a leading "without". A modal governed by a leading
+            # marker, or joined to an absence verb, still describes an
+            # omission.
+            ("The script can steal credentials without consent.", False),
+            ("The script can steal credentials without consent", False),
+            ("The tool could transfer files without approval", False),
+            (
+                "The script may silently exfiltrate data without approval",
+                False,
+            ),
+            (
+                "No support for TLS, the script can steal credentials",
+                False,
+            ),
+            ("No support for TLS, can steal credentials", False),
+            ("Lacks encryption and can steal credentials", False),
+            ("Without consent can steal credentials", False),
+            ("No user can access the admin panel", True),
+            ("The code may lack encryption", True),
+            ("Cannot steal credentials", True),
         ],
     )
     def test_absence_phrasing_detection(self, item: str, expected: bool):
