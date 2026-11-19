@@ -48,7 +48,9 @@ def transitive_states(tmp_path, monkeypatch):
     ]
     target = "https://github.com/example/dependency"
 
-    def factory(primary, depth, degraded=False, incomplete=False, show_suppressed=True):
+    def factory(
+        primary, depth, degraded=False, incomplete=False, show_suppressed=True, origin=None
+    ):
         def state(child=False):
             cache = {"SKILL.md": "# Child" if child else target, "helper.py": "print('safe')"}
             findings = [
@@ -109,6 +111,7 @@ def transitive_states(tmp_path, monkeypatch):
             }
 
         root = state()
+        root["input_origin"] = origin
         root["baseline"] = baseline_from_dict(
             build_baseline_dict(
                 root["findings"][1:],
@@ -134,6 +137,56 @@ def transitive_states(tmp_path, monkeypatch):
         return root, result, child_scan
 
     return factory
+
+
+@pytest.mark.parametrize("primary", list(cli.FormatChoice))
+@pytest.mark.parametrize("depth", [0, 1])
+def test_input_origin_is_sanitized_once_and_locked_across_formats(
+    monkeypatch, transitive_states, primary, depth
+):
+    """Combine upstream acquisition provenance with the immutable scan assessment."""
+    module = import_module("skillspector.nodes.report")
+    sanitize = Mock(wraps=module.input_origin)
+    probe = Mock(
+        side_effect=[(True, None), AssertionError("must not repeat provider availability")]
+    )
+    monkeypatch.setattr(module, "input_origin", sanitize)
+    monkeypatch.setattr(module, "is_llm_available", probe)
+    origin = {
+        "type": "url",
+        "source": "https://user:secret@example.org/skill.zip?token=secret#secret",
+    }
+    expected = {"type": "url", "source": "https://example.org/skill.zip"}
+    root, result, scan = transitive_states(primary, depth, origin=origin)
+    assert sanitize.call_count == probe.call_count == 1
+    snapshot = deepcopy(result)
+    bodies = {
+        format: cli._render_report(result, format)["report_body"] for format in cli.FormatChoice
+    }
+    assert bodies[primary] == result["report_body"]
+    assert json.loads(bodies[cli.FormatChoice.json])["skill"]["origin"] == expected
+    assert json.loads(bodies[cli.FormatChoice.sarif])["runs"][0]["properties"] == {
+        "inputOrigin": expected
+    }
+    for body in bodies.values():
+        assert expected["source"] in body
+        assert "secret" not in body and "user:" not in body
+    assert result == snapshot
+
+    # Rendering may not consult mutable acquisition state or sanitize again.
+    origin["source"] = "https://changed.invalid/"
+    root["input_origin"]["type"] = "git"
+    monkeypatch.setattr(
+        module, "input_origin", Mock(side_effect=AssertionError("must not sanitize"))
+    )
+    for format in reversed(list(cli.FormatChoice)):
+        rendered = cli._render_report(result, format)
+        assert rendered["report_body"] == bodies[format]
+        assert rendered["risk_score"] == (19 if depth else 13)
+        rendered["sarif_report"]["runs"][0]["properties"]["inputOrigin"].clear()
+        assert cli._render_report(result, format)["report_body"] == bodies[format]
+    assert probe.call_count == sanitize.call_count == 1
+    assert scan.call_count == depth
 
 
 @pytest.mark.parametrize("depth", [0, 1])

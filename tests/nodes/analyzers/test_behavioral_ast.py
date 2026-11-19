@@ -72,6 +72,17 @@ class TestExecDetection:
         assert ast1.end_line == 3
         assert ast1.end_column == 1
 
+    @pytest.mark.parametrize("separator", ["\f", "\v", "\x85", "\u2028", "\u2029"])
+    def test_non_newline_line_breaks_do_not_shift_ast_matched_text(self, separator: str) -> None:
+        code = f"# section{separator}\nexec(\n    'payload'\n)\n"
+        ast1 = next(finding for finding in _run(code) if finding.rule_id == "AST1")
+
+        assert ast1.matched_text == "exec(\n    'payload'\n)"
+        assert ast1.start_line == 2
+        assert ast1.start_column == 0
+        assert ast1.end_line == 4
+        assert ast1.end_column == 1
+
     def test_many_same_line_calls_use_preindexed_source_slices(self, monkeypatch) -> None:
         def fail_full_source_rescan(*_args, **_kwargs):
             raise AssertionError("ast.get_source_segment must not run per finding")
