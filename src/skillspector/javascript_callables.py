@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from html.parser import HTMLParser
 
@@ -13,6 +14,33 @@ from tree_sitter import Node
 from skillspector.javascript_ast import JavaScriptProgram
 
 _MAX_BINDING_VISITS = 400_000
+
+
+_IDENTIFIER_ESCAPE_PATTERN = re.compile(
+    r"\\(?:u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))"
+)
+
+
+def _decoded_identifier_text(program: JavaScriptProgram, node: Node) -> str:
+    """Return the identifier spelling with JS escape sequences resolved.
+
+    ``\\u0052egExp``, ``\\u{52}egExp`` and ``\\x52egExp`` all bind the name
+    RegExp, so raw source spelling cannot be compared against override
+    names or recorded bindings. An invalid escape is left as-is, which
+    keeps the proof fail-closed.
+    """
+    spelling = program.text(node)
+    if "\\" not in spelling:
+        return spelling
+
+    def _replace(match: re.Match[str]) -> str:
+        code_point = next(group for group in match.groups() if group is not None)
+        try:
+            return chr(int(code_point, 16))
+        except (ValueError, OverflowError):
+            return match.group(0)
+
+    return _IDENTIFIER_ESCAPE_PATTERN.sub(_replace, spelling)
 
 
 _SHELL_EXECUTION_CALLS = frozenset(
@@ -62,7 +90,10 @@ def _pattern_binding_names(
         check_runtime()
         node = pending.pop()
         if node.type in {"identifier", "shorthand_property_identifier_pattern"}:
-            names.add(program.text(node))
+            # Decode escape sequences: {\u0052egExp} binds RegExp, and
+            # the plain constructor name must match the recorded binding
+            # for the uncertain-binding check to see the shadow.
+            names.add(_decoded_identifier_text(program, node))
         elif node.type in {"assignment_pattern", "object_assignment_pattern"}:
             left = node.child_by_field_name("left")
             if left is not None:

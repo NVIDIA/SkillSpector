@@ -171,6 +171,39 @@ def test_parameter_default_values_do_not_keep_template_files_partial(source: str
     "source",
     [
         pytest.param(
+            "export function formatDate(text) {\n"
+            "  const m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(text);\n"
+            "  return m ? `${m[1]}/${m[2]}/${m[3]}` : null;\n"
+            "}\n",
+            id="regex-literal-exec",
+        ),
+        pytest.param(
+            "const DAY = /^(\\d{4})$/;\nconst m = DAY.exec(t);\nreturn m ? `${m[1]}` : null;\n",
+            id="const-regex-binding-exec",
+        ),
+        pytest.param(
+            'const r2 = new RegExp("^\\\\d+$");\n'
+            "const m = r2.exec(t);\n"
+            "return m ? `${m[1]}` : null;\n",
+            id="const-new-regexp-binding-exec",
+        ),
+        pytest.param(
+            'const m = new RegExp("^\\\\d+$").exec(t);\nreturn m ? `${m[1]}` : null;\n',
+            id="direct-new-regexp-exec",
+        ),
+    ],
+)
+def test_regex_exec_calls_do_not_keep_template_files_partial(source: str) -> None:
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
             "export function run(cb) { return cb(`rm ${x}`); }",
             id="uncertain-parameter-call",
         ),
@@ -199,6 +232,117 @@ def test_uncertain_parameter_calls_keep_template_files_partial(source: str) -> N
     )
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            'const cp = require("child_process");\ncp.exec(`${tool} -rf /`);',
+            id="child-process-alias-exec",
+        ),
+        pytest.param(
+            "const m = foo.exec(t);\nreturn m ? `${m[1]}` : null;\n",
+            id="unknown-receiver-exec",
+        ),
+        pytest.param(
+            "let re = /^\\d+$/;\nconst m = re.exec(t);\nreturn m ? `${m[1]}` : null;\n",
+            id="let-bound-regex-exec",
+        ),
+        pytest.param(
+            "const re = /^\\d+$/;\nre = other;\nconst m = re.exec(t);\n"
+            "return m ? `${m[1]}` : null;\n",
+            id="reassigned-regex-binding-exec",
+        ),
+        pytest.param(
+            "function RegExp() { return { exec: shellExec }; }\n"
+            "const r2 = new RegExp();\n"
+            "const m = r2.exec(t);\n"
+            "return m ? `${m[1]}` : null;\n",
+            id="shadowed-regexp-constructor-exec",
+        ),
+        pytest.param(
+            "try { step(); } catch ({RegExp}) { const re = new RegExp(); re.exec(`${command}`); }\n",
+            id="catch-destructured-regexp-exec",
+        ),
+        pytest.param(
+            "for (const {RegExp} of sources) { const re = new RegExp(); re.exec(`${command}`); }\n",
+            id="for-of-destructured-regexp-exec",
+        ),
+        pytest.param(
+            "function run({RegExp}) { const re = new RegExp(); re.exec(`${command}`); }\n",
+            id="parameter-destructured-regexp-exec",
+        ),
+        pytest.param(
+            "function local() { const re = /x/; re.test(text); }\nre.exec(`${command}`);\n",
+            id="out-of-scope-regex-receiver-exec",
+        ),
+        pytest.param(
+            "function check(handler) {\n"
+            "  function patch() { re['exec'] = handler; }\n"
+            "  const re = /x/;\n"
+            "  patch();\n"
+            "  re.exec(`${command}`);\n"
+            "}\n",
+            id="closure-mutated-regex-before-declaration-exec",
+        ),
+        pytest.param(
+            "{ const re = /x/; mutate(re, handler); }\n"
+            "{ const re = /y/; re.exec(`${command}`); }\n",
+            id="duplicate-regex-binding-escape-exec",
+        ),
+        pytest.param(
+            "function a() { const re = /x/; re.test(t); }\n"
+            "function b() { re.exec(`${command}`); }\n",
+            id="sibling-function-regex-receiver-exec",
+        ),
+        pytest.param(
+            "function f({\\u0052egExp}) { const re = new RegExp(); re.exec(`${command}`); }\n",
+            id="escaped-shorthand-parameter-regexp-exec",
+        ),
+        pytest.param(
+            "try { step(); } catch ({\\u0052egExp}) { const re = new RegExp(); re.exec(`${command}`); }\n",
+            id="escaped-shorthand-catch-regexp-exec",
+        ),
+        pytest.param(
+            "for (const {\\u0052egExp} of sources) { const re = new RegExp(); re.exec(`${command}`); }\n",
+            id="escaped-shorthand-for-of-regexp-exec",
+        ),
+        pytest.param(
+            "import { formatMessage } from './format.mjs';\n"
+            "console.log(formatMessage(`Hello, ${name}`));",
+            id="imported-helper-template-argument",
+        ),
+    ],
+)
+def test_unproven_exec_receivers_keep_template_files_partial(source: str) -> None:
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is True
+    )
+
+
+def test_many_sibling_regex_scopes_keep_proof_work_linear() -> None:
+    # Each block defines and uses its own `const re`, so the binding proof
+    # must visit only that block's references. Scanning every same-named
+    # reference for every binding cost bindings times references here.
+    blocks = "".join("{ const re = /x/; re.test(t); }\n" for _ in range(200))
+    source = blocks + "re.exec(`${command}`);\n"
+    calls = [0]
+
+    def counting_check_runtime() -> None:
+        calls[0] += 1
+
+    assert (
+        tm.has_bounded_parse_exhaustion(source, counting_check_runtime, file_type="javascript")
+        is True
+    )
+    # Deterministic work count, not timing: the quadratic scan needed about
+    # 102,000 check_runtime calls for these 200 scopes, the scope slice
+    # needs about 22,000. The bound sits between the two with room on
+    # both sides, and the file still stays partial because the trailing
+    # `re` is outside every binding scope.
+    assert calls[0] < 40000
+
+
 def test_ledger_completes_parameter_default_value_template() -> None:
     path = "scripts/check.mjs"
     source = (
@@ -207,6 +351,23 @@ def test_ledger_completes_parameter_default_value_template() -> None:
         "  return n <= (max ?? Number.MAX_SAFE_INTEGER) ? `ok: ${n}` : `too large: ${n}`;\n"
         "}\n"
         "console.log(check(process.argv[2] ?? '0'));\n" + _PADDING
+    )
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: source}}, [tm]
+    )
+    row = result["inspection_ledger"][0]
+    assert row["outcome"] is LedgerOutcome.COMPLETED
+    assert "reason_code" not in row
+
+
+def test_ledger_completes_regex_exec_template() -> None:
+    path = "scripts/format-date.js"
+    source = (
+        "export function formatDate(text) {\n"
+        "  const m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(text);\n"
+        "  return m ? `${m[1]}/${m[2]}/${m[3]}` : null;\n"
+        "}\n"
+        "console.log(formatDate(process.argv[2] ?? ''));\n" + _PADDING
     )
     result = static_runner.run_static_patterns_with_ledger(
         {"components": [path], "file_cache": {path: source}}, [tm]
