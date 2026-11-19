@@ -508,3 +508,41 @@ def test_referenced_table_uncertainty_retains_high_severity_evidence_in_both_pub
         assert report["risk_assessment"]["recommendation"] != "SAFE"
         assert report["analysis_completeness"]["is_complete"] is False
         _assert_public_partial(report, True)
+
+
+def test_overflow_source_audit_retains_rendered_and_dropped_command_reads() -> None:
+    header = "| Kind | Value |\n|---|---|\n"
+    row = "| `short|long` | The template's `<name>.cfg` file |\n"
+    doc = header + row + "\n" + ("Additional explanation.\n" * 30)
+    records = []
+    tm_module._markdown_shell_text(doc, lambda: None, overflow_row=records)
+    assert len(records) == 1
+    hs, he, rs, re_ = records[0]
+    assert doc[hs:he] == header
+    assert doc[rs:re_] == row.rstrip("\n")
+    # The source audit must not change the GFM ownership or add rendered spans.
+    spans = []
+    tm_module._markdown_shell_text(doc, lambda: None, inline_code_ranges=spans)
+    assert all(not (rs <= lo < re_) for lo, _ in spans)
+    for command in ('sh -c "$CMD"', "`$(choose)` -rf /"):
+        partial = header + row.replace("<name>.cfg", command) + "\n"
+        _assert_partial(_scan(partial))
+    dangerous = header + row.replace("file", "file; rm -rf /")
+    assert any(f.rule_id == "TM1" for f in _scan(dangerous)["findings"])
+
+
+def test_reference_lookup_requires_an_explicit_path_value() -> None:
+    marked = "`$(where root)/lib/file.c`"
+    guide = "released stable or the experimental " + marked + ", `--show`."
+    start = guide.index("$")
+    end = guide.index("`", start)
+    assert tm_module._documented_path_lookup(guide, start, end)
+    for example in (
+        'sh -c "' + marked + '"',
+        "Run " + marked + " -rf /",
+        guide.replace("where root", "where $root"),
+        guide.replace("where root", "where one; rm -rf /"),
+        guide.replace("where root", "where $(selector)"),
+    ):
+        start = example.index("$")
+        assert not tm_module._documented_path_lookup(example, start, example.index("`", start))

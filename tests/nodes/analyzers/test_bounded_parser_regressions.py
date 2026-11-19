@@ -816,45 +816,6 @@ def test_output_reconciliation_only_clears_resolved_output_incompleteness(
         assert "parser_diagnostic" not in event
 
 
-def test_native_operand_boundary_points_to_the_missing_redirection_target() -> None:
-    from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
-
-    source = 'python3 "${ROOT}/task.py" --id <identifier>` trailing text'
-    end = source.index("`")
-    diagnostics = []
-    _, _, limited = tm._bounded_shell_tokens(
-        source, 0, len("python3"), source_end=end, diagnostics=diagnostics
-    )
-    assert limited and diagnostics[0].check == tm.ParserCheck.COMMAND_REDIRECTION_TARGET
-    assert source[diagnostics[0].start : diagnostics[0].end] == ">"
-    valid = 'python3 "${ROOT}/task.py" --id "<identifier>" > report.txt'
-    assert tm._bounded_shell_tokens(valid, 0, len("python3"), source_end=len(valid))[2] is False
-
-
-def test_rendered_browser_markup_reports_the_dynamic_write_at_its_source():
-    from skillspector.python_tokens import generated_script_markup_span
-
-    script = "const d = PLACEHOLDER; const o = document.createElement('option'); o.textContent = `${d.name}`; el.innerHTML = `<b>${d.html}</b>`;"
-    source = f'PAGE = r"""<!doctype html><html>\n<!-- 🚀 -->\n<script>{script}</script></html>"""\np.write_text(PAGE.replace("PLACEHOLDER", data))\n'
-    offset = source.index("${d.name}")
-    span = generated_script_markup_span(source, offset, lambda: None)
-    assert span is not None
-    assert source[slice(*span)] == "el.innerHTML = `<b>${d.html}</b>`"
-    for change in (
-        source + "shell(PAGE)",
-        source.replace("write_text", "run"),
-        source.replace('r"""', '"""'),
-        source.replace("el.innerHTML", "el.textContent"),
-        source.replace("createElement('option')", "createElement('script')"),
-        source.replace("createElement('option')", "getElementById('option')"),
-        source.replace("o.textContent", "o.innerHTML"),
-        source.replace("const d =", "document.createElement = custom; const d ="),
-        source.replace("<script>", "<!-- <script>").replace("</script>", "</script> -->"),
-        source.replace("PLACEHOLDER;", "SOMETHING;"),
-    ):
-        assert generated_script_markup_span(change, change.index("${d.name}"), lambda: None) is None
-
-
 @pytest.mark.parametrize(
     "source",
     [
@@ -927,6 +888,21 @@ def test_empty_command_substitution_preserves_surrounding_command(separator: str
         )
         is None
     )
+
+
+def test_native_operand_boundary_points_to_the_missing_redirection_target() -> None:
+    from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm
+
+    source = 'python3 "${ROOT}/task.py" --id <identifier>` trailing text'
+    end = source.index("`")
+    diagnostics = []
+    _, _, limited = tm._bounded_shell_tokens(
+        source, 0, len("python3"), source_end=end, diagnostics=diagnostics
+    )
+    assert limited and diagnostics[0].check == tm.ParserCheck.COMMAND_REDIRECTION_TARGET
+    assert source[diagnostics[0].start : diagnostics[0].end] == ">"
+    valid = 'python3 "${ROOT}/task.py" --id "<identifier>" > report.txt'
+    assert tm._bounded_shell_tokens(valid, 0, len("python3"), source_end=len(valid))[2] is False
 
 
 @pytest.mark.parametrize(
@@ -1089,6 +1065,30 @@ def test_generated_text_rejects_mismatched_or_nonraw_source_views() -> None:
         assert diagnostic.check is not ParserCheck.GENERATED_TEXT_DESTINATION
 
 
+def test_rendered_browser_markup_reports_the_dynamic_write_at_its_source():
+    from skillspector.python_tokens import generated_script_markup_span
+
+    script = "const d = PLACEHOLDER; const o = document.createElement('option'); o.textContent = `${d.name}`; el.innerHTML = `<b>${d.html}</b>`;"
+    source = f'PAGE = r"""<!doctype html><html>\n<!-- 🚀 -->\n<script>{script}</script></html>"""\np.write_text(PAGE.replace("PLACEHOLDER", data))\n'
+    offset = source.index("${d.name}")
+    span = generated_script_markup_span(source, offset, lambda: None)
+    assert span is not None
+    assert source[slice(*span)] == "el.innerHTML = `<b>${d.html}</b>`"
+    for change in (
+        source + "shell(PAGE)",
+        source.replace("write_text", "run"),
+        source.replace('r"""', '"""'),
+        source.replace("el.innerHTML", "el.textContent"),
+        source.replace("createElement('option')", "createElement('script')"),
+        source.replace("createElement('option')", "getElementById('option')"),
+        source.replace("o.textContent", "o.innerHTML"),
+        source.replace("const d =", "document.createElement = custom; const d ="),
+        source.replace("<script>", "<!-- <script>").replace("</script>", "</script> -->"),
+        source.replace("PLACEHOLDER;", "SOMETHING;"),
+    ):
+        assert generated_script_markup_span(change, change.index("${d.name}"), lambda: None) is None
+
+
 _PRINT_HELPER = r"""show() { printf '%s\n' "$1"; }"""
 _PRINT_HEAD = r"""show "$(printf '%s' "$line" | head -1)" """
 _PRINT_MATCH = r"""printf 'MATCH=%s\n' "$(printf '%s\n' "$line" | grep -Eqi 'some|other' && echo yes || echo no)" """
@@ -1230,6 +1230,68 @@ def test_ssh_stdin_witness_requires_original_script_and_unquoted_remote_argv(
     source = _remote_stdin_source().replace(old, new)
     detail = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
     assert detail and detail.check is not ParserCheck.SSH_ARGUMENTS
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sudo <tool-name> --list",
+        "sudo <tool-name> -d <device> --read | tee result",
+    ],
+)
+def test_documented_privileged_command_has_only_redirects(command):
+    content = f"# Example λ\n\n```bash\n{command}\n```\n"
+    diagnostic = tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.check is ParserCheck.DOCUMENTED_COMMAND_OPERAND
+    assert content[diagnostic.start : diagnostic.end] == "<tool-name>"
+
+
+def test_fenced_missing_redirection_target_precedes_later_wrapper():
+    content = "# λ\n\n```bash\ncd <directory> && env FILE=<config> process\n```\n"
+    diagnostic = tm.bounded_parse_diagnostic(content, lambda: None, file_type="markdown")
+    assert diagnostic is not None
+    assert diagnostic.cause is ParserCause.MALFORMED_INPUT
+    assert diagnostic.check is ParserCheck.COMMAND_REDIRECTION_TARGET
+    assert diagnostic.start == content.index(">") and diagnostic.end == diagnostic.start + 1
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sudo '<tool-name>' --list",
+        "sudo <tool-name> --list program --option",
+        'sudo <tool-name> --list "$selected"',
+        'sudo <tool-name> "$(lookup)"',
+        "printf '%s' 'cd <directory> && env FILE=<config> process'",
+        "cat <<'END'\nsudo <tool-name> --list\nEND\n",
+    ],
+)
+def test_redirect_refinement_requires_native_command_and_source_roles(command):
+    from skillspector.markdown_tokens import fenced_redirect_diagnostic
+
+    assert fenced_redirect_diagnostic(command, command.index("<"), lambda: None) is None
+
+
+def test_documented_missing_tool_preserves_neighbor_findings_and_runtime_diagnostics():
+    example = "```bash\nsudo <tool> --list | rm -rf /\n```\n"
+    assert _public_result(example, "SKILL.md")["findings"]
+    prior = example.replace("sudo", 'eval "$first"\nsudo')
+    diagnostic = tm.bounded_parse_diagnostic(prior, lambda: None, file_type="markdown")
+    assert diagnostic is not None and diagnostic.check is ParserCheck.COMMAND_STRING_RUNTIME
+
+
+def test_fenced_redirect_refines_the_nominated_command_only():
+    example = "```bash\nsudo <root> && echo ok\n```\n"
+    diag = tm.bounded_parse_diagnostic(example, lambda: None, file_type="markdown")
+    assert diag and diag.check is ParserCheck.COMMAND_REDIRECTION_TARGET
+    assert example[diag.start : diag.end] == ">"
+    fixed_head = "```bash\ncd <directory> && echo ok\n```\n"
+    assert tm.bounded_parse_diagnostic(fixed_head, lambda: None, file_type="markdown") is None
+    later_fault = "```bash\nsudo <tool> --list\ncd <directory> && echo ok\n```\n"
+    diag = tm.bounded_parse_diagnostic(later_fault, lambda: None, file_type="markdown")
+    assert diag and diag.check is ParserCheck.DOCUMENTED_COMMAND_OPERAND
+    assert later_fault[diag.start : diag.end] == "<tool>"
 
 
 @pytest.mark.parametrize(

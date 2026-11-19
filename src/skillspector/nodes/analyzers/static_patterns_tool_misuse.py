@@ -69,7 +69,7 @@ from skillspector.javascript_tokens import JavaScriptTemplateSpans, assertion_te
 from skillspector.javascript_tokens import javascript_template_spans as _javascript_template_spans
 from skillspector.json_tokens import JSONSourceOwnership, prepare_json_source
 from skillspector.logging_config import get_logger
-from skillspector.markdown_tokens import quoted_list_spans
+from skillspector.markdown_tokens import fenced_redirect_diagnostic, quoted_list_spans
 from skillspector.models import (
     AnalyzerFinding,
     Finding,
@@ -93,7 +93,7 @@ from skillspector.python_tokens import (
 )
 from skillspector.python_tokens import python_literal_spans as _python_literal_spans
 from skillspector.python_tokens import python_string_body as _python_string_body
-from skillspector.security_reconstruction import validated_json_string_spans
+from skillspector.security_reconstruction import markdown_html_block, validated_json_string_spans
 from skillspector.semgrep_tokens import semgrep_rule_scalar_roles
 from skillspector.shell_helper_argv import is_managed_shell_variable, reconstruct_helper_commands
 from skillspector.shell_sources import (
@@ -106,6 +106,7 @@ from skillspector.shell_sources import (
     generated_file_is_unmodified,
 )
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+from skillspector.wordprocessingml import paragraph_contractions
 from skillspector.yaml_tokens import YamlScalar, YamlSourceSpans, yaml_source_spans
 
 from . import static_runner
@@ -128,6 +129,7 @@ ANALYZER_ID = "static_patterns_tool_misuse"
 USES_RUNTIME_CHECK = True
 USES_PYTHON_IMPORT_BOUNDS = True
 USES_PREPARED_PARSER_ANALYSIS = True
+USES_RST_SOURCE_TYPE = True
 USES_SOLE_ORIGINAL_SHELL = True
 ANALYZE_USES_POSTPROCESS = True
 POSTPROCESS_USES_PYTHON_AST = True
@@ -303,7 +305,7 @@ _MARKDOWN_CONTRACTION_PROSE_RE = re.compile(
 # ``reference's`` or ``don't``. The suffix must end the word, so a quote that
 # closes a shell word, as in ``r'm'``, never matches.
 _MARKDOWN_WORD_APOSTROPHE_RE = re.compile(
-    r"(?<![\w'/.~-])[A-Za-z]++(?P<apostrophe>')(?:s|t|d|m|re|ve|ll)(?![\w'/])",
+    r"(?<![\w'/.~-])(?:[A-Za-z]++|[A-Za-z0-9]++(?='s\b))(?P<apostrophe>')(?:s|t|d|m|re|ve|ll)(?![\w'/])",
     re.IGNORECASE,
 )
 # Shell syntax that opens a quote, an expansion, or a line continuation.
@@ -10710,6 +10712,14 @@ def _markdown_block_separator(line: str, check_runtime: Callable[[], None]) -> b
     return count >= (3 if internal_gap or marker in {"*", "_"} else 1)
 
 
+# These source spellings contain literal alternatives, even though GFM
+# treats their unescaped pipes as column separators. Never join rendered cells.
+_TABLE_SOURCE_ALTERNATION = re.compile(
+    r"(?<![`\\])`(?:(?:--[a-zA-Z0-9_-]+ +)?[a-zA-Z_][a-zA-Z0-9_*-]*"
+    r"(?:\|[a-zA-Z_][a-zA-Z0-9_*-]*)+|\^<[a-zA-Z_][a-zA-Z0-9_]*>\(\\\.\|\$\))`(?!`)"
+)
+
+
 def _markdown_table_cells(
     line: str, start: int, check_runtime: Callable[[], None]
 ) -> list[tuple[int, int]]:
@@ -10832,6 +10842,251 @@ def _blank_line_local_paired_backticks(line: str) -> str:
     return "".join(chars)
 
 
+# In a text sequence diagram the arrow meets the destination lifeline (>|).
+# Require the whole row so shell operands and redirect targets stay visible.
+_SEQUENCE_DIAGRAM_ARROW = re.compile(
+    r"^(?:[ \t]*\|){2,}[ \t]+[A-Za-z][A-Za-z0-9_]*[ \t]+-{2,}(>)\|[ \t]*\r?$", re.M
+)
+
+
+# Restrict prose punctuation to complete, nonexecutable records. Code examples
+# and neighboring command words still pass through the shell projection.
+_MARKDOWN_CROSS_REFERENCE = re.compile(
+    r"[A-Za-z][A-Za-z0-9 ,.:/-]*(?:->[ A-Za-z0-9,.:/-]+)*"
+    r"[ \t](?P<open>\()[A-Za-z][A-Za-z0-9_-]*[ \t]+->[ \t]+see[ \t]+#?[0-9]+"
+    r"(?P<close>\))[.!]?[ \t]*",
+    re.ASCII,
+)
+_MARKDOWN_EXAMPLE_VALUE = r'`(?:"[A-Za-z0-9_./-]+"|[A-Za-z0-9_./-]+)`'
+_MARKDOWN_EXAMPLE_CELL = re.compile(
+    r"[ \t]*[A-Za-z][A-Za-z0-9_-]*[ \t]+(?P<open>\()e\.g\.[ \t]+"
+    + _MARKDOWN_EXAMPLE_VALUE
+    + r"(?:[ \t]*,[ \t]*"
+    + _MARKDOWN_EXAMPLE_VALUE
+    + r")*[ \t]*(?P<close>\))[.!]?[ \t]*"
+)
+
+
+_MAKE_SIMPLE_TARGET = re.compile(
+    r"([a-zA-Z0-9_./-]+|\$\([A-Za-z_][A-Za-z0-9_]*\)|\$\{[A-Za-z_][A-Za-z0-9_]*\}):"
+    r"(?![=:])"
+)
+_MAKE_RECIPE_VALUE = re.compile(
+    r"\$\$[A-Za-z_][A-Za-z0-9_]*+|\$[@A-Za-z]|\$\([A-Za-z_][A-Za-z0-9_]*\)|"
+    r"\$\{[A-Za-z_][A-Za-z0-9_]*\}"
+)
+_MAKE_ECHO_RECIPE = re.compile(
+    rf'\t@?echo +"(?:[a-zA-Z0-9_./: -]++|{_MAKE_RECIPE_VALUE.pattern})+"'
+    r" +>{1,2} +[a-zA-Z0-9_./-]+[ \t]*"
+)
+_MAKE_LITERAL_OVERRIDE = re.compile(
+    r"override[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*:=[ \t]*[A-Za-z0-9_./: -]*"
+)
+_MAKE_LITERAL_RULE = re.compile(r"[A-Za-z0-9_./-]+:[ \tA-Za-z0-9_./-]*")
+_MAKE_LAYOUT_OVERRIDE = re.compile(
+    r"^[ \t]*(?:(?:-?include|sinclude|define|load)\b|"
+    r"override\b(?![ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*[:?+!]?=)|\.ONESHELL[ \t]*:)|"
+    r"(?<!\w)(?:\.RECIPEPREFIX|\.SHELLFLAGS|SHELL)[ \t]*[:?+!]*=|\$[({]eval[ \t]",
+    re.M,
+)
+
+
+def _make_literal_overrides(lines: list[str], check_runtime: Callable[[], None]) -> set[str]:
+    """Prove forced literal values only in a complete, straight-line Make fragment."""
+    names = set()
+    for line in lines:
+        check_runtime()
+        raw = line.rstrip("\r\n")
+        if not raw.strip() or raw.lstrip(" ").startswith("#"):
+            continue
+        if len(raw) > 1024:
+            return set()
+        if assigned := _MAKE_LITERAL_OVERRIDE.fullmatch(raw):
+            names.add(assigned[1])
+        elif not (_MAKE_LITERAL_RULE.fullmatch(raw) or _MAKE_ECHO_RECIPE.fullmatch(raw)):
+            # Includes, conditional definitions, generated Make syntax and
+            # target-specific bindings can change a value for this recipe.
+            return set()
+    return names
+
+
+def _make_output_recipes(
+    source: str, check_runtime: Callable[[], None]
+) -> Iterator[tuple[int, int, StaticParserDiagnostic | None]]:
+    """Separate the physical recipe line from substitutions which can change its shell syntax."""
+    standard_layout = _MAKE_LAYOUT_OVERRIDE.search(source) is None
+    lines = source.splitlines(keepends=True)
+    fixed = _make_literal_overrides(lines, check_runtime) if "override" in source else set()
+    offset = 0
+    target = None
+    continued = False
+    for line in lines:
+        check_runtime()
+        raw = line.rstrip("\r\n")
+        if raw.startswith("\t"):
+            if target and not continued and len(raw) <= 1024 and _MAKE_ECHO_RECIPE.fullmatch(raw):
+                diagnostic = None
+                for ref in _MAKE_RECIPE_VALUE.finditer(raw):
+                    # Make expands before shell parsing. A shell variable from
+                    # $$NAME stays within the quotes; a Make variable may inject
+                    # quote or command syntax even when its file default is literal.
+                    if ref[0].startswith("$$") or (
+                        ref[0] == "$@" and not target[1].startswith(("$", "."))
+                    ):
+                        continue
+                    name = ref[0][2:-1] if ref[0][1] in "({" else ref[0][1:]
+                    if name in fixed:
+                        continue
+                    diagnostic = StaticParserDiagnostic(
+                        ParserCause.RUNTIME_DEPENDENT,
+                        ParserCheck.COMMAND_STRING_RUNTIME,
+                        offset + ref.start(),
+                        offset + ref.end(),
+                        ParserUncheckedScope.COMMAND_STRING,
+                    )
+                    break
+                # Uncertain layout cannot establish where literal shell quotes
+                # end. It also cannot prove a Make substitution stays data.
+                if diagnostic is not None or standard_layout:
+                    yield offset, offset + len(raw), diagnostic
+        elif raw and not raw.startswith(("#", " ")):
+            target = _MAKE_SIMPLE_TARGET.match(raw)
+        continued = raw.endswith("\\")
+        offset += len(line)
+
+
+_WAVEFORM_AXIS = re.compile(r"^[ \t]*\|(?:[ \t]+\|){2,}[ \t]*\r?$", re.M)
+_WAVEFORM_ROW = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*[ \t]+(?P<signal>[_`|]+)[ \t]*\r?$", re.M)
+_DIRECTORY_TREE_NOTE = re.compile(
+    r'^[ \t│]*(?:├──|└──) +[A-Za-z0-9_./<>-]+[ \t]+# (?P<note>[A-Za-z0-9 ,._<>\[\]…—`:"-]{1,256})\r?$',
+    re.M,
+)
+_CONSOLE_PATH_ERROR = re.compile(
+    r"^[a-zA-Z][a-zA-Z0-9_.-]*: (?:error|fatal): [a-zA-Z][a-zA-Z ]{1,80} "
+    r"(?P<open>`)/[a-zA-Z0-9_./-]+(?P<close>')[.!]?[ \t]*\r?$",
+    re.M,
+)
+_MARKDOWN_QUOTED_STATUS = re.compile(
+    r'\*\*(?P<open>")[A-Z][A-Za-z ]{0,48}\([A-Za-z]+(?: [A-Za-z]+){0,3}\)(?P<close>")\*\*'
+    r"(?= +(?:and|or) +)"
+)
+_MARKDOWN_HEADER_QUALIFIER = re.compile(
+    r"[ \t]*[A-Z][a-zA-Z]+[ \t]+(?P<open>\()[A-Za-z]+(?: [A-Za-z]+){0,3}(?P<close>\))[ \t]*"
+)
+_MARKDOWN_QUOTE_LEAD = re.compile(
+    r"(?:[A-Za-z][A-Za-z ,'-]*\b(?:and|for|says?|reads?|reports?)"
+    r"|[-*] +`[A-Za-z][\w-]*`[ A-Za-z]+→)[ \t]+$"
+)
+_MARKDOWN_QUOTE_FIRST_LINE = re.compile(r'"[A-Za-z]+(?: [A-Za-z]+){1,16}$')
+_MARKDOWN_QUOTE_LAST_LINE = re.compile(r'[ \t]*[A-Za-z]+(?: [A-Za-z]+){0,8}[.!?]?"')
+_MARKDOWN_RECORD_MESSAGE = re.compile(
+    r"(?:^`[A-Za-z][A-Za-z0-9_-]*` +→|\b(?:log|message|output) +(?:stops at|says|reads)) +"
+    r'(?P<open>")(?=[A-Za-z]+ +)[A-Za-z][A-Za-z ,.;-]{1,120}(?P<close>")(?=[ .;,!?]|$)',
+    re.I,
+)
+
+
+_OBJECT_FIELD = r"(?:[a-zA-Z_][a-zA-Z0-9_]*|<[a-zA-Z_][a-zA-Z0-9_]*>)"
+_OBJECT_MEMBER = rf'"{_OBJECT_FIELD}" *: *(?:"{_OBJECT_FIELD}"|<[a-zA-Z_][a-zA-Z0-9_]*>)'
+_OBJECT_TEMPLATE = re.compile(rf"\{{ *{_OBJECT_MEMBER}(?: *, *{_OBJECT_MEMBER})* *\}}")
+
+
+def _documented_clause_start(content: str, start: int, end: int) -> bool:
+    return (
+        end - start <= 32
+        and re.fullmatch(r"(?:command|builtin) +\(", content[start:end]) is not None
+        and re.search(r"\bno line starts with[ \t\r\n]+`$", content[max(0, start - 60) : start])
+        is not None
+        and re.match(r"`[.](?:\s|$)", content[end : end + 4]) is not None
+    )
+
+
+def _documented_expansion_placeholder(content: str, start: int, end: int) -> bool:
+    """Prove a displayed expansion placeholder from its enclosing explanatory phrase."""
+    if end - start > 80 or not content.startswith("$(", start):
+        return False
+    before = content[max(0, start - 160) : start - 1].rpartition("\n")[2]
+    after = content[end + 1 : end + 50]
+    body = content[start:end]
+    if body == "$()":
+        return bool(
+            re.search(r"\b(?:no|without) +$", before) and re.match(r", +`(?:&&|\|\|)`", after)
+        )
+    if body in {"$(...)", "$(…)"}:
+        return bool(
+            re.search(r"\bmake +expands? [a-z ]{0,20}$", before, re.I)
+            and re.match(r" +expressions?\b", after, re.I)
+            or re.search(
+                r"\bon stdout,? +for[ \t]*(?:\r?\n[ \t]{0,3})?$",
+                content[max(0, start - 55) : start - 1],
+                re.I,
+            )
+            and re.match(r",? +and +(?:its|the) +[a-z]+ +on +stderr\b", after, re.I)
+        )
+    return bool(
+        re.fullmatch(r"\$\(\([A-Za-z_][A-Za-z0-9_]* *[+-] *[0-9]+\)\)", body)
+        and re.search(r"\b(?:rejects|does not support) shell arithmetic:", before, re.I)
+        and before.endswith(" instead of ")
+        and re.match(r"[.!?](?:\s|$)", after)
+    )
+
+
+_DOCUMENTED_PATH_LOOKUP = re.compile(
+    r"\$\(([a-zA-Z_][a-zA-Z0-9_]*) +([a-zA-Z_][a-zA-Z0-9_.-]*)\)(?:/[a-zA-Z0-9_.-]+)*"
+)
+
+
+def _documented_path_lookup(content: str, start: int, end: int) -> bool:
+    """Recognize a directory lookup explicitly offered as a reference path."""
+    if end - start > 160 or not content.startswith("$(", start):
+        return False
+    if not _DOCUMENTED_PATH_LOOKUP.fullmatch(content, start, end):
+        return False
+    before = content[max(0, start - 190) : start - 1].rpartition("\n")[2]
+    after = content[end + 1 : end + 170]
+    # The adjacent path is the comparison or example that establishes the
+    # lookup's result as data. An isolated substitution can select a command.
+    return bool(
+        re.search(
+            r"(?:path|directory|experimental): +`\$[A-Z_][A-Z0-9_]*(?:/[a-zA-Z0-9_./-]+)+` +\([a-zA-Z0-9_-]+\) +or +$",
+            before,
+            re.I,
+        )
+        and re.match(r" +\([a-zA-Z0-9_-]+\)[.,;]", after)
+        or re.search(r"; +[a-zA-Z0-9_-]+: +$", before)
+        and re.match(r" +\(e\.g\. +`/[a-zA-Z0-9_./-]+`", after)
+        or re.search(r"\(e\.g\. +`/[a-zA-Z0-9_./-]+`, +source +`[a-zA-Z0-9_./-]+`\), +$", before)
+        and re.match(r"; +(?:old|previous) +`\$[A-Z_]", after, re.I)
+        or "/" in content[start:end]
+        and re.search(r"\breleased +[a-zA-Z0-9_-]+ +or +the +experimental +$", before, re.I)
+        and re.match(r", +`--[a-zA-Z0-9_-]+`", after)
+    )
+
+
+def _markdown_syntax_example(content: str, start: int, end: int) -> bool:
+    """Identify a literal Markdown code span demonstrated inside a longer delimiter."""
+    if end - start > 80 or content[start - 2 : start] != "``" or content[end : end + 2] != "``":
+        return False
+    body = content[start:end]
+    if re.fullmatch(r" `{3,6}[A-Za-z][A-Za-z0-9_-]* ", body):
+        return bool(
+            re.search(r"(?:^|\n)[ \t]*[-*+] +$", content[max(0, start - 30) : start - 2])
+            and re.match(r" +(?:blocks|fences) +(?:→|are|denote)\s", content[end + 2 : end + 52])
+        )
+    match = re.fullmatch(r" `([A-Za-z][A-Za-z0-9_-]*)` ", body)
+    if match is None:
+        return False
+    # A rendered equivalent or a list of inline markup forms establishes the
+    # display role. Bare double-delimited shell snippets still execute.
+    after = content[end + 2 : end + 125]
+    before = content[max(0, start - 100) : start - 2]
+    return bool(
+        re.match(r"[ \t]*→[ \t]*`<code>" + re.escape(match[1]) + r"</code>`", after)
+        or re.search(r"\binline +`\*\*[A-Za-z]+\*\*`, +`\*[A-Za-z]+\*`, +$", before)
+        and re.match(r"[,.;]", after)
+    )
+
+
 def _markdown_shell_text(
     content: str,
     check_runtime: Callable[[], None],
@@ -10848,6 +11103,9 @@ def _markdown_shell_text(
     powershell_blocks: list[tuple[int, int]] | None = None,
     inline_code_ranges: list[tuple[int, int]] | None = None,
     inline_possessive_apostrophes: set[int] | None = None,
+    overflow_row: list[tuple[int, int, int, int]] | None = None,
+    unrendered_code: list[tuple[int, int]] | None = None,
+    nested_markdown: bool = True,
     literal_label_positions: set[int] | None = None,
 ) -> str:
     """Mask Markdown delimiters while retaining code and exact source offsets.
@@ -10870,6 +11128,8 @@ def _markdown_shell_text(
     prose_apostrophes: set[int] = set()
     inline_possessives: set[int] = set()
     runs: list[tuple[int, int]] = []
+    closed_fences: list[tuple[int, int]] = []
+    inline_messages: dict[int, int] = {}
     list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
     backtick_runs = re.compile(r"`+")
 
@@ -10925,10 +11185,35 @@ def _markdown_shell_text(
                 if (start - escape_start) % 2 == 0:
                     return
         for (start, end), (close_start, close_end) in pairs:
+            if (
+                close_start - end <= 1024
+                and content.startswith(("Error: ", "Warning: ", "Fatal: "), end)
+                and not re.search(
+                    r"[;`$\\|<>&\r\n]|\b(?:eval|(?:ba)?sh)\b", content[end:close_start]
+                )
+            ):
+                inline_messages[end] = close_start
             if inline_regions is not None:
                 inline_regions.append((end, close_start))
             output[start:end] = " " * (end - start)
             output[close_start:close_end] = " " * (close_end - close_start)
+            if _documented_clause_start(content, end, close_start):
+                output[close_start - 1] = " "
+            if (
+                content.startswith("{", end)
+                and close_start - end <= 512
+                and re.search(r"\b(?:as|example:) +`$", content[max(0, end - 20) : end])
+                and _OBJECT_TEMPLATE.fullmatch(content, end, close_start)
+            ):
+                # These rigid data templates have identifier keys and values
+                # only. Braces and matching quotes carry no shell state.
+                for mark in range(end, close_start):
+                    if content[mark] in '"{}<>':
+                        output[mark] = " "
+            if _markdown_syntax_example(content, end, close_start):
+                for mark in range(end, close_start):
+                    if content[mark] == "`":
+                        output[mark] = " "
             if inline_code_ranges is not None:
                 inline_code_ranges.append((end, close_start))
             if (
@@ -11006,14 +11291,17 @@ def _markdown_shell_text(
     tree_fence_start: int | None = None
     shell_fence_start: int | None = None
     quoted_block = False
-    html_end: str | None = None
+    in_html = False
+    html_end: re.Pattern[str] | None = None
     paragraph_open = False
     paragraph_in_list = False
     paragraph_list_indent = 0
     list_content_indents: list[int] = []
     table_columns: int | None = None
+    regex_columns: set[int] = set()
     table_minimum_indent = 0
     table_delimiter_line = -1
+    header_start = header_end = 0
     offset = 0
     lines = content.splitlines(keepends=True)
     for line_index, line in enumerate(lines):
@@ -11024,7 +11312,7 @@ def _markdown_shell_text(
         # List containers survive blank lines and restore their enclosing
         # context after a nested item. Literal fence/HTML/quote bodies cannot
         # establish or discard list ownership.
-        list_context = fence is None and html_end is None and not quoted_block
+        list_context = fence is None and not in_html and not quoted_block
         list_index = bisect_right(list_content_indents, indentation)
         list_base = list_content_indents[list_index - 1] if list_index else 0
         # Interpret list padding in columns, preserving the original offsets.
@@ -11078,7 +11366,7 @@ def _markdown_shell_text(
             # A table row has no paragraph for a Setext underline to close.
             # Single '-' still starts an empty item; '---' remains thematic.
             separator = False
-        html_open = re.match(r"<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|[!?/])", leading)
+        html_open, terminator = markdown_html_block(leading, paragraph_open=paragraph_open)
         lazy_list_paragraph = (
             paragraph_open
             and paragraph_in_list
@@ -11103,7 +11391,7 @@ def _markdown_shell_text(
         )
         continuing_paragraph = False
         if table_columns is not None and (
-            html_end is not None
+            in_html
             or fence is not None
             or quote_start
             or quoted_block
@@ -11133,10 +11421,10 @@ def _markdown_shell_text(
             ):
                 powershell_blocks.append((fence_body_start, offset))
             fence = None
-        if html_end is not None:
+        if in_html:
             mask_inline_delimiters()
-            if (html_end and html_end in leading.lower()) or (not html_end and not leading):
-                html_end = None
+            if (html_end and html_end.search(leading)) or (html_end is None and not leading):
+                in_html = False
         elif fence is not None:
             fence_body = stripped.lstrip(" \t")
             closing_fence = MARKDOWN_FENCE_CLOSE.fullmatch(fence_body)
@@ -11164,6 +11452,128 @@ def _markdown_shell_text(
                     and fence[3] in {"powershell", "pwsh", "ps1"}
                 ):
                     powershell_blocks.append((fence_body_start, offset))
+                closed_fences.append((fence_body_start, offset))
+                checklist = (
+                    complete_context
+                    and not fence[3]
+                    and content.startswith("[ ] ", fence_body_start)
+                    and all(
+                        line.startswith(("[ ] ", "[x] ", "[X] "))
+                        for line in content[fence_body_start:offset].splitlines()
+                    )
+                )
+                if (
+                    complete_context
+                    and nested_markdown
+                    and (checklist or fence[3] in {"markdown", "md"})
+                ):
+                    # Only project delimiter pairs that the child Markdown
+                    # document actually owns. A second nested fence remains
+                    # literal, and all command strings in the outer source
+                    # continue through their normal checks.
+                    section = content[fence_body_start:offset]
+                    child_ranges: list[tuple[int, int]] = []
+                    child_markers: list[int] = []
+                    child_view = _markdown_shell_text(
+                        section,
+                        check_runtime,
+                        inline_code_ranges=child_ranges,
+                        fence_boundaries=child_markers,
+                        nested_markdown=False,
+                    )
+                    # A child fence opener remains Markdown punctuation even
+                    # when its code runs to the end of the displayed document.
+                    # Only project actual native marks; keep all code bytes.
+                    for begin in child_markers:
+                        mark = begin
+                        while (
+                            mark < len(section)
+                            and section[mark] in "`~"
+                            and child_view[mark] == " "
+                        ):
+                            output[fence_body_start + mark] = " "
+                            mark += 1
+                    for inner_start, inner_end in child_ranges:
+                        check_runtime()
+                        start, end = fence_body_start + inner_start, fence_body_start + inner_end
+                        if inline_code_ranges is not None:
+                            inline_code_ranges.append((start, end))
+                        if inner_end - inner_start > 128:
+                            continue
+                        label = re.sub(
+                            r"<[A-Za-z][A-Za-z0-9_.: ,/-]*>",
+                            "FIELD",
+                            section[inner_start:inner_end],
+                        )
+                        if not re.fullmatch(r"[—A-Za-z0-9][A-Za-z0-9_./: (),!…—\[\]-]*", label):
+                            continue
+                        # Restrict this projection to single delimiters. Other
+                        # widths may themselves demonstrate inline markup.
+                        if content[start - 2 : start] == "``" or content[end : end + 2] == "``":
+                            continue
+                        output[start - 1] = output[end] = " "
+                        if inline_regions is not None:
+                            inline_regions.append((start, end))
+                if complete_context and fence[3] in {"", "text", "plaintext", "console"}:
+                    # A complete, tool-prefixed error line quotes the path
+                    # printed by the program, including traditional GNU quotes.
+                    if _WAVEFORM_AXIS.search(content, fence_body_start, offset):
+                        for waveform in _WAVEFORM_ROW.finditer(content, fence_body_start, offset):
+                            check_runtime()
+                            signal = waveform["signal"]
+                            if "_" in signal and "``" in signal and signal.count("|") >= 2:
+                                lo, hi = waveform.span("signal")
+                                output[lo:hi] = signal.replace("`", "_")
+                    for row in _DIRECTORY_TREE_NOTE.finditer(content, fence_body_start, offset):
+                        check_runtime()
+                        for token in re.finditer(
+                            r'"<[A-Za-z_][a-zA-Z0-9_]*>"|`[A-Za-z_][a-zA-Z0-9_]*`', row["note"]
+                        ):
+                            pos = row.start("note") + token.start()
+                            for ch in range(len(token[0])):
+                                if token[0][ch] in '"<>`':
+                                    output[pos + ch] = " "
+                    for message in _CONSOLE_PATH_ERROR.finditer(content, fence_body_start, offset):
+                        check_runtime()
+                        output[message.start("open")] = output[message.start("close")] = " "
+                if complete_context and fence[3] == "text":
+                    for arrow in _SEQUENCE_DIAGRAM_ARROW.finditer(
+                        content, fence_body_start, offset
+                    ):
+                        check_runtime()
+                        output[arrow.start(1)] = " "
+                if (
+                    complete_context
+                    and fence[3] in {"yaml", "yml"}
+                    and shell_fence_ranges is not None
+                ):
+                    section = content[fence_body_start:offset]
+                    parsed = yaml_source_spans(section, check_runtime)
+                    if parsed is not None:
+                        for scalar in parsed.scalars:
+                            check_runtime()
+                            if (
+                                scalar.style is None
+                                and scalar.value.startswith('echo "')
+                                and scalar.value.endswith('"')
+                                and "\n" not in scalar.value
+                                and section[scalar.start : scalar.end] == scalar.value
+                            ):
+                                shell_fence_ranges.append(
+                                    (fence_body_start + scalar.start, fence_body_start + scalar.end)
+                                )
+                if (
+                    complete_context
+                    and fence[3] in {"make", "makefile", "gmake"}
+                    and shell_fence_ranges is not None
+                ):
+                    shell_fence_ranges.extend(
+                        (fence_body_start + lo, fence_body_start + hi)
+                        for lo, hi, diagnostic in _make_output_recipes(
+                            content[fence_body_start:offset], check_runtime
+                        )
+                        if diagnostic is None
+                    )
                 if shell_fence_start is not None and shell_fence_ranges is not None:
                     shell_fence_ranges.append((shell_fence_start, offset))
                 shell_fence_start = None
@@ -11231,21 +11641,8 @@ def _markdown_shell_text(
             quoted_block = bool(leading)
         elif html_open:
             mask_inline_delimiters()
-            raw_tag = re.match(r"<(pre|script|style|textarea)(?=[\s/>]|$)", leading, re.I)
-            terminator = (
-                f"</{raw_tag[1].lower()}>"
-                if raw_tag
-                else "-->"
-                if leading.startswith("<!--")
-                else "?>"
-                if leading.startswith("<?")
-                else "]]>"
-                if leading.startswith("<![CDATA[")
-                else ">"
-                if re.match(r"<![A-Z]", leading)
-                else ""
-            )
-            html_end = None if terminator and terminator in leading.lower() else terminator
+            html_end = terminator
+            in_html = html_end is None or html_end.search(leading) is None
         elif nested_fence_opening:
             mask_inline_delimiters()
             begin, end = nested_fence_opening.span(1)
@@ -11362,20 +11759,103 @@ def _markdown_shell_text(
                         # a header only after the next row proves that role.
                         separator = False
                         table_columns = columns
+                        regex_columns = {
+                            i
+                            for i, (lo, hi) in enumerate(
+                                _markdown_table_cells(stripped, prefix, check_runtime)
+                            )
+                            if hi - lo <= 100
+                            and re.fullmatch(
+                                r"(?:signature|pattern|regular expression) +\((?:grep +-E|ERE)\)",
+                                stripped[lo:hi].strip(),
+                                re.I,
+                            )
+                        }
                         table_minimum_indent = minimum_indent
                         table_delimiter_line = line_index + 1
+                        header_start = offset
+                        header_end = offset + len(line) + len(lines[line_index + 1])
                 if table_columns is not None:
                     mask_inline_delimiters()
                     if line_index != table_delimiter_line:
                         cells = _markdown_table_cells(stripped, prefix, check_runtime)
+                        if (
+                            overflow_row is not None
+                            and len(stripped) <= 4096
+                            and header_end - header_start <= 4096
+                            and len(cells) > table_columns
+                            and sum(
+                                match[0].count("|")
+                                for match in _TABLE_SOURCE_ALTERNATION.finditer(stripped)
+                            )
+                            == len(cells) - table_columns
+                        ):
+                            overflow_row.append(
+                                (header_start, header_end, offset, offset + len(stripped))
+                            )
+                        if unrendered_code is not None:
+                            # Independently inspect command-shaped text in
+                            # omitted cells without granting it rendered ownership.
+                            for lower, upper in cells[table_columns:]:
+                                marks = [
+                                    (offset + m.start(), offset + m.end())
+                                    for m in backtick_runs.finditer(stripped, lower, upper)
+                                ]
+                                for (_, start), (end, _) in complete_inline_code_pairs(
+                                    content, marks
+                                ):
+                                    unrendered_code.append((start, end))
                         for cell_index, (cell_start, cell_end) in enumerate(cells):
                             if cell_index >= table_columns:
                                 # GFM drops excess body cells: no rendered
                                 # inline node can grant ownership to their ticks.
                                 break
+                            if (
+                                complete_context
+                                and cell_end - cell_start <= 512
+                                and (
+                                    note := _MARKDOWN_EXAMPLE_CELL.fullmatch(
+                                        stripped, cell_start, cell_end
+                                    )
+                                )
+                            ):
+                                output[offset + note.start("open")] = " "
+                                output[offset + note.start("close")] = " "
+                            if (
+                                complete_context
+                                and line_index + 1 == table_delimiter_line
+                                and cell_end - cell_start <= 128
+                                and (
+                                    qualifier := _MARKDOWN_HEADER_QUALIFIER.fullmatch(
+                                        stripped, cell_start, cell_end
+                                    )
+                                )
+                            ):
+                                output[offset + qualifier.start("open")] = " "
+                                output[offset + qualifier.start("close")] = " "
+                            if complete_context and cell_end - cell_start <= 512:
+                                for message in _MARKDOWN_RECORD_MESSAGE.finditer(
+                                    stripped, cell_start, cell_end
+                                ):
+                                    prose_apostrophes.update(
+                                        (
+                                            offset + message.start("open"),
+                                            offset + message.start("close"),
+                                        )
+                                    )
                             for match in backtick_runs.finditer(stripped, cell_start, cell_end):
                                 check_runtime()
                                 runs.append((offset + match.start(), offset + match.end()))
+                            if complete_context and cell_index in regex_columns:
+                                # A double quote inside the POSIX bracket class
+                                # [^"] is a literal member, not a shell quote.
+                                for (_, begin), (finish, _) in complete_inline_code_pairs(
+                                    content, runs
+                                ):
+                                    pattern = content[begin:finish]
+                                    if len(pattern) <= 512 and not re.search(r"[$`;&|<>]", pattern):
+                                        for atom in re.finditer(r'\[\^"\]', pattern):
+                                            output[begin + atom.start() + 2] = "_"
                             mask_inline_delimiters()
                         if not cells:
                             table_columns = None
@@ -11392,6 +11872,76 @@ def _markdown_shell_text(
                             if len(apostrophes) == stripped.count("'"):
                                 prose_apostrophes.update(apostrophes)
                 elif not separator and not empty_list_item:
+                    if (
+                        heading
+                        and word_apostrophes
+                        and complete_context
+                        and not runs
+                        and len(leading) <= 180
+                        and re.fullmatch(r"#{1,6} +[A-Za-z0-9 ,.'_-]+", leading)
+                    ):
+                        marks = list(_MARKDOWN_WORD_APOSTROPHE_RE.finditer(leading))
+                        if len(marks) == leading.count("'"):
+                            prose_apostrophes.update(
+                                offset + prefix + m.start("apostrophe") for m in marks
+                            )
+
+                    if (
+                        complete_context
+                        and has_list_marker
+                        and not runs
+                        and len(leading) <= 512
+                        and (note := _MARKDOWN_CROSS_REFERENCE.fullmatch(stripped, prefix))
+                    ):
+                        output[offset + note.start("open")] = " "
+                        output[offset + note.start("close")] = " "
+                    if (
+                        complete_context
+                        and not runs
+                        and (status := _MARKDOWN_QUOTED_STATUS.match(leading))
+                    ):
+                        prose_apostrophes.update(
+                            (
+                                offset + prefix + status.start("open"),
+                                offset + prefix + status.start("close"),
+                            )
+                        )
+                    if complete_context and has_list_marker and not runs and len(leading) <= 512:
+                        if message := _MARKDOWN_RECORD_MESSAGE.match(leading):
+                            prose_apostrophes.update(
+                                (
+                                    offset + prefix + message.start("open"),
+                                    offset + prefix + message.start("close"),
+                                )
+                            )
+                    if (
+                        complete_context
+                        and paragraph_open
+                        and not has_list_marker
+                        and not heading
+                        and not runs
+                        and line_index
+                        and len(leading) <= 512
+                        and '"' in leading
+                    ):
+                        previous = lines[line_index - 1].strip()
+                        first = previous.find('"')
+                        last = _MARKDOWN_QUOTE_LAST_LINE.match(leading)
+                        if (
+                            0 < first <= 256
+                            and len(previous) <= 512
+                            and last
+                            and _MARKDOWN_QUOTE_LEAD.fullmatch(previous[:first])
+                            and _MARKDOWN_QUOTE_FIRST_LINE.fullmatch(previous[first:])
+                            and re.fullmatch(
+                                r"[.!?]?(?: +[A-Za-z0-9 %.,-]+)?", leading[last.end() :]
+                            )
+                        ):
+                            # Use the same outer-shell ownership proof as contractions.
+                            previous_start = offset - len(lines[line_index - 1].lstrip())
+                            prose_apostrophes.update(
+                                (previous_start + first, offset + prefix + last.end() - 1)
+                            )
                     prose_leading = leading
                     inline_runtime_guard = False
                     if (
@@ -11499,6 +12049,7 @@ def _markdown_shell_text(
     quoted_code: dict[int, tuple[int, int, int]] = {}
     if complete_context and (quoted := quoted_list_spans(content, check_runtime)) is not None:
         quoted_code = {start: (body, close, end) for start, body, close, end in quoted.code}
+        quoted_code.update((start, (end, end, end)) for start, end in quoted.fence_markers)
         if word_apostrophes:
             code_starts = sorted(quoted_code)
             for start, end in quoted.lines:
@@ -11533,10 +12084,28 @@ def _markdown_shell_text(
         parameter_ends: dict[int, _ParameterExpansionEnd] = {}
         substitution_ends: dict[int, int | None] = {}
         backtick_ends: dict[int, int | None] = {}
+        fence_index = 0
+        punctuation = sorted(prose_apostrophes)
         while cursor <= last_candidate:
+            while fence_index < len(closed_fences) and closed_fences[fence_index][1] <= cursor:
+                fence_index += 1
+            if fence_index < len(closed_fences):
+                fence_start, fence_end = closed_fences[fence_index]
+                if fence_start <= cursor < fence_end:
+                    # Only punctuation already owned by the block's native
+                    # syntax can be masked here. Its other bytes keep their
+                    # original source for the independent execution checks.
+                    index = bisect_left(punctuation, cursor)
+                    if index == len(punctuation) or punctuation[index] >= fence_end:
+                        cursor = fence_end
+                        continue
+                    cursor = punctuation[index]
             if cursor >= next_runtime_check:
                 check_runtime()
                 next_runtime_check = cursor + 4096
+            if cursor in inline_messages:
+                cursor = inline_messages[cursor]
+                continue
             if cursor in quoted_code:
                 body, close, end = quoted_code[cursor]
                 output[cursor:body] = " " * (body - cursor)
@@ -13868,6 +14437,7 @@ def _markdown_owned_commands_diagnostic(
     complete_context: bool,
     prepared_analysis: object | None = None,
     source_view: SecurityTextView | None = None,
+    fence_regions: list[tuple[int, int, str]] | None = None,
 ) -> StaticParserDiagnostic | None:
     if not complete_context:
         return _markdown_structure_diagnostic(
@@ -13878,7 +14448,41 @@ def _markdown_owned_commands_diagnostic(
             source_view=source_view,
         )
     ranges: list[tuple[int, int]] = []
-    projected = _markdown_shell_text(content, check_runtime, inline_code_ranges=ranges)
+    source_only: list[tuple[int, int]] = []
+    fenced = [] if fence_regions is None else fence_regions
+    projected = _markdown_shell_text(
+        content,
+        check_runtime,
+        inline_code_ranges=ranges,
+        unrendered_code=source_only,
+        fence_regions=fenced,
+    )
+    for start, end, language in fenced:
+        if end >= len(content):
+            continue
+        section = content[start:end]
+        if not language:
+            # An unlabelled display can itself contain the start of a shell
+            # example. Its body ends at the containing record even when the
+            # displayed opener has no matching closing line of its own.
+            embedded = re.search(r"(?m)^[ ]{0,3}`{3,}(sh|bash|shell)[ \t]*\r?\n", section)
+            if embedded is not None:
+                start += embedded.end()
+                section = content[start:end]
+                language = embedded[1]
+        if language in {"yaml", "yml"} and yaml_source_spans(section, check_runtime) is not None:
+            inner = bounded_parse_diagnostic(section, check_runtime, file_type="yaml")
+        elif language in {"sh", "bash", "shell"} and re.search(
+            r"(?m)^[ \t]*(?:eval[ \t]|(?:/bin/)?(?:ba|da|z|k)?sh[ \t]+-[a-zA-Z]*c)",
+            section,
+        ):
+            # Earlier document punctuation cannot own the command string of an
+            # explicitly executable fenced example.
+            inner = bounded_parse_diagnostic(section, check_runtime, file_type="shell")
+        else:
+            continue
+        if inner is not None:
+            return inner.shifted(start)
     remaining_work = [8 * len(content) + _ROOT_GLOB_COMMAND_CHARS]
     property_bindings_proven = False
     if "$(" in content and '"' in content:
@@ -13943,13 +14547,20 @@ def _markdown_owned_commands_diagnostic(
     )
     if diagnostic is not None:
         return diagnostic
-    for start, end in ranges:
+    for start, end in (*ranges, *source_only):
         check_runtime()
-        # The structure pass above has checked the enclosing document. This
-        # standalone label has no closing shell substitution. Keep checking
-        # every other body and any shell operand that crosses a delimiter.
-        if _markdown_backtick_label(content, start, end):
+        if (
+            _documented_clause_start(content, start, end)
+            or _markdown_syntax_example(content, start, end)
+            or _documented_expansion_placeholder(content, start, end)
+            or _markdown_backtick_label(content, start, end)
+        ):
             continue
+        if _documented_path_lookup(content, start, end):
+            # The lookup itself still executes. Only its returned directory
+            # belongs to the surrounding reference text.
+            end = content.index(")", start, end)
+            start += 2
         diagnostic = _owned_inline_command_diagnostic(
             content[start:end],
             check_runtime,
@@ -13970,6 +14581,152 @@ def _markdown_owned_commands_diagnostic(
         projected=projected,
         remaining_work=remaining_work,
     )
+
+
+_RST_ROLE_DECLARATION = re.compile(r"\.\. role::[ \t]+([a-zA-Z][a-zA-Z0-9-]*)")
+_RST_TEXT_CELL = re.compile(
+    r" +(?:\* +)?- +:([a-zA-Z][a-zA-Z0-9-]*):"
+    r"(?P<open>`)(?P<body>[a-zA-Z][a-zA-Z0-9 ,./()'_-]*)(?P<close>`)[ \t]*"
+)
+
+
+# Traditional typeset notices use one or two opening graves and the
+# same number of closing apostrophes. Only alphabetic display terms qualify.
+_TYPESET_WORDS = re.compile(
+    r"(?<![a-zA-Z0-9_$\\`])(?P<open>`{1,2})(?P<term>[A-Za-z]++(?:[- .\n]++[A-Za-z]++){0,12})"
+    r"(?P<close>'{1,2})(?![a-zA-Z0-9_'])"
+)
+_NOTICE_FENCES = re.compile(r"^(`{3,})(text)?[ \t]*\r?$", re.M)
+
+
+def _typeset_notice_text(content: str, check_runtime: Callable[[], None]) -> str:
+    """Project paired typography inside closed plain-text notices, preserving source offsets."""
+    if not re.match(r"^# [^\r\n]{0,80}\b(?:licenses?|notices?)\b", content, re.I):
+        return content
+    output: list[str] | None = None
+    opening: re.Match[str] | None = None
+    for fence in _NOTICE_FENCES.finditer(content):
+        check_runtime()
+        if opening is None:
+            if fence[2]:
+                opening = fence
+            continue
+        if fence[2] or len(fence[1]) < len(opening[1]):
+            continue
+        for term in _TYPESET_WORDS.finditer(content, opening.end(), fence.start()):
+            check_runtime()
+            if len(term["open"]) != len(term["close"]):
+                continue
+            # Retain actual shell clauses, escapes and command substitution
+            # wherever the surrounding physical line can consume this term.
+            begin = content.rfind("\n", max(opening.end(), term.start() - 512), term.start()) + 1
+            end = content.find("\n", term.end(), min(fence.start(), term.end() + 512))
+            if (
+                not begin
+                or end < 0
+                or re.search(r'[$\\|<>&"]|\b(?:eval|(?:ba)?sh)\b', content[begin:end])
+            ):
+                continue
+            if output is None:
+                output = list(content)
+            for mark in ("open", "close"):
+                output[term.start(mark) : term.end(mark)] = " " * len(term[mark])
+        opening = None
+    return content if output is None else "".join(output)
+
+
+def _rst_table_role_text(content: str, check_runtime: Callable[[], None]) -> str:
+    """Project plain interpreted-text roles in top-level reStructuredText list tables."""
+    if ".. list-table::" not in content or ".. role::" not in content or content.startswith("#!"):
+        return content
+    roles: set[str] = set()
+    output: list[str] | None = None
+    in_table = False
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        check_runtime()
+        body = line.rstrip("\r\n")
+        if body and not body[0].isspace():
+            in_table = re.fullmatch(r"\.\. list-table::(?:[ \t]+[^\r\n]*)?", body) is not None
+            if declaration := _RST_ROLE_DECLARATION.match(body):
+                name = declaration[1]
+                # A named role inheriting code/raw semantics cannot own prose.
+                if body[declaration.end() :].strip():
+                    roles.discard(name)
+                else:
+                    roles.add(name)
+            elif body.startswith(".. include::"):
+                roles.clear()
+        elif in_table and ("::" in body or body.lstrip().startswith(">>>")):
+            # A nested directive or literal block may contain verbatim rows.
+            in_table = False
+        elif in_table and (cell := _RST_TEXT_CELL.fullmatch(body)) and cell[1] in roles:
+            text = cell["body"]
+            possessives = list(re.finditer(r"(?<=[a-zA-Z])'(?=s\b)", text))
+            if len(possessives) == text.count("'"):
+                if output is None:
+                    output = list(content)
+                output[offset + cell.start("open")] = " "
+                output[offset + cell.start("close")] = " "
+                for mark in possessives:
+                    output[offset + cell.start("body") + mark.start()] = " "
+        offset += len(line)
+    return content if output is None else "".join(output)
+
+
+def _audited_table_row(
+    content: str, diagnostic: StaticParserDiagnostic, check_runtime: Callable[[], None]
+) -> str | None:
+    """Independently inspect a raw overflow record and its actual GFM cells."""
+    if diagnostic.cause is ParserCause.RESOURCE_LIMIT:
+        return None
+    pos = diagnostic.start
+    start = content.rfind("\n", 0, pos) + 1
+    finish = content.find("\n", pos, start + 4097)
+    if finish < 0:
+        finish = len(content)
+    if finish - start > 4096 or not _TABLE_SOURCE_ALTERNATION.search(content, start, finish):
+        return None
+    records: list[tuple[int, int, int, int]] = []
+    _markdown_shell_text(content, check_runtime, overflow_row=records)
+    for head, body, lo, hi in records:
+        if not lo <= pos < hi:
+            continue
+        raw = content[lo:hi]
+        # Fixed directory lookups in declared reference text are data producers.
+        # Preserve the complete command and arguments for the raw command pass.
+        tokens = list(raw)
+        marked = list(re.finditer(r"(?<![\\`])`([^\n`]+)`(?!`)", raw))
+        if 2 * len(marked) != raw.count("`"):
+            return None
+        remaining_work = [8 * len(raw) + _ROOT_GLOB_COMMAND_CHARS]
+        for match in marked:
+            a, b = match.span(1)
+            value = raw[a:b]
+            if _documented_path_lookup(raw, a, b):
+                close = raw.index(")", a, b)
+                tokens[a] = tokens[a + 1] = tokens[close] = " "
+                value = raw[a + 2 : close]
+            if _owned_inline_command_diagnostic(value, check_runtime, remaining_work) is not None:
+                return None
+        source = "".join(tokens)
+        if _has_bounded_parse_exhaustion(source, check_runtime, file_type="other") is not None:
+            return None
+        header = content[head:body]
+        if (
+            _markdown_owned_commands_diagnostic(
+                header + source, check_runtime, complete_context=True
+            )
+            is not None
+        ):
+            return None
+        # Both complete local readings passed. Only the misleading delimiter
+        # bytes change in the cross-record word view; every source operand and
+        # the independent raw finding pass keep their original positions.
+        for match in marked:
+            tokens[match.start()] = tokens[match.end() - 1] = " "
+        return content[:lo] + "".join(tokens) + content[hi:]
+    return None
 
 
 def _forwarded_shell_diagnostic(
@@ -14101,14 +14858,54 @@ def bounded_parse_diagnostic(
     python_stdlib_check: Callable[[str, Callable[[], None]], bool] | None = None,
 ) -> StaticParserDiagnostic | None:
     """Explain the existing first incomplete parser scope without reparsing it."""
+    if file_type == "text" and complete_context:
+        content = _typeset_notice_text(content, check_runtime)
+    if file_type == "rst":
+        if complete_context:
+            content = _rst_table_role_text(content, check_runtime)
+        file_type = "other"
     if file_type == "markdown":
-        return _markdown_owned_commands_diagnostic(
+        fenced: list[tuple[int, int, str]] = []
+        original = _markdown_owned_commands_diagnostic(
             content,
             check_runtime,
             complete_context=complete_context,
             prepared_analysis=prepared_analysis,
             source_view=source_view,
+            fence_regions=fenced,
         )
+        if original is not None and complete_context:
+            projected = _audited_table_row(content, original, check_runtime)
+            if projected is not None:
+                original = _markdown_owned_commands_diagnostic(
+                    projected, check_runtime, complete_context=True
+                )
+        if original is not None and original.check is ParserCheck.COMMAND_WORD_BOUNDARY:
+            for start, end, language in fenced:
+                if start <= original.start < end < len(content) and language in {
+                    "bash",
+                    "sh",
+                    "shell",
+                }:
+                    detail = fenced_redirect_diagnostic(
+                        content[start:end],
+                        original.start - start,
+                        check_runtime,
+                        stop=original.end - start,
+                    )
+                    if detail is not None:
+                        original = detail.shifted(start)
+                    break
+        if complete_context:
+            for start, end, language in fenced:
+                if language not in {"make", "makefile", "gmake"} or end >= len(content):
+                    continue
+                for _, _, diagnostic in _make_output_recipes(content[start:end], check_runtime):
+                    if diagnostic and (
+                        original is None or start + diagnostic.start < original.start
+                    ):
+                        return diagnostic.shifted(start)
+        return original
     exhausted = _has_bounded_parse_exhaustion(
         content,
         check_runtime,
@@ -14119,6 +14916,40 @@ def bounded_parse_diagnostic(
         python_import_check=python_import_check,
         python_stdlib_check=python_stdlib_check,
     )
+    if (
+        complete_context
+        and file_type in {"other", "xml"}
+        and "wordprocessingml/" in content[:8192]
+        and content.removeprefix("\ufeff").lstrip().startswith("<")
+    ):
+        paragraphs: list[tuple[int, int, str]] = []
+        projected = paragraph_contractions(content, check_runtime, paragraphs=paragraphs)
+        for begin, end, value in paragraphs:
+            check_runtime()
+            # Native text runs can divide a command or its argument in the
+            # middle of a word. Reassemble the paragraph before inspecting it.
+            inner = bounded_parse_diagnostic(value, check_runtime, file_type="markdown")
+            if inner is not None:
+                return inner.enclosed(begin, end)
+            if value not in content[begin:end] and analyze(
+                value, "<paragraph>", "markdown", check_runtime=check_runtime
+            ):
+                return StaticParserDiagnostic(
+                    ParserCause.UNSUPPORTED_SYNTAX,
+                    ParserCheck.COMMAND_STRING_EFFECTS,
+                    begin,
+                    end,
+                    ParserUncheckedScope.COMMAND_STRING,
+                    location_precision="enclosing_expression",
+                )
+        if (
+            projected != content
+            and exhausted is not None
+            and exhausted.check is ParserCheck.COMMAND_WORD_BOUNDARY
+        ):
+            exhausted = _has_bounded_parse_exhaustion(
+                projected, check_runtime, file_type=file_type, complete_context=True
+            )
     if (
         file_type == "shell"
         and complete_context
@@ -14224,7 +15055,11 @@ def bounded_parse_diagnostic(
             # Proven rule queries are matching-language data, not shell
             # programs. Finding production still checks their raw/decoded text.
             diagnostic = None
-            if role != "pattern":
+            if role != "pattern" and not (
+                scalar.style is None
+                and content.startswith(":", scalar.end)
+                and re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_.-]*", scalar.value)
+            ):
                 diagnostic = bounded_parse_diagnostic(
                     scalar.value, check_runtime, file_type="shell", complete_context=True
                 )
@@ -14433,6 +15268,8 @@ def _has_bounded_parse_exhaustion(
         hardware_apostrophe_ambiguity = [False]
         hardware_apostrophe_locations: list[tuple[int, int]] = []
         powershell_blocks: list[tuple[int, int]] = []
+        document_fences: list[tuple[int, int, str]] = []
+        original_document = content
         content = _markdown_shell_text(
             content,
             check_runtime,
@@ -14441,10 +15278,26 @@ def _has_bounded_parse_exhaustion(
             directory_tree_markers=word_apostrophes,
             literal_label_positions=structural_quote_closers if word_apostrophes else None,
             shell_fence_ranges=shell_fence_ranges,
+            fence_regions=document_fences,
             hardware_apostrophe_ambiguity=hardware_apostrophe_ambiguity,
             hardware_apostrophe_locations=hardware_apostrophe_locations,
             powershell_blocks=powershell_blocks,
         )
+        if complete_context and structural_quote_closers is not None:
+            for start, end, language in document_fences:
+                if language not in {"python", "py"} or end >= len(content):
+                    continue
+                section = original_document[start:end]
+                if '"""' not in section and "'''" not in section:
+                    continue
+                spans = _python_literal_spans(section, check_runtime)
+                if spans is not None and python_string_value_bounds_allowed(section, check_runtime):
+                    for lower, upper in zip(*spans, strict=True):
+                        if section[lower] == "#":
+                            continue
+                        _, closing = _python_string_body(section, lower, upper)
+                        if upper - closing == 3:
+                            structural_quote_closers.update(range(start + closing, start + upper))
         if hardware_apostrophe_ambiguity[0]:
             start, end = hardware_apostrophe_locations[0]
             return StaticParserDiagnostic(
