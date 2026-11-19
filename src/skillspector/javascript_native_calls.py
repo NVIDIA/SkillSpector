@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_left
 from collections.abc import Callable
 
 from tree_sitter import Node
@@ -758,20 +759,27 @@ def _ordinary_native_calls(
         # declaration are validated too, matching the old loop: a closure
         # defined before the declaration can run after initialization, so
         # a mutation or escape there refuses the proof like any other use.
+        # references[name] is in document order (program.nodes is a
+        # pre-order walk), so each binding slices only its own scope range
+        # instead of scanning every same-named reference in the file: with
+        # thousands of sibling blocks each defining `const re`, the old scan
+        # cost bindings times references. The slice visits exactly the
+        # references the old range check kept, so pre-declaration closures
+        # and every same-named binding are still validated the same way.
+        name_references = references[name]
+        reference_starts = [node.start_byte for node in name_references]
         for binding in binding_nodes:
             named_calls: list[Node] = []
             declarator = binding.parent
             declaration = None if declarator is None else declarator.parent
             scope = None if declaration is None else declaration.parent
-            for reference in references[name]:
+            if scope is None or declarator is None:
+                continue
+            first = bisect_left(reference_starts, scope.start_byte)
+            end = bisect_left(reference_starts, scope.end_byte)
+            for reference in name_references[first:end]:
                 check_runtime()
                 if reference == binding:
-                    continue
-                if (
-                    scope is None
-                    or declarator is None
-                    or not (scope.start_byte <= reference.start_byte < scope.end_byte)
-                ):
                     continue
                 member = reference.parent
                 call = None if member is None else member.parent

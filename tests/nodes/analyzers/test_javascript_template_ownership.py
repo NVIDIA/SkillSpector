@@ -320,6 +320,29 @@ def test_unproven_exec_receivers_keep_template_files_partial(source: str) -> Non
     )
 
 
+def test_many_sibling_regex_scopes_keep_proof_work_linear() -> None:
+    # Each block defines and uses its own `const re`, so the binding proof
+    # must visit only that block's references. Scanning every same-named
+    # reference for every binding cost bindings times references here.
+    blocks = "".join("{ const re = /x/; re.test(t); }\n" for _ in range(200))
+    source = blocks + "re.exec(`${command}`);\n"
+    calls = [0]
+
+    def counting_check_runtime() -> None:
+        calls[0] += 1
+
+    assert (
+        tm.has_bounded_parse_exhaustion(source, counting_check_runtime, file_type="javascript")
+        is True
+    )
+    # Deterministic work count, not timing: the quadratic scan needed about
+    # 102,000 check_runtime calls for these 200 scopes, the scope slice
+    # needs about 22,000. The bound sits between the two with room on
+    # both sides, and the file still stays partial because the trailing
+    # `re` is outside every binding scope.
+    assert calls[0] < 40000
+
+
 def test_ledger_completes_parameter_default_value_template() -> None:
     path = "scripts/check.mjs"
     source = (
