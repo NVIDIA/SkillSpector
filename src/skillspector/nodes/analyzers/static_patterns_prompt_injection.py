@@ -68,13 +68,32 @@ def _is_p9_skipped_path(file_path: str) -> bool:
 
 
 # P1: Instruction Override
+# An override often says whose instructions it means ("ignore your previous
+# instructions", "ignore all of the prior instructions"), so the patterns for
+# earlier instructions accept a quantifier, a determiner and "prior". Keep
+# _obfuscated_instruction_right_context in artifacts.py on the same grammar.
+_P1_QUANTIFIER = r"(?:(?:all|any)\s+(?:of\s+)?)?"
+_P1_RULE_NOUN = r"(?:instructions?|rules?|guidelines?|guidance|constraints?)"
 P1_PATTERNS = [
-    (r"ignore\s+(?:all\s+)?previous\s+instructions?", 0.8),
+    (rf"ignore\s+{_P1_QUANTIFIER}(?:(?:your|the)\s+)?(?:previous|prior)\s+instructions?", 0.8),
     (r"ignore\s+(?:all\s+)?(?:safety|security)\s+(?:rules?|constraints?|guidelines?)", 0.9),
     (r"override\s+(?:safety|security|system)", 0.9),
     (r"bypass\s+(?:safety|security|restrictions?|constraints?)", 0.9),
-    (r"disregard\s+(?:all\s+)?(?:previous|safety|security)", 0.8),
-    (r"forget\s+(?:all\s+)?(?:previous|your)\s+instructions?", 0.8),
+    # The wider forms need an instruction or rule noun, because "disregard
+    # your previous estimate" and "disregard any prior version" are ordinary
+    # requests. The last branch is the original bare form, which stays as it
+    # was; it comes last so that a phrase with a noun is matched in full.
+    (
+        rf"disregard\s+(?:{_P1_QUANTIFIER}(?:(?:your|the)\s+)?(?:previous|prior)\s+{_P1_RULE_NOUN}"
+        rf"|{_P1_QUANTIFIER}(?:your\s+)?(?:safety|security)\s+{_P1_RULE_NOUN}"
+        r"|(?:all\s+)?(?:previous|safety|security))",
+        0.8,
+    ),
+    (
+        rf"forget\s+{_P1_QUANTIFIER}"
+        r"(?:your\s+(?:(?:previous|prior)\s+)?|(?:the\s+)?(?:previous|prior)\s+)instructions?",
+        0.8,
+    ),
     (r"you\s+are\s+now\s+(?:in\s+)?(?:jailbreak|unrestricted|unfiltered)\s+mode", 0.95),
     (r"enable\s+(?:developer|debug|admin|root)\s+mode", 0.7),
     (r"your\s+new\s+(?:instructions?|rules?)\s+are", 0.6),
