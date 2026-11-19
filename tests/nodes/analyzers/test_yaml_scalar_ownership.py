@@ -278,3 +278,13 @@ def test_yaml_ownership_requires_the_complete_stream() -> None:
         file_type="yaml",
         complete_context=False,
     )
+
+
+def test_plain_mapping_key_is_data_but_its_scalar_value_can_execute() -> None:
+    def inspect(source: str):
+        return tm.bounded_parse_diagnostic(source, lambda: None, file_type="yaml")
+
+    assert inspect("readiness:\n  timeout: 30\n") is None
+    diagnostic = inspect('readiness:\n  timeout: 30\nsteps:\n  - sh -c "$CMD"\n')
+    assert diagnostic is not None
+    assert diagnostic.check.value == "command_string_runtime"

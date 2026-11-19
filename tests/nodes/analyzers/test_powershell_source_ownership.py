@@ -518,3 +518,23 @@ def test_markdown_fence_offsets_preserve_following_shell_and_raw_findings(revers
         [tm],
     )
     assert result["findings"]
+
+
+@pytest.mark.parametrize("operator", ["=", "+=", "-=", "*=", "/=", "%=", "??="])
+def test_assignment_owns_only_the_literal_target(operator: str) -> None:
+    source = f'$total {operator} "$(Get-Item $path)`n$value"\n& $total'
+    native = powershell_source(source, lambda: None)
+    assert native is not None and 0 in native.assignment_targets
+    assert not native.owns(source.index("Get-Item"))
+    assert (source.rindex("$total"), len(source)) in native.invocations
+
+
+def test_fenced_assignment_cannot_take_operands_from_the_next_section() -> None:
+    fence = '```powershell\n$buffer += "# $($_.Name)`n---`n$data`n---`n`n"\n```\n'
+    padding = "\nOrdinary paragraph.\n" * 500
+    assert tm.bounded_parse_diagnostic(fence + padding, lambda: None, file_type="markdown") is None
+    unsafe = fence.replace("\n```\n", "\n& $buffer -rf /\n```\n")
+    assert (
+        tm.bounded_parse_diagnostic(unsafe + padding, lambda: None, file_type="markdown")
+        is not None
+    )

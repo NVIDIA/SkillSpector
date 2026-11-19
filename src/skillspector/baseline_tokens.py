@@ -83,6 +83,8 @@ def baseline_rule_scalar_roles(content: str, check_runtime: Callable[[], None]) 
                     return {}
                 for key in allowed & values.keys():
                     roles[values[key].start_mark.index] = "pattern"
+                if "reason" in values:
+                    roles[values["reason"].start_mark.index] = "message"
         if "scanner_version" in fields and not _text(fields["scanner_version"]):
             return {}
         check_runtime()
