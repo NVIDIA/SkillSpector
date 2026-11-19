@@ -74,7 +74,7 @@ logger = logging.getLogger(__name__)
 # Module-level constants
 # ---------------------------------------------------------------------------
 
-_FRAMEWORK_TAGS = ["ASI02", "AML.T0080"]
+_FRAMEWORK_TAGS = ["ASI02", "AML.T0110"]
 TP3_MAX_PARAM_DESC_LENGTH = 500
 TP4_MAX_FILES = bounded_capacity("SKILLSPECTOR_TP4_MAX_FILES", 128, 10_000)
 TP4_MAX_TOTAL_CODE_BYTES = bounded_capacity(
