@@ -2261,6 +2261,7 @@ def _static_printf_substitution(
     *,
     backtick: bool = False,
     quoted_result: bool = False,
+    quoted_data_position: bool = False,
     check_runtime: Callable[[], None] | None = None,
     diagnostics: list[StaticParserDiagnostic] | None = None,
 ) -> str | None:
@@ -2324,17 +2325,24 @@ def _static_printf_substitution(
         command, _, _ = _next_shell_invocation_word(inner, 0, runtime_check)
         if command == "printf":
             if _printf_invocation_has_following_operator(inner, runtime_check):
-                # The printf output is piped (or listed/redirected) into
-                # another command, so the substitution's value is that
-                # command's runtime-dependent output, not a bounded printf
-                # result. Return unresolved without a parse-limit diagnostic.
-                # Scoped to proven quoted data arguments: an unquoted
-                # substitution in command position supplies the command
-                # itself through word splitting, so it keeps its
-                # reconstruction diagnostic instead.
+                if quoted_data_position:
+                    # The printf output is piped (or listed/redirected) into
+                    # another command, so the substitution's value is that
+                    # command's runtime-dependent output, not a bounded printf
+                    # result. Return unresolved without a parse-limit
+                    # diagnostic. Scoped to proven quoted data arguments: a
+                    # quoted substitution in command position names the
+                    # executable, and an unquoted substitution in command
+                    # position supplies the command itself through word
+                    # splitting, so both keep their reconstruction
+                    # diagnostic instead.
+                    return None
+                # A quoted substitution in command position may name the
+                # executable: fall through so the operator in the inner
+                # text keeps its reconstruction diagnostic below.
+            else:
+                failed()
                 return None
-            failed()
-            return None
     if "|" in inner and (pipeline := _SYMBOLIC_PRINTF_PIPELINE_RE.fullmatch(inner)):
         # A variable grep pattern can supply flags as well as change matching.
         # Preserve that uncertainty at the argument that controls the filter.
@@ -2376,14 +2384,15 @@ def _static_printf_substitution(
         and not backtick
         and not literal_result
         and quoted_result
+        and quoted_data_position
         and _printf_invocation_has_following_operator(inner, runtime_check)
     ):
         # Same treatment for allowlisted wrappers (``command``/``builtin``/
         # ``env``) whose first word is not literally ``printf``. Scoped to
-        # proven quoted data arguments in ``$(...)`` only: a backtick
-        # substitution keeps its runtime-command gap, as the quoted-result
-        # branch above does, and an unquoted substitution keeps its
-        # reconstruction diagnostic.
+        # proven quoted data arguments in ``$(...)`` only, in a non-command
+        # position: a backtick substitution keeps its runtime-command gap,
+        # as the quoted-result branch above does, and an unquoted
+        # substitution keeps its reconstruction diagnostic.
         return None
     if not recognized or (not literal_result and re.search(r"[;|&<>\r\n]", inner) is not None):
         if diagnostics is not None and invocation_diagnostics:
@@ -2621,6 +2630,7 @@ def _is_printf_substitution(
     *,
     backtick: bool = False,
     quoted_result: bool = False,
+    quoted_data_position: bool = False,
     check_command_context: bool = True,
     check_runtime: Callable[[], None] | None = None,
     diagnostics: list[StaticParserDiagnostic] | None = None,
@@ -2640,6 +2650,7 @@ def _is_printf_substitution(
         recognized
         and not backtick
         and quoted_result
+        and quoted_data_position
         and _printf_invocation_has_following_operator(inner, runtime_check)
     ):
         # A pipeline, command list, or redirection after the printf words
@@ -2647,12 +2658,14 @@ def _is_printf_substitution(
         # so this is not a bounded printf substitution: the value is
         # runtime-dependent data, as for an ``echo`` pipeline, and its
         # failure to resolve statically is not a coverage gap. Scoped to
-        # proven quoted data arguments in ``$(...)`` only: an unquoted
-        # substitution in command position supplies the command itself
-        # through word splitting, so the outer-operand check has nothing
-        # left to inspect and the reconstruction diagnostic is kept. A
-        # backtick substitution is the runtime command itself, so its gap
-        # is preserved instead of being treated as resolved data.
+        # proven quoted data arguments in ``$(...)`` only, in a
+        # non-command position: a double-quoted substitution in command
+        # position names the executable, and an unquoted substitution in
+        # command position supplies the command itself through word
+        # splitting, so the outer-operand check has nothing left to
+        # inspect and the reconstruction diagnostic is kept. A backtick
+        # substitution is the runtime command itself, so its gap is
+        # preserved instead of being treated as resolved data.
         return False
     if recognized or not check_command_context:
         if recognized and diagnostics is not None:
@@ -2727,6 +2740,7 @@ def _printf_substitution_result(
     *,
     backtick: bool = False,
     quoted_result: bool = False,
+    quoted_data_position: bool = False,
     recognize_limit: bool = True,
     check_command_context: bool = True,
 ) -> tuple[str | None, bool, StaticParserDiagnostic | None]:
@@ -2738,6 +2752,7 @@ def _printf_substitution_result(
         end,
         backtick=backtick,
         quoted_result=quoted_result,
+        quoted_data_position=quoted_data_position,
         check_runtime=check_runtime,
         diagnostics=value_diagnostics,
     )
@@ -2751,6 +2766,7 @@ def _printf_substitution_result(
             end,
             backtick=backtick,
             quoted_result=quoted_result,
+            quoted_data_position=quoted_data_position,
             check_command_context=check_command_context,
             check_runtime=check_runtime,
             diagnostics=invocation_diagnostics,
@@ -2858,6 +2874,7 @@ def _parse_shell_command_word(
     backtick_closures: set[tuple[int, int]] | None = None,
     source_end: int | None = None,
     quoted_substitution_starts: Container[int] | None = None,
+    quoted_data_position: bool | None = None,
 ) -> _ShellCommandWord | None:
     runtime_check = check_runtime or (lambda: None)
     # The shell recognizes ``NAME=value`` before expansion and never runs the
@@ -2865,6 +2882,15 @@ def _parse_shell_command_word(
     # positions, and a later ``$NAME`` command word is still checked, so only
     # this word's printf reconstruction check is skipped.
     assignment = _is_assignment_word(content, start)
+    if quoted_data_position is None:
+        # Quoting alone never proves a data position: a shell executes a
+        # double-quoted substitution in command position as the command
+        # name, so the quoted printf exemption also needs the enclosing
+        # word outside command position. A native argument is proven data
+        # by its caller; any other word is data only when it does not open
+        # a line or follow a command separator. A fragment parsed on its
+        # own (start 0) proves nothing, so it stays fail-closed.
+        quoted_data_position = native_argument or not _is_shell_command_position(content, start)
 
     output: list[str] = []
     wrapper_quote = enclosing_delimiter or (
@@ -2930,7 +2956,15 @@ def _parse_shell_command_word(
                             cursor,
                             substitution_end,
                             runtime_check,
+                            # The exemption needs a proven quoted data
+                            # argument: quoting here, and a non-command
+                            # position for the enclosing word, which travels
+                            # separately so a literal printf in command
+                            # position still resolves to its value. A quoted
+                            # substitution in command position names the
+                            # executable, so it keeps its diagnostic.
                             quoted_result=quoted_printf_allowed,
+                            quoted_data_position=quoted_data_position,
                             recognize_limit=not limited and not assignment,
                             **({"check_command_context": False} if native_argument else {}),
                         )
@@ -3050,10 +3084,14 @@ def _parse_shell_command_word(
                     # The reader started on this substitution, so it has no
                     # quote state of its own: the caller supplies the starts
                     # proven to sit inside a double-quoted span, and only
-                    # those keep the quoted-data exemption. A bare
+                    # those keep the quoted-data exemption, and only in a
+                    # proven non-command position for the enclosing word,
+                    # which travels separately so a literal printf in
+                    # command position still resolves to its value. A bare
                     # substitution keeps its reconstruction diagnostic.
                     quoted_result=quoted_substitution_starts is not None
                     and cursor in quoted_substitution_starts,
+                    quoted_data_position=quoted_data_position,
                     recognize_limit=not limited and not assignment,
                     **({"check_command_context": False} if native_argument else {}),
                 )
@@ -4341,10 +4379,14 @@ def _quoted_candidate_is_complete(
         quoted_printf_allowed=quoted_printf_allowed,
         # The fragment starts on the substitution itself, so the reader has
         # no quote state: only a start proven to sit inside a double-quoted
-        # span keeps the quoted-data exemption here.
+        # span keeps the quoted-data exemption here. The fragment cannot
+        # prove the enclosing word's position, so the caller supplies it
+        # from the full source: a quoted substitution in command position
+        # names the executable and keeps its diagnostic.
         quoted_substitution_starts={0}
         if quote_limits is not None and start in quote_limits and content.startswith("$(", start)
         else None,
+        quoted_data_position=not _is_shell_command_position(content, start),
     )
     if parsed is None or parsed.limited:
         return False
@@ -4644,8 +4686,9 @@ def _has_shell_command_word_exhaustion(
     # starts on such a substitution with no quote state of its own, so the
     # enclosing quoted word's exemption would otherwise be lost when the
     # substitution is revisited as an independent candidate. Only these
-    # starts keep the quoted-data exemption; a bare substitution keeps its
-    # reconstruction diagnostic.
+    # starts keep the quoted-data exemption, and only in a proven
+    # non-command position for the enclosing word; a bare substitution
+    # keeps its reconstruction diagnostic.
     quoted_substitution_starts = frozenset(
         position for position in (quote_limits or {}) if content.startswith("$(", position)
     )
@@ -4887,10 +4930,15 @@ def _has_shell_command_word_exhaustion(
                     substitution_end,
                     # The exemption is for proven quoted data arguments
                     # only: a double quote immediately before the
-                    # substitution puts it in a quoted argument, while a
-                    # bare substitution in command position keeps its
-                    # reconstruction diagnostic.
+                    # substitution puts it in a quoted argument, and the
+                    # enclosing word must sit outside command position,
+                    # where a quoted substitution would name the executable.
+                    # The position travels separately from quoting, so a
+                    # literal printf in command position still resolves
+                    # to its value. A bare substitution in command
+                    # position keeps its reconstruction diagnostic.
                     quoted_result=substitution_start == start + 1 and content[start] == '"',
+                    quoted_data_position=not _is_shell_command_position(content, start),
                     check_runtime=check_runtime,
                 ):
                     if not _quoted_candidate_is_complete(
@@ -8460,6 +8508,9 @@ def _bounded_shell_tokens(
             runtime_check,
             backtick=backtick,
             quoted_result=quoted,
+            # This tokenizer only scans argument words (the command word
+            # sits before body_start), so a quoted pipeline here is data.
+            quoted_data_position=True,
             recognize_limit=not parse_limited,
             check_command_context=False,
         )
