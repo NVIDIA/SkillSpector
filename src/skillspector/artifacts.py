@@ -1026,9 +1026,23 @@ def _obfuscated_instruction_right_context(
         )
 
     if action == "disregard":
-        return quantified(
-            (("your",), optional), ((*earlier, "safety", "security"), required)
-        ) or quantified((("the",), required), (earlier, required), (instructions, required))
+        rule_nouns = (
+            *instructions,
+            "rule",
+            "rules",
+            "guideline",
+            "guidelines",
+            "guidance",
+            "constraint",
+            "constraints",
+        )
+        return (
+            quantified((("your", "the"), optional), (earlier, required), (rule_nouns, required))
+            or quantified(
+                (("your",), optional), (("safety", "security"), required), (rule_nouns, required)
+            )
+            or sequence((("all",), optional), (("previous", "safety", "security"), required))
+        )
 
     if action == "forget":
         return quantified(

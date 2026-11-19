@@ -73,17 +73,20 @@ def _is_p9_skipped_path(file_path: str) -> bool:
 # earlier instructions accept a quantifier, a determiner and "prior". Keep
 # _obfuscated_instruction_right_context in artifacts.py on the same grammar.
 _P1_QUANTIFIER = r"(?:(?:all|any)\s+(?:of\s+)?)?"
+_P1_RULE_NOUN = r"(?:instructions?|rules?|guidelines?|guidance|constraints?)"
 P1_PATTERNS = [
     (rf"ignore\s+{_P1_QUANTIFIER}(?:(?:your|the)\s+)?(?:previous|prior)\s+instructions?", 0.8),
     (r"ignore\s+(?:all\s+)?(?:safety|security)\s+(?:rules?|constraints?|guidelines?)", 0.9),
     (r"override\s+(?:safety|security|system)", 0.9),
     (r"bypass\s+(?:safety|security|restrictions?|constraints?)", 0.9),
-    # No noun follows the first form, so "prior" must end its word ("disregard
-    # priority") and "the" is accepted only when the phrase names instructions.
+    # The wider forms need an instruction or rule noun, because "disregard
+    # your previous estimate" and "disregard any prior version" are ordinary
+    # requests. The last branch is the original bare form, which stays as it
+    # was; it comes last so that a phrase with a noun is matched in full.
     (
-        rf"disregard\s+{_P1_QUANTIFIER}"
-        r"(?:(?:your\s+)?(?:previous|prior\b|safety|security)"
-        r"|the\s+(?:previous|prior)\s+instructions?)",
+        rf"disregard\s+(?:{_P1_QUANTIFIER}(?:(?:your|the)\s+)?(?:previous|prior)\s+{_P1_RULE_NOUN}"
+        rf"|{_P1_QUANTIFIER}(?:your\s+)?(?:safety|security)\s+{_P1_RULE_NOUN}"
+        r"|(?:all\s+)?(?:previous|safety|security))",
         0.8,
     ),
     (
