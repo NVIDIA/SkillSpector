@@ -24,7 +24,8 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from copy import deepcopy
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from html import escape as escape_html
@@ -93,7 +94,7 @@ from skillspector.semantic_runtime import (
     semantic_runtime_ledger_event,
     successful_llm_record,
 )
-from skillspector.state import SkillspectorState, transitive_remaining_seconds
+from skillspector.state import PreparedReport, SkillspectorState, transitive_remaining_seconds
 from skillspector.suppression import Baseline, SuppressedFinding, partition_findings
 from skillspector.terminal_text import visible_terminal_text
 
@@ -1250,6 +1251,7 @@ def _format_terminal(
     show_suppressed: bool = False,
     analysis_completeness: Mapping[str, object] | None = None,
     execution_successful: bool = True,
+    scanned_at: datetime | None = None,
     origin: dict[str, str] | None = None,
 ) -> str:
     """Generate styled Rich output with literal, control-safe dynamic text."""
@@ -1270,7 +1272,8 @@ def _format_terminal(
     if origin is not None:
         console.print(Text.assemble(("Input origin: ", "bold"), _terminal_text(origin["source"])))
         console.print(Text.assemble(("Input type: ", "bold"), _terminal_text(origin["type"])))
-    console.print(f"[bold]Scanned:[/bold] {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    scanned_at = scanned_at or datetime.now(UTC)
+    console.print(f"[bold]Scanned:[/bold] {scanned_at.strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
     severity_colors = {
         "LOW": "green",
@@ -1660,6 +1663,8 @@ def _format_json(
     semantic_runtime_incomplete: bool = False,
     runtime_available: bool | None = None,
     provider_availability: tuple[bool, str | None] | None = None,
+    scanned_at: datetime | None = None,
+    prepared_metadata: dict[str, object] | None = None,
     origin: dict[str, str] | None = None,
 ) -> str:
     """Generate JSON report string."""
@@ -1669,7 +1674,7 @@ def _format_json(
         "skill": {
             "name": skill_name,
             "source": skill_path or "",
-            "scanned_at": datetime.now(UTC).isoformat(),
+            "scanned_at": (scanned_at or datetime.now(UTC)).isoformat(),
             **({"origin": origin} if origin is not None else {}),
         },
         "risk_assessment": {
@@ -1683,7 +1688,9 @@ def _format_json(
         "issues": [f.to_dict() for f in findings],
         "suppressed_count": len(suppressed),
         "suppressed": [sf.to_dict() for sf in suppressed],
-        "metadata": _build_metadata(
+        "metadata": prepared_metadata
+        if prepared_metadata is not None
+        else _build_metadata(
             has_executable_scripts,
             use_llm,
             llm_call_log,
@@ -1831,6 +1838,7 @@ def _format_markdown(
     show_suppressed: bool = False,
     analysis_completeness: Mapping[str, object] | None = None,
     execution_successful: bool = True,
+    scanned_at: datetime | None = None,
     origin: dict[str, str] | None = None,
 ) -> str:
     """Generate Markdown report string."""
@@ -1845,7 +1853,8 @@ def _format_markdown(
     if origin is not None:
         lines.append(f"**Input origin:** {_markdown_code(origin['source'])}  ")
         lines.append(f"**Input type:** {_markdown_cell(origin['type'])}  ")
-    lines.append(f"**Scanned:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}  ")
+    scanned_at = scanned_at or datetime.now(UTC)
+    lines.append(f"**Scanned:** {scanned_at.strftime('%Y-%m-%d %H:%M:%S UTC')}  ")
     lines.append("")
 
     effective_degraded_notice = degraded_notice or _llm_degradation_notice(
@@ -1951,11 +1960,10 @@ def _format_markdown(
     return "\n".join(lines)
 
 
-def report(state: SkillspectorState) -> dict[str, object]:
-    """Render canonical findings and the exceptional ledger projection.
+def prepare_report(state: SkillspectorState) -> PreparedReport:
+    """Finalize report semantics once, independently of the selected format.
 
-    Finalization owns completeness derivation. The report node only selects the
-    validated finding IDs, applies baseline suppression, and renders all surfaces.
+    No renderer receives workflow state, a baseline, or a live provider context.
     """
     clear_python_ast_cache(state.get("python_ast_cache_key"))
     raw_findings = state.get("findings")
@@ -2017,7 +2025,6 @@ def report(state: SkillspectorState) -> dict[str, object]:
         and raw_origin.get("type") in {"directory", "file", "zip", "git", "url"}
     ):
         origin = input_origin(raw_origin["source"], raw_origin["type"])
-    output_format = state.get("output_format") or "sarif"
     llm_requested, use_llm = semantic_runtime_intent(state)
     raw_llm_call_log = state.get("llm_call_log")
     llm_call_log: list[Mapping[str, object]] = (
@@ -2238,101 +2245,133 @@ def report(state: SkillspectorState) -> dict[str, object]:
         structured_summaries=structured_summaries,
         origin=origin,
     )
-    if output_format == "terminal":
-        report_body = _format_terminal(
-            display_findings,
-            component_metadata,
-            manifest,
-            skill_path,
-            risk_score,
-            risk_severity,
-            risk_recommendation,
-            has_executable_scripts,
-            use_llm=llm_requested,
-            llm_call_log=llm_call_log,
-            degraded_notice=degraded_notice,
-            suppressed=suppressed,
-            structured_summaries=structured_summaries,
-            show_suppressed=show_suppressed,
-            analysis_completeness=analysis_completeness,
-            execution_successful=execution_successful,
-            origin=origin,
-        )
-    elif output_format == "json":
-        report_body = _format_json(
-            display_findings,
-            component_metadata,
-            manifest,
-            skill_path,
-            risk_score,
-            risk_severity,
-            risk_recommendation,
-            has_executable_scripts,
-            use_llm=llm_requested,
-            llm_call_log=llm_call_log,
-            inference_usage=inference_usage,
-            llm_provenance=llm_provenance,
-            analysis_completeness=analysis_completeness,
-            suppressed=suppressed,
-            execution_successful=execution_successful,
-            transitive_targets_scanned=(
-                int(transitive_targets_scanned)
-                if isinstance(transitive_targets_scanned, int)
-                else None
-            ),
-            transitive_bytes_scanned=(
-                int(transitive_bytes_scanned) if isinstance(transitive_bytes_scanned, int) else None
-            ),
-            transitive_truncation_reasons=transitive_truncation_reasons,
-            structured_summaries=structured_summaries,
-            llm_execution_enabled=use_llm,
-            semantic_runtime_incomplete=semantic_runtime_incomplete,
-            runtime_available=runtime_available,
-            provider_availability=(provider_available, provider_error),
-            origin=origin,
-        )
-    elif output_format == "markdown":
-        report_body = _format_markdown(
-            display_findings,
-            component_metadata,
-            manifest,
-            skill_path,
-            risk_score,
-            risk_severity,
-            risk_recommendation,
-            has_executable_scripts,
-            use_llm=llm_requested,
-            llm_call_log=llm_call_log,
-            degraded_notice=degraded_notice,
-            suppressed=suppressed,
-            structured_summaries=structured_summaries,
-            show_suppressed=show_suppressed,
-            analysis_completeness=analysis_completeness,
-            execution_successful=execution_successful,
-            origin=origin,
-        )
-    else:
-        report_body = json.dumps(sarif_report, indent=2)
-
-    logger.debug(
-        "Report generated: format=%s, findings_count=%d, suppressed_count=%d",
-        output_format,
-        len(active_findings),
-        len(suppressed),
+    metadata = _build_metadata(
+        has_executable_scripts,
+        llm_requested,
+        llm_call_log,
+        inference_usage,
+        llm_provenance,
+        transitive_targets_scanned,
+        transitive_bytes_scanned,
+        transitive_truncation_reasons,
+        use_llm,
+        semantic_runtime_incomplete,
+        runtime_available,
+        (provider_available, provider_error),
     )
-    return {
-        "sarif_report": sarif_report,
+    # Only presentation data crosses this boundary. JSON bytes make nested
+    # findings, evidence, metadata and coverage immutable too; no pickle or
+    # executable deserialization is used. Each format receives fresh objects.
+    snapshot = {
+        "scanned_at": datetime.now(UTC).isoformat(),
+        "display_findings": [asdict(finding) for finding in display_findings],
+        "filtered_findings": [asdict(finding) for finding in reported_findings],
+        "active_findings": [asdict(finding) for finding in active_findings],
+        "suppressed_findings": [asdict(finding) for finding in suppressed],
+        "component_metadata": [
+            {key: value for key, value in component.items() if key in _json_component(component)}
+            for component in component_metadata
+        ],
+        # Arbitrary frontmatter and internal component/telemetry extensions
+        # are not presentation inputs (and need not be JSON serializable).
+        "manifest": {"name": manifest.get("name")},
+        "skill_path": skill_path,
+        "origin": origin,
         "risk_score": risk_score,
         "risk_severity": risk_severity,
         "risk_recommendation": risk_recommendation,
-        "report_body": report_body,
-        "filtered_findings": reported_findings,
-        "suppressed_findings": suppressed,
-        "active_findings": active_findings,
-        "execution_successful": execution_successful,
+        "has_executable_scripts": has_executable_scripts,
+        "llm_requested": llm_requested,
+        "degraded_notice": degraded_notice,
+        "structured_summaries": structured_summaries,
+        "show_suppressed": show_suppressed,
         "analysis_completeness": dict(analysis_completeness),
+        "execution_successful": execution_successful,
+        "metadata": metadata,
+        "sarif_report": sarif_report,
         "transitive_targets_scanned": transitive_targets_scanned,
         "transitive_bytes_scanned": transitive_bytes_scanned,
         "transitive_truncated": bool(transitive_truncation_reasons),
         "transitive_truncation_reasons": transitive_truncation_reasons,
     }
+    return PreparedReport(json.dumps(snapshot).encode("utf-8"))
+
+
+def render_report(prepared: PreparedReport, output_format: str) -> dict[str, object]:
+    """Format isolated finalized data without reassessing the completed scan."""
+    data = json.loads(prepared.payload)
+    findings = [Finding(**row) for row in data["display_findings"]]
+    suppressed = [
+        SuppressedFinding(Finding(**row["finding"]), row["reason"])
+        for row in data["suppressed_findings"]
+    ]
+    common = {
+        "findings": findings,
+        "component_metadata": data["component_metadata"],
+        "manifest": data["manifest"],
+        "skill_path": data["skill_path"],
+        "origin": data["origin"],
+        "risk_score": data["risk_score"],
+        "risk_severity": data["risk_severity"],
+        "risk_recommendation": data["risk_recommendation"],
+        "has_executable_scripts": data["has_executable_scripts"],
+        "use_llm": data["llm_requested"],
+        "suppressed": suppressed,
+        "structured_summaries": data["structured_summaries"],
+        "analysis_completeness": data["analysis_completeness"],
+        "execution_successful": data["execution_successful"],
+        "scanned_at": datetime.fromisoformat(data["scanned_at"]),
+    }
+    # Formatting helpers receive disposable copies, never the objects used for
+    # the returned canonical projection (or the immutable source snapshot).
+    common = deepcopy(common)
+    if output_format == "terminal":
+        report_body = _format_terminal(
+            **common,
+            degraded_notice=data["degraded_notice"],
+            show_suppressed=data["show_suppressed"],
+        )
+    elif output_format == "json":
+        report_body = _format_json(**common, prepared_metadata=deepcopy(data["metadata"]))
+    elif output_format == "markdown":
+        report_body = _format_markdown(
+            **common,
+            degraded_notice=data["degraded_notice"],
+            show_suppressed=data["show_suppressed"],
+        )
+    else:
+        report_body = json.dumps(data["sarif_report"], indent=2)
+
+    logger.debug(
+        "Report generated: format=%s, findings_count=%d, suppressed_count=%d",
+        output_format,
+        len(data["active_findings"]),
+        len(suppressed),
+    )
+    return {
+        "prepared_report": prepared,
+        "sarif_report": data["sarif_report"],
+        "risk_score": data["risk_score"],
+        "risk_severity": data["risk_severity"],
+        "risk_recommendation": data["risk_recommendation"],
+        "report_body": report_body,
+        "filtered_findings": [Finding(**row) for row in data["filtered_findings"]],
+        "suppressed_findings": suppressed,
+        "active_findings": [Finding(**row) for row in data["active_findings"]],
+        "execution_successful": data["execution_successful"],
+        "analysis_completeness": data["analysis_completeness"],
+        "transitive_targets_scanned": data["transitive_targets_scanned"],
+        "transitive_bytes_scanned": data["transitive_bytes_scanned"],
+        "transitive_truncated": data["transitive_truncated"],
+        "transitive_truncation_reasons": data["transitive_truncation_reasons"],
+    }
+
+
+def report(state: SkillspectorState) -> dict[str, object]:
+    """Workflow node: assess once, then render the requested primary format.
+
+    Deliberately prepare afresh here: transitive merging creates a new completed
+    scan, even when the root graph already produced a report snapshot. Additional
+    formats must call render_report, not this workflow node.
+    """
+    return render_report(prepare_report(state), state.get("output_format") or "sarif")
