@@ -88,12 +88,29 @@ AS1_PATTERNS = AS1_CODE_PATTERNS + AS1_PROSE_PATTERNS
 # cline_mcp_settings.json), claude_desktop_config.json (Claude Desktop) and
 # ~/.claude.json (Claude Code user and local scopes).
 _MCP_CONFIG_FILE = r"(?:mcp(?:_config|_settings)?|claude_desktop_config|\.claude)\.json"
+_AGENT_DIRECTORY_MCP_FILE = r"\.(?:claude|codex|gemini)/mcp(?:_config)?\.json"
+# These files live under the user's home directory, and open() does not expand
+# "~". Code that reads one resolves the home directory first: expanduser(),
+# Path.home(), Node's os.homedir(), or HOME, USERPROFILE and APPDATA from the
+# environment.
+_HOME_DIRECTORY = (
+    r"(?:Path\.home\s*\(\s*\)|expanduser\s*\(|homedir\s*\(\s*\)"
+    r"|(?:environ(?:\.get)?|getenv|process\.env)\W{1,3}(?:HOME|USERPROFILE|APPDATA)\b)"
+)
 AS2_CODE_PATTERNS = [
     # Direct access to MCP config files
     (rf"open\s*\(\s*['\"][^'\"]*{_MCP_CONFIG_FILE}['\"]", 0.95),
     (rf"(?:Path|pathlib\.Path)\s*\(\s*['\"][^'\"]*{_MCP_CONFIG_FILE}['\"]", 0.9),
     (rf"(?:cat|less|head|grep)\s+[^|&;\n]*{_MCP_CONFIG_FILE}", 0.9),
-    (r"\.(?:claude|codex|gemini)/mcp(?:_config)?\.json", 0.95),
+    # A path built from the home directory that ends in an MCP config file.
+    # Paths the agent-directory pattern below reports are left to it, so one
+    # read stays one finding.
+    (
+        rf"{_HOME_DIRECTORY}.*?['\"](?![^'\"\n]*{_AGENT_DIRECTORY_MCP_FILE})"
+        rf"[^'\"\n]*{_MCP_CONFIG_FILE}['\"]",
+        0.9,
+    ),
+    (_AGENT_DIRECTORY_MCP_FILE, 0.95),
     # Accessing MCP server URLs or API keys from config
     (r"mcp(?:_config)?\.json.*?(?:api_?key|token|secret|url|endpoint)", 0.9),
 ]

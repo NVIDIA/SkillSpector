@@ -2087,6 +2087,63 @@ class TestRunStaticPatternsAgentSnooping:
         findings = static_runner.run_static_patterns(state, [agent_snooping_module])
         assert not any(f.rule_id == "AS2" for f in findings)
 
+    @pytest.mark.parametrize(
+        ("component", "code"),
+        [
+            ("s.py", 'open(os.path.expanduser("~/.cursor/mcp.json")).read()\n'),
+            ("s.py", 'Path(os.path.expanduser("~/.cursor/mcp.json")).read_text()\n'),
+            (
+                "s.py",
+                'open(os.path.join(os.path.expanduser("~"), ".cursor", "mcp.json")).read()\n',
+            ),
+            ("s.py", '(pathlib.Path.home() / ".cursor" / "mcp.json").read_text()\n'),
+            ("s.py", 'open(os.environ["HOME"] + "/.codeium/windsurf/mcp_config.json").read()\n'),
+            (
+                "s.py",
+                'open(os.path.join(os.environ.get("APPDATA"), "Claude", '
+                '"claude_desktop_config.json")).read()\n',
+            ),
+            ("s.py", 'open(os.getenv("HOME") + "/.claude.json").read()\n'),
+            ("s.js", "fs.readFileSync(path.join(os.homedir(), '.cursor', 'mcp.json'), 'utf8');\n"),
+            ("s.js", 'fs.readFileSync(process.env.HOME + "/.cursor/mcp.json", "utf8");\n'),
+            ("s.py", 'open(os.path.expanduser("~/.gemini/mcp_config.json")).read()\n'),
+        ],
+        ids=[
+            "expanduser",
+            "path-of-expanduser",
+            "join-from-expanduser",
+            "path-home",
+            "environ-home",
+            "environ-get-appdata",
+            "getenv-home",
+            "node-homedir",
+            "node-process-env",
+            "agent-directory-reported-once",
+        ],
+    )
+    def test_as2_home_directory_paths_produce_finding(self, component, code):
+        """An MCP config reached from the resolved home directory yields AS2 (HIGH)."""
+        state = {"components": [component], "file_cache": {component: code}}
+        findings = static_runner.run_static_patterns(state, [agent_snooping_module])
+        as2 = [f for f in findings if f.rule_id == "AS2"]
+        assert len(as2) == 1
+        assert as2[0].severity == "HIGH"
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'open(os.path.expanduser("~/notes/todo.json")).read()\n',
+            'open(os.path.expanduser("~/project/schemas/mcp-schema.json")).read()\n',
+            'home = Path.home()\nname = "mcp.json"\n',
+        ],
+        ids=["other-file", "similar-name", "separate-lines"],
+    )
+    def test_as2_home_directory_path_to_another_file_is_not_access(self, code):
+        """Resolving the home directory for a file that is not an MCP config is not AS2."""
+        state = {"components": ["s.py"], "file_cache": {"s.py": code}}
+        findings = static_runner.run_static_patterns(state, [agent_snooping_module])
+        assert not any(f.rule_id == "AS2" for f in findings)
+
     def test_as3_other_skill_produces_finding(self):
         """Reading another skill's manifest yields AS3."""
         state = {
