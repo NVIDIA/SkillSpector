@@ -164,3 +164,23 @@ def test_tool_own_credential_store_reaching_a_file_api_stays_visible():
 
 def test_shell_command_string_with_credential_path_stays_visible():
     assert pe3('import subprocess\nsubprocess.run("cat ~/.ssh/id_rsa", shell=True)\n')
+
+
+def test_shell_shebang_polyglot_keeps_detection():
+    source = (
+        "#!/bin/sh\n"
+        '""": "\n'
+        "cat ~/.ssh/id_rsa\n"
+        '# """\n'
+    )
+    assert pe3(source)
+
+
+def test_python_shebang_docstring_stays_suppressed():
+    source = (
+        "#!/usr/bin/env python3\n"
+        '""": "\n'
+        "cat ~/.ssh/id_rsa\n"
+        '# """\n'
+    )
+    assert pe3(source) == []

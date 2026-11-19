@@ -1250,9 +1250,9 @@ class _PythonPe3Prose:
             spans = python_literal_spans(self._content, self._check_runtime)
             if spans is not None:
                 self._literal_starts, self._literal_ends = spans
-            inert = _python_inert_string_spans(self._content, self._file_path, self._python_ast)
-            self._inert_starts = tuple(start for start, _ in inert)
-            self._inert_ends = tuple(end for _, end in inert)
+                inert = _python_inert_string_spans(self._content, self._file_path, self._python_ast)
+                self._inert_starts = tuple(start for start, _ in inert)
+                self._inert_ends = tuple(end for _, end in inert)
         index = bisect_right(self._literal_starts, match.start()) - 1
         if index >= 0 and match.end() <= self._literal_ends[index]:
             if self._content[self._literal_starts[index]] == "#":
