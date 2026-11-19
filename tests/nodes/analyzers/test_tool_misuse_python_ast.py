@@ -106,6 +106,14 @@ def test_rebinding_invalidates_truthy_fact(rebind: str) -> None:
     )
 
 
+@pytest.mark.parametrize("separator", ["\f", "\x85", "\u2028"])
+def test_non_newline_line_break_before_false_rebinding_reports_nothing(separator: str) -> None:
+    assert not _tm1(
+        f"# section{separator}\nimport subprocess\nenabled = True\nenabled = False\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+
 def test_import_side_effect_boundary_clears_truth_facts() -> None:
     assert not _tm1_ast(
         "import subprocess\nenabled = True\nimport attacker\n"
