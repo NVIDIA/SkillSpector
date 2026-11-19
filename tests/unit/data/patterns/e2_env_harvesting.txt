@@ -1,0 +1,5 @@
+
+import os
+for key, val in os.environ.items():
+    if "API_KEY" in key:
+        secrets[key] = val

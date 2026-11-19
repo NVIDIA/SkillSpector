@@ -89,6 +89,7 @@ class LedgerReason(StrEnum):
     SYNTAX_ERROR = "syntax_error"
     LLM_BATCH_FAILED = "llm_batch_failed"
     LLM_STRUCTURED_RESPONSE_INVALID = "llm_structured_response_invalid"
+    LLM_STRUCTURED_OUTPUT_REJECTED = "llm_structured_output_rejected"
     LLM_RESPONSE_REFUSED = "llm_response_refused"
     LLM_RESPONSE_TRUNCATED = "llm_response_truncated"
     LLM_RESPONSE_INCOMPLETE = "llm_response_incomplete"
@@ -437,6 +438,10 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
         "LLM response could not be validated after bounded recovery."
     ),
+    LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED: (
+        "Provider rejected structured output (response_format unsupported; "
+        "tool-calling fallback also rejected)."
+    ),
     LedgerReason.LLM_RESPONSE_REFUSED: "The model declined to complete this assessment.",
     LedgerReason.LLM_RESPONSE_TRUNCATED: "The model's answer was cut short by its output limit.",
     LedgerReason.LLM_RESPONSE_INCOMPLETE: "The model did not finish this assessment.",
@@ -639,11 +644,18 @@ class ParserCheck(StrEnum):
     COMMAND_ARGUMENT_CHARACTERS = "command_argument_characters"
     COMMAND_WORD_BOUNDARY = "command_word_boundary"
     COMMAND_ARGUMENT_BOUNDARY = "command_argument_boundary"
+    COMMAND_REDIRECTION_TARGET = "command_redirection_target"
+    DOCUMENTED_COMMAND_OPERAND = "documented_command_operand"
     COMMAND_IDENTITY = "runtime_command_identity"
+    GENERATED_TEXT_DESTINATION = "generated_text_destination"
     PRINTF_INPUT_CHARACTERS = "printf_input_characters"
     PRINTF_ARGUMENT_COUNT = "printf_argument_count"
     PRINTF_ARGUMENT_CHARACTERS = "printf_argument_characters"
     PRINTF_OUTPUT_CHARACTERS = "printf_output_characters"
+    SSH_ARGUMENTS = "ssh_arguments"
+    SHELL_FILTER_ARGUMENT = "shell_filter_argument"
+    SHELL_SCRIPT_PATH = "shell_script_path"
+    SHELL_ARITHMETIC = "shell_arithmetic"
     PRINTF_FORMAT = "printf_format"
     PRINTF_INVOCATION = "printf_invocation"
     WRAPPER_DEPTH = "wrapper_depth"
@@ -659,6 +671,8 @@ class ParserCheck(StrEnum):
     BRACE_PRODUCTS = "brace_products"
     BRACE_ROUNDS = "brace_rounds"
     BRACE_SYNTAX = "brace_syntax"
+    JAVASCRIPT_SYNTAX = "javascript_syntax"
+    GENERATED_HTML_MARKUP = "generated_html_markup"
     MARKDOWN_LITERAL_OWNERSHIP = "markdown_literal_ownership"
     HEREDOC_HEADER = "heredoc_header"
     HEREDOC_COUNT = "heredoc_count"

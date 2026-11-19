@@ -27,7 +27,7 @@ rule agent_skill_credential_exfiltration_webhook
         $secret_env_js = /process\.env(\.|\[|\s|$)/ nocase
         $secret_dotenv_read = /open\s*\(\s*['"][^'"]*\.env['"]/ nocase
         $secret_ssh_key = /(\.ssh\/(id_rsa|id_ed25519)|authorized_keys)/ nocase
-        $secret_cloud_key = /(OPENAI_API_KEY|ANTHROPIC_API_KEY|NVIDIA_INFERENCE_KEY|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|HF_TOKEN)/ nocase
+        $secret_cloud_key = /(OPENAI_API_KEY|ANTHROPIC_API_KEY|MINIMAX_API_KEY|NVIDIA_INFERENCE_KEY|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|HF_TOKEN)/ nocase
 
         $send_requests = /(requests|httpx)\.(post|put)\s*\(/ nocase
         $send_fetch = /(fetch|axios\.post)\s*\(/ nocase

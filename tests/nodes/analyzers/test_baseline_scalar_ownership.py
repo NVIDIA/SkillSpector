@@ -35,7 +35,7 @@ def test_matcher_values_are_data_without_filename_assumptions(message: str, newl
     spans = yaml_source_spans(source, lambda: None)
     roles = baseline_rule_scalar_roles(source, lambda: None)
     assert spans is not None
-    owned = [scalar.value for scalar in spans.scalars if scalar.start in roles]
+    owned = [scalar.value for scalar in spans.scalars if roles.get(scalar.start) == "pattern"]
     assert owned == ["TM2", "*SKILL.md", message]
     assert _result(source)["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
@@ -43,7 +43,7 @@ def test_matcher_values_are_data_without_filename_assumptions(message: str, newl
 @pytest.mark.parametrize("original,alias", [("id:", "rule_id:"), ("path:", "file:")])
 def test_supported_matcher_aliases_keep_their_data_role(original: str, alias: str) -> None:
     source = _baseline().replace(original, alias)
-    assert len(baseline_rule_scalar_roles(source, lambda: None)) == 3
+    assert list(baseline_rule_scalar_roles(source, lambda: None).values()).count("pattern") == 3
     assert _result(source)["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
@@ -53,7 +53,7 @@ def test_valid_fingerprints_reuse_canonical_schema_constraints() -> None:
         '- hash: "sha256:' + "a" * 64 + '"\n'
         '  rule_id: TM1\n  file: "; sudo"\n  reason: "Reviewed evidence."\n'
     )
-    assert len(baseline_rule_scalar_roles(source, lambda: None)) == 6
+    assert list(baseline_rule_scalar_roles(source, lambda: None).values()).count("pattern") == 6
     assert _result(source)["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
     assert (
         baseline_rule_scalar_roles(source.replace('scanner_version: "1.2.3"\n', ""), lambda: None)
@@ -72,7 +72,7 @@ def _fingerprint_only() -> str:
 
 def test_fingerprint_only_document_owns_matching_metadata() -> None:
     source = _fingerprint_only()
-    assert len(baseline_rule_scalar_roles(source, lambda: None)) == 3
+    assert list(baseline_rule_scalar_roles(source, lambda: None).values()).count("pattern") == 3
     assert _result(source)["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
@@ -169,3 +169,13 @@ def test_cancellation_propagates_without_granting_ownership() -> None:
 
     with pytest.raises(TimeoutError, match="cancelled"):
         baseline_rule_scalar_roles(_baseline(), cancelled)
+
+
+def test_folded_baseline_reason_inspects_documented_inline_commands() -> None:
+    source = _baseline().replace(
+        'reason: "Reviewed matching data."',
+        "reason: >-\n    Reviewed; accepted. `run` inspects the user's choice.",
+    )
+    assert _result(source)["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    runtime = source.replace("`run`", '`sh -c "$CMD"`')
+    assert _result(runtime)["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
