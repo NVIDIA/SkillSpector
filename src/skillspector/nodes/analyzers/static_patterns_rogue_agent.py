@@ -34,7 +34,13 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import LINE_BREAK_CHARS, LOGICAL_LINE_BREAK, get_context_from_lines
+from .common import (
+    LINE_BREAK_CHARS,
+    LOGICAL_LINE_BREAK,
+    MARKDOWN_FENCE_CLOSE,
+    MARKDOWN_FENCE_OPEN,
+    get_context_from_lines,
+)
 from .pattern_defaults import PatternCategory
 from .prohibition_context import is_directly_prohibited
 
@@ -49,16 +55,24 @@ _SECURITY_VIEW_START_EVIDENCE = "_security_view_start"
 # prose that names an update without instructing one:
 #
 # * A Markdown heading only names a section ("## Config + self-update"), so
-#   no RA1 match on a heading line is an instruction. The lines below the
-#   heading are still scanned, so genuine instructions keep their findings.
-# * A bare "self-update" noun on a line that also says the update is offered
-#   to, or run by, the user first ("checked + offered before it's applied",
-#   "offers the update", "the user runs ... to apply it") describes a
-#   consent gate, the opposite of the skill changing itself unasked. The
-#   gate is a closed list of consent wordings on the same logical line; an
-#   imperative ("Apply the self-update now") carries none of them and keeps
-#   its finding. Only the bare self-* noun qualifies: imperative prose
-#   patterns ("update this skill") are not covered by this gate.
+#   a bare self-* noun on a heading line is not an instruction. An
+#   imperative on a heading line ("## Update this skill") still instructs,
+#   and a match inside a fenced code block is code, not a heading, so
+#   neither is skipped. The lines below the heading are still scanned, so
+#   genuine instructions keep their findings.
+# * A bare "self-update" noun shares its sentence and table cell with a
+#   consent gate ("checked + offered before it's applied", "offers the
+#   update", "the user runs ... to apply it") describes a consent gate,
+#   the opposite of the skill changing itself unasked. The gate is a
+#   closed list of consent wordings in the same sentence and table cell
+#   as the match, and in the same clause unless the gate names the update
+#   itself ("offers the update" spans a semicolon in the reported case).
+#   A gate in another sentence or another cell governs something else
+#   ("Apply the self-update now. Ask before restarting.") and does not
+#   exempt. An imperative ("Apply the self-update now") carries none of
+#   them and keeps its finding. Only the bare self-* noun qualifies:
+#   imperative prose patterns ("update this skill") are not covered by
+#   this gate.
 _RA1_SELF_NOUN_PATTERN = re.compile(
     r"self[_-]?(?:update|modify|rewrite|patch|evolve)",
     re.IGNORECASE,
@@ -286,6 +300,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     """Analyze content for rogue agent patterns (RA1–RA2)."""
     findings: list[AnalyzerFinding] = []
     line_starts, line_ends = _logical_line_metadata(content)
+    fence_ranges = _markdown_fence_ranges(content) if file_type in {"markdown", "text"} else None
     content_lines = content.splitlines()
 
     def loc(ln: int) -> Location:
@@ -312,7 +327,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             context = ctx(match.start())
             if _is_negated_safety_constraint(content, match, line_starts, line_ends):
                 continue
-            if _is_markdown_heading_match(content, match, file_type, line_starts, line_ends):
+            if _is_markdown_heading_match(
+                content, match, file_type, fence_ranges, line_starts, line_ends
+            ):
                 continue
             if _is_consent_gated_self_update(content, match, line_starts, line_ends):
                 continue
@@ -611,19 +628,59 @@ def _logical_line_bounds(
     return line_starts[line_index], line_ends[line_index]
 
 
+def _markdown_fence_ranges(content: str) -> list[tuple[int, int]]:
+    """Return body ranges of fenced code blocks.
+
+    Mirrors the privilege-escalation analyzer: a fence opens on a line
+    matching the opening marker and closes on a matching marker line of
+    at least the same length. An unclosed fence runs to the end of the
+    content.
+    """
+    ranges: list[tuple[int, int]] = []
+    active: tuple[str, int, int] | None = None
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        stripped = line.rstrip(LINE_BREAK_CHARS)
+        closing = MARKDOWN_FENCE_CLOSE.fullmatch(stripped)
+        if active is not None:
+            if closing and closing.group(1)[0] == active[0] and len(closing.group(1)) >= active[1]:
+                ranges.append((active[2], offset))
+                active = None
+        else:
+            opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped)
+            if opening:
+                marker = opening.group(1)
+                active = (marker[0], len(marker), offset + len(line))
+        offset += len(line)
+    if active is not None:
+        ranges.append((active[2], len(content)))
+    return ranges
+
+
 def _is_markdown_heading_match(
     content: str,
     match: re.Match[str],
     file_type: str,
+    fence_ranges: list[tuple[int, int]] | None = None,
     line_starts: tuple[int, ...] | None = None,
     line_ends: tuple[int, ...] | None = None,
 ) -> bool:
-    """Return True when an RA1 match lies on a Markdown heading line.
+    """Return True when a bare self-update noun lies on a Markdown heading line.
 
     Headings name sections; they instruct nothing. Only Markdown and plain
     text carry headings, so a ``#`` comment in source keeps its finding.
+    Only the bare self-* noun qualifies: an imperative match on a heading
+    line ("## Update this skill") still instructs and keeps its finding,
+    as does any match inside a fenced code block, where a ``#`` line is a
+    shell comment or a command, not a heading.
     """
     if file_type not in {"markdown", "text"}:
+        return False
+    if _RA1_SELF_NOUN_PATTERN.fullmatch(match.group(0).strip()) is None:
+        return False
+    if fence_ranges is not None and any(
+        start <= match.start() < end for start, end in fence_ranges
+    ):
         return False
     line_start, line_end = _logical_line_bounds(content, match.start(), line_starts, line_ends)
     return _MARKDOWN_HEADING_PATTERN.match(content[line_start:line_end]) is not None
@@ -635,18 +692,52 @@ def _is_consent_gated_self_update(
     line_starts: tuple[int, ...] | None = None,
     line_ends: tuple[int, ...] | None = None,
 ) -> bool:
-    """Return True when a bare self-update noun shares its line with a consent gate.
+    """Return True when a bare self-update noun shares its sentence and table cell with a consent gate.
 
-    The gate wording must be on the same logical line as the match, so a
-    consent row in one table row cannot exempt an instruction in another.
-    The gap inside the offered/asked-before branches may not cross a
-    sentence terminator, so consent in an earlier sentence cannot exempt a
+    The gate must govern that update, not merely appear on the same
+    logical line. A gate in another sentence ("Apply the self-update
+    now. Ask before restarting.") gates the restart, and a gate in
+    another table cell gates that cell's row, so neither exempts. The
+    gate must also sit in the same clause as the match, split on a
+    semicolon, unless the gate names the update itself ("offers the
+    update" spans a semicolon in the reported case). The gap inside
+    the offered/asked-before branches may not cross a sentence
+    terminator, so consent in an earlier sentence cannot exempt a
     later imperative on the same long line.
     """
     if _RA1_SELF_NOUN_PATTERN.fullmatch(match.group(0).strip()) is None:
         return False
     line_start, line_end = _logical_line_bounds(content, match.start(), line_starts, line_ends)
-    return _RA1_CONSENT_GATE_PATTERN.search(content[line_start:line_end]) is not None
+    line = content[line_start:line_end]
+    local_start = match.start() - line_start
+    local_end = local_start + len(match.group(0))
+    sentence_start = max(line.rfind(sep, 0, local_start) for sep in ".!?") + 1
+    sentence_end = len(line)
+    for sep in ".!?":
+        idx = line.find(sep, local_end)
+        if idx != -1:
+            sentence_end = min(sentence_end, idx)
+    cell_start = line.rfind("|", 0, local_start) + 1
+    cell_end = line.find("|", local_end)
+    if cell_end == -1:
+        cell_end = len(line)
+    span_start = max(sentence_start, cell_start)
+    span_end = min(sentence_end, cell_end)
+    if span_start >= span_end:
+        return False
+    span = line[span_start:span_end]
+    for gate in _RA1_CONSENT_GATE_PATTERN.finditer(span):
+        gate_start = span_start + gate.start()
+        gate_end = span_start + gate.end()
+        if gate_start >= local_end:
+            between = line[local_end:gate_start]
+        else:
+            between = line[gate_end:local_start]
+        if ";" not in between:
+            return True
+        if re.search(r"update", gate.group(0), re.IGNORECASE) is not None:
+            return True
+    return False
 
 
 def _is_negated_safety_constraint(

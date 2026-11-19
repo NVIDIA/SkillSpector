@@ -273,6 +273,12 @@ _RETROSPECTIVE_AR_NARRATIVE_PATTERNS = (
 #    on the same line ("Deny ... a worker ... queue it, never refuse"). A
 #    user request is not a work item, so "queue the request, never refuse"
 #    keeps its finding, as does a pronoun with no work-item antecedent.
+# 4. The refusal itself must omit its object or demonstrably refer to that
+#    work item. An explicit unrelated object ("Queue the worker, never
+#    refuse a user request.") is refusal suppression even though the same
+#    clause queues a worker. A pronoun object ("never refuse it") refers
+#    to the proven work item; any other object ("any request", "the user")
+#    keeps the finding.
 _AR1_BARE_REFUSAL_PATTERN = re.compile(
     r"(?:never|do\s+not|don'?t)\s+(?:ever\s+)?(?:refuse|decline)",
     re.IGNORECASE,
@@ -286,6 +292,53 @@ _AR1_QUEUEING_PATTERN = re.compile(
 )
 _AR1_WORK_ITEM_PATTERN = re.compile(rf"\b{_AR1_WORK_ITEM_NOUNS}\b", re.IGNORECASE)
 _AR1_CLAUSE_BOUNDARY_PATTERN = re.compile(r"[.;!?:|\u2014\u2013]")
+
+
+def _refusal_object_head_noun(tail: str) -> str | None:
+    """Return the head noun of the refusal's object phrase, if it parses as one.
+
+    The object is an optional determiner plus up to two words; the head is
+    the last word, so "the queued task" reads as a task and "the user
+    request" reads as a request. This errs toward flagging: a trailing
+    adverb after the object ("the worker immediately") reads as the head
+    and keeps the finding.
+    """
+    match = re.match(
+        r"(?:(?:the|a|an|this|that|any)\s+)?([A-Za-z][\w'-]*)(?:\s+([A-Za-z][\w'-]*))?",
+        tail,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    return match.group(2) or match.group(1)
+
+
+def _refusal_object_is_work_item_or_absent(tail: str) -> bool:
+    """Return True when the refusal omits its object or it is the queued work item.
+
+    The text after "never refuse" is the refusal's own object, not the
+    queueing verb's. An omitted object ("never refuse."), a pronoun
+    ("never refuse it") whose antecedent is the proven work item, or an
+    explicit work-item noun ("never refuse the worker") all stay exempt.
+    Any other object ("a user request", "any request", "the user") or an
+    unparsed tail ("to help", "when asked") keeps the finding.
+    """
+    stripped = tail.lstrip()
+    if not stripped or stripped[0] in ",;:!?|":
+        return True
+    if stripped[0] in "\u2014\u2013":
+        return True
+    first_word = re.match(r"[A-Za-z][\w'-]*", stripped)
+    if first_word is None:
+        return False
+    if first_word.group(0).lower() in {"and", "or", "but"}:
+        return True
+    if re.match(r"(?:it|them)\b", stripped, re.IGNORECASE) is not None:
+        return True
+    head = _refusal_object_head_noun(stripped)
+    if head is None:
+        return False
+    return _AR1_WORK_ITEM_PATTERN.fullmatch(head) is not None
 
 
 def _is_queueing_work_item_refusal(
@@ -311,12 +364,21 @@ def _is_queueing_work_item_refusal(
     if queue_match is None:
         return False
     if _AR1_WORK_ITEM_PATTERN.search(queue_match.group(0)) is not None:
-        return True
-    # Pronoun object ("queue it"): only a work-item noun earlier in the same
-    # table cell proves the pronoun is a work item, not a user request. A
-    # work-item noun in another cell must not exempt this one.
-    cell_start = match_line.rfind("|", 0, line_match_start) + 1
-    return _AR1_WORK_ITEM_PATTERN.search(match_line, cell_start, line_match_start) is not None
+        work_item_proven = True
+    else:
+        # Pronoun object ("queue it"): only a work-item noun earlier in the same
+        # table cell proves the pronoun is a work item, not a user request. A
+        # work-item noun in another cell must not exempt this one.
+        cell_start = match_line.rfind("|", 0, line_match_start) + 1
+        work_item_proven = (
+            _AR1_WORK_ITEM_PATTERN.search(match_line, cell_start, line_match_start) is not None
+        )
+    if not work_item_proven:
+        return False
+    # The refusal must omit its object or demonstrably refer to that work
+    # item. An explicit unrelated object ("never refuse a user request")
+    # is refusal suppression even when the same clause queues a worker.
+    return _refusal_object_is_work_item_or_absent(match_line[line_match_end:clause_end])
 
 
 # AR2 in descriptive Python comments.
