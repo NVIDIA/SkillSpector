@@ -33,6 +33,9 @@ def _ea2(content: str):
         "Do not automatically delete files.",
         "Never skip user confirmation.",
         "Do not assume consent.",
+        "Never claim success without verification.",
+        "Do not report completion without checking.",
+        "You must not declare success without confirmation.",
     ],
 )
 def test_approval_requirement_is_not_excessive_agency(content: str) -> None:
@@ -58,6 +61,12 @@ def test_approval_requirement_is_not_excessive_agency(content: str) -> None:
         "Do not deploy without approval twice; do it once.",
         "Do not automatically delete files locally; do it remotely.",
         "Never bypass user approval? Actually yes, do it.",
+        "Claim success without verification.",
+        "Report completion without checking.",
+        "Never claim success without verification, unless the deadline passes.",
+        "Never claim success without verification; do it anyway.",
+        "Never claim success without verification locally; declare success without checking.",
+        "Do not hesitate to claim success without verification.",
     ],
 )
 def test_affirmative_bypasses_remain_detected(content: str) -> None:
