@@ -1766,6 +1766,18 @@ def decode_python_source(content: bytes) -> str:
     return decoded
 
 
+# CPython ends a source line only at "\r\n", "\r" or "\n", and AST line numbers
+# count those lines (see ``ast.get_source_segment``).  ``str.splitlines`` also
+# breaks at form feeds, vertical tabs, U+001C-U+001E, U+0085, U+2028 and
+# U+2029, which would misalign every later AST line with this file's lines.
+_PYTHON_SOURCE_LINE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+")
+
+
+def _python_source_lines(content: str) -> list[str]:
+    """Split *content* as the Python tokenizer does, keeping line ends."""
+    return _PYTHON_SOURCE_LINE.findall(content)
+
+
 @dataclass(frozen=True, slots=True)
 class ParsedPythonFile:
     """One Python source file's shared parse result and import aliases.
@@ -1795,7 +1807,7 @@ class ParsedPythonFile:
         line_character_starts = [0]
         byte_offset = 0
         character_offset = 0
-        for line in self.content.splitlines(keepends=True):
+        for line in _python_source_lines(self.content):
             byte_offset += len(line.encode("utf-8"))
             character_offset += len(line)
             line_byte_starts.append(byte_offset)
@@ -1937,7 +1949,7 @@ def build_import_aliases(tree: ast.Module) -> dict[str, str]:
 
 def parse_python_source(content: str, filename: str) -> ParsedPythonFile:
     """Parse *content* once and retain its aliases or a structured parse failure."""
-    lines = content.splitlines()
+    lines = [line.rstrip("\r\n") for line in _python_source_lines(content)]
     try:
         tree = ast.parse(content, filename=filename)
     except (SyntaxError, ValueError, RecursionError) as exc:

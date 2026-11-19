@@ -5,7 +5,9 @@ SkillSpector can be installed into OpenCode as a local extension. The extension 
 ## Requirements
 
 - OpenCode installed.
-- Python `>=3.12,<3.15`.
+- Python in the [package's supported range](../pyproject.toml); Python 3.12 or 3.13
+  is recommended for prebuilt YARA wheels. See the
+  [installation notes](../README.md#python-installation-notes).
 - `uv` recommended.
 - This repo checked out locally.
 - Node 22+ to run the extension unit tests (type stripping, no extra dependencies).
@@ -76,7 +78,7 @@ Use skillspector_scan on ./my-skill with noLlm=false.
 export SKILLSPECTOR_PROVIDER=nv_build
 export NVIDIA_INFERENCE_KEY=nvapi-...
 # Optional; omit to use nv_build's bundled default model.
-# export SKILLSPECTOR_MODEL=z-ai/glm-5.3
+# export SKILLSPECTOR_MODEL=z-ai/glm-5.3-flash
 ```
 
 Other valid providers and their credential variables are listed in the main

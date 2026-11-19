@@ -174,7 +174,7 @@ def test_many_inline_suffixes_do_not_create_unbounded_reparsing() -> None:
     assert 0 < calls <= 32 * len(source) + 8192
     assert diagnostic is None or (
         diagnostic.cause is ParserCause.RESOURCE_LIMIT
-        or diagnostic.check is ParserCheck.PRINTF_INVOCATION
+        or diagnostic.check is ParserCheck.COMMAND_IDENTITY
     )
 
 

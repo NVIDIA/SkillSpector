@@ -37,11 +37,43 @@ Do not rely on the numeric score alone. A low score can miss semantic risk, and 
 
 2. Run the static scan.
 
+   On POSIX systems:
+
    ```bash
    skillspector scan "$TARGET" --no-llm --format json --output /tmp/skill-inspector-report.json
    ```
 
-   If the command exits non-zero, inspect any partial report and continue manually. Record that the static line was incomplete.
+   On Windows, safe file output is unsupported, so `--output` always fails
+   (exit code 2) and no report is written. Omit `--output` and redirect
+   stdout to a file outside the scan target instead. Use
+   `[IO.File]::WriteAllText(...)`, not `>` or `Set-Content -Encoding utf8`:
+   plain `>` writes UTF-16 JSON on PowerShell 5.1, which JSON parsers
+   reject, and `Set-Content -Encoding utf8` writes a UTF-8 BOM on
+   PowerShell 5.1, which Python and Node JSON parsers also reject. The
+   `[IO.File]::WriteAllText(...)` form is BOM-free on both PowerShell 5.1
+   and 7+ (`-Encoding utf8NoBOM` is an alternative, but only on
+   PowerShell 6+):
+
+   ```powershell
+   $report = skillspector scan "$TARGET" --no-llm --format json
+   $exitCode = $LASTEXITCODE
+   try {
+       [IO.File]::WriteAllText("$env:TEMP\skill-inspector-report.json", ($report -join "`n"))
+   } catch {
+       exit 2
+   }
+   exit $exitCode
+   ```
+
+   Capture `$LASTEXITCODE` immediately after the scan and exit with it:
+   a successful file write would otherwise mask a failing scan with exit
+   code 0, since `WriteAllText` itself succeeds even when the scanner
+   exits non-zero. Conversely, exit 2 if the write itself fails, so a
+   failed write after a successful scan does not exit 0 either. The string written is the same one the single-line
+   form passed to `WriteAllText` (stdout lines joined with "`n"), so
+   the report stays BOM-free.
+
+   If the command exits non-zero, inspect any partial report and continue manually. Record that the static line was incomplete. On Windows, a non-zero exit from a command using `--output` is a platform refusal, not a scan failure: no partial report exists, so do not look for one or retry the same command.
 
 3. Read the SkillSpector report.
 

@@ -611,6 +611,75 @@ def test_local_registry_accepts_exact_byte_limit(
     assert scan_registry(str(capture))["server_count"] == 1
 
 
+@pytest.mark.parametrize("prefix", [b"", b"\xef\xbb\xbf"])
+def test_local_registry_utf8_signature_preserves_snapshot_and_comparison(
+    tmp_path: Path, prefix: bytes
+) -> None:
+    capture = tmp_path / "registry.json"
+    data = one_server(pinned_server(name="example/ü", description="keep\ufeffthis"))
+    raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    capture.write_bytes(raw)
+    original = scan_registry(str(capture))
+    previous = tmp_path / "previous.json"
+    previous.write_bytes(prefix + json.dumps(original, ensure_ascii=False).encode("utf-8"))
+    capture.write_bytes(prefix + raw)
+    current = scan_registry(str(capture), compare_path=previous)
+    assert current["comparison"] == {
+        "added": [],
+        "removed": [],
+        "changed": [],
+        "unmodeled_changes": [],
+        "unchanged_count": 1,
+    }
+    assert current["findings"] == original["findings"]
+    assert current["risk_score"] == original["risk_score"]
+    assert current["snapshots"][0]["description"] == "keep\ufeffthis"
+    assert current["snapshots"][0]["record_hash"] == original["snapshots"][0]["record_hash"]
+
+
+def test_local_registry_utf8_signature_counts_toward_byte_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "registry.json"
+    raw = b'\xef\xbb\xbf{"servers": []}'
+    capture.write_bytes(raw)
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_BYTES", len(raw))
+    assert scan_registry(str(capture))["server_count"] == 0
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_BYTES", len(raw) - 1)
+    with pytest.raises(ValueError, match="input exceeds"):
+        scan_registry(str(capture))
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'\xef\xbb\xbf\xef\xbb\xbf{"servers": []}',
+        b' \xef\xbb\xbf{"servers": []}',
+        b'\xef\xbb{"servers": []}',
+        b'\xef\xbb\xbf{"servers": []}\xff',
+        '{"servers": []}'.encode("utf-16"),
+        '{"servers": []}'.encode("utf-32"),
+    ],
+)
+def test_local_registry_rejects_other_signatures_and_invalid_utf8(
+    tmp_path: Path, raw: bytes
+) -> None:
+    capture = tmp_path / "registry.json"
+    capture.write_bytes(raw)
+    with pytest.raises(ValueError):
+        scan_registry(str(capture))
+
+
+def test_local_registry_utf8_signature_keeps_depth_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "registry.json"
+    capture.write_bytes(b'\xef\xbb\xbf{"servers": [], "extra": [[[]]]}')
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_DEPTH", 3)
+    with pytest.raises(ValueError, match="nesting exceeds 3 levels"):
+        scan_registry(str(capture))
+
+
 def test_local_registry_bounds_depth_before_parsing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
