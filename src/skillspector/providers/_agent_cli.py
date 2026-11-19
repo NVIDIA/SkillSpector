@@ -1091,6 +1091,39 @@ def _opencode_system_config_dir(env: dict[str, str] | None = None) -> str:
     return _OPENCODE_SYSTEM_CONFIG_DIR
 
 
+# Legacy policy actions (pinned OpenCode 2.2.6/2.2.7
+# packages/schema/src/config/policy.ts): before `mcp.use`, `skill.use`,
+# and `plugin.use` existed, `integration.use` covered them with a
+# resource prefix, and every policy source decodes through that schema.
+# Only prefixed resources convert; a bare `integration.use` `*` keeps
+# its action and covers providers and accounts.
+_OPENCODE_LEGACY_POLICY_ACTIONS = {
+    "mcp": "mcp.use",
+    "skill": "skill.use",
+    "plugin": "plugin.use",
+}
+
+
+def _opencode_effective_policy_action(action: str, resource: object) -> str:
+    """Decode a policy action the way pinned OpenCode 2.2.6/2.2.7 does.
+
+    The pinned decoder (``ConfigPolicy.Info``) leaves every action alone
+    except ``integration.use`` with a prefixed resource: the prefix
+    before the first ``:`` maps through the legacy table above and the
+    resource becomes the remainder after it. A bare resource with no
+    separator, or a prefix outside the table, keeps ``integration.use``.
+    The effect is preserved by the decoder, so only the action needs
+    decoding here; a non-string resource cannot be decoded and is left
+    to the caller to refuse as ambiguous.
+    """
+    if action != "integration.use" or not isinstance(resource, str):
+        return action
+    separator = resource.find(":")
+    if separator == -1:
+        return action
+    return _OPENCODE_LEGACY_POLICY_ACTIONS.get(resource[:separator], action)
+
+
 def _refuse_opencode_managed_config(config: dict[str, Any], path: str, description: str) -> None:
     """Raise AgentCLIError when a managed config document configures plugins.
 
@@ -1100,6 +1133,11 @@ def _refuse_opencode_managed_config(config: dict[str, Any], path: str, descripti
     preferences"`` for the macOS MDM plist). Shared by both managed
     sources because both outrank the project deny the same way: a
     ``plugin.use`` allow, or any listed plugin, must refuse the start.
+    A ``plugin.use`` allow is checked on the decoded action, so a legacy
+    ``integration.use`` rule with a ``plugin:`` resource refuses exactly
+    like a direct ``plugin.use`` rule (pinned policy.ts); a rule whose
+    action is not a string, or an ``integration.use`` rule whose resource
+    is not a string, is ambiguous managed policy and refuses too.
     """
     policies = config.get("policies", [])
     if not isinstance(policies, list):
@@ -1107,7 +1145,16 @@ def _refuse_opencode_managed_config(config: dict[str, Any], path: str, descripti
     for rule in policies:
         if not isinstance(rule, dict):
             raise AgentCLIError(f"OpenCode {description} {path!r} has a malformed policy rule")
-        if rule.get("action") == "plugin.use" and rule.get("effect") != "deny":
+        action = rule.get("action")
+        resource = rule.get("resource")
+        if not isinstance(action, str):
+            raise AgentCLIError(f"OpenCode {description} {path!r} has a malformed policy rule")
+        if action == "integration.use" and not isinstance(resource, str):
+            raise AgentCLIError(f"OpenCode {description} {path!r} has a malformed policy rule")
+        if (
+            _opencode_effective_policy_action(action, resource) == "plugin.use"
+            and rule.get("effect") != "deny"
+        ):
             raise AgentCLIError(
                 f"OpenCode {description} "
                 f"{path!r} allows 'plugin.use' (effect "
@@ -1306,9 +1353,11 @@ def _check_opencode_system_sources(env: dict[str, str] | None = None) -> None:
 
     Each source refuses on:
 
-    - a ``policies`` rule with action exactly ``plugin.use`` and an
+    - a ``policies`` rule whose decoded action is ``plugin.use`` and an
       effect other than ``deny`` (``allow`` or ``ask`` both outrank the
-      project deny);
+      project deny): a direct ``plugin.use`` rule, or a legacy
+      ``integration.use`` rule with a ``plugin:`` resource, which the
+      pinned policy decoder converts to ``plugin.use``;
     - any plugin listed in ``plugin`` or ``plugins`` (add operations
       only: a ``-name`` removal entry configures no plugin);
     - any entry under ``<system dir>/plugin`` or ``<system dir>/plugins``.

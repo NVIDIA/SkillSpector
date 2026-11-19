@@ -1107,6 +1107,30 @@ class TestOpencodeDenyAllPolicyV2:
             encoding="utf-8",
         )
 
+    @staticmethod
+    def _write_system_plugin_legacy_allow(system_dir: Path) -> None:
+        """System dir with only a legacy-form allow, no plugin listed.
+
+        P0 (review 5977061517, #1086): pinned policy.ts decodes a legacy
+        `integration.use` statement with a `plugin:` resource as
+        `plugin.use`, so this document allows an external plugin discovered
+        from another layer even though it lists zero plugins and installs
+        none itself. Deliberately no `plugins/` directory here: the
+        directory check would refuse on its own and hide whether the
+        policy decoder runs. The gate must refuse on the decoded allow
+        alone, before any 2.x server starts.
+        """
+        (system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "integration.use", "resource": "plugin:*", "effect": "allow"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
     @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
     def test_2x_system_plugin_allow_fails_before_startup(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1120,6 +1144,48 @@ class TestOpencodeDenyAllPolicyV2:
         # gate at the configured one.
         system_dir = tmp_path / "system"
         self._write_system_plugin_allow(system_dir)
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(system_dir)
+        )
+
+        # Preflight: the gate fires before `debug agents --standalone`.
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers)
+        argv = _build_opencode_argv(str(binary), "", 0)
+        env = _prepare_opencode_env({"PATH": os.environ.get("PATH", "")}, str(tmp_path), argv)
+        with pytest.raises(AgentCLIError, match="system"):
+            _preflight_opencode_policy(str(binary), argv, env, str(tmp_path))
+        assert list(markers.iterdir()) == []
+
+        # Inference: run_agent_cli fails in the preflight, never runs.
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+        with pytest.raises(AgentCLIError, match="system"):
+            run_agent_cli("opencode", "use every host tool", model="")
+        assert list(markers.iterdir()) == []
+
+        # Auth: the probe reports unavailable and never runs `auth list`.
+        auth_binary = tmp_path / "opencode-auth"
+        auth_markers = tmp_path / "auth-outside"
+        auth_markers.mkdir()
+        TestOpencodeAuthProbeIsolation._write_fake_auth_2x(auth_binary, auth_markers)
+        ok, reason = _opencode_auth_check(str(auth_binary))
+        assert ok is False
+        assert reason is not None and "system" in reason
+        assert list(auth_markers.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_system_plugin_legacy_allow_fails_before_startup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # P0 (review 5977061517, #1086): the pre-import marker regression
+        # for the legacy form. A system plugin with a legacy
+        # `integration.use` / `plugin:*` allow must fail closed before any
+        # 2.x server starts, exactly like the direct `plugin.use` allow:
+        # no probe markers at all, so no plugin code could have loaded.
+        system_dir = tmp_path / "system"
+        self._write_system_plugin_legacy_allow(system_dir)
         monkeypatch.setattr(
             _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(system_dir)
         )
@@ -1274,6 +1340,129 @@ class TestOpencodeSystemSources:
             encoding="utf-8",
         )
         with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_system_legacy_integration_use_plugin_allow_raises(self, _system_dir: Path) -> None:
+        # P0 (review 5977061517, #1086): pinned policy.ts decodes a legacy
+        # `integration.use` statement with a `plugin:` resource as
+        # `plugin.use`, so a managed allow in that form authorizes an
+        # external plugin even though the document lists zero `plugin.use`
+        # rules. The gate must refuse it exactly like a direct allow.
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "integration.use", "resource": "plugin:*", "effect": "allow"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_system_legacy_integration_use_named_plugin_allow_raises(
+        self, _system_dir: Path
+    ) -> None:
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {
+                            "action": "integration.use",
+                            "resource": "plugin:my-plugin",
+                            "effect": "allow",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="allows 'plugin.use'"):
+            _check_opencode_system_sources()
+
+    def test_system_legacy_integration_use_plugin_deny_passes(self, _system_dir: Path) -> None:
+        # The decoder preserves the effect, so a legacy deny decodes to a
+        # `plugin.use` deny and configures no allow.
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "integration.use", "resource": "plugin:*", "effect": "deny"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_system_legacy_integration_use_bare_resource_passes(self, _system_dir: Path) -> None:
+        # Pinned policy.ts: a bare `integration.use` `*` has no separator,
+        # so it keeps its action and covers providers and accounts, not
+        # plugins. It must not be mistaken for a plugin allow.
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {"policies": [{"action": "integration.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_system_legacy_integration_use_unknown_prefix_passes(self, _system_dir: Path) -> None:
+        # Only the `mcp:`, `skill:`, and `plugin:` prefixes convert; any
+        # other prefix keeps the `integration.use` action.
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "integration.use", "resource": "other:foo", "effect": "allow"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_system_legacy_integration_use_mcp_and_skill_prefixes_pass(
+        self, _system_dir: Path
+    ) -> None:
+        # The decoder also converts `mcp:` and `skill:` prefixes, but to
+        # `mcp.use` and `skill.use`, which authorize no plugin, so the
+        # plugin gate passes on them.
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "integration.use", "resource": "mcp:server", "effect": "allow"},
+                        {"action": "integration.use", "resource": "skill:agent", "effect": "allow"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_system_legacy_integration_use_non_string_resource_fails_closed(
+        self, _system_dir: Path
+    ) -> None:
+        # The pinned schema requires a string resource before the decoder
+        # can run, so a non-string resource is ambiguous managed policy
+        # and must refuse rather than pass as a non-plugin rule.
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {"policies": [{"action": "integration.use", "resource": 7, "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="malformed policy rule"):
+            _check_opencode_system_sources()
+
+    def test_system_non_string_action_fails_closed(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.json").write_text(
+            json.dumps({"policies": [{"action": 7, "resource": "*", "effect": "allow"}]}),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="malformed policy rule"):
             _check_opencode_system_sources()
 
     def test_system_deny_passes(self, _system_dir: Path) -> None:
