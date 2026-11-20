@@ -14,7 +14,8 @@ rule offensive_tool_references
         confidence = "0.7"
         reference = "https://github.com/Neo23x0/signature-base"
     strings:
-        $nmap_scan     = /nmap\s+-[sSUAOPpT]/ nocase
+        $nmap_scan     = /\bnmap\s+-[sSUAOPpT]/ nocase
+        $nmap_encoded  = /(^|[^\\])\\(n|t|r|v|f|x0[9a-d]|x20|x26|x28|x3b|x7c|u000[9a-d]|u0020|u0026|u0028|u003b|u007c|u0000000[9a-d]|u00000020|u00000026|u00000028|u0000003b|u0000007c|0?1[1-5]|0?40|0?46|0?50|0?73|174)nmap\s+-[sSUAOPpT]/ nocase
         $sqlmap        = /sqlmap.*(--url|--dbs|--dump)/ nocase
         $nikto         = /nikto\s+-h/ nocase
         $hydra         = /hydra\s+.*-[lLP]/ nocase

@@ -17,6 +17,11 @@
 
 from __future__ import annotations
 
+import json
+import traceback
+from unittest.mock import patch
+
+import httpx
 import pytest
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 
@@ -49,6 +54,7 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
         "AZURE_OPENAI_API_VERSION",
         "SKILLSPECTOR_COMPAT_API_KEY",
         "SKILLSPECTOR_COMPAT_BASE_URL",
+        "SKILLSPECTOR_COMPAT_HEADERS",
         "SKILLSPECTOR_TEMPERATURE",
         "SKILLSPECTOR_SEED",
         "GOOGLE_CLOUD_PROJECT",
@@ -354,6 +360,104 @@ class TestOpenAICompatibleProvider:
         )
         monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(override))
         assert OpenAICompatibleProvider().structured_output_method("my-model") == "json_schema"
+
+
+class TestOpenAICompatibleHeaders:
+    """Custom gateway headers reach both HTTP clients without leaking on errors."""
+
+    @pytest.fixture(autouse=True)
+    def _configure_endpoint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_COMPAT_API_KEY", "synthetic-api-key")
+        monkeypatch.setenv("SKILLSPECTOR_COMPAT_BASE_URL", "https://gateway.example.com/v1")
+
+    @pytest.mark.parametrize("raw_headers", [None, "", " \t\r\n", "{}"])
+    def test_empty_headers(self, monkeypatch: pytest.MonkeyPatch, raw_headers: str | None) -> None:
+        if raw_headers is not None:
+            monkeypatch.setenv("SKILLSPECTOR_COMPAT_HEADERS", raw_headers)
+        llm = OpenAICompatibleProvider().create_chat_model("gateway-model", max_tokens=1024)
+        assert isinstance(llm, ChatOpenAI)
+        assert llm.default_headers == ({} if raw_headers == "{}" else None)
+
+    def test_parses_string_headers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        headers = {"X-Tenant-ID": "my-tenant", "X-API-Key": "synthetic-gateway-key"}
+        monkeypatch.setenv("SKILLSPECTOR_COMPAT_HEADERS", f"  {json.dumps(headers)}  ")
+        llm = OpenAICompatibleProvider().create_chat_model("gateway-model", max_tokens=1024)
+        assert isinstance(llm, ChatOpenAI)
+        assert llm.default_headers == headers
+
+    @pytest.mark.parametrize(
+        "raw_headers",
+        [
+            "not-json",
+            '{"X-API-Key":"synthetic-gateway-secret",}',
+            "[]",
+            "null",
+            "true",
+            "42",
+            '"synthetic-gateway-secret"',
+            '{"X-API-Key":7}',
+            '{"X-API-Key":true}',
+            '{"X-API-Key":null}',
+            '{"X-API-Key":["synthetic-gateway-secret"]}',
+            '{"X-API-Key":{"nested":"synthetic-gateway-secret"}}',
+        ],
+    )
+    def test_invalid_headers_do_not_expose_values(
+        self, monkeypatch: pytest.MonkeyPatch, raw_headers: str
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_COMPAT_HEADERS", raw_headers)
+        with pytest.raises(ValueError) as exc_info:
+            OpenAICompatibleProvider().create_chat_model("gateway-model", max_tokens=1024)
+        assert str(exc_info.value) == (
+            "SKILLSPECTOR_COMPAT_HEADERS must be a JSON object with string keys and values"
+        )
+        assert "synthetic-gateway-secret" not in "".join(traceback.format_exception(exc_info.value))
+
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    async def test_headers_reach_http_requests(
+        self, monkeypatch: pytest.MonkeyPatch, asynchronous: bool
+    ) -> None:
+        headers = {"X-Tenant-ID": "my-tenant", "X-API-Key": "synthetic-gateway-key"}
+        monkeypatch.setenv("SKILLSPECTOR_COMPAT_HEADERS", json.dumps(headers))
+        requests: list[httpx.Request] = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "gateway-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "ok"},
+                        }
+                    ],
+                },
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(respond)) as sync_client:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as async_client:
+                with patch(
+                    "skillspector.providers.chat_models.ChatOpenAI",
+                    side_effect=lambda **kwargs: ChatOpenAI(
+                        http_client=sync_client, http_async_client=async_client, **kwargs
+                    ),
+                ):
+                    llm = OpenAICompatibleProvider().create_chat_model(
+                        "gateway-model", max_tokens=1024
+                    )
+                assert isinstance(llm, ChatOpenAI)
+                response = await llm.ainvoke("hello") if asynchronous else llm.invoke("hello")
+                assert response.content == "ok"
+        assert len(requests) == 1
+        assert requests[0].url == "https://gateway.example.com/v1/chat/completions"
+        for key, value in headers.items():
+            assert requests[0].headers[key] == value
 
 
 class TestOpenAICompatibleProviderSelection:

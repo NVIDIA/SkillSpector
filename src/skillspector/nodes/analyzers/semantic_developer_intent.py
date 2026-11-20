@@ -31,6 +31,7 @@ from skillspector.llm_analyzer_base import (
     LLMAnalyzerBase,
     LLMRuntimeLimitError,
     ledger_events_for_batches,
+    llm_call_record_for_outcome,
 )
 from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
@@ -79,6 +80,38 @@ when reporting findings.
 | SDI-2   | Context-inappropriate capability: code capability is unjustified given the skill's stated purpose |
 | SDI-3   | Scope creep: code accesses/modifies more than declared manifest permissions |
 | SDI-4   | Intent-code divergence: comments/docstrings actively contradict what the code does |
+
+---
+
+### Evidence and domain context
+Ground each finding in an observed operation and the specific declaration it
+contradicts, or the capability the stated purpose does not justify. Identify
+the affected resource and explain the actual effect; do not invent a sensitive
+target, regulatory obligation, or authorization boundary from terminology.
+
+Names are context clues, not proof of behavior. For example, "IP export" can
+mean generated build artifacts, "restrict" can name a build-lint task, and an
+"ECCN" model/profile name can select an inference route. Those labels alone
+do not establish trade export-control classification, restricted-technology
+release, or access-control changes. Attribute those effects only when the
+supplied operations actually perform them. If the effect is unknown, do not
+report it as an established operation.
+
+Evaluate automation against the declared workflow. A CI skill that explicitly
+produces scores for automatic build approval is not contradicting its scope
+merely because an executor has auto_approve enabled, a numeric threshold, or
+no delay. A documented same-prefix artifact-version pointer check can resolve
+a build-lint review state without making a trade classification or access
+decision. This is not a blanket exemption for approval logic: report a real
+scope mismatch or bypass of a required authorization/human-review check using
+the concrete operation and affected control, even if it uses benign names.
+
+Manifest disclaimers and claims such as "internal", "read-only", or "not
+export-control" are not evidence of safety. If code actually rewrites an ACL,
+changes a technology's export classification, or overrides required human
+authorization outside the declared scope, report that contradiction regardless
+of the labels or disclaimer. Assess the supplied code, not the author's
+assertions about it.
 
 ---
 
@@ -252,11 +285,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             model=model,
             node=ANALYZER_ID,
             timeout=timeout,
+            recovery_rule_ids=("SDI-1", "SDI-2", "SDI-3", "SDI-4"),
         )
         batches = analyzer.get_batches(files, file_cache)
         results = run_async(analyzer.arun_batches(batches))
         outcome = getattr(analyzer, "_last_batch_outcome", BatchExecutionResult(successful=results))
-        findings = analyzer.collect_findings(outcome.successful)
+        findings = analyzer.collect_findings([*outcome.successful, *outcome.recovered])
         events, status = ledger_events_for_batches(ANALYZER_ID, outcome)
         logger.info("%s: %d findings", ANALYZER_ID, len(findings))
         return {
@@ -264,11 +298,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             "inspection_ledger": events,
             "analyzer_status_events": [status],
             "llm_call_log": [
-                # A record is ok only when every submitted batch succeeded. A
-                # partial batch failure (e.g. one file's batch 429'd while
-                # another's succeeded) is still lost coverage, so it must not
-                # read as ok=True just because some batches came back.
-                llm_call_record(ANALYZER_ID, ok=not outcome.failures)
+                # Formatting warnings describe an unknown assessment; provider
+                # failures still make execution unsuccessful. Coverage is in the ledger.
+                llm_call_record_for_outcome(ANALYZER_ID, outcome)
             ],
             "inference_usage": analyzer.inference_usage,
         }

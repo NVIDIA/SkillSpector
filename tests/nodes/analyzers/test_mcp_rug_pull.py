@@ -26,6 +26,61 @@ from skillspector.state import WorkflowResourceBudget
 class TestMcpRugPullNode:
     """Tests for the MCP rug-pull comparison logic."""
 
+    def test_rp1_unpinned_npx_in_mcp_server_config(self) -> None:
+        """RP1 inspects executable MCP command and args in JSON configs."""
+        result = node(
+            {
+                "file_cache": {
+                    "mcp.json": (
+                        '{\n  "mcpServers": {\n    "context7": {\n'
+                        '      "command": "npx",\n'
+                        '      "args": ["-y", "@upstash/context7-mcp@latest"]\n'
+                        "    }\n  }\n}"
+                    )
+                }
+            }
+        )
+
+        findings = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+        assert len(findings) == 1
+        assert findings[0].file == "mcp.json"
+        assert findings[0].start_line == 4
+        assert findings[0].matched_text == "npx -y @upstash/context7-mcp"
+
+    def test_rp1_pinned_npx_in_mcp_server_config(self) -> None:
+        """RP1 accepts an MCP command whose package operand is version-pinned."""
+        result = node(
+            {
+                "file_cache": {
+                    "mcp.json": '{"mcpServers":{"context7":{"command":"npx",'
+                    '"args":["-y","@upstash/context7-mcp@1.2.3"]}}}'
+                }
+            }
+        )
+
+        assert not [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+    def test_rp1_json_config_attributes_finding_to_matching_server(self) -> None:
+        """RP1 points to the npx server when it is not the first configured server."""
+        result = node(
+            {
+                "file_cache": {
+                    "mcp.json": (
+                        '{\n  "mcpServers": {\n    "local": {\n'
+                        '      "command": "node",\n      "args": ["server.js"]\n'
+                        '    },\n    "context7": {\n      "command": "npx",\n'
+                        '      "args": ["-y", "@upstash/context7-mcp"]\n'
+                        "    }\n  }\n}"
+                    )
+                }
+            }
+        )
+
+        findings = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+        assert len(findings) == 1
+        assert findings[0].start_line == 8
+        assert findings[0].matched_text == "npx -y @upstash/context7-mcp"
+
     def test_no_previous_manifest_skips(self) -> None:
         """Returns empty findings when previous_manifest is absent."""
         state = {
@@ -264,6 +319,63 @@ class TestMcpRugPullNode:
 
 
 class TestResourceBounds:
+    def test_yaml_timeout_retains_emitted_prefix(self, monkeypatch) -> None:
+        checks = 0
+
+        def remaining_seconds(state):
+            nonlocal checks
+            checks += 1
+            return 1.0 if checks < 40 else 0.0
+
+        monkeypatch.setattr(mcp_rug_pull, "transitive_remaining_seconds", remaining_seconds)
+        content = (
+            'command: npx\nargs: ["@scope/server"]\ntrailer: done\n' + "# trailing padding\n" * 100
+        )
+        result = node(
+            {"file_cache": {"before.sh": "echo hello\n", "mcp.yaml": content, "after.sh": ""}}
+        )
+
+        assert len(result["findings"]) == 1
+        finding = result["findings"][0]
+        assert finding.rule_id == "RP1"
+        assert finding.matched_text == "npx @scope/server"
+        assert finding.start_line == 1
+        events = result["inspection_ledger"]
+        assert events[0]["outcome"] == "completed"
+        assert events[1]["outcome"] == "partial"
+        assert events[1]["reason_code"] == "runtime_limit"
+        assert events[1]["emitted_finding_ids"] == [finding.finding_id]
+        assert events[2]["reason_code"] == "runtime_limit"
+        assert events[2]["emitted_finding_ids"] == []
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_yaml_finding_cap_stops_collection_early(self, monkeypatch) -> None:
+        checks = 0
+        original_check = mcp_rug_pull._RugPullBudget.check_runtime
+
+        def check_runtime(self, path=None):
+            nonlocal checks
+            checks += 1
+            original_check(self, path)
+
+        monkeypatch.setattr(mcp_rug_pull._RugPullBudget, "check_runtime", check_runtime)
+        monkeypatch.setattr(mcp_rug_pull, "MAX_FINDINGS_PER_ARTIFACT", 2)
+        content = "mcpServers:\n" + "".join(
+            f'  server{i}:\n    command: npx\n    args: ["@scope/server{i}"]\n' for i in range(100)
+        )
+        result = node({"file_cache": {"mcp.yaml": content}})
+
+        assert [finding.matched_text for finding in result["findings"]] == [
+            "npx @scope/server0",
+            "npx @scope/server1",
+        ]
+        event = result["inspection_ledger"][0]
+        assert event["outcome"] == "partial"
+        assert event["reason_code"] == "output_limit"
+        assert event["observed_findings"] == 3
+        assert event["limit_findings"] == 2
+        assert checks < 100  # Do not traverse all 100 servers before enforcing the cap.
+
     def test_analyzer_cap_retains_prefix_and_marks_current_and_remaining_partial(
         self, monkeypatch
     ) -> None:

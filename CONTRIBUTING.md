@@ -3,17 +3,63 @@
 We welcome contributions to SkillSpector! By contributing, you agree to abide
 by the [Developer Certificate of Origin](#developer-certificate-of-origin).
 
+> **Security vulnerabilities:** Report suspected vulnerabilities, including in
+> SkillSpector itself, privately to NVIDIA PSIRT by following [SECURITY.md](SECURITY.md).
+> Do not report them through GitHub issues, pull requests, or Discussions.
+
 ## How to Contribute
 
-1. **Open an issue** describing the bug or feature you'd like to work on.
+1. **Open an issue** describing the non-security bug, false positive, or feature you'd like to work on.
 2. **Fork** the repository and create a branch for your change.
 3. **Make your changes**, ensuring all tests pass (`make test`).
 4. **Sign off** every commit (see below).
 5. **Open a pull request** referencing the issue.
 
+## Development Setup
+
+Follow the [README development setup](README.md#setup) for supported Python
+versions, cloning, virtual environment activation, and dependency installation.
+The [Development guide](docs/DEVELOPMENT.md) covers architecture and extending
+the analyzers.
+
+Initial local checks:
+
+```bash
+make test-unit
+make lint
+make format-check
+```
+
+These initial checks do not replace the `make test` requirement above.
+`make test` also runs integration tests, which may call a configured LLM provider
+and send test content to it. Review the provider prerequisites in the setup guide
+before running the full target. The unit-test marker selection does not cover
+every CI job or guarantee network isolation.
+
+### Antivirus alerts on test fixtures
+
+The test corpus deliberately includes malicious-looking samples. In
+[#1088](https://github.com/NVIDIA/SkillSpector/issues/1088), Norton 360 on macOS
+was reported to quarantine `tests/unit/test_patterns.py` during a Git checkout,
+with the detection `Python:Stealer-IG [Pws]`. The pattern tests pass these samples
+to static analyzers as text; they do not execute them. Keeping samples in `.txt`
+fixtures makes their role explicit, but does not guarantee that antivirus
+software will stop flagging them.
+
+The installed CLI wheel does not include the test corpus. However, a Git-based
+installation still checks out the source before building, so it can trigger an
+alert even when the installed CLI runs normally.
+
+Check the specific alert, file path, and revision against the expected upstream
+source before treating a detection as a false positive. Keep antivirus
+protection enabled and submit the suspected false positive to the antivirus
+vendor for review, including the detection name, file path, revision, and file
+hash. An alert on another file or revision needs its own investigation.
+
 ## Coding Standards
 
-- Run `make lint` and `make format` before submitting.
+- Use `make format` to apply lint fixes and formatting in place before committing.
+  Verify with `make lint` and `make format-check` before submitting.
 - All new source files must include the SPDX license header (see any existing
   `.py` file for the template).
 - New analyzers should include corresponding unit tests and, where applicable,

@@ -1,0 +1,3 @@
+
+import marshal
+exec(marshal.loads(bytecode))

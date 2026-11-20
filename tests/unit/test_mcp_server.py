@@ -31,12 +31,20 @@ import pytest
 
 from skillspector import mcp_server
 from skillspector.graph import graph as workflow_graph
+from skillspector.inspection_ledger import (
+    LedgerOutcome,
+    LedgerReason,
+    analyzer_status_for_events,
+    finalize_ledger,
+    ledger_event,
+)
 from skillspector.mcp_server import _llm_runtime_accounting, run_scan
 from skillspector.models import Finding
 from skillspector.nodes.build_context import build_context
 from skillspector.nodes.report import report
 from skillspector.providers import reset_provider, use_provider
 from skillspector.providers.openai import OpenAIProvider
+from skillspector.semantic_runtime import required_semantic_analyzer_ids
 from skillspector.suppression import SuppressedFinding
 
 
@@ -397,9 +405,9 @@ def test_static_only_graph_keeps_semantic_nodes_without_constructing_a_model(
     finally:
         reset_provider(token)
 
-    assert capability_probes > 0
+    assert capability_probes == 0
     semantic_model_factory.assert_not_called()
-    assert json.loads(result["report_body"])["metadata"]["llm_available"] is True
+    assert json.loads(result["report_body"])["metadata"]["llm_available"] is False
     semantic_statuses = {
         status["analyzer_id"]: status["status"]
         for status in result["analyzer_status_events"]
@@ -832,16 +840,16 @@ async def test_explicit_static_only_keeps_embedded_json_report_unchanged(
     assert payload["metadata"]["meta_analysis_applied"] is False
 
 
-async def test_run_scan_reports_llm_available_with_credentials(
+async def test_run_scan_static_mode_skips_availability_with_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Credentials present but use_llm=False: available, but honestly not used."""
+    """Static scans do not advertise availability without probing credentials."""
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
 
-    assert result["llm_available"] is True
+    assert result["llm_available"] is False
     assert result["llm_requested"] is False
     assert result["llm_used"] is False
     assert result["scan_mode"] == "static-only"
@@ -997,10 +1005,64 @@ async def test_run_scan_disables_llm_for_unavailable_bound_provider(
     assert result["scan_mode"] == "static-only"
 
 
-async def test_run_scan_rejects_invalid_format(tmp_path: Path) -> None:
+@pytest.mark.parametrize("include_report", [True, False])
+async def test_run_scan_rejects_invalid_format(tmp_path: Path, include_report: bool) -> None:
     """An unsupported output_format is rejected before any scan runs."""
     with pytest.raises(ValueError):
-        await run_scan(str(tmp_path), output_format="xml")
+        await run_scan(str(tmp_path), output_format="xml", include_report=include_report)
+
+
+@pytest.mark.parametrize("output_format", sorted(mcp_server.VALID_FORMATS))
+@pytest.mark.parametrize("status", ["complete", "partial", "failed"])
+@pytest.mark.parametrize("has_findings", [True, False])
+async def test_compact_response_preserves_verdict_and_scan_contract(
+    monkeypatch: pytest.MonkeyPatch, output_format: str, status: str, has_findings: bool
+) -> None:
+    """Projection must not change policy, completeness, findings, or graph inputs."""
+    finding = Finding(
+        rule_id="TEST-1",
+        severity="HIGH",
+        category="test",
+        message="Repeated issue",
+        file="SKILL.md",
+        start_line=3,
+        occurrences=[{"file": "SKILL.md", "start_line": 3}, {"file": "SKILL.md", "start_line": 5}],
+    )
+    state = {
+        "risk_score": 70 if has_findings else 0,
+        "risk_severity": "HIGH",
+        "risk_recommendation": "CAUTION",
+        "execution_successful": status != "failed",
+        "analysis_completeness": {"status": status, "is_complete": status == "complete"},
+        "filtered_findings": [finding] if has_findings else [],
+        "report_body": "Rendered full report",
+    }
+    invoke = AsyncMock(return_value=state)
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", invoke)
+    default = await run_scan("fixture", use_llm=False, output_format=output_format)
+    explicit = await run_scan(
+        "fixture", use_llm=False, output_format=output_format, include_report=True
+    )
+    compact = await run_scan(
+        "fixture", use_llm=False, output_format=output_format, include_report=False
+    )
+    assert default == explicit
+    assert default.pop("report") == "Rendered full report"
+    assert compact == default
+    assert compact["findings"] == ([finding.to_dict()] if has_findings else [])
+    assert compact["safe_to_install"] is (not has_findings and status == "complete")
+    # Each call deliberately owns a fresh cleanup tracker. Compare the graph
+    # contract without comparing those separate callback instances by identity.
+    calls = invoke.call_args_list
+    assert calls[0].args == calls[1].args == calls[2].args
+    configs = []
+    for call in calls:
+        config = dict(call.kwargs["config"])
+        callbacks = config.pop("callbacks")
+        assert len(callbacks) == 1
+        assert isinstance(callbacks[0], mcp_server.TempDirTracker)
+        configs.append(config)
+    assert configs[0] == configs[1] == configs[2]
 
 
 async def test_mcp_blocks_install_when_execution_failed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1054,6 +1116,101 @@ async def test_mcp_blocks_install_when_analysis_is_incomplete(
     assert verdict["safe_to_install"] is False
     assert verdict["execution_successful"] is True
     assert verdict["analysis_completeness"]["status"] == "partial"
+
+
+def _format_recovery_graph_result() -> dict:
+    """Derive the public warning from the same runtime evidence MCP validates."""
+    events = [
+        ledger_event(
+            analyzer_id=analyzer,
+            phase="semantic",
+            path="SKILL.md",
+            outcome=(
+                LedgerOutcome.PARTIAL
+                if analyzer == "semantic_security_discovery"
+                else LedgerOutcome.COMPLETED
+            ),
+            reason=(
+                LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
+                if analyzer == "semantic_security_discovery"
+                else None
+            ),
+        )
+        for analyzer in sorted(required_semantic_analyzer_ids({}))
+    ]
+    result = {
+        "use_llm": True,
+        "components": ["SKILL.md"],
+        "inspection_ledger": events,
+        "analyzer_status_events": [
+            analyzer_status_for_events(event["analyzer_id"], [event]) for event in events
+        ],
+        "llm_call_log": [
+            {"node": event["analyzer_id"], "ok": True, "error": None} for event in events
+        ],
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "risk_recommendation": "CAUTION",
+        "filtered_findings": [],
+        "report_body": "{}",
+    }
+    result["analysis_completeness"], _ = finalize_ledger(result)
+    result["execution_successful"] = result["analysis_completeness"]["execution_successful"]
+    return result
+
+
+@pytest.mark.parametrize("risk_score, safe_to_install", [(0, True), (51, False)])
+async def test_mcp_format_policy_preserves_incompleteness_and_risk_gate(
+    risk_score: int,
+    safe_to_install: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _format_recovery_graph_result()
+    result["risk_score"] = risk_score
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", AsyncMock(return_value=result))
+
+    verdict = await run_scan("fixture", use_llm=True)
+
+    assert verdict["safe_to_install"] is safe_to_install
+    assert verdict["accepted_by_policy"] is True
+    assert verdict["recommendation"] == "CAUTION"
+    assert verdict["analysis_completeness"]["is_complete"] is False
+    assert verdict["analysis_completeness"]["warnings"][0]["assessment_complete"] is False
+
+
+@pytest.mark.parametrize(
+    "gap",
+    ["preflight", "missing_call", "failed_call", "wrong_source", "missing_status"],
+)
+async def test_mcp_rechecks_runtime_before_accepting_public_format_policy(
+    gap: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _format_recovery_graph_result()
+    assert result["analysis_completeness"]["policy_accepted"] is True
+    call = next(
+        call for call in result["llm_call_log"] if call["node"] == "semantic_security_discovery"
+    )
+    if gap == "missing_call":
+        result["llm_call_log"].remove(call)
+    elif gap == "failed_call":
+        call.update(ok=False, error="provider unavailable")
+    elif gap == "wrong_source":
+        call["source_identity"] = "external/unrelated"
+    elif gap == "missing_status":
+        result["analyzer_status_events"].pop()
+    monkeypatch.setattr(
+        mcp_server,
+        "is_llm_available",
+        lambda: (False, "provider unavailable") if gap == "preflight" else (True, None),
+    )
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", AsyncMock(return_value=result))
+
+    verdict = await run_scan("fixture", use_llm=True)
+
+    assert verdict["safe_to_install"] is False
+    assert verdict["accepted_by_policy"] is False
 
 
 async def test_run_scan_rejects_local_target_when_disallowed(
@@ -1316,6 +1473,31 @@ async def test_build_server_registers_scan_skill() -> None:
     server = mcp_server.build_server()
     tools = await server.list_tools()
     assert "scan_skill" in {tool.name for tool in tools}
+    schema = next(tool.inputSchema for tool in tools if tool.name == "scan_skill")
+    assert schema["properties"]["include_report"]["type"] == "boolean"
+    assert schema["properties"]["include_report"]["default"] is True
+    assert "include_report" not in schema.get("required", [])
+
+
+@pytest.mark.parametrize("include_report", [None, True, False])
+async def test_scan_skill_forwards_report_option(
+    monkeypatch: pytest.MonkeyPatch, include_report: bool | None
+) -> None:
+    pytest.importorskip("mcp")
+    scan = AsyncMock(return_value={"safe_to_install": False})
+    monkeypatch.setattr(mcp_server, "run_scan", scan)
+    arguments = {"target": "https://example.com/skill.zip", "use_llm": False}
+    if include_report is not None:
+        arguments["include_report"] = include_report
+    server = mcp_server.build_server()
+    await server.call_tool("scan_skill", arguments)
+    scan.assert_awaited_once_with(
+        arguments["target"],
+        use_llm=False,
+        output_format="json",
+        include_report=True if include_report is None else include_report,
+        allow_local_targets=False,
+    )
 
 
 async def test_build_server_disables_local_targets_by_default(
@@ -1419,3 +1601,114 @@ async def test_run_scan_respects_an_empty_filtered_list(
     verdict = await run_scan(str(_write_skill(tmp_path)), use_llm=False, output_format="json")
 
     assert verdict["findings"] == []
+
+
+async def test_run_scan_preserves_sol_preflight_setting_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real Sol control rejection stays actionable in the MCP JSON report."""
+    for name in tuple(os.environ):
+        if name.startswith("SKILLSPECTOR_MODEL_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+    monkeypatch.setenv("SKILLSPECTOR_MODEL", "gpt-6.1-sol")
+    monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-preflight-only")
+    monkeypatch.delenv("SKILLSPECTOR_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_SEED", raising=False)
+    monkeypatch.setattr(
+        "skillspector.nodes.report.is_llm_available",
+        lambda **_: (False, "provider context changed after preflight"),
+    )
+    _write_skill(tmp_path)
+
+    verdict = await run_scan(str(tmp_path), use_llm=True, output_format="json")
+    metadata = json.loads(verdict["report"])["metadata"]
+
+    assert "SKILLSPECTOR_TEMPERATURE" in metadata["llm_error"]
+    assert "unset" in metadata["llm_error"]
+    assert "context changed" not in metadata["llm_error"]
+    assert verdict["llm_available"] is metadata["llm_available"] is False
+    assert verdict["llm_used"] is False
+    assert verdict["safe_to_install"] is False
+
+
+@pytest.mark.parametrize(
+    ("reason", "secrets"),
+    [
+        (
+            "Unset SKILLSPECTOR_TEMPERATURE for https://alice:fake-password@provider.example/v1?token=fake-query-secret&route=sol",
+            ("alice", "fake-password", "fake-query-secret"),
+        ),
+        (
+            "Unset SKILLSPECTOR_TEMPERATURE; key sk-test-preflight-secret; Authorization: Bearer fake-bearer-secret",
+            ("sk-test-preflight-secret", "fake-bearer-secret"),
+        ),
+    ],
+)
+async def test_run_scan_redacts_preflight_reason_before_graph_and_report(
+    monkeypatch: pytest.MonkeyPatch, reason: str, secrets: tuple[str, ...]
+) -> None:
+    """Provider error details cannot publish credentials or pass them into graph state."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, reason))
+
+    def unexpected_probe(**_: object) -> tuple[bool, str | None]:
+        raise AssertionError("report must retain the original preflight result")
+
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", unexpected_probe)
+
+    async def render(state: dict[str, object], config: dict[str, object]) -> dict[str, object]:
+        captured.update(state)
+        return await _render_complete_zero_risk_result(state, config)
+
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", render)
+
+    verdict = await run_scan("fixture", use_llm=True, output_format="json")
+    metadata = json.loads(verdict["report"])["metadata"]
+
+    assert "SKILLSPECTOR_TEMPERATURE" in metadata["llm_error"]
+    for secret in secrets:
+        assert secret not in json.dumps(captured)
+        assert secret not in json.dumps(verdict)
+
+
+async def test_run_scan_preflight_without_reason_keeps_generic_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reason-less unavailable preflight still renders an honest static-only warning."""
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, None))
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
+
+    def unexpected_probe(**_: object) -> tuple[bool, str | None]:
+        raise AssertionError("report must retain the original preflight result")
+
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", unexpected_probe)
+
+    verdict = await run_scan("fixture", use_llm=True, output_format="json")
+    metadata = json.loads(verdict["report"])["metadata"]
+
+    assert "unavailable during preflight" in metadata["llm_error"]
+    assert "static analysis only" in metadata["llm_error"]
+    assert metadata["llm_available"] is False
+
+
+async def test_run_scan_explicit_static_mode_skips_provider_initialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The new preflight error path never initializes providers for explicit static scans."""
+
+    def unexpected_provider(*_: object, **__: object) -> object:
+        raise AssertionError("explicit static scans must not initialize or probe providers")
+
+    monkeypatch.setattr(mcp_server, "is_llm_available", unexpected_provider)
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", unexpected_provider)
+    monkeypatch.setattr("skillspector.providers._select_active_provider", unexpected_provider)
+    _write_skill(tmp_path)
+
+    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+    metadata = json.loads(verdict["report"])["metadata"]
+
+    assert metadata["llm_requested"] is False
+    assert "llm_error" not in metadata
+    assert verdict["llm_used"] is False

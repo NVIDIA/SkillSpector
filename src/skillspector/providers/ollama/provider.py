@@ -30,7 +30,10 @@ from pathlib import Path
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from skillspector.providers import registry
-from skillspector.providers.chat_models import create_openai_compatible_chat_model
+from skillspector.providers.chat_models import (
+    create_openai_compatible_chat_model,
+    prepare_openai_chat_model_imports,
+)
 
 OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1"
 
@@ -42,6 +45,10 @@ class OllamaProvider:
 
     DEFAULT_MODEL = "llama3.1:8b"
     SLOT_DEFAULTS: dict[str, str] = {}
+
+    def prepare_chat_model_imports(self) -> None:
+        """Prepare the OpenAI transport without resolving or creating a client."""
+        prepare_openai_chat_model_imports()
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
         """Return ``(api_key, base_url)`` for the Ollama endpoint.

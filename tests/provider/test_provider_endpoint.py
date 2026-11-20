@@ -54,6 +54,7 @@ def test_openai_provider_makes_live_structured_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """OpenAI provider reaches its default endpoint and returns structured output."""
+    from skillspector.llm_utils import bind_structured_output
     from skillspector.providers.openai import OpenAIProvider
 
     _skip_without_env("OPENAI_API_KEY")
@@ -61,12 +62,15 @@ def test_openai_provider_makes_live_structured_request(
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
 
     model = _model_from_env("SKILLSPECTOR_OPENAI_TEST_MODEL", OpenAIProvider.DEFAULT_MODEL)
-    llm = OpenAIProvider().create_chat_model(model, max_tokens=32, timeout=60)
+    provider = OpenAIProvider()
+    # Reasoning models spend output tokens on reasoning, so leave headroom.
+    llm = provider.create_chat_model(model, max_tokens=4096, timeout=120)
     assert llm is not None
     assert llm.openai_api_base is None
 
-    result = llm.with_structured_output(ProviderResult).invoke(
-        [HumanMessage(content="Return only the requested structured output with ok=true.")]
+    # Bind like the analyzers do, so the provider's structured-output method applies.
+    result = bind_structured_output(llm, ProviderResult, model, provider).invoke(
+        "Return only the requested structured output with ok=true."
     )
 
     assert result == ProviderResult(ok=True)
@@ -76,6 +80,7 @@ def test_anthropic_provider_makes_live_structured_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Anthropic provider reaches its default endpoint and returns structured output."""
+    from skillspector.llm_utils import bind_structured_output
     from skillspector.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicProvider
 
     _skip_without_env("ANTHROPIC_API_KEY")
@@ -83,12 +88,15 @@ def test_anthropic_provider_makes_live_structured_request(
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
 
     model = _model_from_env("SKILLSPECTOR_ANTHROPIC_TEST_MODEL", AnthropicProvider.DEFAULT_MODEL)
-    llm = AnthropicProvider().create_chat_model(model, max_tokens=32, timeout=60)
+    provider = AnthropicProvider()
+    # Claude 5.5 always thinks and rejects a forced tool call, so leave headroom
+    # and bind through the provider's structured-output method.
+    llm = provider.create_chat_model(model, max_tokens=4096, timeout=120)
     assert llm is not None
     assert str(llm.anthropic_api_url).rstrip("/") == ANTHROPIC_BASE_URL.rstrip("/")
 
-    result = llm.with_structured_output(ProviderResult).invoke(
-        [HumanMessage(content="Return only the requested structured output with ok=true.")]
+    result = bind_structured_output(llm, ProviderResult, model, provider).invoke(
+        "Return only the requested structured output with ok=true."
     )
 
     assert result == ProviderResult(ok=True)

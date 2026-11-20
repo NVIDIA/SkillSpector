@@ -475,99 +475,87 @@ class PooledChatModel:
 
     # -- Internal -------------------------------------------------------------
 
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        from skillspector.llm_analyzer_base import LLMRuntimeLimitError
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LLMRuntimeLimitError("pooled request runtime limit reached")
+        return remaining
+
     def _invoke_with_retry(
-        self,
-        prompt: str,
-        *,
-        callbacks: list[object] | None = None,
+        self, prompt: str, *, callbacks: list[object] | None = None,
     ) -> object:
-        """Sync retry loop — acquire slot, call LLM, release, retry on 429."""
-        last_exception: Exception | None = None
-
+        """Share one deadline across slot waiting, requests, and key retries."""
+        deadline = time.monotonic() + self._timeout
         for attempt in range(self._max_retries + 1):
-            key = self._pool.acquire()
-            llm = self._build_llm(key)
             try:
-                if callbacks is None:
-                    result = llm.invoke(prompt)
-                else:
-                    result = llm.invoke(prompt, config={"callbacks": callbacks})
-                self._pool.release(key, success=True)
-                if attempt > 0:
-                    self._pool.record_retry_success()
-                return result
-            except Exception as exc:
-                if self._is_rate_limit(exc) and attempt < self._max_retries:
-                    self._pool.release(key, success=False)
-                    logger.debug(
-                        "PooledChatModel: rate-limited, retrying "
-                        "(attempt %d/%d)",
-                        attempt + 1,
-                        self._max_retries,
-                    )
-                    continue
-                self._pool.release(key, success=True)
-                last_exception = exc
+                key = self._pool.acquire(timeout=self._remaining(deadline))
+            except Exception:
+                self._remaining(deadline)
                 raise
-
-        raise RuntimeError(
-            f"PooledChatModel: exhausted {self._max_retries} retries "
-            "due to rate-limit errors"
-        ) from last_exception
+            rate_limited = False
+            try:
+                llm = self._build_llm(key, timeout=self._remaining(deadline))
+                result = llm.invoke(prompt) if callbacks is None else llm.invoke(
+                    prompt, config={"callbacks": callbacks}
+                )
+            except Exception as exc:
+                rate_limited = self._is_rate_limit(exc)
+                if rate_limited and attempt < self._max_retries:
+                    continue
+                raise
+            finally:
+                self._pool.release(key, success=not rate_limited)
+            if attempt > 0:
+                self._pool.record_retry_success()
+            return result
+        raise RuntimeError("PooledChatModel exhausted key retries")
 
     async def _ainvoke_with_retry(
-        self,
-        prompt: str,
-        *,
-        callbacks: list[object] | None = None,
+        self, prompt: str, *, callbacks: list[object] | None = None,
     ) -> object:
-        """Async retry loop — non-blocking acquire first, block only if full."""
+        """Bound asynchronous slot waiting without leaving an acquiring thread."""
         import asyncio
-        last_exception: Exception | None = None
 
+        deadline = time.monotonic() + self._timeout
         for attempt in range(self._max_retries + 1):
+            self._remaining(deadline)
             key = self._pool.try_acquire()
-            if key is None:
-                key = await asyncio.to_thread(self._pool.acquire)
-            llm = self._build_llm(key)
+            while key is None:
+                await asyncio.sleep(min(0.05, self._remaining(deadline)))
+                self._remaining(deadline)
+                key = self._pool.try_acquire()
+            rate_limited = False
             try:
-                if callbacks is None:
-                    result = await llm.ainvoke(prompt)
-                else:
-                    result = await llm.ainvoke(prompt, config={"callbacks": callbacks})
-                self._pool.release(key, success=True)
-                if attempt > 0:
-                    self._pool.record_retry_success()
-                return result
+                llm = self._build_llm(key, timeout=self._remaining(deadline))
+                result = await llm.ainvoke(prompt) if callbacks is None else await llm.ainvoke(
+                    prompt, config={"callbacks": callbacks}
+                )
             except Exception as exc:
-                if self._is_rate_limit(exc) and attempt < self._max_retries:
-                    self._pool.release(key, success=False)
-                    logger.debug(
-                        "PooledChatModel: rate-limited, retrying "
-                        "(attempt %d/%d)",
-                        attempt + 1,
-                        self._max_retries,
-                    )
+                rate_limited = self._is_rate_limit(exc)
+                if rate_limited and attempt < self._max_retries:
                     continue
-                self._pool.release(key, success=True)
-                last_exception = exc
                 raise
+            finally:
+                self._pool.release(key, success=not rate_limited)
+            if attempt > 0:
+                self._pool.record_retry_success()
+            return result
+        raise RuntimeError("PooledChatModel exhausted key retries")
 
-        raise RuntimeError(
-            f"PooledChatModel: exhausted {self._max_retries} retries "
-            "due to rate-limit errors"
-        ) from last_exception
-
-    def _build_llm(self, key: ApiKey):
+    def _build_llm(self, key: ApiKey, *, timeout: float | None = None):
         """Build a fresh :class:`~langchain_openai.ChatOpenAI` for *key*."""
         from langchain_openai import ChatOpenAI
         from pydantic import SecretStr
 
+        timeout = self._timeout if timeout is None else timeout
         try:
             import httpx
-            _timeout = httpx.Timeout(self._timeout, connect=8.0)
+            _timeout = httpx.Timeout(timeout, connect=min(8.0, timeout))
         except ImportError:
-            _timeout = self._timeout
+            _timeout = timeout
 
         return ChatOpenAI(
             model=key.model,
@@ -575,6 +563,7 @@ class PooledChatModel:
             api_key=SecretStr(key.key),
             max_completion_tokens=self._max_tokens,
             timeout=_timeout,
+            max_retries=0,
         )
 
     @staticmethod

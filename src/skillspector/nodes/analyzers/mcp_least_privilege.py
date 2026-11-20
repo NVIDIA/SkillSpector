@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from skillspector.allowed_tools import allowed_tool_grant_name, iter_allowed_tools_entries
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
@@ -250,18 +251,17 @@ def _normalize_allowed_tools(
 
     Accepts the list form (``[Bash, Read]``), the comma-separated string
     form (``"Bash, Read"``), and the space-separated string form
-    (``"Bash Read"``). Anything else yields an empty list.
+    (``"Bash Read"``). Separators inside a ``Tool(specifier)`` scope do not
+    split, so ``"Bash(git status:*) Read"`` and ``"Bash(echo '(') Read"`` each
+    yield two entries. Anything else yields an empty list.
     """
     tools: list[str] = []
     if isinstance(value, list):
         candidates = iter(value)
     elif isinstance(value, str):
-        if "," in value:
-            # A bounded split prevents a comma-dense declaration from creating an
-            # arbitrarily large temporary list before the analyzer can stop it.
-            candidates = iter(value.split(",", _MAX_DECLARATION_VALUES))
-        else:
-            candidates = iter(value.split(None, _MAX_DECLARATION_VALUES))
+        # Entries are produced lazily, so a comma-dense declaration stops at the
+        # limit below without building an arbitrarily large temporary list.
+        candidates = iter_allowed_tools_entries(value)
     else:
         return tools
 
@@ -350,7 +350,8 @@ def _map_permissions_to_categories(
     return categories
 
 
-# Tool name → capability category (Claude / Agent Skills tool names, case-insensitive exact match)
+# Tool name → capability category (Claude / Agent Skills tool names, case-insensitive exact match
+# on the name of a well-formed bare or ``Tool(specifier)`` grant)
 _TOOL_TO_CAPABILITY: dict[str, str] = {
     "bash": "shell",
     "execute": "shell",
@@ -373,14 +374,23 @@ def _map_allowed_tools_to_categories(
     tools: list[str],
     budget: _LeastPrivilegeBudget | None = None,
 ) -> set[str]:
-    """Map Agent Skills ``allowed-tools`` tool names to capability category names."""
+    """Map Agent Skills ``allowed-tools`` tool names to capability category names.
+
+    Scoped grants in the ``Tool(specifier)`` form, such as ``Bash(git:*)`` or
+    ``WebFetch(domain:example.com)``, map by their tool name, so a narrower
+    grant covers the same category as the bare tool. Parentheses inside the
+    specifier are literal, so ``Bash(echo '(')`` maps to ``shell``. Incomplete
+    or blank grants such as ``Bash(``, ``Bash(notes`` or ``Bash()`` map to no
+    category.
+    """
     categories: set[str] = set()
     for tool in tools:
         if budget is not None:
             budget.check_runtime("SKILL.md")
-        if len(tool) > 64:
+        name = allowed_tool_grant_name(tool)
+        if name is None:
             continue
-        cat = _TOOL_TO_CAPABILITY.get(tool.lower().strip())
+        cat = _TOOL_TO_CAPABILITY.get(name.lower())
         if cat:
             categories.add(cat)
     return categories

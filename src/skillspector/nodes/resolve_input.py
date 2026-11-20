@@ -30,11 +30,13 @@ from skillspector.input_handler import (
     selected_source_identity_for_input,
     validate_local_input_path,
 )
+from skillspector.input_origin import input_origin
 from skillspector.logging_config import get_logger
 from skillspector.state import (
     SkillspectorState,
     ensure_workflow_resource_budget,
 )
+from skillspector.suppression import discover_baseline, load_baseline
 
 logger = get_logger(__name__)
 
@@ -55,19 +57,21 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
     # exact object instead of restarting their own aggregate allowance.
     workflow_budget = ensure_workflow_resource_budget(state)
 
-    if input_path and isinstance(input_path, str) and input_path.strip():
+    if input_path and isinstance(input_path, str):
         handler = InputHandler(
             transitive_budget=workflow_budget,
             allow_git_credentials=state.get("allow_git_credentials", True),
         )
         try:
-            resolved, source_type = handler.resolve(input_path.strip())
+            resolved, source_type = handler.resolve(input_path)
             temp_dir = handler.temp_dir_for_cleanup()
             update: dict[str, object] = {
                 "skill_path": str(resolved),
+                "input_origin": input_origin(input_path, source_type),
                 "primary_file_path": handler.primary_file_path,
+                "primary_file_parent_path": handler.primary_file_parent_path,
                 "selected_source_identity": selected_source_identity_for_input(
-                    input_path.strip(),
+                    input_path,
                     source_type=source_type,
                     resolved_path=resolved,
                     temp_dir=temp_dir,
@@ -78,6 +82,16 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
                 update["temp_dir_for_cleanup"] = str(temp_dir)
             else:
                 update["temp_dir_for_cleanup"] = None
+            if (
+                source_type == "zip"
+                and state.get("use_shipped_baseline")
+                and state.get("baseline") is None
+                and not state.get("baseline_path")
+            ):
+                shipped = discover_baseline(resolved)
+                if shipped is not None:
+                    update["baseline"] = load_baseline(shipped)
+                    update["baseline_path"] = str(shipped)
             return update
         except TransitiveIngestTruncatedError as exc:
             # The graph has no directory to scan. Propagate a typed, sanitized
@@ -98,11 +112,12 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             handler.cleanup()
             raise
 
-    if skill_path and isinstance(skill_path, str) and skill_path.strip():
+    if skill_path and isinstance(skill_path, str):
         try:
             resolved = validate_local_input_path(Path(skill_path))
             return {
                 "skill_path": str(resolved),
+                "input_origin": input_origin(skill_path, "directory"),
                 "primary_file_path": None,
                 "selected_source_identity": resolved.name or None,
                 "temp_dir_for_cleanup": None,
@@ -112,6 +127,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             logger.warning("Could not resolve skill_path: %s", e)
             return {
                 "skill_path": None,
+                "input_origin": None,
                 "primary_file_path": None,
                 "selected_source_identity": None,
                 "temp_dir_for_cleanup": None,
@@ -120,6 +136,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
 
     return {
         "skill_path": None,
+        "input_origin": None,
         "primary_file_path": None,
         "selected_source_identity": None,
         "temp_dir_for_cleanup": None,

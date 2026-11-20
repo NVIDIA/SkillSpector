@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import threading
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -32,6 +33,7 @@ from skillspector.nodes.analyzers.osv_client import (
     _estimate_cvss_severity,
     _severity_from_vuln,
     clear_cache,
+    is_available,
     query_batch,
     was_osv_reachable,
 )
@@ -236,6 +238,46 @@ class TestQueryBatch:
         assert any(
             item.reason is LedgerReason.ANALYZER_RUNTIME_ERROR for item in results.limitations
         )
+
+    def test_bracketed_no_proxy_client_failure_returns_empty(self) -> None:
+        # httpx.InvalidURL is a bare Exception subclass, not an HTTPError or
+        # ValueError, so a bracketed IPv6 entry in no_proxy (e.g. "[::1]")
+        # used to escape query_batch() and fail the whole analyzer instead
+        # of falling back to static data (NVIDIA/SkillSpector#966).
+        with patch(
+            "skillspector.nodes.analyzers.osv_client.httpx.Client",
+            side_effect=httpx.InvalidURL("Invalid port: ':1]'"),
+        ):
+            results = query_batch([("requests", "2.31.0")], ECOSYSTEM_PYPI)
+
+        assert results == [[]]
+        assert any(
+            item.reason is LedgerReason.ANALYZER_RUNTIME_ERROR and item.error_class == "InvalidURL"
+            for item in results.limitations
+        )
+        assert was_osv_reachable() is False
+
+    def test_bracketed_no_proxy_env_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Same failure through real httpx environment parsing, no mocks.
+        monkeypatch.setenv("no_proxy", "[::1]")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("http_proxy", raising=False)
+        monkeypatch.delenv("https_proxy", raising=False)
+        monkeypatch.delenv("HTTP_PROXY", raising=False)
+        monkeypatch.delenv("HTTPS_PROXY", raising=False)
+
+        results = query_batch([("requests", "2.31.0")], ECOSYSTEM_PYPI)
+
+        assert results == [[]]
+        assert was_osv_reachable() is False
+
+    def test_bracketed_no_proxy_env_is_available_returns_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("no_proxy", "[::1]")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+
+        assert is_available() is False
 
     def test_timeout_returns_empty(self) -> None:
         mock_client = MagicMock()
@@ -533,3 +575,154 @@ class TestQueryResourceBounds:
         assert results == [[]]
         assert client.post.call_count == 0
         assert any(item.reason is LedgerReason.RUNTIME_LIMIT for item in results.limitations)
+
+
+def _client_returning(results: list | None = None, error: Exception | None = None) -> MagicMock:
+    """A mocked httpx.Client whose batch POST succeeds with *results* or raises *error*."""
+    client = MagicMock()
+    client.__enter__ = MagicMock(return_value=client)
+    client.__exit__ = MagicMock(return_value=False)
+    if error is not None:
+        client.post.side_effect = error
+    else:
+        response = MagicMock()
+        response.json.return_value = {"results": results if results is not None else [{}]}
+        response.raise_for_status = MagicMock()
+        client.post.return_value = response
+    return client
+
+
+def _run_query(
+    budget: OsvQueryBudget,
+    packages: list[tuple[str, str | None]],
+    *,
+    error: Exception | None = None,
+) -> None:
+    client = _client_returning(results=[{} for _ in packages], error=error)
+    with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=client):
+        query_batch(packages, ECOSYSTEM_PYPI, budget=budget)
+
+
+class TestCallScopedReachability:
+    """was_osv_reachable(budget) must depend only on that budget's own calls."""
+
+    def test_budgets_do_not_see_each_others_outcome(self) -> None:
+        ok_budget = OsvQueryBudget.create()
+        failed_budget = OsvQueryBudget.create()
+
+        _run_query(ok_budget, [("requests", "2.31.0")])
+        _run_query(failed_budget, [("jinja2", "2.4.1")], error=httpx.ConnectError("refused"))
+
+        # The shared flag now says "failed", but the successful scan must not.
+        assert was_osv_reachable() is False
+        assert was_osv_reachable(ok_budget) is True
+        assert was_osv_reachable(failed_budget) is False
+
+    def test_fully_cached_call_ignores_the_shared_flag(self) -> None:
+        warm = OsvQueryBudget.create()
+        _run_query(warm, [("requests", "2.31.0")])
+        _run_query(
+            OsvQueryBudget.create(), [("jinja2", "2.4.1")], error=httpx.ConnectError("refused")
+        )
+        assert was_osv_reachable() is False  # another scan left the shared flag False
+
+        cached_budget = OsvQueryBudget.create()
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client") as client_cls:
+            query_batch([("requests", "2.31.0")], ECOSYSTEM_PYPI, budget=cached_budget)
+        client_cls.assert_not_called()  # served from cache: the provider was never contacted
+        assert was_osv_reachable(cached_budget) is True
+
+    def test_empty_package_list_ignores_the_shared_flag(self) -> None:
+        _run_query(
+            OsvQueryBudget.create(), [("jinja2", "2.4.1")], error=httpx.ConnectError("refused")
+        )
+        assert was_osv_reachable() is False
+
+        budget = OsvQueryBudget.create()
+        query_batch([], ECOSYSTEM_PYPI, budget=budget)
+        assert was_osv_reachable(budget) is True
+
+    def test_package_limit_exhausted_is_not_reported_as_unreachable(self) -> None:
+        _run_query(
+            OsvQueryBudget.create(), [("jinja2", "2.4.1")], error=httpx.ConnectError("refused")
+        )
+        assert was_osv_reachable() is False
+
+        budget = OsvQueryBudget.create()
+        budget.max_packages = 0
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client") as client_cls:
+            result = query_batch([("requests", "2.31.0")], ECOSYSTEM_PYPI, budget=budget)
+        client_cls.assert_not_called()
+        assert result.limitations  # the omission is reported as a limitation, not a failure
+        assert was_osv_reachable(budget) is True
+
+    def test_failure_on_a_budget_survives_a_later_cached_call(self) -> None:
+        budget = OsvQueryBudget.create()
+        _run_query(budget, [("jinja2", "2.4.1")], error=httpx.ConnectError("refused"))
+        assert was_osv_reachable(budget) is False
+
+        warm = OsvQueryBudget.create()
+        _run_query(warm, [("requests", "2.31.0")])
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client"):
+            query_batch([("requests", "2.31.0")], ECOSYSTEM_PYPI, budget=budget)
+        # A cache hit did not contact the provider, so it cannot erase the failure.
+        assert was_osv_reachable(budget) is False
+
+    def test_unused_budget_reports_reachable(self) -> None:
+        assert was_osv_reachable(OsvQueryBudget.create()) is True
+
+    def test_no_budget_still_uses_the_shared_flag(self) -> None:
+        _run_query(
+            OsvQueryBudget.create(), [("jinja2", "2.4.1")], error=httpx.ConnectError("refused")
+        )
+        assert was_osv_reachable() is False
+        _run_query(OsvQueryBudget.create(), [("requests", "2.31.0")])
+        assert was_osv_reachable() is True
+
+    def test_overlapping_scans_each_keep_their_own_outcome(self) -> None:
+        """Eight scans are inside the provider call at once; half fail, half succeed."""
+        count = 8
+        barrier = threading.Barrier(count, timeout=10)
+        failing = {f"scan-{i}" for i in range(count) if i % 2}
+
+        def make_client(*_args, **_kwargs) -> MagicMock:
+            client = MagicMock()
+            client.__enter__ = MagicMock(return_value=client)
+            client.__exit__ = MagicMock(return_value=False)
+
+            def post(*_a, **_k):
+                barrier.wait()  # every scan reaches the provider before any returns
+                if threading.current_thread().name in failing:
+                    raise httpx.ConnectError("refused")
+                response = MagicMock()
+                response.json.return_value = {"results": [{}]}
+                response.raise_for_status = MagicMock()
+                return response
+
+            client.post.side_effect = post
+            return client
+
+        budgets: dict[str, OsvQueryBudget] = {}
+        errors: list[BaseException] = []
+
+        def scan(name: str) -> None:
+            try:
+                budgets[name] = OsvQueryBudget.create()
+                query_batch([(f"pkg-{name}", "1.0")], ECOSYSTEM_PYPI, budget=budgets[name])
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", make_client):
+            threads = [
+                threading.Thread(target=scan, args=(f"scan-{i}",), name=f"scan-{i}")
+                for i in range(count)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=20)
+
+        assert not errors
+        assert set(budgets) == {f"scan-{i}" for i in range(count)}
+        for name, budget in budgets.items():
+            assert was_osv_reachable(budget) is (name not in failing), name

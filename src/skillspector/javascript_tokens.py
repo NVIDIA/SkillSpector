@@ -1,0 +1,3115 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Bounded JavaScript ownership for shell-completeness checks.
+
+Assertion messages require a proved receiver. General template ownership also
+requires a complete syntax tree and retains conservative shell-execution checks.
+Original source bytes remain the input to security matching.
+"""
+
+from __future__ import annotations
+
+import re
+from bisect import bisect_left
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from html.parser import HTMLParser
+
+from tree_sitter import Node
+
+from skillspector.javascript_ast import NODE_SHEBANG as _NODE_SHEBANG
+from skillspector.javascript_ast import JavaScriptProgram, ParseFailure, parse_javascript_source
+from skillspector.javascript_callables import (
+    _SHELL_EXECUTION_CALLS,
+    _callable_member,
+    _external_option_callback,
+    _forwarded_stage_call,
+    _is_shell_execution_module,
+    _module_wrapper_markup,
+    _ordinary_array_map,
+    _pattern_binding_names,
+    _private_arrow_barrier,
+    _private_callable_uses,
+    _written_script_field,
+)
+from skillspector.javascript_native_calls import _dynamic_process_call, _ordinary_native_calls
+
+_MAX_SOURCE_CHARS = 1_000_000
+_MAX_TOKENS = 100_000
+_MAX_NESTING = 128
+_LINE_ENDS = "\r\n\u2028\u2029"
+_BrowserBinding = tuple[str, int, str]
+_IDENTIFIER = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
+_TEMPLATE_VALUE = re.compile(
+    r"\s*[A-Za-z_$][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_$][A-Za-z0-9_$]*)*\s*\Z"
+)
+_ASSERT_MODULES = frozenset({"node:assert", "node:assert/strict"})
+_ASSERT_MODULE_ALIASES = _ASSERT_MODULES | {"assert", "assert/strict"}
+_MESSAGE_ARGUMENTS = {
+    "ok": 2,
+    "equal": 3,
+    "notEqual": 3,
+    "strictEqual": 3,
+    "notStrictEqual": 3,
+    "deepEqual": 3,
+    "notDeepEqual": 3,
+    "deepStrictEqual": 3,
+    "notDeepStrictEqual": 3,
+    "match": 3,
+    "doesNotMatch": 3,
+    "throws": 3,
+    "doesNotThrow": 3,
+}
+_EXPRESSION_PREFIX_WORDS = frozenset(
+    {
+        "return",
+        "throw",
+        "case",
+        "delete",
+        "void",
+        "typeof",
+        "new",
+        "yield",
+        "await",
+        "in",
+        "instanceof",
+        "else",
+        "do",
+    }
+)
+_OPERATORS = frozenset(
+    {
+        "===",
+        "!==",
+        ">>>",
+        "**=",
+        "&&=",
+        "||=",
+        "??=",
+        "...",
+        "=>",
+        "==",
+        "!=",
+        "<=",
+        ">=",
+        "&&",
+        "||",
+        "??",
+        "++",
+        "--",
+        "**",
+        "+=",
+        "-=",
+        "*=",
+        "%=",
+        "&=",
+        "|=",
+        "^=",
+        "<<",
+        ">>",
+        "?.",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _Token:
+    kind: str
+    start: int
+    end: int
+    depth: int
+    interpolation_names: tuple[str, ...] = ()
+
+
+def _tokens(
+    content: str, check_runtime: Callable[[], None]
+) -> tuple[list[_Token], dict[int, int]] | None:
+    """Tokenize the limited lexical forms needed to prove message boundaries."""
+    tokens: list[_Token] = []
+    pairs: dict[int, int] = {}
+    stack: list[tuple[str, int]] = []
+    cursor = 0
+    expression_start = True
+    next_check = 0
+
+    def check(position: int) -> None:
+        nonlocal next_check
+        if position >= next_check:
+            check_runtime()
+            next_check = position + 4096
+
+    if content.startswith("#!"):
+        if _NODE_SHEBANG.match(content) is None:
+            return None
+        cursor = content.find("\n")
+        if cursor < 0:
+            return None
+    while cursor < len(content):
+        check(cursor)
+        character = content[cursor]
+        if character.isspace():
+            cursor += 1
+            continue
+        if character == "\x00" or len(tokens) >= _MAX_TOKENS:
+            return None
+        if content.startswith("//", cursor):
+            while cursor < len(content) and content[cursor] not in _LINE_ENDS:
+                check(cursor)
+                cursor += 1
+            continue
+        if content.startswith("/*", cursor):
+            cursor += 2
+            while cursor < len(content) and not content.startswith("*/", cursor):
+                check(cursor)
+                cursor += 1
+            if cursor == len(content):
+                return None
+            cursor += 2
+            continue
+        start = cursor
+        kind = "punctuation"
+        interpolation_names: list[str] = []
+        if character in "'\"`":
+            kind = "template" if character == "`" else "string"
+            cursor += 1
+            while cursor < len(content):
+                check(cursor)
+                current = content[cursor]
+                if current == "\\":
+                    cursor += 2
+                    if cursor <= len(content) and content[cursor - 1 : cursor + 1] == "\r\n":
+                        cursor += 1
+                    continue
+                if current == character:
+                    cursor += 1
+                    break
+                if kind == "string" and current in _LINE_ENDS:
+                    return None
+                if kind == "template" and content.startswith("${", cursor):
+                    value_start = cursor + 2
+                    cursor = value_start
+                    while cursor < len(content) and content[cursor] != "}":
+                        check(cursor)
+                        # Calls, computed members, comments, nested templates,
+                        # and other effectful expressions never gain ownership.
+                        if not content[cursor].isascii():
+                            return None
+                        cursor += 1
+                    value = content[value_start:cursor]
+                    if cursor == len(content) or _TEMPLATE_VALUE.fullmatch(value) is None:
+                        return None
+                    interpolation_names.extend(_IDENTIFIER.findall(value))
+                    cursor += 1
+                    continue
+                cursor += 1
+            else:
+                return None
+            expression_start = False
+        elif character == "/":
+            # Division versus a statement-level regexp needs more grammar.
+            # Only a clear expression prefix establishes regexp ownership.
+            if not expression_start:
+                return None
+            kind = "regexp"
+            cursor += 1
+            in_class = False
+            while cursor < len(content):
+                check(cursor)
+                current = content[cursor]
+                if current in _LINE_ENDS:
+                    return None
+                if current == "\\":
+                    if cursor + 1 == len(content) or content[cursor + 1] in _LINE_ENDS:
+                        return None
+                    cursor += 2
+                    continue
+                if current == "[":
+                    if in_class:
+                        # Unicode-set nested classes require a different grammar.
+                        return None
+                    in_class = True
+                elif current == "]":
+                    in_class = False
+                elif current == "/" and not in_class:
+                    cursor += 1
+                    break
+                cursor += 1
+            else:
+                return None
+            flags_start = cursor
+            while cursor < len(content) and content[cursor].isascii() and content[cursor].isalpha():
+                check(cursor)
+                cursor += 1
+            flags = content[flags_start:cursor]
+            if len(set(flags)) != len(flags) or set(flags) - set("dgimsuy"):
+                return None
+            expression_start = False
+        elif (identifier := _IDENTIFIER.match(content, cursor)) is not None:
+            kind = "identifier"
+            cursor = identifier.end()
+            previous = content[tokens[-1].start : tokens[-1].end] if tokens else ""
+            expression_start = identifier[0] in _EXPRESSION_PREFIX_WORDS and previous not in {
+                ".",
+                "?.",
+            }
+        elif character.isascii() and character.isdigit():
+            kind = "number"
+            cursor += 1
+            while cursor < len(content) and content[cursor] in "0123456789abcdefABCDEFxXoObBn._":
+                check(cursor)
+                cursor += 1
+            expression_start = False
+        elif character in "()[]{};,:.?=<>!~+-*%&|^":
+            width = 1
+            if content[cursor : cursor + 3] in _OPERATORS:
+                width = 3
+            elif content[cursor : cursor + 2] in _OPERATORS:
+                width = 2
+            cursor += width
+            operator = content[start:cursor]
+            if operator == "!" and not expression_start:
+                # TypeScript's postfix assertion leaves division possible.
+                return None
+            if operator in "([{":
+                if len(stack) >= _MAX_NESTING:
+                    return None
+                stack.append((operator, len(tokens)))
+            elif operator in ")]}":
+                if not stack or stack[-1][0] != {"}": "{", ")": "(", "]": "["}[operator]:
+                    return None
+                _, opening = stack.pop()
+                pairs[opening] = len(tokens)
+            expression_start = operator not in {")", "]", "}", ".", "?.", "++", "--"}
+        else:
+            # Escaped/Unicode identifiers, JSX, and unknown lexical forms are
+            # not proof of a Node assertion receiver or template boundary.
+            return None
+        tokens.append(_Token(kind, start, cursor, len(stack), tuple(interpolation_names)))
+    check_runtime()
+    return None if stack else (tokens, pairs)
+
+
+def assertion_template_shell_text(content: str, check_runtime: Callable[[], None]) -> str:
+    """Project only proven Node assertion message delimiters for shell completeness.
+
+    Literal bodies and interpolations remain byte-for-byte present. Findings
+    must still be produced from the original source. Unknown calls, tagged or
+    concatenated templates, ambiguous imports, and receiver mutation/shadowing
+    receive no exemption. Runtime interruption propagates to the caller.
+
+    This assumes the standard built-in module. It cannot prove the absence of
+    arbitrary runtime monkeypatching or object getters.
+    """
+    if len(content) > _MAX_SOURCE_CHARS or "node:assert" not in content or "`" not in content:
+        return content
+    parsed = _tokens(content, check_runtime)
+    if parsed is None:
+        return content
+    tokens, pairs = parsed
+    values = [content[token.start : token.end] for token in tokens]
+    imports: list[tuple[str, int, int]] = []
+    for index, token in enumerate(tokens):
+        if index % 256 == 0:
+            check_runtime()
+        if token.kind == "identifier" and (
+            values[index] == "require"
+            or values[index] == "import"
+            and values[index + 1 : index + 2] == ["("]
+        ):
+            return content
+        if token.kind == "string" and index and values[index - 1] in {"import", "from"}:
+            # Escaped module names can alias the same mutable built-in object.
+            if "\\" in values[index]:
+                return content
+        if values[index] != "import" or token.depth:
+            continue
+        following = values[index : index + 7]
+        if len(following) >= 5 and following[2] == "from" and following[4] == ";":
+            binding_index, module_index = index + 1, index + 3
+        elif (
+            len(following) == 7
+            and following[1:3] == ["*", "as"]
+            and following[4] == "from"
+            and following[6] == ";"
+        ):
+            binding_index, module_index = index + 3, index + 5
+        else:
+            continue
+        if (
+            tokens[binding_index].kind == "identifier"
+            and tokens[module_index].kind == "string"
+            and values[module_index][1:-1] in _ASSERT_MODULES
+        ):
+            imports.append((values[binding_index], binding_index, module_index))
+    if len(imports) != 1:
+        return content
+    binding, binding_index, module_index = imports[0]
+    if any(
+        token.kind == "string"
+        and index != module_index
+        and values[index][1:-1] in _ASSERT_MODULE_ALIASES
+        or binding in token.interpolation_names
+        for index, token in enumerate(tokens)
+    ):
+        return content
+    delimiters: list[int] = []
+    for index, token in enumerate(tokens):
+        if index % 256 == 0:
+            check_runtime()
+        if token.kind != "identifier" or values[index] != binding or index == binding_index:
+            continue
+        if (index and values[index - 1] in {".", "?.", "new"}) or values[index + 1 : index + 2] != [
+            "."
+        ]:
+            return content
+        if (
+            index + 3 >= len(tokens)
+            or values[index + 2] not in _MESSAGE_ARGUMENTS
+            or values[index + 3] != "("
+        ):
+            return content
+        opening = index + 3
+        closing = pairs.get(opening)
+        if closing is None:
+            return content
+        arguments: list[tuple[int, int]] = []
+        begin = cursor = opening + 1
+        while cursor < closing:
+            check_runtime()
+            if cursor in pairs:
+                cursor = pairs[cursor] + 1
+                continue
+            if values[cursor] == ",":
+                arguments.append((begin, cursor))
+                begin = cursor + 1
+            cursor += 1
+        if begin < closing:
+            arguments.append((begin, closing))
+        if len(arguments) != _MESSAGE_ARGUMENTS[values[index + 2]] or any(
+            start == end or values[start] == "..." for start, end in arguments
+        ):
+            continue
+        start, end = arguments[-1]
+        if end == start + 1 and tokens[start].kind == "template":
+            delimiters.extend((tokens[start].start, tokens[start].end - 1))
+    if not delimiters:
+        return content
+    output = list(content)
+    for position in delimiters:
+        output[position] = " "
+    check_runtime()
+    return "".join(output)
+
+
+def _nested_template_code(
+    content: str, check_runtime: Callable[[], None]
+) -> tuple[str, list[tuple[int, int, tuple[int, ...]]], set[int]] | None:
+    """Expose template expressions to the existing lexer, retaining exact offsets."""
+    if len(content) > _MAX_SOURCE_CHARS:
+        return None
+    output = list(content)
+    templates: list[tuple[int, int, tuple[int, ...]]] = []
+    expression_openers: set[int] = set()
+    next_check = 0
+
+    def check(position: int) -> None:
+        nonlocal next_check
+        if position >= next_check:
+            check_runtime()
+            next_check = position + 4096
+
+    def code(cursor: int, depth: int, *, interpolation: bool = False) -> int | None:
+        if depth >= _MAX_NESTING:
+            return None
+        braces = 0
+        while cursor < len(content):
+            check(cursor)
+            character = content[cursor]
+            if character in "'\"":
+                quote = character
+                cursor += 1
+                while cursor < len(content) and content[cursor] != quote:
+                    check(cursor)
+                    if content[cursor] in _LINE_ENDS:
+                        return None
+                    cursor += 2 if content[cursor] == "\\" else 1
+                if cursor >= len(content):
+                    return None
+            elif content.startswith("//", cursor):
+                while cursor < len(content) and content[cursor] not in _LINE_ENDS:
+                    check(cursor)
+                    cursor += 1
+                continue
+            elif content.startswith("/*", cursor):
+                cursor += 2
+                while cursor < len(content) and not content.startswith("*/", cursor):
+                    check(cursor)
+                    cursor += 1
+                if cursor == len(content):
+                    return None
+                cursor += 2
+                continue
+            elif character == "/":
+                # Regexp/division ambiguity cannot establish nested ownership.
+                return None
+            elif character == "`":
+                end = template(cursor, depth + 1)
+                if end is None:
+                    return None
+                cursor = end
+                continue
+            elif character == "{":
+                braces += 1
+                if braces + depth >= _MAX_NESTING:
+                    return None
+            elif character == "}":
+                if not braces and interpolation:
+                    return cursor
+                braces -= 1
+                if braces < 0:
+                    return None
+            cursor += 1
+        return None if interpolation or braces else cursor
+
+    def template(start: int, depth: int) -> int | None:
+        if depth >= _MAX_NESTING or len(templates) >= _MAX_TOKENS:
+            return None
+        delimiters = [start]
+        expression_openers.add(start)
+        output[start] = "("
+        cursor = start + 1
+        while cursor < len(content):
+            check(cursor)
+            if content[cursor] == "`":
+                output[cursor] = ")"
+                delimiters.append(cursor)
+                templates.append((start, cursor + 1, tuple(delimiters)))
+                return cursor + 1
+            if content.startswith("${", cursor):
+                end = code(cursor + 2, depth + 1, interpolation=True)
+                if end is None:
+                    return None
+                expression_openers.add(cursor)
+                output[cursor], output[cursor + 1], output[end] = "(", " ", ")"
+                delimiters.extend((cursor, cursor + 1, end))
+                cursor = end + 1
+                continue
+            if content[cursor] == "\\":
+                # Decoding an escape needs a separate source/value proof.
+                return None
+            if content[cursor] not in _LINE_ENDS:
+                output[cursor] = " "
+            cursor += 1
+        return None
+
+    if code(0, 0) is None:
+        return None
+    check_runtime()
+    return "".join(output), templates, expression_openers
+
+
+def browser_escaped_list_shell_text(content: str, check_runtime: Callable[[], None]) -> str:
+    """Own only JSON-backed list values passed through a local escaping formatter.
+
+    This proves explicit source consumers, not that a browser program is inert.
+    As with assertion messages, ordinary built-ins are assumed; arbitrary runtime
+    getters/monkeypatching are outside this proof. Explicit aliases, mutation,
+    shadowing, unknown consumers, and executable expressions never gain ownership.
+    Only backticks change. Raw findings and interpolation bytes remain untouched.
+    """
+    if "JSON.parse" not in content or "replaceAll" not in content or "innerHTML" not in content:
+        return content
+    nested = _nested_template_code(content, check_runtime)
+    if nested is None:
+        return content
+    code, templates, expression_openers = nested
+    parsed = _tokens(code, check_runtime)
+    if parsed is None:
+        return content
+    tokens, pairs = parsed
+    values = [code[token.start : token.end] for token in tokens]
+    positions = [token.start for token in tokens]
+    reverse = {end: start for start, end in pairs.items()}
+    template_spans = {
+        bisect_left(positions, start): (bisect_left(positions, end), delimiters)
+        for start, end, delimiters in templates
+    }
+    for start in template_spans:
+        if start and (
+            tokens[start - 1].kind == "identifier"
+            and values[start - 1] != "return"
+            or values[start - 1] in {")", "]"}
+        ):
+            # A tag receives a strings array before its interpolation values.
+            # Projecting it as an ordinary call would shift parameter sources.
+            return content
+    fields: dict[int, int] = {}
+    for start, (_, delimiters) in template_spans.items():
+        for position in delimiters[1:-1:3]:
+            fields[bisect_left(positions, position)] = start
+    budget = _MAX_TOKENS * 4
+
+    def step(amount: int = 1) -> bool:
+        nonlocal budget
+        previous = budget
+        budget -= amount
+        if budget // 256 != previous // 256:
+            check_runtime()
+        return budget > 0
+
+    def parts(start: int, end: int) -> list[tuple[int, int]]:
+        result = []
+        begin = cursor = start
+        while cursor < end and step():
+            if values[cursor] == ",":
+                result.append((begin, cursor))
+                begin = cursor + 1
+            cursor = pairs.get(cursor, cursor) + 1
+        if begin < end:
+            result.append((begin, end))
+        return result
+
+    def arguments(opening: int) -> list[tuple[int, int]]:
+        return parts(opening + 1, pairs[opening])
+
+    enclosing: list[int | None] = []
+    blocks: list[tuple[int, int]] = []
+    stack: list[int] = []
+    block_stack: list[int] = []
+    for index, value in enumerate(values):
+        if not step():
+            return content
+        while stack and pairs[stack[-1]] == index:
+            opening = stack.pop()
+            if values[opening] == "{":
+                block_stack.pop()
+        enclosing.append(stack[-1] if stack else None)
+        blocks.append(
+            (block_stack[-1], pairs[block_stack[-1]]) if block_stack else (0, len(tokens))
+        )
+        if index in pairs:
+            stack.append(index)
+            if value == "{":
+                block_stack.append(index)
+
+    functions: dict[str, tuple[int, int, int, list[str]]] = {}
+    constants: dict[str, list[tuple[int, int, int, int, int]]] = {}
+    arrows: dict[int, tuple[int, int, int, list[str]]] = {}
+    native_methods = {
+        "map",
+        "filter",
+        "find",
+        "some",
+        "flatMap",
+        "forEach",
+        "join",
+        "replaceAll",
+        "trim",
+        "toLowerCase",
+        "includes",
+        "getElementById",
+        "querySelectorAll",
+        "addEventListener",
+    }
+    protected = {"String", "JSON", "document", "Object"}
+    forbidden = {"constructor", "prototype", "__proto__", "globalThis", "window", "self", "with"}
+    for index, value in enumerate(values):
+        if not step():
+            return content
+        if value in forbidden:
+            return content
+        if value in protected:
+            expected = {"String": ["("], "JSON": ["."], "document": ["."], "Object": ["."]}[value]
+            if values[index + 1 : index + 1 + len(expected)] != expected or (
+                index and values[index - 1] in {"function", ".", "?.", "const", "let", "var"}
+            ):
+                return content
+        if value == "JSON" and values[index + 2 : index + 4] not in (
+            ["parse", "("],
+            ["stringify", "("],
+        ):
+            return content
+        if value == "document" and values[index + 2 : index + 4] != ["getElementById", "("]:
+            return content
+        if value == "Object" and values[index + 2 : index + 4] != ["entries", "("]:
+            return content
+        if value in native_methods and index and values[index - 1] in {".", "?."}:
+            if values[index + 1 : index + 2] != ["("]:
+                return content
+        if values[index + 1 : index + 2] == [":"] and (
+            value in native_methods
+            or tokens[index].kind == "string"
+            and value[1:-1] in native_methods
+        ):
+            return content
+        if value == "]" and values[index + 1 : index + 2] in ([":"], ["="]):
+            return content
+        if value == "function":
+            opening = index + 2
+            closing = pairs.get(opening)
+            body = -1 if closing is None else closing + 1
+            end = pairs.get(body)
+            if (
+                tokens[index].depth
+                or end is None
+                or values[body] != "{"
+                or tokens[index + 1].kind != "identifier"
+                or values[index + 1] in functions
+                or len(functions) >= _MAX_NESTING
+            ):
+                return content
+            params = arguments(opening)
+            names = []
+            for begin, stop in params:
+                if (
+                    tokens[begin].kind != "identifier"
+                    or values[begin] in protected
+                    or values[begin] in names
+                ):
+                    return content
+                if stop != begin + 1 and not (
+                    stop == begin + 3
+                    and values[begin + 1] == "="
+                    and tokens[begin + 2].kind == "string"
+                ):
+                    return content
+                names.append(values[begin])
+            functions[values[index + 1]] = index + 1, body, end, names
+        if value == "const":
+            if (
+                index + 2 >= len(tokens)
+                or tokens[index + 1].kind != "identifier"
+                or values[index + 2] != "="
+            ):
+                return content
+            stop = index + 3
+            while stop < len(tokens) and values[stop] != ";" and step():
+                stop = pairs.get(stop, stop) + 1
+            if stop == len(tokens):
+                return content
+            constants.setdefault(values[index + 1], []).append(
+                (index + 1, index + 3, stop, *blocks[index])
+            )
+        if value == "=>":
+            if index and values[index - 1] == ")":
+                opening = reverse[index - 1]
+                begin, stop = opening + 1, index - 1
+                call = enclosing[opening]
+            elif index and tokens[index - 1].kind == "identifier":
+                begin, stop = index - 1, index
+                call = enclosing[begin]
+            else:
+                return content
+            if begin < stop and values[begin] in {"{", "["} and pairs.get(begin) == stop - 1:
+                begin, stop = begin + 1, stop - 1
+            names = []
+            for lower, upper in parts(begin, stop):
+                if (
+                    upper != lower + 1
+                    or tokens[lower].kind != "identifier"
+                    or values[lower] in protected
+                    or values[lower] in names
+                ):
+                    return content
+                names.append(values[lower])
+            body = index + 1
+            end = pairs.get(body, body) + 1
+            if body not in pairs:
+                while end < len(tokens) and values[end] not in {",", ";", ")", "]", "}"} and step():
+                    end = pairs.get(end, end) + 1
+            if call is not None:
+                arrows[index] = call, body, end, names
+
+    arrows_by_call: dict[int, list[tuple[int, int, int, list[str]]]] = {}
+    arrows_by_body: dict[tuple[int, int], tuple[int, int, int, list[str]]] = {}
+    arrows_by_name: dict[str, list[tuple[int, int, int, list[str]]]] = {}
+    for row in arrows.values():
+        arrows_by_call.setdefault(row[0], []).append(row)
+        arrows_by_body[row[1:3]] = row
+        for name in row[3]:
+            arrows_by_name.setdefault(name, []).append(row)
+
+    def literal(index: int) -> str | None:
+        value = values[index]
+        return value[1:-1] if tokens[index].kind == "string" and "\\" not in value else None
+
+    # Verify the actual text escaping operation, with no aliases or extra body.
+    escapes: set[str] = set()
+    for name, (_, body, end, params) in functions.items():
+        if len(params) != 1:
+            continue
+        sequence = values[body + 1 : end]
+        prefix = ["return", "String", "(", params[0], "??"]
+        cursor = body + 1
+        if sequence[:5] != prefix or literal(cursor + 5) != "" or values[cursor + 6] != ")":
+            continue
+        cursor += 7
+        for before, after in [("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"), ('"', "&quot;")]:
+            if (
+                values[cursor : cursor + 3] != [".", "replaceAll", "("]
+                or literal(cursor + 3) != before
+                or values[cursor + 4 : cursor + 5] != [","]
+                or literal(cursor + 5) != after
+                or values[cursor + 6 : cursor + 7] != [")"]
+            ):
+                break
+            cursor += 7
+        else:
+            if values[cursor:end] == [";"]:
+                escapes.add(name)
+
+    def source(start: int, end: int) -> str:
+        return content[tokens[start].start : tokens[end - 1].end]
+
+    def template_fields(start: int) -> list[tuple[int, int]]:
+        delimiters = template_spans[start][1]
+        return [
+            (bisect_left(positions, p) + 1, pairs[bisect_left(positions, p)])
+            for p in delimiters[1:-1:3]
+        ]
+
+    def text_slot(template: int, field: int, *, inert: bool = False) -> bool:
+        """The selected HTML fragment occurs in ordinary literal markup text."""
+        marker = "SKILLSPECTOR_SELECTED_FRAGMENT"
+        if marker in content:
+            return False
+        _, delimiters = template_spans[template]
+        if not step(1 + (delimiters[-1] - delimiters[0]) // 32):
+            return False
+        chunks = []
+        cursor = delimiters[0] + 1
+        for dollar, _, close in zip(
+            delimiters[1:-1:3], delimiters[2:-1:3], delimiters[3:-1:3], strict=True
+        ):
+            chunks.append(content[cursor:dollar])
+            chunks.append(marker if bisect_left(positions, dollar) == field else "VALUE")
+            cursor = close + 1
+        chunks.append(content[cursor : delimiters[-1]])
+
+        class Slot(HTMLParser):
+            valid = True
+            found = False
+            context = ""
+
+            def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                if inert and (
+                    tag not in {"div", "span", "ul", "li", "p", "strong", "em", "b", "code"}
+                    or any(name not in {"class", "id", "title"} for name, _ in attrs)
+                ):
+                    self.valid = False
+                if tag in {"script", "style", "iframe", "object", "embed", "textarea", "title"}:
+                    self.context = tag
+                if any(value is not None and marker in value for _, value in attrs):
+                    self.valid = False
+
+            def handle_endtag(self, tag: str) -> None:
+                if tag == self.context:
+                    self.context = ""
+
+            def handle_data(self, data: str) -> None:
+                if marker in data:
+                    self.found = True
+                    self.valid = self.valid and not self.context
+
+        parser = Slot(convert_charrefs=False)
+        check_runtime()
+        parser.feed("".join(chunks))
+        parser.close()
+        check_runtime()
+        return parser.valid and parser.found
+
+    # The formatter has one escaped empty branch and one map/escape/join branch.
+    formatters: set[str] = set()
+    for name, (_, body, end, params) in functions.items():
+        if len(params) != 2:
+            continue
+        items, empty = params
+        for escape in escapes:
+            if not step(end - body + 1):
+                return content
+            compact = re.sub(r"\s+", "", source(body + 1, end))
+            head = f"if(!{items}||!{items}.length){{return"
+            if not compact.startswith(head):
+                continue
+            returns = [index for index in range(body + 1, end) if values[index] == "return"]
+            if len(returns) != 2:
+                continue
+            first, second = (index + 1 for index in returns)
+            if first not in template_spans or second not in template_spans:
+                continue
+            first_end, _ = template_spans[first]
+            second_end, _ = template_spans[second]
+            if values[first_end:second] != [";", "}", "return"] or values[second_end:end] != [";"]:
+                continue
+            a, b = template_fields(first), template_fields(second)
+            if len(a) != 1 or len(b) != 1:
+                continue
+            if values[a[0][0] : a[0][1]] != [escape, "(", empty, ")"] or not text_slot(
+                first, a[0][0] - 1, inert=True
+            ):
+                continue
+            begin, stop = b[0]
+            if values[begin : begin + 4] != [items, ".", "map", "("]:
+                continue
+            call = begin + 3
+            args = arguments(call)
+            if len(args) != 1:
+                continue
+            matching = arrows_by_call.get(call, [])
+            if len(matching) != 1:
+                continue
+            _, inner, inner_end, names = matching[0]
+            if (
+                len(names) != 1
+                or inner not in template_spans
+                or template_spans[inner][0] != inner_end
+            ):
+                continue
+            item = names[0]
+            field = template_fields(inner)
+            if len(field) != 1 or not text_slot(inner, field[0][0] - 1, inert=True):
+                continue
+            expression = values[field[0][0] : field[0][1]]
+            simple = [escape, "(", item, ")"]
+            fallback = [
+                escape,
+                "(",
+                "typeof",
+                item,
+                "===",
+                "'string'",
+                "?",
+                item,
+                ":",
+                "JSON",
+                ".",
+                "stringify",
+                "(",
+                item,
+                ")",
+                ")",
+            ]
+            if expression != simple and expression != fallback:
+                continue
+            close = pairs[call] + 1
+            if (
+                values[close : close + 3] != [".", "join", "("]
+                or literal(close + 3) != ""
+                or values[close + 4 : stop] != [")"]
+            ):
+                continue
+            if text_slot(second, begin - 1, inert=True):
+                formatters.add(name)
+    if not formatters:
+        return content
+
+    # A closed callable vocabulary rules out explicit escapes of JSON values
+    # into arbitrary code. Native method spelling alone never proves a selected
+    # receiver: ordinary() below separately traces that receiver back to JSON.
+    callbacks: set[int] = set()
+    function_parameter_openers = {declaration + 1 for declaration, _, _, _ in functions.values()}
+    defaults = {
+        a + 1
+        for opening in function_parameter_openers
+        for a, b in arguments(opening)
+        if b == a + 3 and values[a + 1] == "="
+    }
+    declaration_indices = {row[0] for rows in constants.values() for row in rows}
+    mutated: set[str] = set()
+    member_writes: list[int] = []
+    for index, value in enumerate(values):
+        if not step():
+            return content
+        if value == "=" and index - 1 not in declaration_indices and index not in defaults:
+            if index < 3 or values[index - 2] != ".":
+                return content
+            member_writes.append(index)
+            if tokens[index - 3].kind == "identifier":
+                mutated.add(values[index - 3])
+        if (
+            value.endswith("=") and value not in {"=", "==", "===", "!=", "!==", "<=", ">=", "=>"}
+        ) or value in {"++", "--", "delete", "new", "class", "import", "export", "let", "var"}:
+            return content
+        if value != "(" or tokens[index].start in expression_openers:
+            continue
+        closing = pairs[index]
+        if index in function_parameter_openers or values[closing + 1 : closing + 2] == ["=>"]:
+            continue
+        previous = values[index - 1] if index else ""
+        if previous == "if":
+            continue
+        if index and tokens[index - 1].kind == "identifier":
+            if index > 1 and values[index - 2] == ".":
+                receiver = values[index - 3] if index > 2 else ""
+                if not (
+                    previous in native_methods
+                    or receiver == "JSON"
+                    and previous in {"parse", "stringify"}
+                    or receiver == "Object"
+                    and previous == "entries"
+                ):
+                    return content
+                args = arguments(index)
+                if previous == "replaceAll" and (
+                    len(args) != 2 or any(b != a + 1 or literal(a) is None for a, b in args)
+                ):
+                    return content
+                if previous in {
+                    "map",
+                    "filter",
+                    "find",
+                    "some",
+                    "flatMap",
+                    "forEach",
+                    "addEventListener",
+                }:
+                    slot = 1 if previous == "addEventListener" else 0
+                    if len(args) <= slot:
+                        return content
+                    a, b = args[slot]
+                    if b == a + 1 and values[a] in functions:
+                        callbacks.add(a)
+                    elif index not in arrows_by_call:
+                        return content
+            elif previous not in functions and previous != "String":
+                return content
+        elif previous in {")", "]", "?."}:
+            return content
+    for index, value in enumerate(values):
+        if not step():
+            return content
+        if value in functions and index != functions[value][0]:
+            if index and values[index - 1] in {".", "?."}:
+                return content
+            if values[index + 1 : index + 2] != ["("] and index not in callbacks:
+                return content
+
+    selected_names = escapes | formatters
+    for index, value in enumerate(values):
+        if not step():
+            return content
+        if value in selected_names:
+            if index == functions[value][0]:
+                continue
+            if value in escapes and index in callbacks:
+                continue
+            if (
+                values[index + 1 : index + 2] != ["("]
+                or index
+                and values[index - 1] in {".", "?.", "function", "new"}
+            ):
+                return content
+        if (
+            tokens[index].kind == "string"
+            and literal(index) in selected_names | protected | native_methods
+            and index >= 2
+            and values[index - 1] == "["
+            and values[index + 1 : index + 2] == ["]"]
+            and (tokens[index - 2].kind == "identifier" or values[index - 2] in {")", "]", "}"})
+        ):
+            # Protect computed member references, not text arguments such as a
+            # DOM element whose ID happens to be "filter" or "map".
+            return content
+
+    def receiver_start(end: int, depth: int = 0) -> int | None:
+        if depth >= _MAX_NESTING or end <= 0 or not step():
+            return None
+        last = end - 1
+        if last in reverse:
+            opening = reverse[last]
+            if opening and (
+                tokens[opening - 1].kind == "identifier" or values[opening - 1] in {")", "]"}
+            ):
+                return receiver_start(opening, depth + 1)
+            return opening
+        if tokens[last].kind not in {"identifier", "string", "number"}:
+            return None
+        if last >= 2 and values[last - 1] in {".", "?."}:
+            return receiver_start(last - 1, depth + 1)
+        return last
+
+    # Resolve the nearest explicit binding, including callback/function
+    # parameters. A same-spelled outer DOM or JSON constant is not that value.
+    binding_rows: dict[_BrowserBinding, tuple[int, int, int, int]] = {}
+    bindings_by_name: dict[str, list[_BrowserBinding]] = {}
+    for name, rows in constants.items():
+        for declaration, a, b, lower, upper in rows:
+            key = ("const", declaration, name)
+            binding_rows[key] = a, b, lower, upper
+            bindings_by_name.setdefault(name, []).append(key)
+    for declaration, body, stop, params in functions.values():
+        for slot, parameter in enumerate(params):
+            key = ("function", declaration, parameter)
+            binding_rows[key] = slot, declaration, body + 1, stop
+            bindings_by_name.setdefault(parameter, []).append(key)
+    for call, body, stop, params in arrows.values():
+        for slot, parameter in enumerate(params):
+            key = ("arrow", body, parameter)
+            binding_rows[key] = slot, call, body, stop
+            bindings_by_name.setdefault(parameter, []).append(key)
+
+    def binding(name: str, index: int) -> _BrowserBinding | None:
+        owner = None
+        width = len(tokens) + 1
+        for key in bindings_by_name.get(name, []):
+            if not step():
+                return None
+            _, _, lower, upper = binding_rows[key]
+            if lower <= index < upper:
+                size = upper - lower
+                if size == width:
+                    return None
+                if size < width:
+                    owner, width = key, size
+        return owner
+
+    calls_by_function: dict[int, list[int]] = {}
+    for index, value in enumerate(values):
+        if not step():
+            return content
+        if value in functions and index != functions[value][0]:
+            declaration = functions[value][0]
+            if binding(value, index) is not None:
+                return content
+            calls_by_function.setdefault(declaration, []).append(index)
+
+    resolving: set[tuple[str, int, str]] = set()
+    dependencies: set[_BrowserBinding] = set()
+
+    def ordinary(start: int, end: int, env: frozenset[str] = frozenset(), depth: int = 0) -> bool:
+        if start >= end or depth >= 32 or not step():
+            return False
+        if start in template_spans and template_spans[start][0] == end:
+            return all(ordinary(a, b, env, depth + 1) for a, b in template_fields(start))
+        if values[start] == "(" and pairs.get(start) == end - 1:
+            return ordinary(start + 1, end - 1, env, depth + 1)
+        cursor = start
+        while cursor < end:
+            if not step():
+                return False
+            if values[cursor] in {"===", "!==", "==", "!=", "&&", "||", "??"}:
+                return ordinary(start, cursor, env, depth + 1) and ordinary(
+                    cursor + 1, end, env, depth + 1
+                )
+            cursor = pairs.get(cursor, cursor) + 1
+        if values[start] in {"!", "typeof"}:
+            return ordinary(start + 1, end, env, depth + 1)
+        cursor = start + 1
+        value = values[start]
+        if value in {"{", "["} and start in pairs:
+            closing = pairs[start]
+            if closing >= end:
+                return False
+            for a, b in parts(start + 1, closing):
+                if values[start] == "{" and a + 1 < b and values[a + 1] == ":":
+                    if tokens[a].kind != "identifier" or values[a] in forbidden | native_methods:
+                        return False
+                    a += 2
+                elif value == "[" and values[a] == "...":
+                    a += 1
+                if not ordinary(a, b, env, depth + 1):
+                    return False
+            cursor = closing + 1
+        elif value == "Object" and values[start + 1 : start + 4] == [".", "entries", "("]:
+            opening = start + 3
+            args = arguments(opening)
+            if len(args) != 1 or not ordinary(*args[0], env, depth + 1):
+                return False
+            cursor = pairs[opening] + 1
+        elif value == "JSON" and values[start + 1 : start + 4] == [".", "parse", "("]:
+            opening = start + 3
+            args = arguments(opening)
+            if len(args) != 1:
+                return False
+            a, b = args[0]
+            if (
+                values[a : a + 4] != ["document", ".", "getElementById", "("]
+                or literal(a + 4) is None
+                or values[a + 5 : b] != [")", ".", "textContent"]
+            ):
+                return False
+            cursor = pairs[opening] + 1
+        elif start + 1 < end and values[start + 1] == "(" and value in functions:
+            declaration, body, stop, params = functions[value]
+            opening = start + 1
+            args = arguments(opening)
+            key = "call", declaration, value
+            if (
+                key in resolving
+                or len(args) != len(params)
+                or values[body + 1 : body + 2] != ["return"]
+                or values[stop - 1 : stop] != [";"]
+            ):
+                return False
+            if not all(ordinary(a, b, env, depth + 1) for a, b in args):
+                return False
+            resolving.add(key)
+            valid = ordinary(body + 2, stop - 1, frozenset(params), depth + 1)
+            resolving.remove(key)
+            if not valid:
+                return False
+            cursor = pairs[opening] + 1
+        elif (
+            tokens[start].kind in {"string", "number"}
+            or value in {"true", "false", "null"}
+            or value in env
+        ):
+            pass
+        elif tokens[start].kind == "identifier":
+            if value in mutated:
+                return False
+            key = binding(value, start)
+            if key is None or key in resolving:
+                return False
+            dependencies.add(key)
+            a, b, _, _ = binding_rows[key]
+            resolving.add(key)
+            if key[0] == "const":
+                valid = ordinary(a, b, frozenset(), depth + 1)
+            elif key[0] == "arrow":
+                call = b
+                begin = receiver_start(call - 2)
+                valid = (
+                    begin is not None
+                    and values[call - 1] in {"map", "filter", "find", "some", "flatMap", "forEach"}
+                    and ordinary(begin, call - 2, frozenset(), depth + 1)
+                )
+            else:
+                # Every explicit invocation must provide an ordinary argument.
+                # A recursive unchanged forwarding edge adds no new source.
+                valid = True
+                sources = 0
+                for call in calls_by_function.get(key[1], []):
+                    if not step():
+                        valid = False
+                        break
+                    if call in callbacks:
+                        opening = enclosing[call]
+                        begin = None if opening is None else receiver_start(opening - 2)
+                        good = (
+                            a == 0
+                            and opening is not None
+                            and begin is not None
+                            and values[opening - 1]
+                            in {"map", "filter", "find", "some", "flatMap", "forEach"}
+                            and ordinary(begin, opening - 2, frozenset(), depth + 1)
+                        )
+                    else:
+                        args = arguments(call + 1)
+                        if a >= len(args):
+                            params = arguments(key[1] + 1)
+                            lower, upper = params[a]
+                            good = upper == lower + 3 and literal(lower + 2) is not None
+                        else:
+                            lower, upper = args[a]
+                            if upper == lower + 1 and binding(values[lower], lower) == key:
+                                continue
+                            good = ordinary(lower, upper, frozenset(), depth + 1)
+                    sources += 1
+                    if not good:
+                        valid = False
+                        break
+                valid = valid and sources > 0
+            resolving.remove(key)
+            if not valid:
+                return False
+        else:
+            return False
+        while cursor < end and step():
+            if (
+                values[cursor] == "["
+                and pairs.get(cursor) == cursor + 2
+                and tokens[cursor + 1].kind == "number"
+            ):
+                cursor += 3
+                continue
+            if values[cursor] not in {".", "?."} or cursor + 1 >= end:
+                return False
+            member = values[cursor + 1]
+            if tokens[cursor + 1].kind != "identifier" or member in forbidden:
+                return False
+            cursor += 2
+            if cursor < end and values[cursor] == "(":
+                if member not in {
+                    "map",
+                    "filter",
+                    "find",
+                    "some",
+                    "flatMap",
+                    "join",
+                    "trim",
+                    "toLowerCase",
+                }:
+                    return False
+                args = arguments(cursor)
+                if member in {"trim", "toLowerCase"}:
+                    if args:
+                        return False
+                elif member == "join":
+                    if len(args) > 1 or any(b != a + 1 or literal(a) is None for a, b in args):
+                        return False
+                else:
+                    matches = arrows_by_call.get(cursor, [])
+                    if len(args) != 1:
+                        return False
+                    a, b = args[0]
+                    if member in {"filter", "find", "some"} and b == a + 1 and a in callbacks:
+                        # These native operations retain existing members;
+                        # dependency closure separately audits the predicate.
+                        cursor = pairs[cursor] + 1
+                        continue
+                    if len(matches) != 1:
+                        return False
+                    _, body, stop, names = matches[0]
+                    if member in {"filter", "find", "some"}:
+                        # A simple predicate can select only existing JSON
+                        # members. Its values need not become part of output.
+                        if not step(stop - body + 1) or any(
+                            values[i] not in {".", "?.", "!", "===", "!==", "==", "!=", "&&", "||"}
+                            and tokens[i].kind not in {"identifier", "string", "number"}
+                            for i in range(body, stop)
+                        ):
+                            return False
+                    elif not ordinary(body, stop, env | frozenset(names), depth + 1):
+                        return False
+                cursor = pairs[cursor] + 1
+        return cursor == end
+
+    def display(start: int, end: int) -> bool:
+        escaped = False
+        for _ in range(_MAX_NESTING):
+            if not step():
+                return False
+            if values[end : end + 3] == [".", "join", "("]:
+                args = arguments(end + 2)
+                if len(args) != 1 or args[0][1] != args[0][0] + 1 or literal(args[0][0]) != "":
+                    return False
+                end = pairs[end + 2] + 1
+                continue
+            parent = enclosing[start]
+            if parent in fields and start == parent + 1 and pairs[parent] == end:
+                template = fields[parent]
+                if not text_slot(template, parent):
+                    return False
+                start, end = template, template_spans[template][0]
+                continue
+            arrow = arrows_by_body.get((start, end))
+            if arrow is not None:
+                call = arrow[0]
+                begin = receiver_start(call - 2)
+                if values[call - 1] != "map" or begin is None or not ordinary(begin, call - 2):
+                    return False
+                start, end = begin, pairs[call] + 1
+                continue
+            if parent is not None and parent and values[parent - 1] in formatters:
+                args = arguments(parent)
+                if (
+                    not args
+                    or args[0] != (start, end)
+                    or len(args) > 2
+                    or any(b != a + 1 or literal(a) is None for a, b in args[1:])
+                ):
+                    return False
+                escaped = True
+                start, end = parent - 1, pairs[parent] + 1
+                continue
+            if (
+                start >= 4
+                and values[start - 3 : start] == [".", "innerHTML", "="]
+                and values[end : end + 1] == [";"]
+            ):
+                return escaped and dom(start - 4, start - 3) == "element"
+            return False
+        return False
+
+    def dom(start: int, end: int, depth: int = 0) -> str | None:
+        if depth >= 32 or start >= end or not step():
+            return None
+        cursor = start + 1
+        kind = None
+        if values[start : start + 4] == ["document", ".", "getElementById", "("]:
+            if literal(start + 4) is None or values[start + 5 : start + 6] != [")"]:
+                return None
+            cursor, kind = start + 6, "element"
+        elif tokens[start].kind == "identifier":
+            key = binding(values[start], start)
+            if key is None:
+                return None
+            dependencies.add(key)
+            a, b, _, _ = binding_rows[key]
+            if key[0] == "const":
+                kind = dom(a, b, depth + 1)
+            elif key[0] == "arrow" and a == 0 and values[b - 1] == "forEach":
+                begin = receiver_start(b - 2)
+                if begin is not None and dom(begin, b - 2, depth + 1) == "list":
+                    kind = "element"
+        if kind is None:
+            return None
+        if cursor < end and values[cursor : cursor + 3] == [".", "querySelectorAll", "("]:
+            args = arguments(cursor + 2)
+            if (
+                kind != "element"
+                or len(args) != 1
+                or args[0][1] != args[0][0] + 1
+                or literal(args[0][0]) is None
+            ):
+                return None
+            cursor, kind = pairs[cursor + 2] + 1, "list"
+        return kind if cursor == end else None
+
+    member_values: list[tuple[_BrowserBinding, int, int]] = []
+    for index in member_writes:
+        begin = receiver_start(index - 2)
+        if begin is None:
+            return content
+        if (
+            values[index - 1] in {"innerHTML", "textContent", "value"}
+            and dom(begin, index - 2) == "element"
+        ):
+            continue
+        if begin != index - 3:
+            return content
+        owner = binding(values[begin], begin)
+        if owner is None or owner[0] != "const":
+            return content
+        a, b, _, _ = binding_rows[owner]
+        if values[a] != "{" or pairs.get(a) != b - 1:
+            return content
+        stop = index + 1
+        while stop < len(tokens) and values[stop] != ";" and step():
+            stop = pairs.get(stop, stop) + 1
+        if stop == len(tokens) or budget <= 0:
+            return content
+        member_values.append((owner, index + 1, stop))
+
+    for index in callbacks:
+        if values[index] not in escapes:
+            continue
+        call = enclosing[index]
+        if call is None:
+            return content
+        begin = receiver_start(call - 2)
+        if begin is None or values[call - 1] != "map" or not ordinary(begin, call - 2):
+            return content
+    output = list(content)
+    changed = False
+    for start, (end, delimiters) in template_spans.items():
+        if not step():
+            return content
+        expressions = template_fields(start)
+        if not expressions or any(
+            _TEMPLATE_VALUE.fullmatch(source(a, b)) is None for a, b in expressions
+        ):
+            continue
+        if not display(start, end) or not all(ordinary(a, b) for a, b in expressions):
+            continue
+        output[delimiters[0]] = output[delimiters[-1]] = " "
+        changed = True
+
+    # Follow explicit aliases and helper returns that carry a proven value.
+    # Unknown native-looking receivers must not acquire it through a callback.
+    def dependency(index: int) -> bool:
+        if (
+            tokens[index].kind != "identifier"
+            or index
+            and values[index - 1] in {".", "?."}
+            or values[index + 1 : index + 2] == [":"]
+        ):
+            return False
+        if values[index] == "document":
+            # A second literal lookup can reacquire the selected element even
+            # without referring to its local constant binding.
+            return True
+        key = binding(values[index], index)
+        if key is None and values[index] in functions:
+            key = ("call", functions[values[index]][0], values[index])
+        return key in dependencies
+
+    def carries(start: int, end: int) -> bool:
+        return step(end - start + 1) and any(dependency(i) for i in range(start, end))
+
+    for _ in range(_MAX_NESTING):
+        before = len(dependencies)
+        for name, rows in constants.items():
+            for declaration, a, b, _, _ in rows:
+                if carries(a, b):
+                    dependencies.add(("const", declaration, name))
+        for owner, a, b in member_values:
+            if carries(a, b):
+                dependencies.add(owner)
+        for name, (declaration, a, b, params) in functions.items():
+            if carries(a, b):
+                dependencies.add(("call", declaration, name))
+            for call in calls_by_function.get(declaration, []):
+                if not step():
+                    return content
+                if call in callbacks:
+                    opening = enclosing[call]
+                    begin = None if opening is None else receiver_start(opening - 2)
+                    if begin is not None and carries(begin, opening - 2):
+                        dependencies.update(
+                            ("function", declaration, parameter) for parameter in params
+                        )
+                else:
+                    for parameter, (lower, upper) in zip(params, arguments(call + 1), strict=False):
+                        if carries(lower, upper):
+                            dependencies.add(("function", declaration, parameter))
+        for call, body, _, params in arrows.values():
+            begin = receiver_start(call - 2) if call >= 3 and values[call - 2] == "." else None
+            if begin is not None and carries(begin, call - 2):
+                dependencies.update(("arrow", body, parameter) for parameter in params)
+        if budget <= 0:
+            return content
+        if len(dependencies) == before:
+            break
+    else:
+        return content
+    for opening in pairs:
+        if values[opening] != "(" or opening < 3 or values[opening - 2] != ".":
+            continue
+        member = values[opening - 1]
+        if member not in native_methods:
+            continue
+        closing = pairs[opening]
+        if not step(closing - opening + 1):
+            return content
+        if not any(dependency(i) for i in range(opening + 1, closing)):
+            continue
+        begin = receiver_start(opening - 2)
+        if begin is None or not (
+            ordinary(begin, opening - 2) or dom(begin, opening - 2) is not None
+        ):
+            return content
+    check_runtime()
+    return "".join(output) if changed and budget > 0 else content
+
+
+JavaScriptTemplateSpans = tuple[tuple[int, ...], tuple[int, ...]]
+
+
+def browser_markup_witness(
+    source: str, position: int, check_runtime: Callable[[], None]
+) -> tuple[int, int] | None:
+    """Find a dynamic markup sink when the diagnosed field is plain DOM text."""
+    program = parse_javascript_source(source, check_runtime)
+    if program is None:
+        return None
+    text_write = markup = None
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return None
+        if node.type in {"identifier", "property_identifier"}:
+            name = program.text(node)
+            if name in {
+                "eval",
+                "Function",
+                "Reflect",
+                "defineProperty",
+                "setPrototypeOf",
+                "prototype",
+                "__proto__",
+                "globalThis",
+            }:
+                return None
+            if name == "document" and (
+                node.parent is None
+                or node.parent.type != "member_expression"
+                or node.parent.child_by_field_name("object") != node
+            ):
+                return None
+            if name == "createElement":
+                member = node.parent
+                if (
+                    member is None
+                    or member.parent is None
+                    or member.parent.type != "call_expression"
+                    or member.parent.child_by_field_name("function") != member
+                ):
+                    return None
+        if node.type != "assignment_expression":
+            continue
+        target = node.child_by_field_name("left")
+        value = node.child_by_field_name("right")
+        if (
+            target is None
+            or target.type != "member_expression"
+            or value is None
+            or value.type != "template_string"
+        ):
+            continue
+        fields = [part for part in value.named_children if part.type == "template_substitution"]
+        property_name = _callable_member(program, target)
+        if property_name == "innerHTML" and fields and markup is None:
+            markup = program.span(node)
+        if property_name == "textContent" and any(
+            program.span(part)[0] == position for part in fields
+        ):
+            # A command within the interpolation remains independently relevant.
+            field = next(part for part in fields if program.span(part)[0] == position)
+            pending = list(field.named_children)
+            while pending:
+                check_runtime()
+                expression = pending.pop()
+                if expression.type not in {
+                    "identifier",
+                    "member_expression",
+                    "property_identifier",
+                    "number",
+                }:
+                    return None
+                pending.extend(expression.named_children)
+            text_write = target
+    if markup is None or text_write is None:
+        return None
+    receiver = text_write.child_by_field_name("object")
+    if receiver is None or receiver.type != "identifier":
+        return None
+    scope = text_write.parent
+    while scope is not None and scope.type not in {"statement_block", "program"}:
+        check_runtime()
+        scope = scope.parent
+    if scope is None:
+        return None
+    for statement in scope.named_children:
+        check_runtime()
+        if statement.end_byte > text_write.start_byte:
+            break
+        if statement.type != "lexical_declaration" or statement.children[0].type != "const":
+            continue
+        for binding in statement.named_children:
+            bound, value = binding.child_by_field_name("name"), binding.child_by_field_name("value")
+            if (
+                bound is None
+                or bound.type != "identifier"
+                or program.text(bound) != program.text(receiver)
+                or value is None
+                or value.type != "call_expression"
+            ):
+                continue
+            method = value.child_by_field_name("function")
+            args = value.child_by_field_name("arguments")
+            if (
+                method is not None
+                and method.type == "member_expression"
+                and (doc := method.child_by_field_name("object")) is not None
+                and doc.type == "identifier"
+                and program.text(doc) == "document"
+                and _callable_member(program, method) == "createElement"
+                and args is not None
+                and len(args.named_children) == 1
+                and (tag := args.named_children[0]).type == "string"
+                and program.text(tag)[1:-1]
+                in {"div", "label", "li", "option", "p", "pre", "span", "td"}
+            ):
+                return markup
+    return None
+
+
+def _markup_parameter(
+    program: JavaScriptProgram,
+    template: Node,
+    parameters: set[str],
+    check_runtime: Callable[[], None],
+) -> Node | None:
+    """Identify parameters occupying whole attribute values in a template."""
+    marker = "__skillspector_dynamic_attribute_"
+    if template.end_byte - template.start_byte > 8192:
+        return None
+    chunks: list[str] = []
+    fields: dict[str, Node] = {}
+    for part in template.named_children:
+        check_runtime()
+        if part.type == "string_fragment":
+            chunk = program.text(part)
+            if marker in chunk:
+                return None
+        elif part.type == "template_substitution":
+            chunk = f"{marker}{len(chunks)}__"
+            field = part.named_children
+            if (
+                len(field) == 1
+                and field[0].type == "identifier"
+                and program.text(field[0]) in parameters
+            ):
+                fields[chunk] = part
+        else:
+            return None
+        chunks.append(chunk)
+    if not fields or not chunks or not chunks[0].lstrip().startswith("<"):
+        return None
+    found: list[Node] = []
+
+    class Attributes(HTMLParser):
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            check_runtime()
+            if marker in tag or any(marker in key for key, _ in attrs):
+                return
+            for _, value in attrs:
+                if value is not None and value in fields:
+                    found.append(fields[value])
+
+    parser = Attributes()
+    try:
+        parser.feed("".join(chunks))
+        parser.close()
+    except (ValueError, AssertionError):
+        return None
+    return next(iter(found), None)
+
+
+def _exported_markup_field(
+    program: JavaScriptProgram, templates: list[Node], check_runtime: Callable[[], None]
+) -> tuple[int, int] | None:
+    """Return the source field written verbatim to an exported HTML/SVG attribute."""
+    budget = _MAX_TOKENS * 4
+    # Keep more direct execution evidence independent of markup somewhere
+    # else in the same program.
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "import_statement":
+            imported = node.child_by_field_name("source")
+            if imported is None or _is_shell_execution_module(program.text(imported)):
+                return None
+        if node.type in {"call_expression", "new_expression"}:
+            callee = node.child_by_field_name("function") or node.child_by_field_name("constructor")
+            if callee is not None and (
+                callee.type == "import"
+                or callee.type == "identifier"
+                and program.text(callee).casefold() in _SHELL_EXECUTION_CALLS
+                or (_callable_member(program, callee) or "").casefold() in _SHELL_EXECUTION_CALLS
+            ):
+                return None
+    for template in templates:
+        check_runtime()
+        ret = template.parent
+        if ret is None or ret.type != "return_statement" or (body := ret.parent) is None:
+            continue
+        function = body.parent
+        if (
+            function is None
+            or function.type != "function_declaration"
+            or function.parent is None
+            or function.parent.type != "export_statement"
+            or (parameters := function.child_by_field_name("parameters")) is None
+        ):
+            continue
+        budget -= template.descendant_count + parameters.descendant_count
+        if budget < 0:
+            return None
+        names = _pattern_binding_names(program, parameters, check_runtime)
+        selected = _markup_parameter(program, template, names, check_runtime)
+        if selected is None:
+            continue
+        name = program.text(selected.named_children[0])
+        pending = [body]
+        while pending:
+            check_runtime()
+            budget -= 1
+            if budget < 0:
+                return None
+            node = pending.pop()
+            if node.type in {
+                "assignment_expression",
+                "augmented_assignment_expression",
+                "update_expression",
+                "variable_declarator",
+            }:
+                target = (
+                    node.child_by_field_name("left")
+                    or node.child_by_field_name("argument")
+                    or node.child_by_field_name("name")
+                )
+                if target is not None and name in _pattern_binding_names(
+                    program, target, check_runtime
+                ):
+                    break
+            pending.extend(node.named_children)
+        else:
+            return program.span(selected)
+    return None
+
+
+def _local_or_regex_call(
+    program: JavaScriptProgram, witness: Node, check_runtime: Callable[[], None]
+) -> bool:
+    if (
+        witness.type != "call_expression"
+        or (callee := witness.child_by_field_name("function")) is None
+    ):
+        return False
+    if callee.type == "member_expression":
+        obj = callee.child_by_field_name("object")
+        return (
+            obj is not None and obj.type == "regex" and _callable_member(program, callee) == "exec"
+        )
+    if callee.type != "identifier":
+        return False
+    scope = witness.parent
+    budget = _MAX_TOKENS
+    while scope is not None:
+        check_runtime()
+        if scope.type in {"statement_block", "program"}:
+            for stmt in scope.named_children:
+                check_runtime()
+                budget -= 1
+                if budget < 0:
+                    return False
+                if stmt.type != "lexical_declaration" or stmt.children[0].type != "const":
+                    continue
+                for binding in stmt.named_children:
+                    name, value = (
+                        binding.child_by_field_name("name"),
+                        binding.child_by_field_name("value"),
+                    )
+                    if (
+                        name is not None
+                        and value is not None
+                        and value.type == "arrow_function"
+                        and program.text(name) == program.text(callee)
+                    ):
+                        return True
+        scope = scope.parent
+    return False
+
+
+def _runtime_argument_call(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> Node | None:
+    """Find a call through a function argument or a directly constructed command."""
+    parameters: dict[int, set[str]] = {}
+    rebindings: dict[str, list[Node]] = {}
+    for part in program.nodes:
+        check_runtime()
+        target = None
+        if part.type in {"variable_declarator", "class_declaration", "function_declaration"}:
+            target = part.child_by_field_name("name")
+        elif part.type in {
+            "assignment_expression",
+            "augmented_assignment_expression",
+            "for_in_statement",
+        }:
+            target = part.child_by_field_name("left")
+        elif part.type == "update_expression":
+            target = part.child_by_field_name("argument")
+        elif part.type == "catch_clause":
+            target = part.child_by_field_name("parameter")
+        if target is not None:
+            for name in _pattern_binding_names(program, target, check_runtime):
+                rebindings.setdefault(name, []).append(part)
+    external = _external_option_callback(program, check_runtime) or _forwarded_stage_call(
+        program, check_runtime
+    )
+    implicit: dict[int, Node] = {}
+    proven = (
+        _promise_settlers(program, check_runtime)
+        | _private_callable_uses(program, check_runtime, implicit)[0]
+    )
+    first_parameter = None
+    budget = _MAX_TOKENS * 4
+    for node in program.nodes:
+        check_runtime()
+        if node.type != "call_expression":
+            continue
+        callee = node.child_by_field_name("function")
+        args = node.child_by_field_name("arguments")
+        if (
+            callee is None
+            or callee.type != "identifier"
+            or args is None
+            or args.type != "arguments"
+        ):
+            continue
+        name = program.text(callee)
+        if name.casefold() in _SHELL_EXECUTION_CALLS and any(
+            arg.type == "template_string"
+            and any(part.type == "template_substitution" for part in arg.named_children)
+            for arg in args.named_children
+        ):
+            return node
+        if first_parameter is not None or callee.id in proven:
+            continue
+        scope = node.parent
+        while scope is not None:
+            check_runtime()
+            budget -= 1
+            if budget < 0:
+                return first_parameter
+            if scope.type in {
+                "function_declaration",
+                "arrow_function",
+                "function_expression",
+                "method_definition",
+            }:
+                if scope.id not in parameters:
+                    formals = scope.child_by_field_name("parameters") or scope.child_by_field_name(
+                        "parameter"
+                    )
+                    parameters[scope.id] = (
+                        _pattern_binding_names(program, formals, check_runtime)
+                        if formals is not None
+                        else set()
+                    )
+                if name in parameters[scope.id]:
+                    # Prefer user-selected callbacks over settlers of a syntactic
+                    # Promise executor. The module-wide execution check still
+                    # retains unknown or shadowed constructors.
+                    parent = scope.parent
+                    if parent.type == "arguments" and parent.parent.type == "new_expression":
+                        constructor = parent.parent.child_by_field_name("constructor")
+                        if (
+                            constructor is not None
+                            and program.text(constructor) == "Promise"
+                            and "Promise" not in rebindings
+                        ):
+                            break
+                    rebound = rebindings.get(name, ())
+                    budget -= len(rebound)
+                    if budget < 0:
+                        return first_parameter
+                    if not any(
+                        scope.start_byte < binding.start_byte < scope.end_byte
+                        for binding in rebound
+                    ):
+                        first_parameter = node
+                    break
+            scope = scope.parent
+    return external or first_parameter or next(iter(implicit.values()), None)
+
+
+def _code_evaluation_witness(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> Node | None:
+    """Prefer a direct evaluator to a less specific module-level witness."""
+    witnessed: dict[str, Node] = {}
+    uncertain: set[str] = set()
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return None
+        if node.type not in {"identifier", "shorthand_property_identifier_pattern"}:
+            continue
+        name = program.text(node)
+        if name not in {"Function", "eval"}:
+            continue
+        call = node.parent
+        if (
+            call is None
+            or call.type not in {"call_expression", "new_expression"}
+            or (call.child_by_field_name("function") or call.child_by_field_name("constructor"))
+            != node
+        ):
+            uncertain.add(name)
+            continue
+        arguments = call.child_by_field_name("arguments")
+        if arguments is not None and any(
+            arg.type not in {"string", "number", "comment"} for arg in arguments.named_children
+        ):
+            witnessed.setdefault(name, call)
+    return next((call for name, call in witnessed.items() if name not in uncertain), None)
+
+
+def javascript_template_spans(
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    dialect: str = "javascript",
+    unresolved_executables: list[int] | None = None,
+    parse_failures: list[ParseFailure] | None = None,
+    regex_literals: list[tuple[int, int]] | None = None,
+    generated_markup: list[tuple[int, int]] | None = None,
+) -> JavaScriptTemplateSpans | None:
+    """Prove host delimiters while retaining unresolved executable templates.
+
+    Modern syntax is parsed unchanged. Dynamic values in a file with a shell
+    execution surface stay unresolved: a CST is not a dataflow proof. Static
+    command templates retain the ordinary bounded shell inspection instead of
+    gaining a delimiter exemption. Raw finding checks always keep the source.
+    """
+    if "`" not in content:
+        return None
+    program = parse_javascript_source(
+        content, check_runtime, dialect=dialect, failures=parse_failures
+    )
+    if program is None:
+        if unresolved_executables is not None:
+            unresolved_executables.append(content.index("`"))
+        return None
+    execution_node = None
+    checked_execution = False
+    if regex_literals is not None and any(node.type == "regex" for node in program.nodes):
+        # A lexical boundary cannot replace unresolved behavior. Apply the
+        # existing execution barrier even when the source has no templates.
+        execution_node = _has_shell_execution_call(program, check_runtime)
+        checked_execution = True
+        if execution_node is None:
+            regex_literals.extend(_plain_regex_value_spans(program, check_runtime))
+    templates = [node for node in program.nodes if node.type == "template_string"]
+    if not templates:
+        return None
+    projected = (
+        assertion_template_shell_text(content, check_runtime)
+        if dialect == "javascript"
+        else content
+    )
+    if not checked_execution:
+        execution_node = _has_shell_execution_call(program, check_runtime)
+    if execution_node is not None:
+        for node in templates:
+            check_runtime()
+            start, end = program.span(node)
+            if projected[start] != content[start] and projected[end - 1] != content[end - 1]:
+                # Existing Node assertion proof owns this diagnostic argument,
+                # even when an unrelated literal shell command shares the file.
+                continue
+            if unresolved_executables is not None and (
+                any(child.type == "template_substitution" for child in node.named_children)
+                or "$" in program.text(node)
+                or (
+                    node.parent is not None
+                    and node.parent.type == "call_expression"
+                    and node.parent.child_by_field_name("arguments") == node
+                )
+            ):
+                # The witness is the unresolved callable, which may precede or
+                # follow an ordinary template elsewhere in the same module.
+                witness = _code_evaluation_witness(program, check_runtime)
+                if (
+                    witness is None
+                    and generated_markup is not None
+                    and execution_node.type == "call_expression"
+                ):
+                    native_field = _module_wrapper_markup(
+                        program, execution_node, check_runtime
+                    ) or _written_script_field(program, execution_node, check_runtime)
+                    if native_field is not None:
+                        generated_markup.append(program.span(native_field))
+                if witness is None and execution_node.type == "import_statement":
+                    witness = _forwarded_stage_call(program, check_runtime)
+                if witness is None and execution_node.type == "new_expression":
+                    witness = _external_option_callback(program, check_runtime)
+                # A diagnostic string still evaluates its substitutions. Prefer a
+                # concrete callback over a same-spelled data member elsewhere.
+                args = node.parent
+                call = None if args is None else args.parent
+                thrown = (
+                    args is not None
+                    and args.type == "arguments"
+                    and call is not None
+                    and call.type == "new_expression"
+                    and call.parent is not None
+                    and call.parent.type == "throw_statement"
+                )
+                if witness is None and (
+                    thrown or _local_or_regex_call(program, execution_node, check_runtime)
+                ):
+                    witness = _runtime_argument_call(program, check_runtime)
+                if (
+                    witness is None
+                    and generated_markup is not None
+                    and execution_node.type == "identifier"
+                ):
+                    owner = execution_node.parent
+                    if (
+                        owner is not None
+                        and owner.type == "member_expression"
+                        and owner.child_by_field_name("object") == execution_node
+                        and _callable_member(program, owner) in {"length", "map", "slice", "push"}
+                    ):
+                        markup = _exported_markup_field(program, templates, check_runtime)
+                        if markup is not None:
+                            generated_markup.append(markup)
+                unresolved_executables.append(program.span(witness or execution_node)[0])
+                break
+        return None
+    if _has_unproven_assertion_template_call(content, projected, program, templates, check_runtime):
+        return None
+    starts: list[int] = []
+    ends: list[int] = []
+    for node in templates:
+        check_runtime()
+        start, end = program.span(node)
+        if (
+            not (0 <= start < end <= len(content))
+            or content[start] != "`"
+            or content[end - 1] != "`"
+        ):
+            return None
+        # Nested templates share their outer literal's proven delimiter range.
+        if starts and start < ends[-1]:
+            if end <= ends[-1]:
+                continue
+            return None
+        starts.append(start)
+        ends.append(end)
+    return tuple(starts), tuple(ends)
+
+
+def _plain_regex_value_spans(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> list[tuple[int, int]]:
+    """Bound lexical regex candidates after the execution barrier.
+
+    Only direct String values and immutable top-level String bindings supply
+    native matching receivers. Explicit overrides retain the shell fallback.
+    """
+    matching = {"match", "matchAll", "search", "split", "replace", "replaceAll"}
+    references: dict[str, list[Node]] = {}
+    candidates: dict[str, tuple[Node, Node]] = {}
+    overrides = {
+        "String",
+        "RegExp",
+        "Reflect",
+        "prototype",
+        "constructor",
+        "__proto__",
+        "defineProperty",
+        "defineProperties",
+        "getPrototypeOf",
+        "setPrototypeOf",
+        "__defineGetter__",
+        "__defineSetter__",
+    }
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return []
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            references.setdefault(program.text(node), []).append(node)
+        if node.type == "variable_declarator":
+            binding = node.child_by_field_name("name")
+            value = node.child_by_field_name("value")
+            declaration = node.parent
+            if (
+                binding is not None
+                and binding.type == "identifier"
+                and value is not None
+                and value.type == "string"
+                and declaration is not None
+                and declaration.type == "lexical_declaration"
+                and declaration.children[0].type == "const"
+                and declaration.parent == program.root_node
+            ):
+                candidates[program.text(binding)] = (binding, node)
+        if node.type in {"identifier", "property_identifier", "string"} and (
+            program.text(node).strip("\"'") in overrides
+        ):
+            return []
+        if node.type in {"method_definition", "pair"}:
+            name = node.child_by_field_name("name") or node.child_by_field_name("key")
+            if name is not None and (
+                name.type == "computed_property_name" or program.text(name).strip("\"'") in matching
+            ):
+                return []
+        if node.type in {"assignment_expression", "augmented_assignment_expression"}:
+            target = node.child_by_field_name("left")
+            if target is not None and (
+                target.type == "subscript_expression"
+                or target.type == "member_expression"
+                and _callable_member(program, target) in matching
+            ):
+                return []
+    for node in program.nodes:
+        check_runtime()
+        property_node = node.child_by_field_name("property") or node.child_by_field_name("index")
+        if node.type in {"member_expression", "subscript_expression"} and (
+            _callable_member(program, node) == "source"
+            or property_node is not None
+            and "\\" in program.text(property_node)
+            or node.type == "subscript_expression"
+            and (property_node is None or property_node.type not in {"string", "number"})
+        ):
+            # Source extraction needs a separate use proof before a pattern
+            # can stop lending boundaries to executable text.
+            return []
+    string_references: set[int] = set()
+    budget = _MAX_TOKENS * 4
+    for name, (binding, declaration) in candidates.items():
+        owned = {binding.id}
+        for reference in references[name]:
+            budget -= 1
+            if budget < 0:
+                return []
+            check_runtime()
+            if reference == binding:
+                continue
+            member = reference.parent
+            call = None if member is None else member.parent
+            if not (
+                reference.type == "identifier"
+                and reference.start_byte >= declaration.end_byte
+                and member is not None
+                and member.type == "member_expression"
+                and member.child_by_field_name("object") == reference
+                and _callable_member(program, member) in matching
+                and call is not None
+                and call.type == "call_expression"
+                and call.child_by_field_name("function") == member
+            ):
+                break
+            owned.add(reference.id)
+        else:
+            string_references.update(owned)
+    spans: list[tuple[int, int]] = []
+    for node in program.nodes:
+        check_runtime()
+        if node.type != "regex":
+            continue
+        pattern = node.child_by_field_name("pattern")
+        flags = node.child_by_field_name("flags")
+        flag_text = program.text(flags) if flags is not None else ""
+        if (
+            pattern is None
+            or len(set(flag_text)) != len(flag_text)
+            or set(flag_text) - set("dgimsuvy")
+            or {"u", "v"} <= set(flag_text)
+        ):
+            continue
+        start, end = program.span(node)
+        pattern_end = program.span(pattern)[1]
+        if (
+            program.content[start : start + 1] != "/"
+            or program.content[pattern_end : pattern_end + 1] != "/"
+        ):
+            continue
+        arguments = node.parent
+        call = None if arguments is None else arguments.parent
+        member = None if call is None else call.child_by_field_name("function")
+        receiver = None if member is None else member.child_by_field_name("object")
+        previous = node.prev_named_sibling
+        while previous is not None and previous.type == "comment":
+            check_runtime()
+            previous = previous.prev_named_sibling
+        if (
+            arguments is not None
+            and arguments.type == "arguments"
+            and previous is None
+            and call is not None
+            and call.type == "call_expression"
+            and member is not None
+            and member.type == "member_expression"
+            and _callable_member(program, member) in matching
+            and receiver is not None
+            and (receiver.type == "string" or receiver.id in string_references)
+        ):
+            spans.append((start, end))
+    return spans
+
+
+def _scalar_template_identifiers(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> set[int]:
+    """Own exact references to unique immutable scalars used only in templates."""
+    candidates: dict[str, tuple[Node, int]] = {}
+    references: dict[str, list[Node]] = {}
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return set()
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            name = program.text(node)
+            if name.casefold() in _SHELL_EXECUTION_CALLS:
+                references.setdefault(name, []).append(node)
+        if node.type != "variable_declarator":
+            continue
+        declaration = node.parent
+        binding = node.child_by_field_name("name")
+        value = node.child_by_field_name("value")
+        if (
+            declaration is not None
+            and declaration.type == "lexical_declaration"
+            and declaration.children[0].type == "const"
+            and declaration.parent == program.root_node
+            and binding is not None
+            and binding.type == "identifier"
+            and value is not None
+            and value.type in {"number", "string", "true", "false", "null"}
+        ):
+            name = program.text(binding)
+            # CST parsing does not establish strict-mode intrinsic binding rules.
+            if name.casefold() in _SHELL_EXECUTION_CALLS - {"eval", "function"}:
+                candidates[name] = (binding, node.end_byte)
+    owned: set[int] = set()
+    for name, (binding, declaration_end) in candidates.items():
+        identifiers: set[int] = set()
+        for node in references[name]:
+            check_runtime()
+            if node.id != binding.id and not (
+                node.type == "identifier"
+                and node.start_byte > declaration_end
+                and node.parent is not None
+                and node.parent.type == "template_substitution"
+                and node.parent.named_children == [node]
+            ):
+                break
+            identifiers.add(node.id)
+        else:
+            owned.update(identifiers)
+    return owned
+
+
+def _array_accumulator_identifiers(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> set[int]:
+    """A lexical binding assigned only array literals or null is not callable."""
+    candidates: list[tuple[Node, Node, bool]] = []
+    references: dict[str, list[Node]] = {}
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return set()
+        if node.type not in {
+            "identifier",
+            "shorthand_property_identifier_pattern",
+            "shorthand_property_identifier",
+        }:
+            continue
+        name = program.text(node)
+        if name in {"eval", "Function"}:
+            return set()
+        if name.casefold() not in _SHELL_EXECUTION_CALLS:
+            continue
+        references.setdefault(name, []).append(node)
+        decl = node.parent
+        if (
+            decl is None
+            or decl.type != "variable_declarator"
+            or decl.child_by_field_name("name") != node
+        ):
+            continue
+        value, lexical = decl.child_by_field_name("value"), decl.parent
+        if (
+            value is not None
+            and value.type in {"null", "array"}
+            and lexical is not None
+            and lexical.type == "lexical_declaration"
+            and lexical.parent is not None
+            and lexical.parent.type == "statement_block"
+        ):
+            candidates.append((node, lexical.parent, value.type == "array"))
+
+    owned: set[int] = set()
+    budget = _MAX_TOKENS * 4
+    for binding, scope, saw_array in candidates:
+        ids = {binding.id}
+        for ref in references[program.text(binding)]:
+            budget -= 1
+            check_runtime()
+            if budget < 0:
+                return set()
+            if ref == binding or not (scope.start_byte <= ref.start_byte < scope.end_byte):
+                continue
+            use = ref.parent
+            if ref.start_byte < binding.end_byte or use is None:
+                break
+            if use.type == "assignment_expression" and use.child_by_field_name("left") == ref:
+                value = use.child_by_field_name("right")
+                if value is None or value.type not in {"null", "array"}:
+                    break
+                saw_array |= value.type == "array"
+            elif use.type == "member_expression" and use.child_by_field_name("object") == ref:
+                call = use.parent
+                if (
+                    _callable_member(program, use) != "push"
+                    or call is None
+                    or call.type != "call_expression"
+                    or call.child_by_field_name("function") != use
+                ):
+                    break
+            elif use.type == "arguments":
+                call = use.parent
+                callee = call.child_by_field_name("function") if call is not None else None
+                if (
+                    callee is None
+                    or callee.type != "member_expression"
+                    or _callable_member(program, callee) != "push"
+                ):
+                    break
+            elif use.type in {"parenthesized_expression", "unary_expression"}:
+                if use.type == "unary_expression" and (
+                    (operator := use.child_by_field_name("operator")) is None
+                    or program.text(operator) != "!"
+                ):
+                    break
+                condition = use if use.type == "parenthesized_expression" else use.parent
+                clause = None if condition is None else condition.parent
+                if (
+                    clause is None
+                    or clause.type != "if_statement"
+                    or clause.child_by_field_name("condition") != condition
+                ):
+                    break
+            else:
+                break
+            ids.add(ref.id)
+        else:
+            if saw_array:
+                owned.update(ids)
+    return owned
+
+
+def _data_parameter_identifiers(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> set[int]:
+    """A parameter used exclusively for field reads is never itself invoked."""
+    references: dict[str, list[Node]] = {}
+    candidates: list[tuple[Node, Node]] = []
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return set()
+        if node.type not in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            continue
+        name = program.text(node)
+        if name.casefold() not in _SHELL_EXECUTION_CALLS - {"eval", "function"}:
+            continue
+        references.setdefault(name, []).append(node)
+        parent = node.parent
+        if parent is None:
+            continue
+        in_parameters = parent.type == "formal_parameters"
+        if in_parameters:
+            parent = parent.parent
+        if (
+            parent is not None
+            and parent.type
+            in {
+                "function_declaration",
+                "function_expression",
+                "arrow_function",
+                "method_definition",
+            }
+            and (in_parameters or parent.child_by_field_name("parameter") == node)
+        ):
+            candidates.append((node, parent))
+
+    owned: set[int] = set()
+    budget = _MAX_TOKENS * 4
+    for binding, function in candidates:
+        identifiers = {binding.id}
+        for reference in references[program.text(binding)]:
+            budget -= 1
+            if budget < 0:
+                return set()
+            check_runtime()
+            if reference == binding or not (
+                function.start_byte <= reference.start_byte < function.end_byte
+            ):
+                continue
+            member = reference.parent
+            if (
+                member is None
+                or member.type != "member_expression"
+                or member.child_by_field_name("object") != reference
+            ):
+                break
+            field = _callable_member(program, member)
+            consumer = member.parent
+            if (
+                not field
+                or field.casefold() in _SHELL_EXECUTION_CALLS
+                or field in {"call", "apply", "bind", "constructor", "prototype", "__proto__"}
+            ):
+                break
+            if consumer is None or (
+                consumer.type in {"call_expression", "new_expression"}
+                and member
+                in (
+                    consumer.child_by_field_name("function"),
+                    consumer.child_by_field_name("constructor"),
+                )
+            ):
+                break
+            identifiers.add(reference.id)
+        else:
+            owned.update(identifiers)
+    return owned
+
+
+def _promise_settlers(program: JavaScriptProgram, check_runtime: Callable[[], None]) -> set[int]:
+    """Identify direct calls to unchanged, lexically bound native Promise settlers."""
+    if "Promise" not in program.content:
+        return set()
+    references: dict[str, list[Node]] = {}
+    executors: list[Node] = []
+    for node in program.nodes:
+        check_runtime()
+        if node.type in {"with_statement", "this"}:
+            return set()
+        if node.type not in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+            "property_identifier",
+            "string",
+        }:
+            continue
+        spelling = program.text(node).strip("\"'")
+        if spelling in {
+            "globalThis",
+            "global",
+            "window",
+            "self",
+            "Reflect",
+            "eval",
+            "Function",
+            "defineProperty",
+            "defineProperties",
+            "setPrototypeOf",
+        } or (node.type != "string" and "\\" in spelling):
+            return set()
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            references.setdefault(spelling, []).append(node)
+        if spelling != "Promise":
+            continue
+        new = node.parent
+        if (
+            node.type != "identifier"
+            or new is None
+            or new.type != "new_expression"
+            or new.child_by_field_name("constructor") != node
+        ):
+            return set()
+        arguments = new.child_by_field_name("arguments")
+        args = (
+            []
+            if arguments is None
+            else [arg for arg in arguments.named_children if arg.type != "comment"]
+        )
+        if len(args) == 1 and args[0].type in {"arrow_function", "function_expression"}:
+            executors.append(args[0])
+
+    owned: set[int] = set()
+    budget = _MAX_TOKENS * 4
+    for executor in executors:
+        parameters = executor.child_by_field_name("parameters")
+        single = executor.child_by_field_name("parameter")
+        bindings = (
+            [single]
+            if single is not None
+            else ([] if parameters is None else parameters.named_children)
+        )
+        if len(bindings) > 2 or any(binding.type != "identifier" for binding in bindings):
+            continue
+        if len({program.text(binding) for binding in bindings}) != len(bindings):
+            continue
+        for binding in bindings:
+            calls: set[int] = set()
+            for ref in references[program.text(binding)]:
+                check_runtime()
+                budget -= 1
+                if budget < 0:
+                    return set()
+                if ref == binding or not (
+                    executor.start_byte <= ref.start_byte < executor.end_byte
+                ):
+                    continue
+                call = ref.parent
+                if (
+                    call is None
+                    or call.type != "call_expression"
+                    or call.child_by_field_name("function") != ref
+                    or (args_node := call.child_by_field_name("arguments")) is None
+                    or args_node.type != "arguments"
+                ):
+                    break
+                calls.add(ref.id)
+            else:
+                owned.update(calls)
+    return owned
+
+
+def _numeric_local_identifiers(
+    program: JavaScriptProgram, check_runtime: Callable[[], None], implicit: dict[int, Node]
+) -> set[int]:
+    """Resolve exact references to immutable local arithmetic helpers.
+
+    Other scopes can reuse the name. Shadowing, reassignment, escaping helpers
+    and bodies with calls/member reads cannot establish this narrower proof.
+    """
+    references: dict[str, list[Node]] = {}
+    candidates: list[tuple[Node, Node, Node]] = []
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "with_statement":
+            return set()
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            references.setdefault(program.text(node), []).append(node)
+        if node.type != "variable_declarator":
+            continue
+        declaration = node.parent
+        binding = node.child_by_field_name("name")
+        function = node.child_by_field_name("value")
+        if (
+            declaration is None
+            or declaration.type != "lexical_declaration"
+            or declaration.children[0].type != "const"
+            or declaration.parent is None
+            or declaration.parent.type not in {"program", "statement_block"}
+            or binding is None
+            or binding.type != "identifier"
+            or program.text(binding).casefold() in {"eval", "function"}
+            or function is None
+            or function.type != "arrow_function"
+        ):
+            continue
+        parameters = function.child_by_field_name("parameters")
+        single = function.child_by_field_name("parameter")
+        params = [] if parameters is None else parameters.named_children
+        if single is not None:
+            params = [single]
+        if any(parameter.type != "identifier" for parameter in params):
+            continue
+        names = {program.text(parameter) for parameter in params}
+        if len(names) != len(params):
+            continue
+        body = function.child_by_field_name("body")
+        if body is None:
+            continue
+        pending = [body]
+        while pending:
+            check_runtime()
+            expression = pending.pop()
+            if expression.type == "identifier":
+                if program.text(expression) not in names:
+                    break
+            elif expression.type in {"unary_expression", "binary_expression"}:
+                operator = expression.child_by_field_name("operator")
+                if operator is None or program.text(operator) not in {
+                    "+",
+                    "-",
+                    "*",
+                    "/",
+                    "%",
+                    "**",
+                    "~",
+                    "&",
+                    "|",
+                    "^",
+                    "<<",
+                    ">>",
+                    ">>>",
+                }:
+                    break
+            elif expression.type not in {"number", "parenthesized_expression"}:
+                break
+            pending.extend(expression.named_children)
+        else:
+            candidates.append((binding, node, declaration.parent))
+    owned: set[int] = set()
+    budget = _MAX_TOKENS * 4
+
+    plain_map = _ordinary_array_map(program, check_runtime)
+
+    def spend(count: int) -> bool:
+        nonlocal budget
+        check_runtime()
+        budget -= count
+        return budget >= 0
+
+    for binding, declaration, scope in candidates:
+        identifiers = {binding.id}
+        calls: list[Node] = []
+        for reference in references[program.text(binding)]:
+            budget -= 1
+            if budget < 0:
+                return set()
+            check_runtime()
+            if reference == binding or not (
+                scope.start_byte <= reference.start_byte < scope.end_byte
+            ):
+                continue
+            call = reference.parent
+            if (
+                reference.start_byte < declaration.end_byte
+                or call is None
+                or call.type != "call_expression"
+                or call.child_by_field_name("function") != reference
+                or (arguments := call.child_by_field_name("arguments")) is None
+                or arguments.type == "template_string"
+            ):
+                break
+            identifiers.add(reference.id)
+            calls.append(reference)
+        else:
+            arrow = declaration.child_by_field_name("value")
+            owned.add(binding.id)
+            if arrow is None or not calls:
+                continue
+            result_used = any(
+                (direct := ref.parent) is None
+                or (use := direct.parent) is None
+                or use.type != "expression_statement"
+                for ref in calls
+            )
+            barrier = _private_arrow_barrier(
+                program,
+                arrow,
+                calls,
+                references,
+                spend,
+                result_used=result_used,
+                plain_map=plain_map,
+            )
+            if barrier is not None:
+                implicit.update((ref.id, barrier) for ref in calls)
+            owned.update(identifiers)
+    return owned
+
+
+def _implicit_template_callback(
+    program: JavaScriptProgram, unknown: set[str], check_runtime: Callable[[], None]
+) -> Node | None:
+    """A property read or string conversion can invoke a registered callback."""
+    receivers: dict[tuple[int, str], bool] = {}
+    for node in program.nodes:
+        check_runtime()
+        if node.type == "variable_declarator":
+            name = node.child_by_field_name("name")
+            value = node.child_by_field_name("value")
+            declaration = node.parent
+            if (
+                name is None
+                or name.type != "identifier"
+                or value is None
+                or declaration is None
+                or declaration.type != "lexical_declaration"
+                or declaration.children[0].type != "const"
+                or declaration.parent is None
+            ):
+                continue
+            proxy = value.type == "new_expression"
+            if proxy:
+                constructor = value.child_by_field_name("constructor")
+                args = value.child_by_field_name("arguments")
+                if (
+                    constructor is None
+                    or program.text(constructor) != "Proxy"
+                    or args is None
+                    or len(args.named_children) != 2
+                ):
+                    continue
+                value = args.named_children[1]
+            if value.type != "object":
+                continue
+            hooks: dict[str, Node | None] = {}
+            for field in value.named_children:
+                check_runtime()
+                key = field.child_by_field_name("key") or field.child_by_field_name("name")
+                if key is None:
+                    continue
+                if key.type == "computed_property_name" and key.named_child_count == 1:
+                    member = key.named_children[0]
+                    obj = member.child_by_field_name("object")
+                    if (
+                        obj is None
+                        or program.text(obj) != "Symbol"
+                        or _callable_member(program, member) != "toPrimitive"
+                    ):
+                        continue
+                    hook = "Symbol.toPrimitive"
+                else:
+                    hook = program.text(key).strip("\"'")
+                    if hook not in {"get", "toString", "valueOf"}:
+                        continue
+                hooks[hook] = field.child_by_field_name("value")
+            if proxy:
+                callback = hooks.get("get")
+            elif "Symbol.toPrimitive" in hooks:
+                callback = hooks["Symbol.toPrimitive"]
+            else:
+                callback = hooks.get("toString")
+                # The native inherited toString already returns a primitive.
+                # valueOf is reached here only when toString is non-callable.
+                if callback is not None and callback.type in {
+                    "null",
+                    "number",
+                    "string",
+                    "false",
+                    "true",
+                }:
+                    callback = hooks.get("valueOf")
+            if (
+                callback is not None
+                and callback.type == "identifier"
+                and program.text(callback) in unknown
+            ):
+                receivers[(declaration.parent.id, program.text(name))] = proxy
+        elif receivers and node.type == "template_substitution" and node.named_child_count == 1:
+            expression = node.named_children[0]
+            root = expression
+            while root.type in {"member_expression", "subscript_expression"}:
+                check_runtime()
+                receiver = root.child_by_field_name("object")
+                if receiver is None:
+                    break
+                root = receiver
+            if root.type != "identifier":
+                continue
+            scope = node.parent
+            while scope is not None and scope.type not in {"program", "statement_block"}:
+                check_runtime()
+                scope = scope.parent
+            if scope is not None:
+                receiver_is_proxy = receivers.get((scope.id, program.text(root)))
+                if receiver_is_proxy is True or (receiver_is_proxy is False and expression == root):
+                    return expression
+    return None
+
+
+def _has_shell_execution_call(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> Node | None:
+    scalar_identifiers = _scalar_template_identifiers(program, check_runtime)
+    implicit: dict[int, Node] = {}
+    numeric_inputs: dict[int, Node] = {}
+    ordinary_identifiers = _numeric_local_identifiers(program, check_runtime, numeric_inputs)
+    private_calls, namespace_aliases = _private_callable_uses(program, check_runtime, implicit)
+    ordinary_identifiers.update(private_calls)
+    ordinary_identifiers.update(_promise_settlers(program, check_runtime))
+    native_members, native_calls, native_paths = _ordinary_native_calls(program, check_runtime)
+    owned_identifiers = scalar_identifiers | ordinary_identifiers | native_members
+    owned_identifiers.update(_data_parameter_identifiers(program, check_runtime))
+    owned_identifiers.update(_array_accumulator_identifiers(program, check_runtime))
+    uncertain_bindings: set[str] = set()
+    global_objects = {"globalThis", "global", "window", "self"}
+    imported_callables: set[str] = set(namespace_aliases)
+    template_values: set[str] = set()
+    aliases: dict[str, set[str]] = {}
+    for node in program.nodes:
+        check_runtime()
+        target = None
+        value = None
+        if node.type == "variable_declarator":
+            target = node.child_by_field_name("name")
+            value = node.child_by_field_name("value")
+        elif node.type in {"assignment_expression", "augmented_assignment_expression"}:
+            target = node.child_by_field_name("left")
+            value = node.child_by_field_name("right")
+        elif node.type == "formal_parameters":
+            target = node
+        elif node.type == "arrow_function":
+            target = node.child_by_field_name("parameter")
+        elif node.type == "import_statement":
+            source = node.child_by_field_name("source")
+            if source is not None and program.text(source).strip("\"'") in _ASSERT_MODULE_ALIASES:
+                # The existing assertion projection separately proves message
+                # positions and refuses aliases or mutations of the binding.
+                continue
+            pending = list(node.named_children)
+            while pending:
+                check_runtime()
+                imported = pending.pop()
+                if imported.type == "identifier":
+                    imported_callables.add(program.text(imported))
+                pending.extend(imported.named_children)
+        if target is not None and target.type == "identifier" and value is not None:
+            name = program.text(target)
+            if node.type == "augmented_assignment_expression":
+                uncertain_bindings.add(name)
+            if value.type == "template_string":
+                template_values.add(name)
+            for origin in _callable_values(program, value, check_runtime):
+                if origin.type in {"identifier", "shorthand_property_identifier"}:
+                    aliases.setdefault(program.text(origin), set()).add(name)
+                elif origin.type in {"member_expression", "subscript_expression"}:
+                    # Extracting call/apply/bind retains the receiver's
+                    # provenance. Other member values remain unknown callables.
+                    if _callable_member(program, origin) not in {"call", "apply", "bind"}:
+                        uncertain_bindings.add(name)
+                elif origin.type not in {
+                    "identifier",
+                    "arrow_function",
+                    "function_expression",
+                    "generator_function",
+                    "number",
+                    "string",
+                    "template_string",
+                    "array",
+                    "object",
+                    "true",
+                    "false",
+                    "null",
+                }:
+                    uncertain_bindings.add(name)
+            continue
+        if target is not None:
+            if target.type in {
+                "formal_parameters",
+                "object_pattern",
+                "array_pattern",
+                "assignment_pattern",
+                "object_assignment_pattern",
+                "rest_pattern",
+                "pair_pattern",
+            }:
+                # Parameter and destructuring patterns bind only their
+                # binding positions. Identifiers in default-value
+                # expressions are references, not bindings: recording them
+                # would mark later ordinary calls to the same name as calls
+                # through an unknown callable.
+                uncertain_bindings.update(_pattern_binding_names(program, target, check_runtime))
+            else:
+                # Unknown callable origins include computed global members,
+                # injected parameters, aliases and reassigned local bindings.
+                pending = [target]
+                while pending:
+                    check_runtime()
+                    binding = pending.pop()
+                    if binding.type in {"identifier", "shorthand_property_identifier_pattern"}:
+                        uncertain_bindings.add(program.text(binding))
+                    pending.extend(binding.named_children)
+    for names in (
+        global_objects,
+        imported_callables,
+        template_values,
+        uncertain_bindings,
+    ):
+        pending_names = list(names)
+        while pending_names:
+            check_runtime()
+            for alias in aliases.get(pending_names.pop(), ()):
+                if alias not in names:
+                    names.add(alias)
+                    pending_names.append(alias)
+    for node in program.nodes:
+        check_runtime()
+        if node.type in {"identifier", "shorthand_property_identifier"} or (
+            node.type == "property_identifier"
+            and node.parent is not None
+            and node.parent.type == "member_expression"
+        ):
+            spelling = program.text(node)
+            parent = node.parent
+            if (
+                parent is not None
+                and parent.type == "for_in_statement"
+                and parent.child_by_field_name("left") == node
+                and any(child.type in {"let", "const"} for child in parent.children)
+            ):
+                # The loop declares this name. Its uses and the iterable are
+                # separate nodes, including any later invocation or escape.
+                continue
+            # Escaped names and extracted callable aliases are not resolved here.
+            if (
+                "\\" in spelling
+                or spelling == "Reflect"
+                or (
+                    spelling.casefold() in _SHELL_EXECUTION_CALLS
+                    and node.id not in owned_identifiers
+                )
+            ):
+                return node
+        if node.type == "subscript_expression":
+            owner = node.child_by_field_name("object")
+            while owner is not None and owner.type in {"member_expression", "subscript_expression"}:
+                check_runtime()
+                owner = owner.child_by_field_name("object")
+            if _callable_member(program, node) in {"eval", "Function", "Reflect"} or (
+                owner is not None and program.text(owner) in global_objects
+            ):
+                # A computed global can supply eval/Function through an alias,
+                # including an object or array later destructured elsewhere.
+                return node
+        if node.type == "import_statement":
+            source = node.child_by_field_name("source")
+            if source is None or (
+                node.id not in native_members and _is_shell_execution_module(program.text(source))
+            ):
+                if source is not None and program.text(source)[1:-1] in {
+                    "child_process",
+                    "node:child_process",
+                }:
+                    dispatch = _dynamic_process_call(program, node, check_runtime)
+                    if dispatch is not None:
+                        return dispatch
+                return node
+        if node.type not in {"call_expression", "new_expression"}:
+            continue
+        callee = node.child_by_field_name("function") or node.child_by_field_name("constructor")
+        arguments = node.child_by_field_name("arguments")
+        if callee is None or arguments is None or arguments.type == "template_string":
+            return node
+        selected_names: set[str] = set()
+        callable_ids = {origin.id for origin in _callable_values(program, callee, check_runtime)}
+        for origin in _callable_values(program, callee, check_runtime, all_receivers=True):
+            if origin.type == "identifier":
+                name = program.text(origin)
+                selected_names.add(name)
+                if (
+                    origin.id in callable_ids
+                    and name in uncertain_bindings
+                    and origin.id not in ordinary_identifiers
+                ):
+                    return node
+            elif origin.type in {"call_expression", "new_expression"}:
+                # Unknown call results, including bound functions, cannot
+                # borrow the ordinary direct-call ownership heuristic.
+                if origin.id in callable_ids:
+                    return node
+            elif origin.type in {"member_expression", "subscript_expression"}:
+                member = _callable_member(program, origin)
+                if (
+                    member is not None
+                    and member.casefold() in _SHELL_EXECUTION_CALLS
+                    and origin.id not in native_members
+                ):
+                    return node
+                if member == "construct":
+                    return node
+                if (
+                    origin.id in callable_ids
+                    and origin.type == "subscript_expression"
+                    and member not in {"call", "apply", "bind"}
+                ):
+                    index = origin.child_by_field_name("index")
+                    if index is None or index.type not in {"number", "null", "true", "false"}:
+                        return node
+        if selected_names & imported_callables and node.id not in native_calls:
+            # An unresolved imported function may execute its argument. Keep
+            # direct template arguments and simple local aliases unowned;
+            # this does not claim interprocedural argument-flow analysis.
+            pending = [arg for arg in arguments.named_children if arg.id not in native_paths]
+            while pending:
+                check_runtime()
+                argument = pending.pop()
+                if argument.type == "template_string" or (
+                    argument.type == "identifier" and program.text(argument) in template_values
+                ):
+                    return node
+                pending.extend(argument.named_children)
+        if selected_names & {"require", "import"} or callee.type == "import":
+            args = arguments.named_children
+            if (
+                len(args) != 1
+                or args[0].type != "string"
+                or _is_shell_execution_module(program.text(args[0]))
+            ):
+                return node
+    if any(hook in program.content for hook in ("Proxy", "toString", "valueOf", "toPrimitive")):
+        hook = _implicit_template_callback(
+            program, uncertain_bindings | imported_callables, check_runtime
+        )
+        if hook is not None:
+            return hook
+    # A local arithmetic function has a known target. Prefer a separately
+    # witnessed runtime consumer before an unproved conversion in its operands.
+    return next(iter(implicit.values()), None) or next(iter(numeric_inputs.values()), None)
+
+
+def _callable_values(
+    program: JavaScriptProgram,
+    value: Node,
+    check_runtime: Callable[[], None],
+    *,
+    all_receivers: bool = False,
+) -> Iterator[Node]:
+    """Walk selected values and function-helper receivers without executing code."""
+    pending = [value]
+    while pending:
+        check_runtime()
+        node = pending.pop()
+        if node.type in {"parenthesized_expression", "await_expression"}:
+            pending.extend(node.named_children)
+        elif node.type in {
+            "as_expression",
+            "satisfies_expression",
+            "non_null_expression",
+            "instantiation_expression",
+        }:
+            # A TypeScript type annotation leaves the runtime callee unchanged.
+            pending.extend(node.named_children[:1])
+        elif node.type == "type_assertion":
+            pending.extend(node.named_children[-1:])
+        elif (
+            node.type == "binary_expression"
+            and (operator := node.child_by_field_name("operator")) is not None
+            and program.text(operator) in {"&&", "||", "??"}
+        ):
+            pending.extend(node.named_children)
+        elif node.type == "ternary_expression":
+            for field in ("consequence", "alternative"):
+                child = node.child_by_field_name(field)
+                if child is not None:
+                    pending.append(child)
+        elif node.type in {"assignment_expression", "assignment_pattern"}:
+            child = node.child_by_field_name("right")
+            if child is not None:
+                pending.append(child)
+        elif node.type == "sequence_expression":
+            children = [child for child in node.named_children if child.type != "comment"]
+            if children:
+                pending.append(children[-1])
+        elif node.type != "comment":
+            yield node
+            if node.type in {"member_expression", "subscript_expression"} and (
+                all_receivers or _callable_member(program, node) in {"call", "apply", "bind"}
+            ):
+                owner = node.child_by_field_name("object")
+                if owner is not None:
+                    pending.append(owner)
+
+
+def _has_unproven_assertion_template_call(
+    content: str,
+    projected: str,
+    program: JavaScriptProgram,
+    templates: list[Node],
+    check_runtime: Callable[[], None],
+) -> bool:
+    if "node:assert" in content and projected == content:
+        return True
+    unprojected_templates = sorted(
+        (start, end)
+        for start, end in (program.span(node) for node in templates)
+        if projected[start] == content[start] or projected[end - 1] == content[end - 1]
+    )
+    template_starts = [start for start, _end in unprojected_templates]
+    for node in program.nodes:
+        check_runtime()
+        if node.type != "call_expression":
+            continue
+        callee = node.child_by_field_name("function")
+        arguments = node.child_by_field_name("arguments")
+        if callee is None or arguments is None or not _is_assertion_like_callee(program, callee):
+            continue
+        for argument in arguments.named_children:
+            argument_start, argument_end = program.span(argument)
+            index = bisect_left(template_starts, argument_start)
+            if (
+                index < len(unprojected_templates)
+                and template_starts[index] < argument_end
+                and unprojected_templates[index][1] <= argument_end
+            ):
+                return True
+    return False
+
+
+def _is_assertion_like_callee(program: JavaScriptProgram, callee: Node) -> bool:
+    if callee.type == "identifier":
+        return program.text(callee).casefold() in {"assert", "check"}
+    if callee.type not in {"member_expression", "subscript_expression"}:
+        return False
+    member = callee.child_by_field_name("property") or callee.child_by_field_name("index")
+    return member is not None and program.text(member).strip("\"'") in _MESSAGE_ARGUMENTS

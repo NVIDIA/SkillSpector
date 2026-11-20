@@ -24,11 +24,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-
-from langchain_core.language_models.chat_models import BaseChatModel
+from typing import TYPE_CHECKING
 
 from skillspector.providers import registry
-from skillspector.providers.chat_models import create_openai_compatible_chat_model
+
+if TYPE_CHECKING:
+    from langchain_core.language_models.chat_models import BaseChatModel
 
 BUILD_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
@@ -38,13 +39,21 @@ REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 class NvBuildProvider:
     """build.nvidia.com credentials + bundled-YAML metadata provider."""
 
-    # GLM-5.2 is retired on the hosted endpoint (HTTP 410).
+    # GLM-5.2 and GLM-5.3 are retired on the hosted endpoint (HTTP 410);
+    # z-ai/glm-5.3-flash is the only GLM id it still serves.
     # Choose defaults for detection, not latency alone: a faster replacement
-    # previously missed the credential-disclosure control. GLM-5.3 detected
-    # SSD-3 on that control; the prompt-injection control remains unverified
-    # because its hosted requests timed out. Recheck both before replacing it.
-    DEFAULT_MODEL = "z-ai/glm-5.3"
+    # previously missed the credential-disclosure control. GLM-5.3 (now
+    # retired) detected SSD-3 on that control; the prompt-injection control
+    # remains unverified because its hosted requests timed out. The flash
+    # variant has not been rechecked against either control.
+    DEFAULT_MODEL = "z-ai/glm-5.3-flash"
     SLOT_DEFAULTS: dict[str, str] = {}
+
+    def prepare_chat_model_imports(self) -> None:
+        """Prepare the OpenAI transport without resolving or creating a client."""
+        from skillspector.providers.chat_models import prepare_openai_chat_model_imports
+
+        prepare_openai_chat_model_imports()
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
         """Return ``(api_key, base_url)`` from ``NVIDIA_INFERENCE_KEY``."""
@@ -61,14 +70,16 @@ class NvBuildProvider:
         timeout: float | None = 120,
     ) -> BaseChatModel | None:
         """Create ``ChatOpenAI`` for the build.nvidia.com endpoint."""
+        from skillspector.providers.chat_models import create_openai_compatible_chat_model
+
         return create_openai_compatible_chat_model(
             model=model,
             credentials=self.resolve_credentials(),
             max_tokens=max_tokens,
             timeout=timeout,
-            # GLM-5.3 otherwise defaults to maximum reasoning effort.
+            # GLM-5.3 models otherwise default to maximum reasoning effort.
             # https://build.nvidia.com/z-ai/glm-5-3/modelcard
-            default_reasoning_effort="high" if model == "z-ai/glm-5.3" else None,
+            default_reasoning_effort="high" if model == "z-ai/glm-5.3-flash" else None,
         )
 
     def get_context_length(self, model: str) -> int | None:
