@@ -953,7 +953,15 @@ class TestReportNode:
 
         rendered = MarkdownIt().render(body) if output_format == "markdown" else body
         assert "archive_member_limit" in rendered
-        assert "outer.zip!/nested.zip" in body
+        if output_format == "sarif":
+            notification = json.loads(body)["runs"][0]["invocations"][0][
+                "toolExecutionNotifications"
+            ][0]
+            location = notification["locations"][0]["physicalLocation"]["artifactLocation"]
+            # `!` is an RFC 3986 sub-delim and this codebase's archive-member separator.
+            assert location["uri"] == "outer.zip!/nested.zip"
+        else:
+            assert "outer.zip!/nested.zip" in body
 
     def test_report_default_output_format_is_sarif(self) -> None:
         """When output_format is missing, report uses sarif."""
@@ -2421,6 +2429,61 @@ def test_report_sarif_bounds_completeness_notifications(
     assert projected["ledgerExceptionCount"] == 4
     assert projected["notificationRecordLimit"] == 2
     assert projected["notificationsTruncated"] is True
+
+
+def test_report_sarif_encodes_exception_notification_paths() -> None:
+    exceptions = [
+        {
+            "outcome": "failed",
+            "phase": "nested_artifact_inspection",
+            "reason_code": "archive_malformed",
+            "message": "Malformed archive.",
+            "path": "broken#old.zip",
+            "fatal": True,
+        },
+        {
+            "outcome": "skipped",
+            "phase": "nested_artifact_inspection",
+            "reason_code": "archive_unsupported",
+            "message": "Unsupported archive.",
+            "path": "nested\\broken old#archive.zip",
+            "fatal": False,
+        },
+    ]
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "sarif",
+        "analysis_completeness": {  # type: ignore[typeddict-item]
+            "total_components": 2,
+            "coverage_percent": 0.0,
+            "is_complete": False,
+            "status": "partial",
+            "fully_inspected_files": 0,
+            "partially_inspected_files": 0,
+            "entirely_uninspected_files": 2,
+            "ledger_exceptions": exceptions,
+            "scope_exclusions": [],
+            "limitations": [],
+        },
+    }
+
+    invocation = report(state)["sarif_report"]["runs"][0]["invocations"][0]
+    notifications = invocation["toolExecutionNotifications"]
+    notification_uris = [
+        item["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        for item in notifications
+        if item.get("locations")
+    ]
+
+    # Unscoped paths keep literal backslashes (a valid POSIX filename character);
+    # only a path scoped beneath a source identity normalizes separators.
+    assert notification_uris == [
+        "broken%23old.zip",
+        "nested%5Cbroken%20old%23archive.zip",
+    ]
 
 
 # ---------------------------------------------------------------------------
