@@ -333,6 +333,56 @@ def test_sarif_occurrence_uri_preserves_literal_filename() -> None:
     assert artifact["uri"] == "nested/a%23b.py"
 
 
+@pytest.mark.parametrize("suppressed", [False, True])
+def test_sarif_unscoped_uri_keeps_absolute_path_root(suppressed: bool) -> None:
+    """An unscoped absolute artifact keeps its root slash; only scoped paths are relative."""
+    finding = _make_finding(file="/tmp/a b.py")
+    assert finding.source_identity is None
+    sarif = (
+        _build_sarif([], [SuppressedFinding(finding=finding, reason="reviewed")])
+        if suppressed
+        else _build_sarif([finding])
+    )
+    validate_sarif_report(sarif)
+    artifact = sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"][
+        "artifactLocation"
+    ]
+    assert artifact["uri"] == "/tmp/a%20b.py"
+    assert unquote(artifact["uri"]) == finding.file
+
+
+def test_sarif_unscoped_uri_agrees_with_notification_location() -> None:
+    """Finding and notification locations apply the same unscoped encoding policy."""
+    finding = _make_finding(file="/tmp/a b.py")
+    finding_uri = _build_sarif([finding])["runs"][0]["results"][0]["locations"][0][
+        "physicalLocation"
+    ]["artifactLocation"]["uri"]
+    notification_sarif = _build_sarif(
+        [],
+        analysis_completeness={
+            "ledger_exceptions": [
+                {"path": "/tmp/a b.py", "message": "File skipped", "start_line": 1}
+            ]
+        },
+    )
+    notification = notification_sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"][0]
+    notification_uri = notification["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+    assert notification_uri == finding_uri == "/tmp/a%20b.py"
+
+
+def test_sarif_scoped_uri_makes_absolute_path_relative_to_identity() -> None:
+    """A path joined beneath a source identity drops the root slash of that scope."""
+    finding = _make_finding(file="/tmp/a b.py")
+    scope = f"external/{'a' * 64}"
+    finding.source_identity = scope
+    sarif = _build_sarif([finding])
+    validate_sarif_report(sarif)
+    artifact = sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"][
+        "artifactLocation"
+    ]
+    assert artifact["uri"] == f"{scope}/tmp/a%20b.py"
+
+
 @pytest.mark.parametrize("category", ["ledger_exceptions", "scope_exclusions"])
 @pytest.mark.parametrize(
     "filename,encoded",

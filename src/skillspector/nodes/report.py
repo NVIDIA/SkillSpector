@@ -349,13 +349,17 @@ def _sarif_artifact_location(
 ) -> SarifArtifactLocation:
     """Build a source-scoped SARIF artifact location for one occurrence."""
     occurrence = occurrence or {}
-    file_path = str(occurrence.get("file", finding.file)).replace("\\", "/").lstrip("/")
+    raw_file_path = str(occurrence.get("file", finding.file))
     provenance = _occurrence_provenance(finding, occurrence)
     source_identity = _report_source_identity(provenance)
     if source_identity:
+        # Only a path joined beneath a source identity is relative to that scope, so
+        # only this branch may drop the leading separators. An unscoped artifact keeps
+        # its own absolute/relative form, matching the notification locations.
+        file_path = raw_file_path.replace("\\", "/").lstrip("/")
         uri = f"{source_identity}/{file_path}"
     else:
-        uri = str(occurrence.get("file", finding.file))
+        uri = raw_file_path
     properties = {
         {
             "source_identity": "sourceIdentity",
