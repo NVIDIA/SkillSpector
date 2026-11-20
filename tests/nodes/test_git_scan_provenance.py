@@ -33,6 +33,7 @@ _GIT_URL = "https://github.com/example/template-provenance.git"
 _TRACKED_SCRIPT = ".tracked.sh"
 _LOCAL_SCRIPT = ".local.sh"
 _TEMPLATE_HOOK = ".git/hooks/post-checkout"
+_TEMPLATE_METADATA = ".git/info/provenance-sentinel"
 _SCRIPT = b"#!/bin/sh\nprintf '%s\\n' 'fixture'\n"
 
 
@@ -53,7 +54,10 @@ def git_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for key in os.environ.copy():
         if key.startswith("GIT_"):
             monkeypatch.delenv(key)
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "git.config"))
+    git_home = tmp_path / "git-home"
+    git_home.mkdir()
+    for key in ("HOME", "USERPROFILE", "XDG_CONFIG_HOME"):
+        monkeypatch.setenv(key, str(git_home))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
     monkeypatch.setattr("skillspector.input_handler._is_private_ip", lambda _host: False)
@@ -88,7 +92,9 @@ def git_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return repo
 
 
-def _scan_artifacts(target: str) -> tuple[set[str], set[tuple[str, str]], dict[str, str]]:
+def _scan_artifacts(
+    target: str,
+) -> tuple[set[str], set[tuple[str, str]], dict[str, str], set[str]]:
     result = graph.invoke({"input_path": target, "use_llm": False, "output_format": "json"})
     temp_dir = result.get("temp_dir_for_cleanup")
     try:
@@ -99,6 +105,7 @@ def _scan_artifacts(target: str) -> tuple[set[str], set[tuple[str, str]], dict[s
             set(result["raw_file_cache"]),
             {(finding["id"], finding["location"]["file"]) for finding in report["issues"]},
             report["skill"]["origin"],
+            {artifact["path"] for artifact in result["artifact_inventory"]},
         )
     finally:
         if temp_dir:
@@ -109,7 +116,7 @@ def _scan_artifacts(target: str) -> tuple[set[str], set[tuple[str, str]], dict[s
 def test_git_url_scan_ignores_local_templates(
     git_repository: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, template_setting: str
 ) -> None:
-    clean_snapshot, clean_findings, clean_origin = _scan_artifacts(_GIT_URL)
+    clean_snapshot, clean_findings, clean_origin, _ = _scan_artifacts(_GIT_URL)
     assert _TRACKED_SCRIPT in clean_snapshot
     assert ("SC9", _TRACKED_SCRIPT) in clean_findings
     assert _TEMPLATE_HOOK not in clean_snapshot
@@ -118,13 +125,18 @@ def test_git_url_scan_ignores_local_templates(
     template = tmp_path / "template"
     (template / "hooks").mkdir(parents=True)
     _write_script(template / "hooks" / "post-checkout")
+    metadata = template / Path(_TEMPLATE_METADATA).relative_to(".git")
+    metadata.parent.mkdir()
+    metadata.write_text("Passive template metadata.\n", encoding="utf-8")
     if template_setting == "GIT_TEMPLATE_DIR":
         monkeypatch.setenv(template_setting, str(template))
     else:
         _git("config", "--global", template_setting, str(template))
 
     assert not (git_repository / _TEMPLATE_HOOK).exists()
-    assert _scan_artifacts(_GIT_URL) == (clean_snapshot, clean_findings, clean_origin)
+    snapshot, findings, origin, inventory = _scan_artifacts(_GIT_URL)
+    assert {_TEMPLATE_HOOK, _TEMPLATE_METADATA}.isdisjoint(inventory)
+    assert (snapshot, findings, origin) == (clean_snapshot, clean_findings, clean_origin)
 
 
 def test_local_scan_includes_existing_hidden_executable(git_repository: Path) -> None:
@@ -133,9 +145,10 @@ def test_local_scan_includes_existing_hidden_executable(git_repository: Path) ->
     hook.parent.mkdir()
     _write_script(hook)
 
-    snapshot, findings, origin = _scan_artifacts(str(git_repository))
+    snapshot, findings, origin, inventory = _scan_artifacts(str(git_repository))
 
     assert {_LOCAL_SCRIPT, _TEMPLATE_HOOK} <= snapshot
+    assert {_LOCAL_SCRIPT, _TEMPLATE_HOOK} <= inventory
     assert {("SC9", _LOCAL_SCRIPT), ("SC9", _TEMPLATE_HOOK)} <= findings
     assert origin == {"type": "directory", "source": str(git_repository)}
 
