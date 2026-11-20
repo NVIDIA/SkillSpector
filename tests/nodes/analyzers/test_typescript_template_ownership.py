@@ -253,7 +253,7 @@ def test_an_undecodable_specifier_with_a_shell_call_fails_closed(source: str) ->
 def test_an_undecodable_benign_string_does_not_claim_ownership() -> None:
     # Nothing destructive is reachable, so no conservative evidence is due; an undecodable
     # escape must also not be read as a shell surface.
-    source = 'const label = "node:child_\\x7"; const value = `${label}`;'
+    source = 'const label = "node:child_\\uD800"; const value = `${label}`;'
 
     assert typescript_template_spans(source, lambda: None) is not None
     assert (
@@ -414,6 +414,44 @@ def test_ledger_keeps_partial_status_for_a_keyword_property_division(keyword: st
     row = result["inspection_ledger"][0]
     assert row["outcome"] is LedgerOutcome.PARTIAL
     assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+def test_a_member_control_name_before_a_slash_does_not_open_a_regex() -> None:
+    # ``obj.if()`` is a method call, not a statement head. Its closing paren
+    # must not make the following slash open a regex that skips ``eval``.
+    source = "const label = `${obj.if() / eval(input) / 2}`;"
+
+    assert typescript_template_spans(source, lambda: None) is None
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="typescript")
+        is True
+    )
+
+
+def test_ledger_keeps_partial_status_for_a_member_control_call_division() -> None:
+    path = "scripts/run.ts"
+    source = "const label = `${obj.if() / eval(input) / 2}`;"
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: source + _PADDING}}, [tm]
+    )
+
+    row = result["inspection_ledger"][0]
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+def test_a_genuine_control_head_still_opens_a_regex() -> None:
+    # The member-role check must not suppress the regex after a real
+    # ``if (...)`` statement head.
+    source = "if (ok) /`/.test(value);\nconst label = `${item.name}`;"
+
+    starts, _ = typescript_template_spans(source, lambda: None) or ((), ())
+    assert starts == (source.index("`", source.index("const label")),)
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="typescript")
+        is False
+    )
 
 
 def test_a_private_keyword_property_before_a_slash_does_not_open_a_regex() -> None:

@@ -13,13 +13,11 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
+from skillspector.javascript_callables import _is_shell_execution_module
 from skillspector.javascript_tokens import (
     _SHELL_EXECUTION_CALLS as _JAVASCRIPT_EXECUTION_CALLS,
 )
-from skillspector.javascript_tokens import (
-    _SHELL_EXECUTION_MODULES,
-    JavaScriptTemplateSpans,
-)
+from skillspector.javascript_tokens import JavaScriptTemplateSpans
 from skillspector.python_ast import MAX_PYTHON_AST_SOURCE_CHARS
 
 _MAX_NESTING = 128
@@ -155,13 +153,6 @@ def _decode_string_source(source: str, check_runtime: Callable[[], None]) -> str
         cursor += 1
     check_runtime()
     return "".join(output)
-
-
-def _is_shell_execution_module(value: str) -> bool:
-    normalized = value.removeprefix("node:")
-    return any(
-        normalized == name or normalized.startswith(f"{name}/") for name in _SHELL_EXECUTION_MODULES
-    )
 
 
 def typescript_template_spans(
@@ -452,8 +443,13 @@ def typescript_template_spans(
                 last_kind, last_value, last_closed_control = "punct", "/", False
                 continue
             if character == "(":
+                # A keyword member call such as ``obj.if()`` is not a statement
+                # head; its closing paren must not make the following slash a
+                # regex opener.
                 paren_stack.append(
-                    last_kind == "identifier" and last_value.casefold() in _CONTROL_WORDS
+                    last_kind == "identifier"
+                    and not last_member
+                    and last_value.casefold() in _CONTROL_WORDS
                 )
                 callee = last_value if last_kind == "identifier" else None
                 delimiters.append(("(", ")"))
