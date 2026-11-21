@@ -78,26 +78,40 @@ _FR_A = r"(?:à?|à)"
 _FR_O = r"(?:ô?|ô)"
 _FR_U = r"(?:u\u0302?|û)"
 _FR_APOS = r"['’]?"
+# Word limits that count combining accents, which \w and \b do not: in NFD,
+# \b sees a limit between the accent of "ré" and "active".
+_FR_WORD_CHAR = r"[\w\u0300-\u036f]"
+_FR_START = rf"(?<!{_FR_WORD_CHAR})"
+# An underscore closing Markdown emphasis ends the word too.
+_FR_END = rf"(?!(?!_){_FR_WORD_CHAR})"
 _FR_USER = rf"(?:l{_FR_APOS}|les\s+)?utilisateurs?"
+_FR_ORDERS = r"(?:instructions?|consignes?|directives?)"
 _FR_RULES = rf"(?:r{_FR_E}gles?|consignes?|directives?|instructions?)"
 _FR_SAFETY = rf"(?:s{_FR_E}curit{_FR_E}|s{_FR_U}ret{_FR_E})"
 _FR_DET = r"(?:(?:toutes\s+)?(?:les|tes|vos)\s+|toutes\s+)?"
 _FR_PREVIOUS = rf"(?:pr{_FR_E}c{_FR_E}dentes?|ant{_FR_E}rieures?|initiales?|d{_FR_APOS}origine)"
+# Verbs carry no guard on their left: a prefixed verb still sends ("renvoie"),
+# and an order may follow "_" emphasis or the "n" of a literal "\n" in code.
 _FR_SEND = (
     rf"(?:envoie|envoyez|transmets|transmettez|t{_FR_E}l{_FR_E}verse|t{_FR_E}l{_FR_E}versez"
     rf"|transf{_FR_E}re|transf{_FR_E}rez|poste|postez)"
 )
 _FR_COVERTLY = (
     rf"(?:discr{_FR_E}tement|silencieusement|secr{_FR_E}tement|en\s+secret|en\s+cachette)"
+    rf"{_FR_END}"
 )
 _FR_COVERT_ACTION = (
-    r"(?:envoie|envoyez|transmets|transmettez|enregistre|enregistrez|journalise|journalisez)"
+    rf"(?:envo(?:ie|yez|yer)|transm(?:ets|ettez|ettre)|enregistre[rz]?|journalise[rz]?)"
+    rf"{_FR_END}"
 )
-_FR_WORD_CHAR = r"[\ẁ-ͯ]"
-# Complete send verbs only: a bare stem also matches nouns such as "transmission".
-_FR_SEND_VERB = (
-    rf"(?<!{_FR_WORD_CHAR})(?:envo(?:ies?|yez|yer)|transm(?:ets?|ettez|ettre)"
-    rf"|t{_FR_E}l{_FR_E}vers(?:es?|ez|er))(?!{_FR_WORD_CHAR})"
+# An order to send: an imperative that no negation follows, or "tu dois",
+# "vous devez", "il faut" with the infinitive. A bare stem would also match
+# nouns such as "transmission", and a bare infinitive would match prohibitions
+# such as "il est interdit de transmettre" or "ne doit pas envoyer".
+_FR_SEND_ORDER = (
+    rf"(?:(?:tu\s+dois|vous\s+devez|il\s+faut)\s+(?:envoyer|transmettre|t{_FR_E}l{_FR_E}verser)"
+    rf"|(?:envoie|envoyez|transmets|transmettez|t{_FR_E}l{_FR_E}verse|t{_FR_E}l{_FR_E}versez)"
+    rf"(?!\s+(?:jamais|pas|plus|rien|(?:(?:en|sous)\s+)?aucune?){_FR_END})){_FR_END}"
 )
 # Rest of the same sentence. A terminator ends it unless a word character
 # follows, which keeps ".env" and URLs inside the sentence.
@@ -120,11 +134,12 @@ P1_PATTERNS = [
     # French (fr). Each entry mirrors an English entry above.
     (
         rf"(?:ignore|ignorez|oublie|oubliez)\s+{_FR_DET}"
-        rf"(?:instructions?|consignes?|directives?)\s+{_FR_PREVIOUS}",
+        rf"(?:{_FR_ORDERS}\s+{_FR_PREVIOUS}|{_FR_PREVIOUS}\s+{_FR_ORDERS})",
         0.8,
     ),
+    (rf"(?:oublie|oubliez)\s+(?:toutes\s+)?(?:tes|vos)\s+{_FR_ORDERS}", 0.8),
     (
-        rf"(?:\bne\s+(?:tiens|tenez)\s+(?:plus|pas)\s+compte|\bfai(?:s|tes)\s+abstraction)"
+        rf"{_FR_START}(?:ne\s+(?:tiens|tenez)\s+(?:plus|pas)\s+compte|fai(?:s|tes)\s+abstraction)"
         rf"\s+(?:des|de\s+(?:tes|vos|ces|toutes\s+les))\s+{_FR_RULES}"
         rf"\s+(?:{_FR_PREVIOUS}|de\s+{_FR_SAFETY})",
         0.8,
@@ -136,32 +151,40 @@ P1_PATTERNS = [
         0.9,
     ),
     (
+        # A bare "limites" or "filtres" is not a safety control ("contourne
+        # les limites de la commune"), so both need "de sécurité".
         rf"(?:contourne|contournez|outrepasse|outrepassez)\s+{_FR_DET}"
-        rf"(?:restrictions?|garde-fous?|protections?|filtres?|limites?"
-        rf"|(?:r{_FR_E}gles?|consignes?|contraintes?)\s+de\s+{_FR_SAFETY})",
+        rf"(?:restrictions?|garde-fous?|protections?"
+        rf"|(?:r{_FR_E}gles?|consignes?|contraintes?|filtres?|limites?)\s+de\s+{_FR_SAFETY})",
         0.9,
     ),
     (
-        rf"(?:\btu\s+es|\bvous\s+{_FR_E}tes)\s+(?:d{_FR_E}sormais|maintenant|{_FR_A}\s+pr{_FR_E}sent)"
+        rf"{_FR_START}(?:tu\s+es|vous\s+{_FR_E}tes)"
+        rf"\s+(?:d{_FR_E}sormais|maintenant|{_FR_A}\s+pr{_FR_E}sent)"
         rf"\s+en\s+mode\s+(?:jailbreak|sans\s+(?:restrictions?|limites?|filtres?|censure)"
         rf"|non\s+(?:restreint|filtr{_FR_E}|censur{_FR_E}))",
         0.95,
     ),
     (
-        rf"\b(?:active|activez)\s+(?:le\s+)?mode\s+"
+        rf"{_FR_START}(?:active|activez)\s+(?:le\s+)?mode\s+"
         rf"(?:d{_FR_E}veloppeur|d{_FR_E}bogage|debug|admin(?:istrateur)?|root)",
         0.7,
     ),
-    (rf"\b(?:tes|vos)\s+nouvelles\s+(?:instructions?|consignes?|r{_FR_E}gles?)\s+sont", 0.6),
+    (
+        rf"{_FR_START}(?:tes|vos)\s+nouvelles\s+(?:instructions?|consignes?|r{_FR_E}gles?)\s+sont",
+        0.6,
+    ),
     (
         # Anchored to the start of a clause so that a conditional such as
         # "si vous ne respectez pas les consignes" is not read as an order.
-        rf"(?:^|(?<=[.!?:;\n]))[ \t]*(?:(?:[-*+>]|\d+[.)])[ \t]+)?"
+        # A list or heading marker, emphasis or an opening quote may precede it.
+        rf"(?:^|(?<=[.!?:;,\n]))[ \t]*(?:(?:[-*+>]|#{{1,6}}|\d+[.)])[ \t]+)?"
+        rf'(?:[*_]{{1,3}})?(?:[«“"][ \u00a0\u202f]?)?'
         rf"ne\s+(?:suis|suivez|respecte|respectez)\s+"
         rf"(?:(?:plus|pas)\s+)?(?:aucune|les|tes|vos)\s+(?:r{_FR_E}gles?|consignes?|directives?)",
         0.85,
     ),
-    (r"\b(?:tu\s+dois|vous\s+devez)\s+(?:toujours\s+)?ignorer", 0.7),
+    (rf"{_FR_START}(?:tu\s+dois|vous\s+devez)\s+(?:toujours\s+)?ignorer", 0.7),
 ]
 # P2: Hidden Instructions. Build the character class from the shared P9
 # constant so hidden-instruction and padding detection cannot drift apart.
@@ -287,7 +310,10 @@ P3_PATTERNS_FR = [
         rf"{_FR_SEND}\s+(?:(?:toute\s+la|tout\s+le|toutes\s+les|la|le|les)\s+|l{_FR_APOS})?"
         rf"(?:conversation|contexte|discussion|historique|messages?|{_FR_E}changes?)"
         rf"(?:\s+(?:de\s+la|du|des)\s+(?:conversation|discussion|session|chat|{_FR_E}changes?))?"
-        rf"\s+(?:{_FR_A}|vers|sur)",
+        # An accented "à" is always the preposition, even when the
+        # letter-spacing view glues it to a spaced target. A bare "a" must
+        # end there, or "avec" and "avant" would read as a destination.
+        rf"\s+(?:a\u0300|à|(?:aux?|a|vers|sur){_FR_END})",
         0.9,
     ),
     (
@@ -300,23 +326,24 @@ P3_PATTERNS_FR = [
     (rf"{_FR_COVERT_ACTION}\s+{_FR_COVERTLY}", 0.9),
     (
         rf"sans\s+(?:le\s+dire\s+{_FR_A}|en\s+informer|informer|pr{_FR_E}venir|avertir|alerter)"
-        rf"\s+{_FR_USER}{_FR_SAME_SENTENCE}{_FR_SEND_VERB}",
+        rf"\s+{_FR_USER}{_FR_SAME_SENTENCE}{_FR_SEND_ORDER}",
         0.9,
     ),
-    (rf"{_FR_UNKNOWN_TO_USER}{_FR_SAME_SENTENCE}{_FR_SEND_VERB}", 0.9),
-    (rf"{_FR_SEND_VERB}{_FR_SAME_SENTENCE}{_FR_UNKNOWN_TO_USER}", 0.9),
+    (rf"{_FR_UNKNOWN_TO_USER}{_FR_SAME_SENTENCE}{_FR_SEND_ORDER}", 0.9),
+    (rf"{_FR_SEND_ORDER}{_FR_SAME_SENTENCE}{_FR_UNKNOWN_TO_USER}", 0.9),
 ]
 P4_PATTERNS_FR = [
     (
         rf"(?:recommande|recommandez|privil{_FR_E}gie|privil{_FR_E}giez|sugg{_FR_E}re|sugg{_FR_E}rez"
-        rf"|choisis|choisissez|utilise|utilisez)\s+toujours\s+(?:[\w\u0300-\u036f]+\s+){{0,3}}"
+        rf"|choisis|choisissez|utilise|utilisez)\s+toujours\s+(?:{_FR_WORD_CHAR}+\s+){{0,3}}"
         rf"(?:plut{_FR_O}t\s+que|au\s+lieu\s+de|{_FR_A}\s+la\s+place\s+de)",
         0.7,
     ),
     (
-        rf"ne\s+(?:mentionne|mentionnez|dis|dites|signale|signalez|r{_FR_E}v{_FR_E}le|r{_FR_E}v{_FR_E}lez"
-        rf"|pr{_FR_E}viens|pr{_FR_E}venez|avertis|avertissez|informe|informez)\s+jamais\s+"
-        rf"(?:rien\s+)?(?:{_FR_A}\s+)?{_FR_USER}",
+        # "ne" elides before a vowel: "n'informe", "n'avertissez".
+        rf"n(?:e\s+|['\u2019])(?:mentionne|mentionnez|dis|dites|signale|signalez"
+        rf"|r{_FR_E}v{_FR_E}le|r{_FR_E}v{_FR_E}lez|pr{_FR_E}viens|pr{_FR_E}venez|avertis|avertissez"
+        rf"|informe|informez)\s+jamais\s+(?:rien\s+)?(?:{_FR_A}\s+)?{_FR_USER}",
         0.75,
     ),
     (
