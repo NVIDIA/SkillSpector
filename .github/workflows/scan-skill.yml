@@ -1,0 +1,58 @@
+name: Scan an AI Skill
+
+on:
+  workflow_dispatch:
+    inputs:
+      skill_url:
+        description: "Public GitHub repository URL of the skill to scan"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out SkillSpector
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install SkillSpector
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: Validate target URL
+        env:
+          SKILL_URL: ${{ inputs.skill_url }}
+        run: |
+          if [[ "$SKILL_URL" != https://github.com/* ]]; then
+            echo "Please provide a public GitHub repository URL."
+            exit 1
+          fi
+
+      - name: Scan skill
+        env:
+          SKILL_URL: ${{ inputs.skill_url }}
+        run: |
+          skillspector scan "$SKILL_URL" \
+            --no-llm \
+            --format json \
+            --output report.json
+
+      - name: Save scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skillspector-report
+          path: report.json
+          if-no-files-found: ignore
+          retention-days: 7
