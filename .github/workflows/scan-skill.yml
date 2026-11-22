@@ -1,12 +1,10 @@
-name: Scan an AI Skill
+
+name: Daily SkillSpector Scan
 
 on:
   workflow_dispatch:
-    inputs:
-      skill_url:
-        description: "Public GitHub repository URL of the skill to scan"
-        required: true
-        type: string
+  schedule:
+    - cron: "30 15 * * *"
 
 permissions:
   contents: read
@@ -14,7 +12,7 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 120
 
     steps:
       - name: Check out SkillSpector
@@ -30,29 +28,115 @@ jobs:
           python -m pip install --upgrade pip
           pip install .
 
-      - name: Validate target URL
+      - name: Create read-only GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.SKILLSPECTOR_APP_ID }}
+          private-key: ${{ secrets.SKILLSPECTOR_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+
+      - name: Discover and clone repositories
         env:
-          SKILL_URL: ${{ inputs.skill_url }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        shell: bash
         run: |
-          if [[ "$SKILL_URL" != https://github.com/* ]]; then
-            echo "Please provide a public GitHub repository URL."
-            exit 1
+          set -euo pipefail
+          mkdir -p repos reports
+
+          gh api --paginate /installation/repositories \
+            --jq '.repositories[].full_name' > repositories.txt
+
+          APP_TOKEN="$GH_TOKEN"
+          unset GH_TOKEN
+
+          while IFS= read -r repo; do
+            [ -n "$repo" ] || continue
+            slug="${repo//\//_}"
+            echo "Cloning $repo"
+
+            if ! GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0=http.extraheader \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$APP_TOKEN" | base64 -w0)" \
+              git clone --depth=1 "https://github.com/$repo.git" "repos/$slug"; then
+              echo "$repo" >> clone-failures.txt
+            fi
+          done < repositories.txt
+
+          unset APP_TOKEN
+
+      - name: Scan discovered AI skill directories
+        shell: bash
+        run: |
+          set -uo pipefail
+          scanned=0
+          skipped=0
+          failed=0
+
+          while IFS= read -r repo; do
+            [ -n "$repo" ] || continue
+            slug="${repo//\//_}"
+            target="repos/$slug"
+
+            if [ ! -d "$target" ]; then
+              failed=$((failed + 1))
+              continue
+            fi
+
+            index=0
+            found=0
+
+            while IFS= read -r -d '' skill_file; do
+              found=1
+              index=$((index + 1))
+              report="reports/${slug}-skill-${index}.json"
+
+              echo "Scanning $repo: $skill_file"
+
+              if skillspector scan "$(dirname "$skill_file")" \
+                --no-llm --format json --output "$report"; then
+                scanned=$((scanned + 1))
+              else
+                if [ -s "$report" ]; then
+                  scanned=$((scanned + 1))
+                else
+                  failed=$((failed + 1))
+                fi
+              fi
+            done < <(find "$target" -type f -name SKILL.md \
+              -not -path '*/.git/*' -print0)
+
+            if [ "$found" -eq 0 ]; then
+              skipped=$((skipped + 1))
+            fi
+          done < repositories.txt
+
+          {
+            echo "# Daily SkillSpector Scan"
+            echo "Skill directories scanned: $scanned"
+            echo "Repositories without SKILL.md: $skipped"
+            echo "Scan failures: $failed"
+            echo "Repositories discovered: $(wc -l < repositories.txt)"
+            echo
+            echo "This workflow scans AI skill directories, not every source file or package in each repository."
+            echo "Static analysis only; no LLM transmission or automatic repairs."
+          } > scan-summary.txt
+
+          if [ -f clone-failures.txt ]; then
+            echo "Some repositories could not be cloned." >> scan-summary.txt
           fi
 
-      - name: Scan skill
-        env:
-          SKILL_URL: ${{ inputs.skill_url }}
-        run: |
-          skillspector scan "$SKILL_URL" \
-            --no-llm \
-            --format json \
-            --output report.json
-
-      - name: Save scan report
+      - name: Upload scan reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: skillspector-report
-          path: report.json
-          if-no-files-found: ignore
-          retention-days: 7
+          name: skillspector-daily-reports
+          path: |
+            reports/
+            scan-summary.txt
+            repositories.txt
+            clone-failures.txt
+          if-no-files-found: warn
+          retention-days: 30
+          
