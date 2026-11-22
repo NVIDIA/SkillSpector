@@ -79,6 +79,54 @@ def test_each_consumer_uses_its_current_assignment_without_cache_poisoning(rever
     assert observed[caller.rindex('"$helper"')] == "second"
 
 
+@pytest.mark.parametrize(
+    ("assignment", "operand", "destructive"),
+    [
+        ("cmd='printf ready'", '"$cmd"', False),
+        ("cmd='rm -rf /'", '"${cmd}"', True),
+        ("flag=-rf", '"rm $flag /"', True),
+    ],
+)
+def test_literal_command_binding_is_inspected_at_its_consumer(assignment, operand, destructive):
+    caller = f"{assignment}\nsh -c {operand}\n"
+    prepared = _prepare(caller)
+    assert prepared is not None
+    findings = list(
+        prepared.analyze_source_commands(
+            content=caller,
+            file_path="scripts/caller.sh",
+            file_type="shell",
+            source_view=SecurityTextView("raw", caller),
+        )
+    )
+    assert any(f.rule_id == "TM1" and f.location.start_line == 2 for f in findings) == destructive
+    assert not prepared.has_bounded_parse_exhaustion()
+
+
+@pytest.mark.parametrize(
+    "caller",
+    [
+        'cmd="$INPUT"\nsh -c "$cmd"',
+        'cmd=$(read_command)\nsh -c "$cmd"',
+        'if ready; then cmd=safe; fi\nsh -c "$cmd"',
+        'cmd=safe > /missing/file\nsh -c "$cmd"',
+        '< /missing/file cmd=safe\nsh -c "$cmd"',
+        '<<<input cmd=safe\nsh -c "$cmd"',
+        '<<EOF cmd=safe\ninput\nEOF\nsh -c "$cmd"',
+        'cmd=safe && false || sh -c "$cmd"',
+        "cmd=safe\nsh -c $cmd",
+        'cmd=safe\nsh -c "$1"',
+        'cmd=safe\nsh -c "$cmd $INPUT"',
+        'cmd=safe\nsh -c "$cmd\nprintf next"',
+        'cmd=safe\nsh -c "echo\r$cmd"',
+        'cmd=safe\nsh -c "$cmd$cmd"',
+        'cmd=safe\nread cmd\nsh -c "$cmd"',
+    ],
+)
+def test_uncertain_shell_command_binding_stays_unresolved(caller):
+    assert _prepare(caller) is None
+
+
 def test_unknown_reassignment_does_not_erase_an_earlier_known_value() -> None:
     caller = 'helper=first\nprintf "%s" "$helper"\nhelper="$runtime"\nprintf "%s" "$helper"\n'
     assert _expanded_values(_value_resolver(caller), "helper") == ["first", None]
@@ -1053,3 +1101,74 @@ def test_unknown_archive_member_write_cannot_reuse_the_cached_copy() -> None:
     )
     prepared = _prepare(caller)
     assert prepared is None or not tuple(prepared.variants())
+
+
+def test_fixed_node_process_argv_and_native_regex_keep_data_in_host_language():
+    source = """
+import {execFileSync as inspect} from 'node:child_process';
+const pattern = /test/g;
+export function describe(config, value) {
+    const branch = inspect('git', ['-C', config.repo, 'rev-parse', '--abbrev-ref', 'HEAD'],
+        {encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000});
+    pattern.lastIndex = 0;
+    return pattern.exec(value) ? `Branch: ${branch}` : `Missing: ${value}`;
+}
+"""
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is None
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "inspect(binary, ['-C', dir, 'rev-parse', 'HEAD'])",
+        "inspect('git', ['-C', dir, 'rev-parse', flag])",
+        "inspect('git', ['-C', ...dirs, 'rev-parse', 'HEAD'])",
+        "inspect('git', ['-C', , 'rev-parse', 'HEAD'])",
+        "inspect('git', ['-C', dir, 'rev-parse', 'HEAD'], {shell:true})",
+        "inspect('git', ['-C', dir, 'rev-parse', 'HEAD'], {...options})",
+        "inspect('git', ['-C', dir, 'rev-parse', 'HEAD'], {env:{PATH:dir}})",
+        "inspect('git', ['-C', dir, 'rev-parse', 'HEAD'], {stdio:['pipe',, 'ignore']})",
+        "const config = { get dir() { return choose() } }; inspect('git', ['-C', config.dir, 'rev-parse', 'HEAD'])",
+        "inspect('sh', ['-c', command])",
+        "other(inspect)",
+        "import {syncBuiltinESMExports} from 'node:module'; syncBuiltinESMExports()",
+        "pattern.exec = userFunction",
+        "update(pattern)",
+        "RegExp.prototype.exec = userFunction",
+        "Object.prototype.shell = true",
+        "process.env.PATH = custom",
+        "process.env = alternate",
+        "const e = process.env; e.PATH = other",
+        "const p = process; p.env.PATH = other",
+        "Object.assign(process.env, options)",
+        "[process.env.PATH] = parts",
+        "delete process.env.PATH",
+        "import {env as settings} from 'node:process'; settings.PATH = other",
+        "Object.setPrototypeOf(pattern, other)",
+        "const make = RegExp; make.prototype.exec = other",
+        "target[key] = other",
+        "const p = /other/['__pro'+'to__']; Object.assign(p, {exec: userFunction})",
+        "const q = /other/; foreign(q)",
+        "foreign(/other/)",
+    ],
+)
+def test_dynamic_process_or_regex_use_preserves_incomplete_inspection(statement):
+    source = f"""
+import {{execFileSync as inspect}} from 'node:child_process';
+const pattern = /test/g;
+inspect('git', ['-C', dir, 'rev-parse', 'HEAD']);
+{statement};
+pattern.exec(`search ${{input}}`);
+"""
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is not None
+
+
+def test_dynamic_named_node_dispatch_identifies_invocation():
+    source = """
+import {spawn as launch} from 'node:child_process';
+export const label = `Mode: ${name}`;
+export function start(config) { return launch(config.binary, config.argv); }
+"""
+    result = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert result is not None
+    assert result.start == source.index("launch(config.binary")

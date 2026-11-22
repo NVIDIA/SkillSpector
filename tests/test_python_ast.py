@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import shutil
 import subprocess
@@ -1899,6 +1900,31 @@ def test_parse_python_source_exposes_import_aliases() -> None:
     }
     assert parsed.lines == ["import os as operating_system", "from subprocess import run"]
     assert parsed.content == "import os as operating_system\nfrom subprocess import run\n"
+
+
+@pytest.mark.parametrize(
+    "line_end",
+    [
+        pytest.param("\n", id="lf"),
+        pytest.param("\r\n", id="crlf"),
+        pytest.param("\r", id="cr"),
+        pytest.param("\f\n", id="form-feed"),
+        pytest.param("\v\n", id="vertical-tab"),
+        pytest.param("\x1c\n", id="file-separator"),
+        pytest.param("\x85\n", id="next-line"),
+        pytest.param("\u2028\n", id="line-separator"),
+        pytest.param("\u2029\n", id="paragraph-separator"),
+    ],
+)
+def test_parsed_source_lines_follow_python_line_boundaries(line_end: str) -> None:
+    content = f"# section{line_end}label = 'ü'; exec(\n    'payload'\n)\n"
+    parsed = parse_python_source(content, "script.py")
+    assert parsed.tree is not None
+    call = next(node for node in ast.walk(parsed.tree) if isinstance(node, ast.Call))
+
+    assert parsed.source_segment(call) == ast.get_source_segment(content, call)
+    assert parsed.lines[call.lineno - 1] == "label = 'ü'; exec("
+    assert parsed.character_column(call.lineno, call.col_offset) == len("label = 'ü'; ")
 
 
 def test_parse_python_source_retains_syntax_error_result() -> None:

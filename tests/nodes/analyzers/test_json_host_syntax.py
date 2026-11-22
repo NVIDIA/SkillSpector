@@ -594,12 +594,19 @@ def test_native_pair_keeps_genuine_interior_runtime_uncertainty(command: str) ->
     assert event["parser_diagnostic"]["cause"] == "runtime_dependent"
 
 
-def test_native_bound_preserves_an_already_reported_reconstructed_effect() -> None:
-    result = _scan('{"note":"x `$(printf rm) -rf *`"}')
+@pytest.mark.parametrize("substitution", ["$(printf rm)", "$(printf %s rm)"])
+def test_native_bound_preserves_an_already_reported_reconstructed_effect(substitution: str) -> None:
+    command = f"{substitution} -rf *"
+    source = json.dumps({"note": f"x `{command}`"})
+    result = _scan(source)
     assert any(f.rule_id == "TM1" and f.severity == "HIGH" for f in result["findings"])
     event = result["inspection_ledger"][0]
     assert event["outcome"] is LedgerOutcome.PARTIAL
-    assert event["parser_diagnostic"]["check"] == "printf_invocation"
+    diagnostic = event["parser_diagnostic"]
+    assert diagnostic["cause"] == ParserCause.RUNTIME_DEPENDENT
+    assert diagnostic["check"] == ParserCheck.COMMAND_IDENTITY
+    assert diagnostic["unchecked_scope"] == "command_word"
+    assert source[diagnostic["source_start_offset"] : diagnostic["source_end_offset"]] == command
 
 
 def test_native_bound_cannot_hide_an_unreported_reconstructed_destructive_effect() -> None:

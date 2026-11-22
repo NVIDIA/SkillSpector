@@ -77,6 +77,31 @@ def test_markdown_table_cell_naming_a_wrapper_is_complete(wrapper: str) -> None:
     assert not _exhausted(content + _PADDING, "markdown")
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_text_diagram_arrow_is_not_a_shell_redirection(newline: str) -> None:
+    diagram = "```text\n|          |\n|      |  timeout ---->|\n```\n".replace("\n", newline)
+
+    assert not _exhausted(diagram, "markdown")
+    assert not _exhausted(_PADDING + diagram + _PADDING, "markdown")
+    assert _exhausted(diagram, "markdown", complete_context=False)
+    assert not _exhausted(diagram + "```sh\nsudo rm -rf /\n```\n", "markdown")
+    findings = tm_module.analyze(diagram + "```sh\nsudo rm -rf /\n```\n", "SKILL.md", "markdown")
+    assert any(finding.rule_id == "TM1" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "```sh\n|      |  timeout ---->|\n```\n",
+        "```text\n|      |  timeout ---->|\n",
+        '```text\n|      |  timeout ---->|"$DEST"\n```\n',
+        '```text\n|      |  timeout ---->|\nsudo >log "$CMD"\n```\n',
+    ],
+)
+def test_diagram_projection_preserves_unproven_command_boundaries(source: str) -> None:
+    assert _exhausted(source, "markdown")
+
+
 def test_markdown_api_parameter_table_is_complete() -> None:
     content = (
         "| Name | Type | Default | Description |\n"
@@ -275,3 +300,110 @@ def test_wrapper_chain_budget_stays_partial(wrapper: str) -> None:
     source = " ".join([wrapper] * 40) + " sh -c 'echo ready'\n"
 
     assert _exhausted(source, "shell")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "- Cause -> resolution: Find the problem (timeout -> see 42)\n",
+        '| Name | Meaning |\n|---|---|\n| wait | Timeout (e.g. `"2m"`, `"3h"`) |\n',
+        'The command uses `ssh host "batch -p\n<queue> -A <account> file"` here.\n',
+    ],
+)
+def test_markdown_documentation_punctuation_keeps_later_executable_content(content: str) -> None:
+    dangerous = "\n```sh\nsudo rm -rf /\n```\n"
+    unresolved = '\n```sh\nsudo >log "$command"\n```\n'
+
+    assert not _exhausted(content, "markdown")
+    assert _exhausted(content + unresolved, "markdown")
+    assert any(
+        f.rule_id == "TM1" for f in tm_module.analyze(content + dangerous, "SKILL.md", "markdown")
+    )
+
+
+def test_only_plain_declared_list_table_roles_own_rst_punctuation() -> None:
+    document = ".. role:: note\n\n.. list-table:: Names\n\n   * - :note:`The child's name.`\n"
+    projected = tm_module._rst_table_role_text(document, lambda: None)
+
+    assert projected == document.replace("`", " ").replace("'", " ")
+    assert _exhausted(document + '\nsudo >log "$command"\n', "rst")
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["references/guide.rst"], "file_cache": {"references/guide.rst": document}},
+        [tm_module],
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        ".. role:: note(code)\n\n.. list-table:: Names\n\n   * - :note:`The child's name.`\n",
+        ".. role:: note\n\n.. list-table:: Names\n\n   * - :note:`$(shell)`\n",
+        ".. role:: note\n\n.. code-block:: sh\n\n   * - :note:`The child's name.`\n",
+        ".. role:: note\n\n.. list-table:: Names\n\n   * - .. code:: bash\n        - :note:`Code`\n",
+        ".. role:: note\n\n.. include:: roles.rst\n\n.. list-table:: Names\n\n   * - :note:`Code`\n",
+    ],
+)
+def test_rst_unproved_role_and_literal_context_remains_visible(body: str) -> None:
+    assert tm_module._rst_table_role_text(body, lambda: None) == body
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "| Command (worked example) | Owner |\n|---|---|\n| `ls` | Reader |\n",
+        'The summary reports "two of three\ncomplete" for this record.\n',
+        "Use inline `**bold**`, `*italic*`, `` `code` ``, or a link.\n",
+        "`` `example` `` → `<code>example</code>`.\n",
+        "Make expands its own `$(...)` expressions.\n",
+        "The runner rejects shell arithmetic: use a counter instead of `$((n+1))`.\n",
+        "The notation changes (csh: no `$()`, `&&`).\n",
+    ],
+)
+def test_documented_examples_keep_adjacent_shell_checks(content: str) -> None:
+    assert not _exhausted(content, "markdown")
+    assert _exhausted(content + '\n```sh\nbash -c "$payload"\n```\n', "markdown")
+    assert any(
+        f.rule_id == "TM1"
+        for f in tm_module.analyze(content + "\n`sudo rm -rf /`\n", "SKILL.md", "markdown")
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Execute `` `name` ``.\n",
+        "Run `$((n+1))`.\n",
+        "Run `$($tool -rf /)`.\n",
+        'Make expands its own `$(eval "$value")` expressions.\n',
+    ],
+)
+def test_unproved_shell_contexts_stay_partial(content: str) -> None:
+    assert _exhausted(content, "markdown")
+
+
+def test_run_instruction_does_not_mark_an_empty_substitution_as_prose() -> None:
+    content = "Run `$()`.\n"
+    start = content.index("$()")
+    assert not tm_module._documented_expansion_placeholder(content, start, start + len("$()"))
+
+
+def test_typeset_notice_requires_closed_prose_and_preserves_shell_consumers() -> None:
+    header = "# Third-party license notices\n\n"
+    start = "````text\n"
+    end = "````\n"
+    words = "Use the terms `Sample Project' and ``AS IS'' in descriptions.\n"
+    payload = 'sh -c "echo `Example Term\'"\n'
+    source = header + start + words + payload + end
+    expected = source.replace("`Sample Project'", " Sample Project ").replace(
+        "``AS IS''", "  AS IS  "
+    )
+
+    assert tm_module._typeset_notice_text(source, lambda: None) == expected
+    for variant in [start + words + end, header + start + words, header + "````sh\n" + words + end]:
+        assert tm_module._typeset_notice_text(variant, lambda: None) == variant
+
+
+def test_shell_syntax_never_becomes_a_plain_wrapped_quotation() -> None:
+    content = 'The summary reports "one of three\nsudo $command".\n'
+    assert tm_module._markdown_shell_text(content, lambda: None) == content
