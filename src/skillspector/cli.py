@@ -600,7 +600,9 @@ def scan(
         typer.Option(
             "--recursive",
             "-r",
-            help="Scan immediate subdirectories that each contain a SKILL.md as independent skills.",
+            help="Scan immediate child directories with SKILL.md, skill.md, or a supported "
+            "AISOP/AISP bundle as independent skills. A Markdown skill manifest at the scan "
+            "root selects a single-skill scan.",
         ),
     ] = False,
     max_skills: Annotated[
