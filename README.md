@@ -1190,22 +1190,29 @@ Based on research from "Agent Skills in the Wild: An Empirical Study of Security
 
 ```python
 from skillspector import graph
+from skillspector.cleanup import cleanup_result
 
 # Invoke the LangGraph workflow
 result = graph.invoke({
     "input_path": "/path/to/skill",
     "output_format": "json",   # terminal, json, markdown, or sarif
-    "use_llm": True,           # False for static-only analysis
+    "use_llm": False,          # Set True to use a configured LLM provider
 })
 
-# Access results
-print(f"Risk Score: {result['risk_score']}/100")
-print(f"Severity: {result['risk_severity']}")
-print(f"Recommendation: {result['risk_recommendation']}")
+try:
+    print(f"Risk Score: {result['risk_score']}/100")
+    print(f"Severity: {result['risk_severity']}")
+    print(f"Recommendation: {result['risk_recommendation']}")
 
-for finding in result["filtered_findings"]:
-    print(f"[{finding['severity']}] {finding['rule_id']}: {finding['message']}")
+    for finding in result["filtered_findings"]:
+        print(f"[{finding.severity}] {finding.rule_id}: {finding.message}")
+finally:
+    cleanup_result(result)
 ```
+
+The graph returns Python state, including `Finding` objects in
+`filtered_findings`. Set `output_format` to choose the rendered report in
+`result["report_body"]`.
 
 ## License
 
