@@ -163,6 +163,14 @@ class OsvQueryBudget:
     # other's reachability outcome. See was_osv_reachable().
     query_ok: bool | None = None
     local_db_path: str | None = field(default_factory=lambda: os.getenv("SKILLSPECTOR_OSV_DB_PATH"))
+    # Scan-local prefetch results: (name, version, ecosystem) key -> (results,
+    # limitations recorded while the prefetch looked that coordinate up). A
+    # partial result is never cached, so this is the only copy the later
+    # per-file lookup can read. See prefetch().
+    prefetched: dict[
+        tuple[str, str | None, str],
+        tuple[list[VulnResult], tuple[OsvQueryLimitation, ...]],
+    ] = field(default_factory=dict)
     _snapshots: dict[str, SnapshotIndex | OsvQueryLimitation] = field(default_factory=dict)
     _stack: ExitStack = field(default_factory=ExitStack)
 
@@ -788,11 +796,69 @@ def query_batch(
     A scan-owned budget should be closed after its last lookup. If a lookup
     fails, the caller can use static fallback for uncovered packages.
     """
+    owned = budget is None
+    active_budget = budget or OsvQueryBudget.create(timeout_seconds)
+    try:
+        return _query_packages(
+            [(name, version, ecosystem) for name, version in packages],
+            active_budget,
+        )
+    finally:
+        if owned:
+            active_budget.close()
+
+
+def prefetch(
+    packages: list[tuple[str, str | None, str]],
+    *,
+    budget: OsvQueryBudget,
+) -> None:
+    """Look up (name, version, ecosystem) packages in shared batches for later calls.
+
+    One scan calls :func:`query_batch` once per dependency file and ecosystem,
+    and a batch is never shared across calls. Prefetching every file's packages
+    first packs them into mixed-ecosystem batches. Each looked-up coordinate is
+    held in ``budget.prefetched`` with the limitations recorded for it, so a
+    later call reads the same results, partial ones included, and reports the
+    same limitations without a second request. Package accounting
+    (``max_packages``) stays with those later calls; the prefetch itself is
+    bounded by the same budget. Local snapshot lookups need no prefetch.
+    """
+    if budget.local_db_path is not None:
+        return
+    unique: dict[tuple[str, str | None, str], tuple[str, str | None, str]] = {}
+    for name, version, ecosystem in packages:
+        if isinstance(name, str) and (version is None or isinstance(version, str)):
+            unique.setdefault(_cache_key(name, version, ecosystem), (name, version, ecosystem))
+    packages_seen = budget.packages_seen
+    try:
+        _query_packages(list(unique.values()), budget, prefetching=True)
+    finally:
+        budget.packages_seen = packages_seen
+
+
+def _query_packages(
+    packages: list[tuple[str, str | None, str]],
+    active_budget: OsvQueryBudget,
+    *,
+    prefetching: bool = False,
+) -> QueryBatchResults:
+    """Run the bounded OSV batch lookup for (name, version, ecosystem) packages."""
     global _last_query_ok
 
-    active_budget = budget or OsvQueryBudget.create(timeout_seconds)
     limitations_start = len(active_budget.limitations or [])
     limitations_generation = active_budget.limitation_generation
+    # Limitations a prefetch recorded for coordinates this call reads back.
+    replayed: list[OsvQueryLimitation] = []
+
+    def call_limitations() -> tuple[OsvQueryLimitation, ...]:
+        own = _limitations_since(
+            active_budget,
+            start_index=limitations_start,
+            start_generation=limitations_generation,
+        )
+        return tuple(dict.fromkeys((*replayed, *own)))
+
     if not packages:
         return QueryBatchResults([])
 
@@ -812,18 +878,14 @@ def query_batch(
         return QueryBatchResults(
             all_results,
             local_checked=frozenset() if active_budget.local_db_path is not None else None,
-            limitations=_limitations_since(
-                active_budget,
-                start_index=limitations_start,
-                start_generation=limitations_generation,
-            ),
+            limitations=call_limitations(),
         )
 
     uncached_indices: list[int] = []
     uncached_queries: list[dict] = []
     local_packages: list[tuple[int, str, str | None]] = []
 
-    for i, (name, version) in enumerate(retained_packages):
+    for i, (name, version, ecosystem) in enumerate(retained_packages):
         if not isinstance(name, str) or (version is not None and not isinstance(version, str)):
             active_budget.note(
                 OsvQueryLimitation(
@@ -854,6 +916,11 @@ def query_batch(
             local_packages.append((i, name, version or None))
             continue
         key = _cache_key(name, version, ecosystem)
+        held = active_budget.prefetched.get(key)
+        if held is not None:
+            all_results[i] = list(held[0])
+            replayed.extend(held[1])
+            continue
         cached = _get_cached(key)
         if cached is not None:
             all_results[i] = cached
@@ -862,33 +929,21 @@ def query_batch(
             uncached_queries.append(_build_query(name, version, ecosystem))
 
     if active_budget.local_db_path is not None:
-        try:
-            checked = (
-                _query_snapshot(local_packages, ecosystem, all_results, active_budget)
-                if local_packages
-                else frozenset()
-            )
-            return QueryBatchResults(
-                all_results,
-                limitations=_limitations_since(
-                    active_budget,
-                    start_index=limitations_start,
-                    start_generation=limitations_generation,
-                ),
-                local_checked=checked,
-            )
-        finally:
-            if budget is None:
-                active_budget.close()
+        checked = (
+            _query_snapshot(local_packages, ecosystem, all_results, active_budget)
+            if local_packages
+            else frozenset()
+        )
+        return QueryBatchResults(
+            all_results,
+            limitations=call_limitations(),
+            local_checked=checked,
+        )
 
     if not uncached_queries:
         return QueryBatchResults(
             all_results,
-            limitations=_limitations_since(
-                active_budget,
-                start_index=limitations_start,
-                start_generation=limitations_generation,
-            ),
+            limitations=call_limitations(),
         )
 
     successful_batches = 0
@@ -959,9 +1014,14 @@ def query_batch(
                             )
                         )
                         continue
-                    name, version = retained_packages[idx]
+                    name, version, ecosystem = retained_packages[idx]
                     if not vulns_raw:
                         _put_cache(_cache_key(name, version, ecosystem), [])
+                        if prefetching:
+                            active_budget.prefetched[_cache_key(name, version, ecosystem)] = (
+                                [],
+                                (),
+                            )
                         logger.info(
                             "OSV.dev: no vulnerabilities found for %s==%s (passed)",
                             name,
@@ -969,6 +1029,7 @@ def query_batch(
                         )
                         continue
                     package_generation = active_budget.limitation_generation
+                    package_start = len(active_budget.limitations or [])
                     if len(vulns_raw) > MAX_OSV_VULNS_PER_PACKAGE:
                         active_budget.note(
                             OsvQueryLimitation(
@@ -1015,6 +1076,17 @@ def query_batch(
                     all_results[idx] = vuln_details
                     if active_budget.limitation_generation == package_generation:
                         _put_cache(_cache_key(name, version, ecosystem), vuln_details)
+                    if prefetching:
+                        # Partial results stay uncached; hold them with their
+                        # limitations so the per-file call reports both.
+                        active_budget.prefetched[_cache_key(name, version, ecosystem)] = (
+                            vuln_details,
+                            _limitations_since(
+                                active_budget,
+                                start_index=package_start,
+                                start_generation=package_generation,
+                            ),
+                        )
 
         query_ok = successful_batches > 0
     except _OsvLimitReachedError:
@@ -1046,11 +1118,7 @@ def query_batch(
     _last_query_ok = query_ok  # legacy fallback only; written, never read here
     return QueryBatchResults(
         all_results,
-        limitations=_limitations_since(
-            active_budget,
-            start_index=limitations_start,
-            start_generation=limitations_generation,
-        ),
+        limitations=call_limitations(),
     )
 
 
