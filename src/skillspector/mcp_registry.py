@@ -19,7 +19,8 @@ from urllib.parse import quote
 
 import httpx
 
-REGISTRY_URL = "https://registry.modelcontextprotocol.io/v0/servers"
+REGISTRY_URL = "https://registry.modelcontextprotocol.io/v0.1/servers"
+LEGACY_REGISTRY_URL = "https://registry.modelcontextprotocol.io/v0/servers"
 OFFICIAL_META_KEY = "io.modelcontextprotocol.registry/official"
 MAX_REGISTRY_BYTES = 16 * 1024 * 1024
 MAX_REGISTRY_DEPTH = 64
@@ -379,7 +380,9 @@ def _load_local_registry(path: Path) -> dict[str, Any]:
         raw = source_file.read(MAX_REGISTRY_BYTES + 1)
     if len(raw) > MAX_REGISTRY_BYTES:
         raise ValueError(f"input exceeds {MAX_REGISTRY_BYTES} bytes")
-    text = raw.decode("utf-8")
+    # Local captures and comparison reports may carry a UTF-8 signature.
+    # Count it in the raw byte budget, then strip only that leading signature.
+    text = raw.decode("utf-8-sig")
     # The JSON decoder owns syntax validation; only bound nesting here, while
     # ignoring delimiters in strings, before its recursive parser runs.
     depth = 0
@@ -410,7 +413,7 @@ def _load_payload(input_path: str) -> dict[str, Any]:
         if Path(input_path).is_file():
             return _load_local_registry(Path(input_path))
         if input_path.startswith(("http://", "https://")):
-            if input_path != REGISTRY_URL:
+            if input_path not in {REGISTRY_URL, LEGACY_REGISTRY_URL}:
                 raise ValueError(
                     f"MCP Registry source failed: {input_path}: only the official registry URL is supported"
                 )

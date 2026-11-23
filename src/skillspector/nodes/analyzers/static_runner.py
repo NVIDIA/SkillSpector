@@ -923,7 +923,14 @@ def security_view_match_is_literal(content: str, start: int, end: int) -> bool:
     return source_text[source_start:source_end] == content[start:end]
 
 
-def _advance_markdown_fence(active: tuple[str, int] | None, line: str) -> tuple[str, int] | None:
+def _fence_info(opening: re.Match[str]) -> str:
+    """Return an opening fence's info string, such as ``gitignore`` or ``bash``."""
+    return opening.string[opening.end(1) :].strip()
+
+
+def _advance_markdown_fence(
+    active: tuple[str, int, str] | None, line: str
+) -> tuple[str, int, str] | None:
     stripped = line.rstrip(LINE_BREAK_CHARS)
     closing = MARKDOWN_FENCE_CLOSE.fullmatch(stripped)
     if active is not None:
@@ -933,16 +940,16 @@ def _advance_markdown_fence(active: tuple[str, int] | None, line: str) -> tuple[
     opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped)
     if opening:
         marker = opening.group(1)
-        return marker[0], len(marker)
+        return marker[0], len(marker), _fence_info(opening)
     return None
 
 
 def _markdown_fence_states(
     content: str, offsets: tuple[int, ...]
-) -> tuple[dict[int, tuple[str, int] | None], dict[int, tuple[str, int, str, int, int]]]:
-    states: dict[int, tuple[str, int] | None] = {}
-    transitions: dict[int, tuple[str, int, str, int, int]] = {}
-    active: tuple[str, int] | None = None
+) -> tuple[dict[int, tuple[str, int, str] | None], dict[int, tuple[str, int, str, int, int, str]]]:
+    states: dict[int, tuple[str, int, str] | None] = {}
+    transitions: dict[int, tuple[str, int, str, int, int, str]] = {}
+    active: tuple[str, int, str] | None = None
     offset_index = 0
     content_offset = 0
     for line in content.splitlines(keepends=True):
@@ -957,7 +964,14 @@ def _markdown_fence_states(
             if offset > content_offset:
                 if active is None and opening is not None:
                     marker = opening.group(1)
-                    transitions[offset] = (marker[0], len(marker), "open", line_end, content_offset)
+                    transitions[offset] = (
+                        marker[0],
+                        len(marker),
+                        "open",
+                        line_end,
+                        content_offset,
+                        _fence_info(opening),
+                    )
                 elif (
                     active is not None
                     and closing is not None
@@ -971,6 +985,7 @@ def _markdown_fence_states(
                         "close",
                         line_end,
                         content_offset,
+                        active[2],
                     )
             offset_index += 1
         if not complete:
@@ -1043,19 +1058,24 @@ def _markdown_context_prefix(
     content: str,
     window_start: int,
     window_end: int,
-    fence_states: dict[int, tuple[str, int] | None],
-    fence_transitions: dict[int, tuple[str, int, str, int, int]],
+    fence_states: dict[int, tuple[str, int, str] | None],
+    fence_transitions: dict[int, tuple[str, int, str, int, int, str]],
 ) -> str:
-    """Return synthetic fence context for one window that starts mid-document."""
+    """Return synthetic fence context for one window that starts mid-document.
+
+    The rebuilt opening line keeps the fence's info string, so analyzers that
+    depend on the fence language (for example PE3 ignore-list fences) see the
+    same block in every window.
+    """
     fence = fence_states.get(window_start)
     transition = fence_transitions.get(window_start)
     if transition is not None and transition[2] == "close" and transition[3] <= window_end:
         closing_prefix = content[transition[4] : window_start]
-        return transition[0] * transition[1] + "\n" + closing_prefix
+        return transition[0] * transition[1] + transition[5] + "\n" + closing_prefix
     if fence is not None:
-        return fence[0] * fence[1] + "\n"
+        return fence[0] * fence[1] + fence[2] + "\n"
     if transition is not None and transition[3] <= window_end:
-        return transition[0] * transition[1] + "\n"
+        return transition[0] * transition[1] + transition[5] + "\n"
     return ""
 
 
@@ -1399,7 +1419,24 @@ def _bounded_parser_incomplete(
     python_import_bounds: PythonImportBounds | None = None,
     prepared_analysis: object | None = None,
 ) -> bool:
+    # Parser hooks consume the native dialect for the actual source path,
+    # including marker and derived views. Finding applicability keeps its
+    # established inventory type.
+    if file_type == "other":
+        suffix = path.lower().rsplit(".", 1)[-1]
+        file_type = {
+            "jsx": "javascript",
+            "tsx": "tsx",
+            "mts": "typescript",
+            "cts": "typescript",
+        }.get(suffix, file_type)
     kwargs = {"file_type": file_type, "complete_context": complete_context}
+    if (
+        file_type == "other"
+        and path.lower().endswith(".rst")
+        and getattr(module, "USES_RST_SOURCE_TYPE", False) is True
+    ):
+        kwargs["file_type"] = "rst"
     if vars(module).get("USES_PREPARED_PARSER_ANALYSIS") is True:
         kwargs.update(
             prepared_analysis=prepared_analysis,
@@ -1543,8 +1580,8 @@ class _WindowSourceContext:
     """Shared whole-artifact coordinates for marker and raw window scans."""
 
     line_starts: tuple[int, ...]
-    fence_states: dict[int, tuple[str, int] | None]
-    fence_transitions: dict[int, tuple[str, int, str, int, int]]
+    fence_states: dict[int, tuple[str, int, str] | None]
+    fence_transitions: dict[int, tuple[str, int, str, int, int, str]]
 
 
 @dataclass
@@ -1595,7 +1632,19 @@ class _CompleteSourceCache:
     text: Mapping[str, str]
     raw: Mapping[str, bytes] | None
     inventory: object
+    only_planned_path: str | None = None
     _validated: Mapping[str, str] | None = None
+
+    def is_sole_original(self, path: str, content: str, check_runtime: Callable[[], None]) -> bool:
+        # A validated subset does not establish an absence of other callers.
+        return (
+            self.only_planned_path == path
+            and isinstance(self.inventory, list)
+            and len(self.inventory) == len(self.text) == 1
+            and self.raw is not None
+            and len(self.raw) == 1
+            and self.validated(check_runtime).get(path) == content
+        )
 
     def validated(self, check_runtime: Callable[[], None]) -> Mapping[str, str]:
         check_runtime()
@@ -3537,8 +3586,18 @@ def _scan_all_views_with_parser_diagnostics(
                 if prepare_parser is not None:
                     parser_analyses[id(module)] = prepare_parser(
                         content=content,
-                        file_type="json" if _oms_projected else _infer_file_type(path),
+                        file_type=parser_file_type,
                         check_runtime=finding_budget.check_runtime,
+                        **(
+                            {"sole_original_shell": True}
+                            if parser_file_type == "shell"
+                            and source_cache is not None
+                            and vars(module).get("USES_SOLE_ORIGINAL_SHELL") is True
+                            and source_cache.is_sole_original(
+                                path, content, finding_budget.check_runtime
+                            )
+                            else {}
+                        ),
                     )
                     finding_budget.check_runtime()
                 prepare = _explicit_analysis_hook(module, "prepare_analysis")
@@ -3743,6 +3802,34 @@ def _scan_all_views_with_parser_diagnostics(
                             prepared_analysis=parser_analyses.get(id(module)),
                         )
                     )
+            prior = parser_diagnostics[0] if parser_diagnostics else None
+            if (
+                parser_file_type == "shell"
+                and source_cache is not None
+                and (
+                    prior is None
+                    and not bounded_parse_limited
+                    or prior is not None
+                    and prior.cause == ParserCause.RUNTIME_DEPENDENT
+                    and prior.location_precision == "source_span"
+                )
+            ):
+                for module in modules_for_windows:
+                    extra = _explicit_analysis_hook(module, "sourced_callable_diagnostic")
+                    if extra is None:
+                        continue
+                    diagnostic = extra(
+                        path,
+                        content,
+                        source_cache.validated(finding_budget.check_runtime),
+                        finding_budget.check_runtime,
+                    )
+                    if isinstance(diagnostic, StaticParserDiagnostic) and (
+                        prior is None or diagnostic.start < prior.start
+                    ):
+                        parser_diagnostics.insert(0, diagnostic)
+                        bounded_parse_limited = True
+                        break
         except _StaticResourceLimitError as exc:
             return (
                 _deduplicate_view_findings(findings)[:max_findings],
@@ -4388,7 +4475,12 @@ def run_static_patterns(
         and "!/" not in str(metadata.get("path", ""))
     }
     raw_inventory = state.get("artifact_inventory", [])
-    source_cache = _CompleteSourceCache(file_cache, raw_file_cache, raw_inventory)
+    source_cache = _CompleteSourceCache(
+        file_cache,
+        raw_file_cache,
+        raw_inventory,
+        components[0] if len(components) == 1 and state.get("inspection_ledger") == [] else None,
+    )
     binary_paths = (
         {
             str(item.get("path", ""))
@@ -4533,7 +4625,12 @@ def run_static_patterns_with_ledger(
     events: list[InspectionLedgerEvent] = []
     notices: list[dict[str, object]] = []
     raw_inventory = state.get("artifact_inventory", [])
-    source_cache = _CompleteSourceCache(file_cache, raw_file_cache, raw_inventory)
+    source_cache = _CompleteSourceCache(
+        file_cache,
+        raw_file_cache,
+        raw_inventory,
+        components[0] if len(components) == 1 and state.get("inspection_ledger") == [] else None,
+    )
     inventory: dict[str, dict[str, object]] = (
         {str(item.get("path", "")): item for item in raw_inventory if isinstance(item, dict)}
         if isinstance(raw_inventory, list)

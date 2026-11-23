@@ -34,12 +34,11 @@ from hashlib import sha256
 from pathlib import Path
 from stat import S_ISDIR
 from time import monotonic
-from typing import Annotated, cast
+from typing import TYPE_CHECKING, Annotated, cast
 from urllib.parse import quote
 
 import typer
 from click.core import ParameterSource
-from langchain_core.runnables import RunnableConfig
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.text import Text
@@ -50,7 +49,6 @@ from skillspector.cleanup import TempDirTracker, cleanup_result
 from skillspector.cli_entry import create_app
 from skillspector.cli_entry import main as main
 from skillspector.cli_entry import version_callback as version_callback
-from skillspector.constants import RISK_THRESHOLD
 from skillspector.file_output import require_secure_file_output, write_text_no_follow
 from skillspector.graph_proxy import graph
 from skillspector.input_handler import _normalize_root_owned_alias, validate_local_input_path
@@ -63,7 +61,6 @@ from skillspector.inspection_ledger import (
     inspection_work_id,
     ledger_event,
 )
-from skillspector.llm_utils import unsupported_control_error
 from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
 from skillspector.models import OCCURRENCE_FINDING_ID_KEY, Finding
@@ -73,9 +70,8 @@ from skillspector.multi_skill import (
     _manifest_file,
     detect_skills,
 )
-from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
-from skillspector.nodes.report import report, risk_severity_and_recommendation
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
+from skillspector.scan_policy import RISK_THRESHOLD
 from skillspector.semantic_runtime import (
     has_semantic_runtime_event,
     semantic_runtime_intent,
@@ -94,7 +90,44 @@ from skillspector.suppression import (
 )
 from skillspector.terminal_text import visible_terminal_text as _visible_terminal_text
 
+if TYPE_CHECKING:
+    from langchain_core.runnables import RunnableConfig
+
+    from skillspector.state import SkillspectorState
+
 logger = get_logger(__name__)
+
+
+def __getattr__(name: str) -> object:
+    """Keep analyzer compatibility exports lazy until a scan needs them."""
+    if name in {"ANALYZER_MODULES", "ANALYZER_NODE_IDS"}:
+        from skillspector.nodes import analyzers
+
+        value = getattr(analyzers, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def report(state: SkillspectorState) -> dict[str, object]:
+    """Load the scanner report builder only for actual skill reports."""
+    from skillspector.nodes.report import report as build_report
+
+    return build_report(state)
+
+
+def unsupported_control_error(timeout: float | None = 120) -> str | None:
+    """Keep the preflight hook patchable without loading providers for help."""
+    from skillspector.llm_utils import unsupported_control_error as check_controls
+
+    return check_controls(timeout=timeout)
+
+
+def risk_severity_and_recommendation(score: int) -> tuple[str, str]:
+    """Keep recursive verdict policy patchable while deferring report imports."""
+    from skillspector.nodes.report import risk_severity_and_recommendation as assess_score
+
+    return assess_score(score)
 
 
 def _ensure_utf8_streams() -> None:
@@ -703,7 +736,7 @@ def scan(
     Environment variables:
 
         SKILLSPECTOR_PROVIDER  Active LLM provider: openai | anthropic |
-                               anthropic_proxy | bedrock | nv_build |
+                               anthropic_proxy | bedrock | minimax | nv_build |
                                nv_inference | ollama | azure_openai |
                                openai_compatible | gemini | claude_cli |
                                gemini_cli | opencode_cli. Defaults to the NVIDIA path
@@ -717,6 +750,7 @@ def scan(
 
         OPENAI_API_KEY [+ OPENAI_BASE_URL]   for SKILLSPECTOR_PROVIDER=openai
         ANTHROPIC_API_KEY                    for SKILLSPECTOR_PROVIDER=anthropic
+        MINIMAX_API_KEY                      for SKILLSPECTOR_PROVIDER=minimax
         ANTHROPIC_PROXY_API_KEY +
           ANTHROPIC_PROXY_ENDPOINT_URL       for anthropic_proxy
         AWS_PROFILE (optional) + AWS_REGION  for SKILLSPECTOR_PROVIDER=bedrock
@@ -1634,10 +1668,11 @@ def _discovered_files_tree(paths: list[str]) -> Tree:
 
 def _wired_analyzer_node_ids() -> frozenset[str]:
     """Return only analyzers present in the compiled graph."""
+    node_ids = sys.modules[__name__].ANALYZER_NODE_IDS
     graph_nodes = getattr(graph, "nodes", {})
     if not isinstance(graph_nodes, dict):
-        return frozenset(ANALYZER_NODE_IDS)
-    return frozenset(node_id for node_id in ANALYZER_NODE_IDS if node_id in graph_nodes)
+        return frozenset(node_ids)
+    return frozenset(node_id for node_id in node_ids if node_id in graph_nodes)
 
 
 def _run_graph_scan(
@@ -2584,7 +2619,7 @@ def _scan_transitive(
         requested=llm_requested,
         enabled=llm_enabled,
         result=merged_result,
-        discovered_modules=ANALYZER_MODULES,
+        discovered_modules=sys.modules[__name__].ANALYZER_MODULES,
     )
     pre_runtime_failure_events = _distinct_failed_ledger_events(merged_inspection_ledger)
     if runtime_event is not None and not has_semantic_runtime_event(
@@ -3579,6 +3614,13 @@ def baseline(
             help="Skip LLM analysis when generating the baseline (static analysis only).",
         ),
     ] = False,
+    yara_rules_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--yara-rules-dir",
+            help="Directory containing additional YARA rule files (.yar/.yara) to load alongside built-in rules.",
+        ),
+    ] = None,
     reason: Annotated[
         str,
         typer.Option(
@@ -3614,7 +3656,12 @@ def baseline(
             set_level("DEBUG")
             err_console.print("[dim]Scanning to build baseline...[/dim]")
         # output_format is irrelevant here; we consume findings, not report_body.
-        state = _scan_state(input_path, FormatChoice.json, no_llm)
+        state = _scan_state(
+            input_path,
+            FormatChoice.json,
+            no_llm,
+            yara_rules_dir=str(yara_rules_dir.resolve()) if yara_rules_dir else None,
+        )
         if not to_stdout:
             state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)

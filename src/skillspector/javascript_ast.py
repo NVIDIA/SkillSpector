@@ -15,15 +15,22 @@ from array import array
 from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 
 import tree_sitter_javascript
+import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser, Tree
 
 MAX_JAVASCRIPT_SOURCE_CHARS = 1_000_000
 _MAX_NODES = 100_000
+ParseFailure = Literal["resource_limit", "malformed_input", "unsupported_syntax"]
 _MAX_DEPTH = 128
 _MAX_SECONDS = 2.0
-_LANGUAGE = Language(tree_sitter_javascript.language())
+_LANGUAGES = {
+    "javascript": Language(tree_sitter_javascript.language()),
+    "typescript": Language(tree_sitter_typescript.language_typescript()),
+    "tsx": Language(tree_sitter_typescript.language_tsx()),
+}
 NODE_SHEBANG = re.compile(r"#![ \t]*(?:\S*/)?(?:env[ \t]+)?node(?:js)?(?=[ \t\r\n]|$)")
 
 
@@ -50,7 +57,11 @@ class JavaScriptProgram:
 
 
 def parse_javascript_source(
-    content: str, check_runtime: Callable[[], None]
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    dialect: str = "javascript",
+    failures: list[ParseFailure] | None = None,
 ) -> JavaScriptProgram | None:
     """Return complete syntax, or no ownership on malformed/over-budget input.
 
@@ -59,30 +70,52 @@ def parse_javascript_source(
     checked immediately before and after that bounded native operation.
     """
     check_runtime()
-    if len(content) > MAX_JAVASCRIPT_SOURCE_CHARS or "\x00" in content:
+
+    def failed(reason: ParseFailure) -> None:
+        if failures is not None:
+            failures.append(reason)
+
+    if len(content) > MAX_JAVASCRIPT_SOURCE_CHARS:
+        failed("resource_limit")
+        return None
+    if "\x00" in content:
+        failed("malformed_input")
         return None
     deadline = time.monotonic() + _MAX_SECONDS
     try:
         source = content.encode("utf-8")
     except UnicodeEncodeError:
+        failed("malformed_input")
         return None
     check_runtime()
     remaining = deadline - time.monotonic()
     if remaining <= 0:
+        failed("resource_limit")
         return None
     tree: Tree | None
+    language = _LANGUAGES.get(dialect)
+    if language is None:
+        failed("unsupported_syntax")
+        return None
     try:
         # Zero disables the native timeout, so round a positive budget up to
         # at least one microsecond. A fresh parser cannot resume timed-out work.
-        parser = Parser(_LANGUAGE, timeout_micros=max(1, int(remaining * 1_000_000)))
+        parser = Parser(language, timeout_micros=max(1, int(remaining * 1_000_000)))
         tree = parser.parse(source)
     except (ValueError, TypeError, OverflowError):
         tree = None
     check_runtime()
     if tree is None or time.monotonic() >= deadline:
+        failed("resource_limit")
         return None
     root = tree.root_node
     if root.type != "program" or root.has_error or root.end_byte != len(source):
+        failed("malformed_input")
+        return None
+    # The native tree includes punctuation; Python retains only named syntax.
+    # Bound both allocations independently before walking a wide input.
+    if root.descendant_count > 2 * _MAX_NODES:
+        failed("resource_limit")
         return None
 
     nodes: list[Node] = []
@@ -94,21 +127,28 @@ def parse_javascript_source(
         if visited % 256 == 0:
             check_runtime()
             if time.monotonic() >= deadline:
+                failed("resource_limit")
                 return None
-        if visited > _MAX_NODES or depth > _MAX_DEPTH or node.is_error or node.is_missing:
+        if visited > _MAX_NODES or depth > _MAX_DEPTH:
+            failed("resource_limit")
+            return None
+        if node.is_error or node.is_missing:
+            failed("malformed_input")
             return None
         if node.type == "hash_bang_line" and (
             node.start_byte != 0 or NODE_SHEBANG.match(content) is None
         ):
+            failed("unsupported_syntax")
             return None
         if _invalid_optional_target(node, check_runtime):
+            failed("malformed_input")
             return None
-        if node.is_named:
-            nodes.append(node)
+        nodes.append(node)
         # Bound child allocation before materializing a wide CST level.
-        if visited + len(pending) + node.child_count > _MAX_NODES:
+        if visited + len(pending) + node.named_child_count > _MAX_NODES:
+            failed("resource_limit")
             return None
-        pending.extend((child, depth + 1) for child in reversed(node.children))
+        pending.extend((child, depth + 1) for child in reversed(node.named_children))
 
     multibyte_ends = array("I")
     extra_bytes = array("I")
@@ -118,6 +158,7 @@ def parse_javascript_source(
         if index % 4096 == 0:
             check_runtime()
             if time.monotonic() >= deadline:
+                failed("resource_limit")
                 return None
         codepoint = ord(character)
         width = 1 + (codepoint > 0x7F) + (codepoint > 0x7FF) + (codepoint > 0xFFFF)

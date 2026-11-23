@@ -70,8 +70,10 @@ from skillspector.llm_utils import (
     _ainvoke_with_usage,
     _invoke_with_usage,
     bind_structured_output,
+    bind_structured_output_fallback,
     chat_model_provider_name,
     get_chat_model,
+    is_structured_output_rejection,
     new_inference_usage_collector,
     structured_output_instructions,
 )
@@ -86,6 +88,8 @@ from skillspector.response_recovery import (
     recover_payload,
     recovery_field_choices,
 )
+from skillspector.semantic_runtime import STRUCTURED_OUTPUT_UNAVAILABLE_ERROR
+from skillspector.state import LLMCallRecord, llm_call_record
 from skillspector.structured_response import (
     ResponseIssue,
     completed_response_text,
@@ -252,6 +256,18 @@ class LLMInputBudgetError(RuntimeError):
 
 class LLMRuntimeLimitError(RuntimeError):
     """Signal that no shared scan time remains for an LLM operation."""
+
+
+class LLMStructuredOutputUnavailableError(Exception):
+    """The gateway rejected structured output in both available shapes.
+
+    Raised when a provider answers the ``json_schema`` response format with
+    HTTP 400 and the unforced tool-calling retry is rejected the same way:
+    the gateway cannot serve structured output at all, so the batch has no
+    recovery left. It is a plain :class:`Exception`, not a ``ValueError``,
+    so batch execution records it as a failure instead of treating it as a
+    misconfiguration that aborts the scan.
+    """
 
 
 _RETRYABLE_PROVIDER_ERROR_NAMES = frozenset(
@@ -977,6 +993,30 @@ class _RecoveredBatch:
     failure: Exception | None = None
 
 
+def llm_call_record_for_outcome(node_id: str, outcome: BatchExecutionResult) -> LLMCallRecord:
+    """Build the call-log record for one analyzer run from its batch outcome.
+
+    A run whose every batch failed because the gateway rejects structured
+    output carries that as its error, so the report can tell a provider that
+    cannot serve structured output from a provider that was never reached.
+    Partial failures keep the existing error-free record: the provider did
+    serve some assessments, so the failure is a coverage gap, not an
+    unavailable LLM. A successful or recovered batch proves the provider
+    served an assessment, so the unavailable error is reserved for total
+    rejection.
+    """
+    if not outcome.failures:
+        return llm_call_record(node_id, ok=True)
+    if outcome.successful or outcome.recovered:
+        return llm_call_record(node_id, ok=False)
+    if all(
+        failure.reason is LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
+        for failure in outcome.failures
+    ):
+        return llm_call_record(node_id, ok=False, error=STRUCTURED_OUTPUT_UNAVAILABLE_ERROR)
+    return llm_call_record(node_id, ok=False)
+
+
 @dataclass(frozen=True)
 class _RecoveryQuestion:
     prompt: str
@@ -1523,6 +1563,10 @@ class LLMAnalyzerBase:
         self.recovery_rule_ids = recovery_rule_ids
         self._timeout = timeout
         self._dynamic_timeout = callable(timeout)
+        # Set once a gateway rejects the json_schema response format: later
+        # batches (and formatting retries) bind the schema as an unforced
+        # tool call instead of paying one rejected request per batch.
+        self._use_structured_output_fallback = False
         self._input_budget = get_max_input_tokens(model)
         self._request_ordinal = 0
         self._request_ordinal_lock = threading.Lock()
@@ -1556,8 +1600,32 @@ class LLMAnalyzerBase:
             chat_model=self._llm,
         )
 
-    def _bind_structured_output(self, llm: object, schema: type) -> object:
-        return bind_structured_output(llm, schema, self.model)
+    def _bind_structured_output(
+        self, llm: object, schema: type, *, preserve_text: str | None = None
+    ) -> object:
+        if self._use_structured_output_fallback:
+            fallback = bind_structured_output_fallback(
+                llm, schema, self.model, preserve_text=preserve_text
+            )
+            if fallback is not None:
+                return fallback
+        return bind_structured_output(llm, schema, self.model, preserve_text=preserve_text)
+
+    def _fallback_structured_output(self, llm: object) -> object | None:
+        """Rebind the response schema as an unforced tool call, once per analyzer.
+
+        Returns ``None`` when the model cannot take the fallback shape, so the
+        caller re-raises the original rejection instead of retrying a binding
+        that cannot help. Sets the instance flag on success: the gateway has
+        shown it rejects ``json_schema``, so later batches bind the fallback
+        directly.
+        """
+        if self.response_schema is None:
+            return None
+        fallback = bind_structured_output_fallback(llm, self.response_schema, self.model)
+        if fallback is not None:
+            self._use_structured_output_fallback = True
+        return fallback
 
     def _remaining_timeout(self) -> float | None:
         if callable(self._timeout):
@@ -1971,12 +2039,64 @@ class LLMAnalyzerBase:
         )
         llm, structured_llm = self._model_for_call()
         self._check_prompt_budget(prompt, chat_model=llm)
+        # Snapshot whether this request started on the fallback binding. The
+        # shared flag only guides future bindings: a concurrent batch may flip
+        # it while this request is in flight, and that must not classify this
+        # request as already having tried the fallback.
+        started_on_fallback = self._use_structured_output_fallback
         if structured_llm:
+            if started_on_fallback:
+                # A gateway that rejected json_schema once rejects it for every
+                # batch: bind the fallback directly instead of paying for
+                # another rejected request.
+                structured_llm = self._bind_structured_output(llm, self.response_schema)  # type: ignore[arg-type]
             try:
                 response = self._invoke_with_failure_diagnostic(structured_llm, prompt)
                 _require_structured_response(response)
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError(getattr(exc, "issue", None)) from exc
+            except Exception as exc:
+                if is_structured_output_rejection(exc) and started_on_fallback:
+                    # This batch already ran on the fallback binding: both
+                    # shapes were rejected, so there is no recovery left.
+                    raise LLMStructuredOutputUnavailableError(
+                        "provider rejected structured output (response_format "
+                        "unsupported; tool-calling fallback also rejected)"
+                    ) from exc
+                if not is_structured_output_rejection(exc):
+                    raise
+                # Refresh the remaining workflow deadline and request timeout
+                # before the fallback call: _model_for_call() ran before the
+                # initial request, so the retry must not reuse that earlier
+                # timeout once the deadline has expired.
+                self._require_time_remaining()
+                llm, _ = self._model_for_call()
+                fallback = self._fallback_structured_output(llm)
+                if fallback is None:
+                    raise
+                logger.warning(
+                    "LLM structured output rejected for %s; retrying with tool calling",
+                    batch.file_label,
+                )
+                try:
+                    response = self._invoke_with_failure_diagnostic(fallback, prompt)
+                    _require_structured_response(response)
+                except (StructuredOutputParseError, ValidationError) as retry_exc:
+                    raise _StructuredResponseValidationError(
+                        getattr(retry_exc, "issue", None)
+                    ) from retry_exc
+                except Exception as retry_exc:
+                    # The fallback runs inside the handler for the initial
+                    # rejection, so Python links that rejection as this
+                    # error's implicit context. Stop the walk there: only
+                    # the fallback request's own failure may report the
+                    # run as structured-output unavailable.
+                    if is_structured_output_rejection(retry_exc, stop_before=exc):
+                        raise LLMStructuredOutputUnavailableError(
+                            "provider rejected structured output (response_format "
+                            "unsupported; tool-calling fallback also rejected)"
+                        ) from retry_exc
+                    raise
         else:
             response = _raw_response_text(self._invoke_with_failure_diagnostic(llm, prompt))
         logger.debug("LLM response for %s", batch.file_label)
@@ -2002,10 +2122,9 @@ class LLMAnalyzerBase:
             )
         llm, _ = self._model_for_call()
         self._check_prompt_budget(prompt, chat_model=llm)
-        return bind_structured_output(
+        return self._bind_structured_output(
             llm,
             schema,
-            self.model,
             preserve_text=source,
         ), prompt
 
@@ -2463,6 +2582,8 @@ class LLMAnalyzerBase:
             except LLMRuntimeLimitError:
                 raise
             except Exception as exc:
+                if isinstance(exc, LLMStructuredOutputUnavailableError):
+                    retry_outcome.reason = LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
                 retryable = _is_retryable_provider_error(exc)
                 if not retryable:
                     self._require_time_remaining()
@@ -2509,12 +2630,64 @@ class LLMAnalyzerBase:
         )
         llm, structured_llm = self._model_for_call()
         self._check_prompt_budget(prompt, chat_model=llm)
+        # Snapshot whether this request started on the fallback binding. The
+        # shared flag only guides future bindings: a concurrent batch may flip
+        # it while this request is in flight, and that must not classify this
+        # request as already having tried the fallback.
+        started_on_fallback = self._use_structured_output_fallback
         if structured_llm:
+            if started_on_fallback:
+                # A gateway that rejected json_schema once rejects it for every
+                # batch: bind the fallback directly instead of paying for
+                # another rejected request.
+                structured_llm = self._bind_structured_output(llm, self.response_schema)  # type: ignore[arg-type]
             try:
                 response = await self._ainvoke_with_failure_diagnostic(structured_llm, prompt)
                 _require_structured_response(response)
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError(getattr(exc, "issue", None)) from exc
+            except Exception as exc:
+                if is_structured_output_rejection(exc) and started_on_fallback:
+                    # This batch already ran on the fallback binding: both
+                    # shapes were rejected, so there is no recovery left.
+                    raise LLMStructuredOutputUnavailableError(
+                        "provider rejected structured output (response_format "
+                        "unsupported; tool-calling fallback also rejected)"
+                    ) from exc
+                if not is_structured_output_rejection(exc):
+                    raise
+                # Refresh the remaining workflow deadline and request timeout
+                # before the fallback call: _model_for_call() ran before the
+                # initial request, so the retry must not reuse that earlier
+                # timeout once the deadline has expired.
+                self._require_time_remaining()
+                llm, _ = self._model_for_call()
+                fallback = self._fallback_structured_output(llm)
+                if fallback is None:
+                    raise
+                logger.warning(
+                    "LLM structured output rejected for %s; retrying with tool calling",
+                    batch.file_label,
+                )
+                try:
+                    response = await self._ainvoke_with_failure_diagnostic(fallback, prompt)
+                    _require_structured_response(response)
+                except (StructuredOutputParseError, ValidationError) as retry_exc:
+                    raise _StructuredResponseValidationError(
+                        getattr(retry_exc, "issue", None)
+                    ) from retry_exc
+                except Exception as retry_exc:
+                    # The fallback runs inside the handler for the initial
+                    # rejection, so Python links that rejection as this
+                    # error's implicit context. Stop the walk there: only
+                    # the fallback request's own failure may report the
+                    # run as structured-output unavailable.
+                    if is_structured_output_rejection(retry_exc, stop_before=exc):
+                        raise LLMStructuredOutputUnavailableError(
+                            "provider rejected structured output (response_format "
+                            "unsupported; tool-calling fallback also rejected)"
+                        ) from retry_exc
+                    raise
         else:
             response = _raw_response_text(await self._ainvoke_with_failure_diagnostic(llm, prompt))
         logger.debug("LLM response for %s", batch.file_label)
@@ -2590,6 +2763,8 @@ class LLMAnalyzerBase:
             except LLMRuntimeLimitError:
                 raise
             except Exception as exc:
+                if isinstance(exc, LLMStructuredOutputUnavailableError):
+                    retry_outcome.reason = LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED
                 retryable = _is_retryable_provider_error(exc)
                 if not retryable:
                     self._require_time_remaining()
