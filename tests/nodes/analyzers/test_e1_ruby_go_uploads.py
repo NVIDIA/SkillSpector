@@ -137,3 +137,35 @@ def test_go_raw_string_literals_match_interpreted_strings(raw: str, quoted: str)
 
 def test_go_raw_string_receiver_with_non_http_url_is_not_e1() -> None:
     assert not _e1('client.Post(`/relative/path`, "text/plain", body)', "main.go")
+
+
+@pytest.mark.parametrize("verb", ["POST", "PUT", "PATCH"])
+@pytest.mark.parametrize(
+    "context",
+    [
+        'context.WithValue(ctx, key, "trial(")',
+        'context.WithValue(ctx, key, "trial)")',
+        "context.WithValue(ctx, key, `raw(`)",
+        'context.WithValue(ctx, key, "say \\"hi(\\"")',
+    ],
+)
+def test_go_context_string_literal_with_parenthesis_is_reported(context: str, verb: str) -> None:
+    content = f'req, _ := http.NewRequestWithContext({context}, "{verb}", target, body)'
+    assert len(_e1(content, "main.go")) == 1, content
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        # The apparent closing quote belongs to the raw string, not the verb.
+        'req, _ := http.NewRequest(`POST", target, body)`, nil)',
+        'req, _ := http.NewRequest("POST`, target, body)',
+        'req, _ := http.NewRequestWithContext(ctx, `POST", target, body)`, nil)',
+        # Verb must end at the argument boundary.
+        'req, _ := http.NewRequest("POSTS", target, body)',
+        # GET stays excluded with a punctuated context string.
+        'req, _ := http.NewRequestWithContext(context.WithValue(ctx, k, "a("), "GET", target, nil)',
+    ],
+)
+def test_go_mismatched_or_unbounded_method_is_not_e1(content: str) -> None:
+    assert _e1(content, "main.go") == []
