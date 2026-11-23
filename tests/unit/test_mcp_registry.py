@@ -24,6 +24,11 @@ from skillspector.mcp_registry import (
     scan_registry,
 )
 
+OFFICIAL_URLS = (
+    "https://registry.modelcontextprotocol.io/v0.1/servers",
+    "https://registry.modelcontextprotocol.io/v0/servers",
+)
+
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "mcp_registry"
 
 
@@ -140,7 +145,8 @@ def test_contract_isolation_uses_normalized_snapshots() -> None:
     assert all("server" not in server["snapshot"] for server in report["servers"])
 
 
-def test_registry_url_scan_follows_next_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+def test_registry_url_scan_follows_next_cursor(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
     page_one = {
         "servers": [{"server": {"name": "page/one"}}],
         "metadata": {"nextCursor": "cursor-2"},
@@ -154,11 +160,66 @@ def test_registry_url_scan_follows_next_cursor(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr("skillspector.mcp_registry.httpx.get", fake_get)
 
-    report = scan_registry(REGISTRY_URL)
+    report = scan_registry(url)
 
+    assert report["source"] == url
+    assert all(snapshot["source"] == url for snapshot in report["snapshots"])
     assert report["server_count"] == 2
     assert [server["snapshot"]["name"] for server in report["servers"]] == ["page/one", "page/two"]
-    assert calls == [(REGISTRY_URL, None), (REGISTRY_URL, {"cursor": "cursor-2"})]
+    assert calls == [(url, None), (url, {"cursor": "cursor-2"})]
+
+
+def test_registry_defaults_and_named_lookups_use_stable_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_get(url: str, **kwargs: Any) -> _Response:
+        calls.append(url)
+        return _Response(one_server(pinned_server()))
+
+    monkeypatch.setattr(mcp_registry.httpx, "get", fake_get)
+    assert scan_registry()["server_count"] == 1
+    assert scan_registry("safe/example")["server_count"] == 1
+    assert calls == [OFFICIAL_URLS[0], f"{OFFICIAL_URLS[0]}/safe%2Fexample/versions"]
+
+
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda url: url + "/",
+        lambda url: url + "/extra",
+        lambda url: url + "?limit=1",
+        lambda url: url + "?",
+        lambda url: url + "#fragment",
+        lambda url: url + "#",
+        lambda url: url.replace("https:", "http:"),
+        lambda url: url.replace(".io/", ".io:443/"),
+        lambda url: url.replace(".io/", ".io:8443/"),
+        lambda url: url.replace("https://", "https://user@"),
+        lambda url: url.replace(".io/", ".io.evil.invalid/"),
+        lambda url: url.replace(".io/", ".io./"),
+        lambda url: url.replace("/servers", "/%73ervers"),
+        lambda url: url.replace("/servers", "/other/../servers"),
+    ],
+)
+def test_official_registry_url_neighbors_are_rejected_before_http(
+    monkeypatch: pytest.MonkeyPatch, url: str, change: Any
+) -> None:
+    monkeypatch.setattr(mcp_registry.httpx, "get", lambda *a, **kw: pytest.fail("must not fetch"))
+    with pytest.raises(ValueError, match="only the official registry URL is supported"):
+        scan_registry(change(url))
+
+
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+@pytest.mark.parametrize("response", [[], {"servers": {}}, {"servers": [None]}])
+def test_official_registry_urls_preserve_invalid_response_errors(
+    monkeypatch: pytest.MonkeyPatch, url: str, response: Any
+) -> None:
+    monkeypatch.setattr(mcp_registry.httpx, "get", lambda *a, **kw: _Response(response))
+    with pytest.raises(ValueError, match="MCP Registry"):
+        scan_registry(url)
 
 
 def test_untrusted_registry_url_is_rejected() -> None:
@@ -483,7 +544,8 @@ def test_error_on_invalid_repository_shape() -> None:
         )
 
 
-def test_error_on_repeated_next_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+def test_error_on_repeated_next_cursor(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
     page = {"servers": [{"server": {"name": "page/one"}}], "metadata": {"nextCursor": "cursor-1"}}
 
     def fake_get(url: str, *, params: dict[str, str] | None = None, timeout: int) -> _Response:
@@ -492,17 +554,18 @@ def test_error_on_repeated_next_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("skillspector.mcp_registry.httpx.get", fake_get)
 
     with pytest.raises(ValueError, match="repeated pagination cursor"):
-        scan_registry(REGISTRY_URL)
+        scan_registry(url)
 
 
-def test_error_on_http_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+def test_error_on_http_failure(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
     def fake_get(url: str, *, params: dict[str, str] | None = None, timeout: int) -> _Response:
         raise httpx.HTTPError("network down")
 
     monkeypatch.setattr("skillspector.mcp_registry.httpx.get", fake_get)
 
     with pytest.raises(ValueError, match="MCP Registry source failed"):
-        scan_registry(REGISTRY_URL)
+        scan_registry(url)
 
 
 def test_scan_registry_scans_partial_paginated_capture(tmp_path: Path) -> None:
@@ -609,6 +672,75 @@ def test_local_registry_accepts_exact_byte_limit(
     capture.write_bytes(raw)
     monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_BYTES", len(raw), raising=False)
     assert scan_registry(str(capture))["server_count"] == 1
+
+
+@pytest.mark.parametrize("prefix", [b"", b"\xef\xbb\xbf"])
+def test_local_registry_utf8_signature_preserves_snapshot_and_comparison(
+    tmp_path: Path, prefix: bytes
+) -> None:
+    capture = tmp_path / "registry.json"
+    data = one_server(pinned_server(name="example/ü", description="keep\ufeffthis"))
+    raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    capture.write_bytes(raw)
+    original = scan_registry(str(capture))
+    previous = tmp_path / "previous.json"
+    previous.write_bytes(prefix + json.dumps(original, ensure_ascii=False).encode("utf-8"))
+    capture.write_bytes(prefix + raw)
+    current = scan_registry(str(capture), compare_path=previous)
+    assert current["comparison"] == {
+        "added": [],
+        "removed": [],
+        "changed": [],
+        "unmodeled_changes": [],
+        "unchanged_count": 1,
+    }
+    assert current["findings"] == original["findings"]
+    assert current["risk_score"] == original["risk_score"]
+    assert current["snapshots"][0]["description"] == "keep\ufeffthis"
+    assert current["snapshots"][0]["record_hash"] == original["snapshots"][0]["record_hash"]
+
+
+def test_local_registry_utf8_signature_counts_toward_byte_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "registry.json"
+    raw = b'\xef\xbb\xbf{"servers": []}'
+    capture.write_bytes(raw)
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_BYTES", len(raw))
+    assert scan_registry(str(capture))["server_count"] == 0
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_BYTES", len(raw) - 1)
+    with pytest.raises(ValueError, match="input exceeds"):
+        scan_registry(str(capture))
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'\xef\xbb\xbf\xef\xbb\xbf{"servers": []}',
+        b' \xef\xbb\xbf{"servers": []}',
+        b'\xef\xbb{"servers": []}',
+        b'\xef\xbb\xbf{"servers": []}\xff',
+        '{"servers": []}'.encode("utf-16"),
+        '{"servers": []}'.encode("utf-32"),
+    ],
+)
+def test_local_registry_rejects_other_signatures_and_invalid_utf8(
+    tmp_path: Path, raw: bytes
+) -> None:
+    capture = tmp_path / "registry.json"
+    capture.write_bytes(raw)
+    with pytest.raises(ValueError):
+        scan_registry(str(capture))
+
+
+def test_local_registry_utf8_signature_keeps_depth_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "registry.json"
+    capture.write_bytes(b'\xef\xbb\xbf{"servers": [], "extra": [[[]]]}')
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_DEPTH", 3)
+    with pytest.raises(ValueError, match="nesting exceeds 3 levels"):
+        scan_registry(str(capture))
 
 
 def test_local_registry_bounds_depth_before_parsing(

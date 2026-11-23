@@ -1905,6 +1905,14 @@ def test_cli_as3_self_reference_fixture_preserves_only_peer_path(tmp_path: Path)
     ] == [("README.md", "skills/peer-skill/SKILL.md")]
 
 
+def test_cli_shell_env_harvest_fixture_is_flagged() -> None:
+    fixture = Path(__file__).parents[1] / "fixtures" / "e2_shell_env_harvest"
+    result = runner.invoke(app, ["scan", str(fixture), "--format", "json", "--no-llm"])
+    assert result.exit_code in {0, 1}, result.output
+    payload = json.loads(result.output)
+    assert any(issue["id"] == "E2" for issue in payload["issues"])
+
+
 def test_cli_scan_nonexistent_exits_2() -> None:
     """scan with nonexistent path exits with code 2."""
     result = runner.invoke(app, ["scan", "/nonexistent/path/xyz"])
@@ -8613,3 +8621,47 @@ def test_scan_report_saved_message_shows_bracketed_path_literally(tmp_path: Path
     )
     assert "out[b].json" in "".join(result.output.split())
     assert report.exists()
+
+
+def test_recursive_risk_assessment_uses_cli_verdict_hook() -> None:
+    from skillspector import cli
+
+    with patch("skillspector.cli.risk_severity_and_recommendation", return_value=("LOW", "SAFE")):
+        result = cli._multi_skill_risk_assessment(
+            25, execution_failed=False, analysis_incomplete=True
+        )
+
+    assert result == {
+        "max_risk_score": 25,
+        "severity": "LOW",
+        "recommendation": "CAUTION",
+    }
+
+
+@pytest.mark.parametrize("output_name", ["baseline.yaml", "baseline.json", "-"])
+@pytest.mark.parametrize("custom_rules", [False, True])
+def test_baseline_custom_rules_match_scan_configuration(
+    tmp_path, monkeypatch, output_name, custom_rules
+):
+    """Baseline generation must use the same normalized rule path as scan."""
+    monkeypatch.chdir(tmp_path)
+    states = []
+
+    def invoke(state):
+        states.append(state)
+        return {
+            "active_findings": [_finding("YR4", "marker")],
+            "file_cache": {"SKILL.md": "marker"},
+        }
+
+    monkeypatch.setattr(cli.graph, "invoke", invoke)
+    args = ["baseline", str(tmp_path), "--no-llm", "-o", output_name]
+    if custom_rules:
+        args += ["--yara-rules-dir", "rules"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert states[0].get("yara_rules_dir") == (str(tmp_path / "rules") if custom_rules else None)
+    data = yaml.safe_load(
+        result.stdout if output_name == "-" else (tmp_path / output_name).read_text()
+    )
+    assert len(data["fingerprints"]) == 1

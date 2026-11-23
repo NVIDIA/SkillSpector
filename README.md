@@ -21,6 +21,11 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 - **[Analysis resource bounds](docs/ANALYSIS_RESOURCE_BOUNDS.md)** — Fail-closed bundle, parser, nested-artifact, ledger, and finding ceilings.
 - **[Pi extension](docs/PI_EXTENSION.md)** — Install SkillSpector as a Pi tool for scanning skills from inside agent sessions.
 - **[OpenCode extension](docs/OPENCODE_EXTENSION.md)** — Install SkillSpector as an OpenCode tool and `/skillspector` command for scanning skills from inside agent sessions.
+- **[LLM analyzer base guide](docs/LLM_ANALYZER_BASE_GUIDE.md)** — How to build LLM-powered analyzer nodes on top of `LLMAnalyzerBase`.
+- **[Dependency source redirection](docs/DEPENDENCY_SOURCE_REDIRECTION.md)** — How SC10 findings flag a skill that changes where its packages are fetched from.
+- **[Live vulnerability lookups (SC4)](docs/SC4-osv-live-vulnerability-lookups.md)** — How SC4 checks dependencies against OSV.dev.
+- **[Eval dataset scanning](docs/EVAL_DATASETS.md)** — Which eval dataset files the static pattern analyzers skip.
+- **[MCP least-privilege analysis (LP1–LP4)](docs/B.3.1-mcp-least-privilege.md)** and **[MCP tool-poisoning detection (TP1–TP4)](docs/B.3.2-mcp-tool-poisoning.md)** — Design notes for the MCP analyzers.
 
 ## Features
 
@@ -38,19 +43,24 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 
 > **Open-source software notice:** This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.
 
-Create and activate a virtual environment first (all `make` targets assume the venv is active). Use **uv** or **pip**; the Makefile uses `uv` if available, otherwise `pip`.
+Use **Python 3.12 or 3.13** for installation with prebuilt YARA wheels on supported
+platforms. The examples below select 3.13 explicitly; see the
+[Python installation notes](#python-installation-notes) for newer interpreters.
+For source installs, create and activate a virtual environment first (all `make`
+targets assume the venv is active). Use **uv** or **pip**; the Makefile uses `uv`
+if available, otherwise `pip`.
 
 **Quick install with uv (CLI-only):**
 
 ```bash
-uv tool install git+https://github.com/NVIDIA/skillspector.git
+uv tool install --python 3.13 git+https://github.com/NVIDIA/skillspector.git
 # Update later: uv tool update skillspector
 ```
 
 If you plan to run `skillspector mcp`, install the MCP extra at install time:
 
 ```bash
-uv tool install 'skillspector[mcp] @ git+https://github.com/NVIDIA/skillspector.git'
+uv tool install --python 3.13 'skillspector[mcp] @ git+https://github.com/NVIDIA/skillspector.git'
 ```
 
 **From source:**
@@ -61,8 +71,8 @@ git clone https://github.com/NVIDIA/skillspector.git
 cd skillspector
 
 # Create and activate virtual environment
-uv venv .venv && source .venv/bin/activate
-# or: python3 -m venv .venv && source .venv/bin/activate
+uv venv --python 3.13 .venv && source .venv/bin/activate
+# or: python3.13 -m venv .venv && source .venv/bin/activate
 
 # Install for production use
 make install
@@ -70,6 +80,29 @@ make install
 
 To contribute, follow the [Development setup](#setup) for a supported Python
 interpreter and development dependencies.
+
+### Python installation notes
+
+The package declares Python `>=3.12,<3.16` in [pyproject.toml](pyproject.toml).
+That range does not guarantee prebuilt wheels for every dependency and platform.
+[yara-python 4.5.4 on PyPI](https://pypi.org/project/yara-python/4.5.4/#files)
+provides CPython 3.12/3.13 wheels, but no CPython 3.14/3.15 wheels. Installing it
+on those newer interpreters requires a native source build with a C toolchain
+and Python development headers. Such builds can fail with OpenSSL 4 headers;
+[issue #1008](https://github.com/NVIDIA/SkillSpector/issues/1008) tracks that
+installation problem and upstream wheel availability.
+
+If installation fails while compiling YARA, select Python 3.12 or 3.13 explicitly
+using the commands above. For a new CLI-only installation with `pipx`, first
+install Python 3.13 and make `python3.13` available on PATH, then run:
+
+```bash
+pipx install --python python3.13 git+https://github.com/NVIDIA/skillspector.git
+```
+
+The upstream [wheel-build update](https://github.com/VirusTotal/yara-python/pull/281)
+is separate from publishing a new release to PyPI. Check the published files
+before choosing a newer interpreter; a source build may still be required.
 
 ### Docker (no Python required)
 
@@ -224,8 +257,13 @@ all matching versions are assessed. The server name remains the report source:
 skillspector scan 'ac.inference.sh/mcp' --mcp-registry --format json --output current.json
 ```
 
-Use `https://registry.modelcontextprotocol.io/v0/servers` as the input to scan
-the full catalog. Local registry captures are also supported.
+Use `https://registry.modelcontextprotocol.io/v0.1/servers` as the input to scan
+the full catalog. Named lookups also use this stable API. The exact legacy URL
+`https://registry.modelcontextprotocol.io/v0/servers` remains supported. Other
+URLs, including URLs with queries or fragments, are rejected. Local registry
+captures are supported as UTF-8 JSON, with or without a leading UTF-8 byte-order
+mark (BOM). The same encoding is accepted for saved Registry reports used with
+`--mcp-registry-compare`.
 
 Start with raw registry payload captures (`registry-before.json` and
 `registry-after.json`). Save a scan report as `previous.json`, then compare a
@@ -323,8 +361,9 @@ inference gateways.
 | `openai` | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`) | api.openai.com (or any OpenAI-compatible URL) | `gpt-5.4` |
 | `anthropic` | `ANTHROPIC_API_KEY` | api.anthropic.com | `claude-opus-4-6` (`meta_analyzer`: `claude-sonnet-4-6`) |
 | `anthropic_proxy` | `ANTHROPIC_PROXY_API_KEY` + `ANTHROPIC_PROXY_ENDPOINT_URL` | Any Vertex-style raw-predict proxy | `claude-sonnet-4-6` |
+| `minimax` | `MINIMAX_API_KEY` (+ optional `MINIMAX_REGION`) | Global or China regional endpoint | `MiniMax-M3.1-Flash` |
 | `bedrock` | `AWS_PROFILE` (optional) + `AWS_REGION` — SigV4 via boto3 | AWS Bedrock Runtime | `us.anthropic.claude-sonnet-4-6` |
-| `nv_build` | `NVIDIA_INFERENCE_KEY` | build.nvidia.com | `z-ai/glm-5.3` |
+| `nv_build` | `NVIDIA_INFERENCE_KEY` | build.nvidia.com | `z-ai/glm-5.3-flash` |
 | `gemini` | `GOOGLE_CLOUD_PROJECT` (+ optional `GOOGLE_CLOUD_LOCATION`) via ADC | Google Cloud OpenAI-compatible Gemini endpoint | `gemini-3.8-flash` |
 | `ollama` | _(none)_ | `OLLAMA_BASE_URL` (default `http://localhost:11434/v1`) | `llama3.1:8b` |
 | `azure_openai` | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` | Azure OpenAI Service | `gpt-4o` (deployment defaults to the model label) |
@@ -347,7 +386,7 @@ injection, refusals, and incomplete responses.
 Record findings, completion status, latency, and usage, and compare against
 previous defaults where accessible.
 
-For NVIDIA Build's `z-ai/glm-5.3`, SkillSpector requests `high` reasoning effort.
+For NVIDIA Build's `z-ai/glm-5.3-flash`, SkillSpector requests `high` reasoning effort.
 Set `SKILLSPECTOR_REASONING_EFFORT` to override it with `low`, `high`, or `max`.
 The bundled 128,000-token context and 32,000-token output budgets are conservative
 application limits; they do not claim the hosted endpoint's maximum capacity.
@@ -418,6 +457,15 @@ skillspector scan ./my-skill/
 # NVIDIA build.nvidia.com
 export SKILLSPECTOR_PROVIDER=nv_build
 export NVIDIA_INFERENCE_KEY=nvapi-...
+skillspector scan ./my-skill/
+
+# MiniMax global endpoint; use cn_zh for the China endpoint
+export SKILLSPECTOR_PROVIDER=minimax
+export MINIMAX_API_KEY=your-key
+export MINIMAX_REGION=global_en
+# Default: MiniMax-M3.1-Flash; set SKILLSPECTOR_MODEL=MiniMax-M3 to select M3.
+# Flash reasoning effort: low, medium, high, xhigh, max (endpoint default).
+# Explicit legacy/custom model IDs remain supported through SKILLSPECTOR_MODEL.
 skillspector scan ./my-skill/
 
 # Gemini on Google Cloud (Application Default Credentials / Workload Identity)
@@ -499,7 +547,7 @@ out-of-band audit step.
 
 ```bash
 # Install, or reinstall if you already used the CLI-only path
-uv tool install --force 'skillspector[mcp] @ git+https://github.com/NVIDIA/skillspector.git'
+uv tool install --python 3.13 --force 'skillspector[mcp] @ git+https://github.com/NVIDIA/skillspector.git'
 
 # FastMCP stdio transport for local CLI agents
 skillspector mcp
@@ -795,20 +843,23 @@ Issues (2)
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `gemini`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `gemini_cli`, or `opencode_cli`. Hosted providers use bundled `model_registry.yaml` defaults; CLI providers fall back to the local runtime's default model unless `SKILLSPECTOR_MODEL` is set. Defaults to `nv_build`. | Optional |
+| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `minimax`, `nv_build`, `gemini`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `gemini_cli`, or `opencode_cli`. Hosted providers use bundled `model_registry.yaml` defaults; CLI providers fall back to the local runtime's default model unless `SKILLSPECTOR_MODEL` is set. Defaults to `nv_build`. | Optional |
 | `GOOGLE_CLOUD_PROJECT` | Google Cloud project ID for the `gemini` provider. Authenticates via Google Cloud Application Default Credentials (ADC) or GKE Workload Identity. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=gemini` |
 | `GOOGLE_CLOUD_LOCATION` | Google Cloud location for the `gemini` provider endpoint (e.g. `global`, `us`, `eu`, `us-central1`). Defaults to `global`. | Optional (used when `SKILLSPECTOR_PROVIDER=gemini`) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Optional path to ADC credential/config file (e.g. Workload or Workforce Identity Federation config; exported service account keys are discouraged). For local development, use `gcloud auth application-default login`; for GKE, use Workload Identity. | Optional (used when `SKILLSPECTOR_PROVIDER=gemini`) |
 | `NVIDIA_INFERENCE_KEY` | Credential for the `nv_build` provider (build.nvidia.com). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=nv_build` |
 | `OPENAI_API_KEY` | Credential for the OpenAI provider (`SKILLSPECTOR_PROVIDER=openai`). Also serves as the tier-2 fallback in the credential waterfall when the active provider returns no credentials; the fallback then uses the `openai` default model (`gpt-5.4`) for any slot without a model override. Claude Opus or Sonnet 5.5 gateway IDs are not supported through the fallback, because it keeps the active provider's structured-output method; select `SKILLSPECTOR_PROVIDER=openai` for them. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=openai` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
-| `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3`; other provider/model combinations keep their endpoint defaults. The value applies to every model slot, so the `anthropic` `meta_analyzer` default receives the same effort as the analyzers. `gpt-6.1-sol` accepts only `low`, `medium`, `high`, `xhigh`, or `max`; any other value stops a scan before analysis (exit code 2). | Optional |
+| `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3-flash`; other provider/model combinations keep their endpoint defaults. The value applies to every model slot, so the `anthropic` `meta_analyzer` default receives the same effort as the analyzers. `gpt-6.1-sol` accepts only `low`, `medium`, `high`, `xhigh`, or `max`; any other value stops a scan before analysis (exit code 2). | Optional |
 | `SKILLSPECTOR_OUTPUT_LANGUAGE` | Short, single-line language label (letters, numbers, spaces, `_`, or `-`; maximum 64 characters) for human-readable LLM finding text such as messages, explanations, and remediation. Rule IDs, severity values, paths, code, and other machine-readable values remain unchanged. Unset, blank, or invalid values preserve the default output language. | Optional |
 | `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves the provider default. Lower values can reduce run-to-run variation but do not guarantee identical output. `gpt-6.1-sol` rejects every explicit temperature, including `1`. Claude Opus 4.7 and later, Sonnet 5, Fable 5, Mythos 5 and Haiku 5 models (for example `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-5-5`) accept only `1.0` on the native Anthropic endpoint ([API compatibility rule](https://platform.claude.com/docs/en/api/messages/create)); gateways, proxies, and Bedrock still reject every explicit value for these models. Unsupported settings on active LLM slots stop a scan before analysis (exit code 2). Static scans (`--no-llm`) skip provider initialization and control validation. A Bedrock application-inference-profile ARN hides the model name, so declare `sampling: rejected` for it in the model registry. | Optional |
 | `SKILLSPECTOR_SEED` | Optional integer sampling seed for OpenAI-compatible and Azure OpenAI providers. Other hosted providers and CLI providers do not receive it. Provider support remains model-dependent; `gpt-6.1-sol` receives it, but OpenAI treats `seed` as best-effort, so output can still differ between runs. | Optional |
 | `SKILLSPECTOR_COMPACT_PROMPTS` | Opt-in compact line numbering in LLM prompts: numbered lines render as `L1:`, `L2:` instead of zero-padded `L01:`, `L02:`. Accepted truthy values are `1`, `true`, and `yes` (case-insensitive; surrounding whitespace is trimmed). Unset or any other value keeps the default zero-padded format. | Optional |
 | `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
 | `ANTHROPIC_BASE_URL` | Override the native Anthropic endpoint (default: `https://api.anthropic.com`). | Optional |
+| `MINIMAX_API_KEY` | Credential for the MiniMax provider (`SKILLSPECTOR_PROVIDER=minimax`). | Required when `SKILLSPECTOR_PROVIDER=minimax` |
+| `MINIMAX_REGION` | MiniMax regional endpoint: `global_en` (default) or `cn_zh`. | Optional |
+| `MINIMAX_BASE_URL` | Override the selected MiniMax regional endpoint. | Optional |
 | `ANTHROPIC_AUTH_SCHEME` | Set to `bearer` to send `ANTHROPIC_API_KEY` as `Authorization: Bearer` instead of `x-api-key`, for gateways exposing the Messages API. | Optional |
 | `ANTHROPIC_PROXY_ENDPOINT_URL` | Full endpoint URL for the Anthropic proxy provider (Vertex-style raw-predict). | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
 | `ANTHROPIC_PROXY_API_KEY` | Bearer token for the Anthropic proxy provider. | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
@@ -852,7 +903,7 @@ Options:
   --help                                       Show this message and exit
 
 # Generate a baseline of all current findings (see docs/SUPPRESSION.md)
-skillspector baseline <path> [-o FILE] [--no-llm] [--reason TEXT]
+skillspector baseline <path> [-o FILE] [--no-llm] [--yara-rules-dir PATH] [--reason TEXT]
 ```
 
 Report files and new baselines use private permissions (0600). Existing baselines

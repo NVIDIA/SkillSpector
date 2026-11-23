@@ -1,8 +1,10 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
 * fix(e1): report outbound uploads made with Ruby (`Net::HTTP.post`, `Net::HTTP::Post.new`, HTTParty/RestClient/Faraday `post`/`put`) and Go (`http.Post`, `http.PostForm`, `client.Post("https://...")`, `http.NewRequest` with POST/PUT/PATCH) HTTP clients as External Transmission; read-only `get` requests are not reported
+* fix(deps): bump the locked `pyasn1` from 0.6.4 to 0.6.5 (CVE-2026-119194, CVE-2026-119195, CVE-2026-119196, CVE-2026-119197), `cryptography` from 49.0.0 to 50.0.2 (CVE-2026-69247) and the `[mcp]` extra's `pyjwt` from 2.13.0 to 2.15.1 (CVE-2026-102268 and related advisories) (#1146)
 * fix(deps): bump the locked `langgraph` from 1.2.6 to 1.2.20 (and `langgraph-checkpoint` 4.1.1 to 4.3.1, which it requires) past GHSA-3fx2-cqw9-xr3c; the locked `langgraph-sdk` 0.4.10 was already patched (#1078)
 * fix(pi): accept scans from symlinked workspace roots while preserving the CLI's checks on symlinks below the workspace. Custom YARA rules loaded with `--yara-rules-dir` cannot use `include`; place each rule directly in the selected directory.
+* fix(tp): tag TP1-TP4 findings with MITRE ATLAS AML.T0110 (AI Agent Tool Poisoning) instead of AML.T0080 (AI Agent Context Poisoning)
 * fix(coverage): account for successfully inspected linked ZIP containers while retaining member failures and archive limits
 * fix(supply-chain): resolve npm manifest dependencies within their owning lockfile and workspace installation paths
 * fix(supply-chain): stop npm workspace `link: true` and versionless lockfile slots from borrowing an ancestor install's pinned version
