@@ -44,9 +44,10 @@ import time
 import tomllib
 from bisect import bisect_right
 from collections import ChainMap
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 from urllib.parse import urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
@@ -74,7 +75,7 @@ from skillspector.state import (
     transitive_remaining_seconds,
 )
 
-from . import static_runner
+from . import powershell_cradles, static_runner
 from .common import (
     LOGICAL_LINE_BREAK,
     get_context_from_lines,
@@ -140,13 +141,6 @@ SC1_PROSE_PATTERNS = [
     (r"(?:don't|do\s+not)\s+(?:pin|lock|specify)\s+(?:package\s+)?versions?", 0.7),
 ]
 SC1_PATTERNS = SC1_CODE_PATTERNS + SC1_PROSE_PATTERNS
-_PS_WEB_CMDLET = r"(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod)"
-_PS_FETCH_START = rf"\b(?:{_PS_WEB_CMDLET}|curl|wget)[ \t]|\.DownloadString\s*\("
-# One unit of a PowerShell pipeline segment: a quoted string, or any character
-# that is not an unquoted statement/pipeline separator.
-_PS_PIPELINE_CHAR = r"\"[^\"\n]*\"|'[^'\n]*'|[^|;\n\"']"
-# Same, but also stops at ``)`` so a wrapped fetch operand ends with its call.
-_PS_OPERAND_CHAR = r"\"[^\"\n]*\"|'[^'\n]*'|[^|;)\n\"']"
 SC2_CODE_PATTERNS = [
     (r"curl\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh", 0.9),
     (r"wget\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh", 0.9),
@@ -159,29 +153,6 @@ SC2_CODE_PATTERNS = [
     (r"eval\s*\(\s*(?:await\s+)?fetch\s*\(", 0.9),
     (r"new\s+Function\s*\([^)]*fetch\s*\(", 0.9),
     (r"subprocess\.[^(]+\([^)]*(?:curl|wget)\s+https?://", 0.8),
-    # PowerShell download cradles: fetched text piped to, or wrapped by,
-    # Invoke-Expression / a script block / a PowerShell host.  Matches stay
-    # inside one PowerShell pipeline: an unquoted ``;``, ``|`` or newline ends
-    # the span, while quoted argument data may contain them.  The wrapper forms
-    # also capture the fetch operand so trusted-host classification sees the URL.
-    (
-        rf"(?:{_PS_FETCH_START})(?:{_PS_PIPELINE_CHAR})*\|\s*(?:iex|Invoke-Expression)\b",
-        0.9,
-    ),
-    (
-        rf"\b(?:iex|Invoke-Expression)\b(?:{_PS_PIPELINE_CHAR})*?"
-        rf"(?:\.DownloadString\s*\(|\(\s*{_PS_WEB_CMDLET}\b)(?:{_PS_OPERAND_CHAR})*",
-        0.9,
-    ),
-    (
-        rf"\[scriptblock\]::Create\s*\((?:{_PS_PIPELINE_CHAR})*?"
-        rf"(?:\.DownloadString\s*\(|\(\s*{_PS_WEB_CMDLET}\b)(?:{_PS_OPERAND_CHAR})*",
-        0.9,
-    ),
-    (
-        rf"(?:{_PS_FETCH_START})(?:{_PS_PIPELINE_CHAR})*\|\s*(?:pwsh|powershell)(?:\.exe)?\b",
-        0.9,
-    ),
 ]
 SC2_PROSE_PATTERNS = [
     (r"download\s+and\s+(?:run|execute)\s+(?:the\s+)?script", 0.7),
@@ -2586,6 +2557,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         complete_match=match.group(0),
                     )
                 )
+    sc2_match_sources: list[tuple[Iterable[Any], float]] = []
     for pattern, confidence in SC2_PATTERNS:
         if (pattern, confidence) in _SC2_SHELL_PATTERNS:
             matches = _iter_sc2_shell_matches(pattern, content, shell_command_ranges)
@@ -2597,6 +2569,11 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             matches = static_runner.iter_pattern_matches(
                 pattern, content, re.IGNORECASE | re.MULTILINE
             )
+        sc2_match_sources.append((matches, confidence))
+    # PowerShell cradles need real quoting, grouping and pipeline boundaries,
+    # which a regular expression cannot supply.
+    sc2_match_sources.append((powershell_cradles.find_cradles(content, file_type), 0.9))
+    for matches, confidence in sc2_match_sources:
         for match in matches:
             line_num = line_number(match.start())
             mt = match.group(0)
@@ -2611,7 +2588,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 match.start(),
                 line_starts,
             )
-            if _is_safe_supply_chain_pattern(mt) or data_consumer:
+            cradle_source = powershell_cradles.trusted_source_text(match)
+            if (
+                _is_trusted_source(cradle_source)
+                if cradle_source is not None
+                else _is_safe_supply_chain_pattern(mt)
+            ) or data_consumer:
                 adj = min(confidence, 0.15)
                 sev = Severity.LOW
             else:
