@@ -3624,7 +3624,7 @@ class TestTriggerAnalysis:
             "# hello-skill\n",
             encoding="utf-8",
         )
-        manifest = _parse_manifest(skill_dir)
+        manifest, _ = _parse_manifest(skill_dir)
         assert manifest["description"] == "Use this skill whenever the user says hello"
         findings = sc_mod._analyze_triggers(manifest, "hello-skill")
         assert any(finding.rule_id == "TR1" for finding in findings)

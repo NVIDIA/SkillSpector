@@ -23,6 +23,8 @@ from dataclasses import asdict
 import pytest
 import yaml
 
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.nodes.analyzers import mcp_rug_pull
 from skillspector.nodes.analyzers.mcp_rug_pull import (
     _RP1_CONFIG_KEY,
     _RP1_CONFIG_MAX_ARG_LINES,
@@ -744,18 +746,104 @@ def test_rp3_version_wildcard():
     assert len(rp3) >= 1
 
 
-def test_rp3_version_wildcard_from_skill_frontmatter(tmp_path):
-    """RP3 receives the version projected from real skill frontmatter."""
-    (tmp_path / "SKILL.md").write_text(
-        '---\nname: test-skill\ndescription: For tests\nversion: "*"\n---\n',
-        encoding="utf-8",
-    )
+@pytest.mark.parametrize(
+    ("filename", "newline", "frontmatter", "version_line", "version", "snippet"),
+    [
+        (
+            "SKILL.md",
+            "\n",
+            'name: test-skill\ndescription: For tests\nversion: "*"',
+            4,
+            "*",
+            'version: "*"',
+        ),
+        (
+            "skill.md",
+            "\r\n",
+            'description: For tests\n\n# Release selection\n"version": "^1.2"\nname: test-skill',
+            5,
+            "^1.2",
+            '"version": "^1.2"',
+        ),
+        (
+            "SKILL.md",
+            "\n",
+            'description: For tests\nversion: "1.2.3"\nversion: ">=1.2"',
+            4,
+            ">=1.2",
+            'version: ">=1.2"',
+        ),
+        (
+            "SKILL.md",
+            "\n",
+            'version: "1.2.3"\n!<tag:yaml.org,2002:value> version: latest',
+            3,
+            "latest",
+            "!<tag:yaml.org,2002:value> version: latest",
+        ),
+        (
+            "SKILL.md",
+            "\n",
+            '{name: test-skill, version: "latest", description: For tests}',
+            2,
+            "latest",
+            'version: "latest"',
+        ),
+    ],
+)
+def test_rp3_version_location_from_skill_frontmatter(
+    tmp_path, filename, newline, frontmatter, version_line, version, snippet
+):
+    content = "\n".join(("---", frontmatter, "---", "", "Describe the project.", ""))
+    (tmp_path / filename).write_bytes(content.replace("\n", newline).encode("utf-8"))
 
     result = node(build_context({"skill_path": str(tmp_path)}))
-
     rp3 = [finding for finding in result["findings"] if finding.rule_id == "RP3"]
+
     assert len(rp3) == 1
-    assert rp3[0].matched_text == "*"
+    assert rp3[0].file == filename
+    assert rp3[0].start_line == version_line
+    assert rp3[0].matched_text == version
+    assert rp3[0].code_snippet == snippet
+    body = report({"filtered_findings": rp3, "output_format": "json"})["report_body"]
+    issue = next(item for item in json.loads(body)["issues"] if item["id"] == "RP3")
+    assert issue["location"]["start_line"] == version_line
+    assert issue["code_snippet"] == snippet
+
+
+def test_rp3_version_snippet_cannot_reintroduce_yaml_escaped_credentials(tmp_path):
+    (tmp_path / "SKILL.md").write_text(
+        '---\nversion: ">=1.2 \\x68ttps://test:FAKE_TEST_PASSWORD@example.com"\n---\n',
+        encoding="utf-8",
+    )
+    result = node(build_context({"skill_path": str(tmp_path)}))
+    findings = [finding for finding in result["findings"] if finding.rule_id == "RP3"]
+    assert len(findings) == 1
+
+    body = report({"filtered_findings": findings, "output_format": "json"})["report_body"]
+    assert "FAKE_TEST_PASSWORD" not in body
+    issue = next(item for item in json.loads(body)["issues"] if item["id"] == "RP3")
+    assert issue["location"]["start_line"] == 2
+    assert "example.com" in issue["code_snippet"]
+
+
+def test_lowercase_manifest_rp3_timeout_remains_partial(tmp_path, monkeypatch):
+    (tmp_path / "skill.md").write_text(
+        '---\nname: test-skill\nversion: "*"\n---\n', encoding="utf-8"
+    )
+    state = build_context({"skill_path": str(tmp_path)})
+
+    def exhaust_rp3_budget(*_args):
+        raise mcp_rug_pull._RugPullResourceLimitError(
+            LedgerReason.RUNTIME_LIMIT, {"observed_seconds": 1.0, "limit_seconds": 1.0}
+        )
+
+    monkeypatch.setattr(mcp_rug_pull, "_check_rp3", exhaust_rp3_budget)
+    result = node(state)
+
+    manifest = next(entry for entry in result["inspection_ledger"] if entry["path"] == "skill.md")
+    assert manifest["outcome"] is LedgerOutcome.PARTIAL
+    assert manifest["reason_code"] is LedgerReason.RUNTIME_LIMIT
 
 
 def test_rp3_broad_version_preview_preserves_full_value_identity() -> None:
