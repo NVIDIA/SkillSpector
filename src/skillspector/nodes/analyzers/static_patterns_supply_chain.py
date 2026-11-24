@@ -44,9 +44,10 @@ import time
 import tomllib
 from bisect import bisect_right
 from collections import ChainMap
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 from urllib.parse import urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
@@ -74,7 +75,7 @@ from skillspector.state import (
     transitive_remaining_seconds,
 )
 
-from . import static_runner
+from . import powershell_cradles, static_runner
 from .common import (
     LOGICAL_LINE_BREAK,
     get_context_from_lines,
@@ -2661,6 +2662,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         complete_match=match.group(0),
                     )
                 )
+    sc2_match_sources: list[tuple[Iterable[Any], float]] = []
     for pattern, confidence in SC2_PATTERNS:
         if (pattern, confidence) in _SC2_SHELL_PATTERNS:
             matches = _iter_sc2_shell_matches(pattern, content, shell_command_ranges)
@@ -2672,6 +2674,11 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             matches = static_runner.iter_pattern_matches(
                 pattern, content, re.IGNORECASE | re.MULTILINE
             )
+        sc2_match_sources.append((matches, confidence))
+    # PowerShell cradles need real quoting, grouping and pipeline boundaries,
+    # which a regular expression cannot supply.
+    sc2_match_sources.append((powershell_cradles.find_cradles(content, file_type), 0.9))
+    for matches, confidence in sc2_match_sources:
         for match in matches:
             line_num = line_number(match.start())
             mt = match.group(0)
@@ -2686,7 +2693,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 match.start(),
                 line_starts,
             )
-            if _is_safe_supply_chain_pattern(mt) or data_consumer:
+            cradle_source = powershell_cradles.trusted_source_text(match)
+            if (
+                _is_trusted_source(cradle_source)
+                if cradle_source is not None
+                else _is_safe_supply_chain_pattern(mt)
+            ) or data_consumer:
                 adj = min(confidence, 0.15)
                 sev = Severity.LOW
             else:
