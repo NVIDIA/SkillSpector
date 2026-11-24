@@ -413,7 +413,8 @@ def _main_impl() -> None:
     _print(
         f"\n[bold]SkillSpector Batch Scan[/bold] — "
         f"{len(skill_dirs)} skill(s) in [dim]{display(root)}[/dim]"
-        f"  ([cyan]{args.workers} workers[/cyan]{pool_note})\n"
+        f"  ([cyan]{args.workers} workers[/cyan]{pool_note})\n",
+        file=sys.stderr,
     )
 
     # -- Scan (parallel) -----------------------------------------------------
@@ -485,7 +486,8 @@ def _main_impl() -> None:
                     errors += 1
                     _print(
                         f"  [{idx}/{total}] [cyan]{display(rel_name)}[/cyan] → "
-                        f"[red]ERROR: {display(error_msg)}[/red]"
+                        f"[red]ERROR: {display(error_msg)}[/red]",
+                        file=sys.stderr,
                     )
                 else:
                     risk = entry.get("risk_assessment", {})
@@ -498,7 +500,8 @@ def _main_impl() -> None:
                     _print(
                         f"  [{idx}/{total}] [cyan]{display(rel_name)}[/cyan] → "
                         f"[{color}]{score}/100 {display(severity)}[/{color}] "
-                        f"({n_issues} issue(s))"
+                        f"({n_issues} issue(s))",
+                        file=sys.stderr,
                     )
 
         if api_pool is not None:
@@ -523,7 +526,7 @@ def _main_impl() -> None:
                 f"{snap['rate_limits_hit']} rate-limit(s), {snap['retry_successes']} retried"
             )
         _parts.append(f"{snap['keys_configured']} keys")
-        _print(f"\n[dim]API Pool: {', '.join(_parts)}[/dim]")
+        _print(f"\n[dim]API Pool: {', '.join(_parts)}[/dim]", file=sys.stderr)
 
     # -- Output --------------------------------------------------------------
     fmt = args.format
@@ -540,7 +543,7 @@ def _main_impl() -> None:
         except (OSError, ValueError) as exc:
             _print(f"Error: {exc}", markup=False, file=sys.stderr)
             sys.exit(2)
-        _print(f"\n[green]Batch report saved to:[/green] {display(args.output)}")
+        _print(f"\n[green]Batch report saved to:[/green] {display(args.output)}", file=sys.stderr)
     else:
         if fmt == "terminal":
             _print(report_body, markup=False, highlight=False)

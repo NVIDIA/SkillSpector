@@ -349,13 +349,17 @@ def _sarif_artifact_location(
 ) -> SarifArtifactLocation:
     """Build a source-scoped SARIF artifact location for one occurrence."""
     occurrence = occurrence or {}
-    file_path = str(occurrence.get("file", finding.file)).replace("\\", "/").lstrip("/")
+    raw_file_path = str(occurrence.get("file", finding.file))
     provenance = _occurrence_provenance(finding, occurrence)
     source_identity = _report_source_identity(provenance)
     if source_identity:
+        # Only a path joined beneath a source identity is relative to that scope, so
+        # only this branch may drop the leading separators. An unscoped artifact keeps
+        # its own absolute/relative form, matching the notification locations.
+        file_path = raw_file_path.replace("\\", "/").lstrip("/")
         uri = f"{source_identity}/{file_path}"
     else:
-        uri = str(occurrence.get("file", finding.file))
+        uri = raw_file_path
     properties = {
         {
             "source_identity": "sourceIdentity",
@@ -365,7 +369,12 @@ def _sarif_artifact_location(
         }[key]: value
         for key, value in provenance.items()
     }
-    return SarifArtifactLocation(uri=quote(uri, safe="/!"), properties=properties or None)
+    return SarifArtifactLocation(uri=_sarif_uri(uri), properties=properties or None)
+
+
+def _sarif_uri(path: str) -> str:
+    """Percent-encode an artifact path per RFC 3986, keeping only separators literal."""
+    return quote(path, safe="/!")
 
 
 def _occurrence_columns(
@@ -1033,7 +1042,7 @@ def _build_sarif(
             locations = [
                 SarifLocation(
                     physicalLocation=SarifPhysicalLocation(
-                        artifactLocation=SarifArtifactLocation(uri=quote(path, safe="/!")),
+                        artifactLocation=SarifArtifactLocation(uri=_sarif_uri(path)),
                         region=region,
                     )
                 )
