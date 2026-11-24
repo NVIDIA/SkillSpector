@@ -28,6 +28,7 @@ import os
 import stat
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -134,6 +135,7 @@ class MultiSkillDetectionResult:
     structured_candidates_examined: int = 0
     structured_input_bytes_examined: int = 0
     omitted_symlink_entries: int = 0
+    excluded_root_paths: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -279,18 +281,18 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
 
         skills: list[SkillDirectory] = []
         limitations: list[MultiSkillDetectionLimitation] = []
+        excluded_root_paths: list[str] = []
         omitted_symlink_entries = 0
         for entry in _bounded_scandir(directory, budget=budget):
             budget.check_runtime()
-            child = Path(entry.path)
             if entry.name in _SKIP_DIRS:
-                # Intentionally ignored names (e.g. `.git`, `.venv`,
-                # `node_modules`) are not a discovery gap even when they are
-                # symlinks; skip them before recording any limitation. Any
-                # other symlinked name is recorded below, so an eligible
-                # dot-prefixed skill such as `.review-helper` is never
-                # silently excluded.
+                # Only fixed root names can be reported. Keep ignoring them
+                # even if metadata is unreadable, and never follow links.
+                with suppress(OSError):
+                    if entry.is_symlink() or entry.is_dir(follow_symlinks=False):
+                        excluded_root_paths.append(f"{entry.name}/")
                 continue
+            child = Path(entry.path)
             try:
                 if entry.is_symlink() or _is_link_or_junction(child):
                     limitations.append(
@@ -337,6 +339,7 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
         structured_candidates_examined=budget.structured_candidates,
         structured_input_bytes_examined=budget.structured_bytes,
         omitted_symlink_entries=omitted_symlink_entries,
+        excluded_root_paths=tuple(excluded_root_paths),
     )
 
 
