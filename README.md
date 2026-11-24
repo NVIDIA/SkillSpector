@@ -50,6 +50,18 @@ For source installs, create and activate a virtual environment first (all `make`
 targets assume the venv is active). Use **uv** or **pip**; the Makefile uses `uv`
 if available, otherwise `pip`.
 
+Once a release is available on [PyPI](https://pypi.org/project/skillspector/),
+install or upgrade SkillSpector from a Python virtual environment:
+
+```bash
+python -m pip install --upgrade skillspector
+# To include the optional MCP server:
+python -m pip install --upgrade 'skillspector[mcp]'
+```
+
+Verify the installation with `skillspector --version`. The GitHub installation
+below works ahead of the first PyPI release and for users following development.
+
 **Quick install with uv (CLI-only):**
 
 ```bash
