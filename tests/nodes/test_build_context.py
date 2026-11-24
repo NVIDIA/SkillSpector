@@ -47,12 +47,15 @@ from skillspector.providers import reset_provider, use_provider
 from skillspector.providers.openai import OpenAIProvider
 from skillspector.python_ast import ParsedPythonFile, get_python_ast
 from skillspector.state import (
+    DEFAULT_MAX_TRANSITIVE_BYTES,
+    DEFAULT_MAX_WORKFLOW_BYTES,
     DEFAULT_MAX_WORKFLOW_SECONDS,
     MAX_WORKFLOW_ARTIFACTS,
     MAX_WORKFLOW_BYTES,
     MAX_WORKFLOW_SECONDS,
     SkillspectorState,
     WorkflowResourceBudget,
+    _workflow_max_bytes_from_environment,
     _workflow_max_seconds_from_environment,
 )
 
@@ -196,7 +199,7 @@ def test_build_context_starts_and_returns_default_graph_wide_budget(tmp_path: Pa
     assert isinstance(budget, WorkflowResourceBudget)
     assert DEFAULT_MAX_WORKFLOW_SECONDS == 1080.0
     assert budget.max_seconds == MAX_WORKFLOW_SECONDS
-    assert budget.max_bytes == MAX_WORKFLOW_BYTES == 64 * 1024 * 1024
+    assert budget.max_bytes == MAX_WORKFLOW_BYTES == DEFAULT_MAX_WORKFLOW_BYTES
     assert budget.max_artifacts == MAX_WORKFLOW_ARTIFACTS == 10_000
     assert budget.started_at is not None
     assert budget.scanned_bytes == len(payload)
@@ -250,6 +253,75 @@ def test_workflow_environment_reaches_graph_and_cli_budgets(
         timeout=30,
     )
     assert json.loads(result.stdout) == [expected, expected]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, DEFAULT_MAX_WORKFLOW_BYTES),
+        ("1024", 1024),
+        (str(64 * 1024 * 1024), 64 * 1024 * 1024),
+        ("0", DEFAULT_MAX_WORKFLOW_BYTES),
+        ("-1", DEFAULT_MAX_WORKFLOW_BYTES),
+        ("", DEFAULT_MAX_WORKFLOW_BYTES),
+        ("1.5", DEFAULT_MAX_WORKFLOW_BYTES),
+        ("nan", DEFAULT_MAX_WORKFLOW_BYTES),
+        ("inf", DEFAULT_MAX_WORKFLOW_BYTES),
+        ("not-a-number", DEFAULT_MAX_WORKFLOW_BYTES),
+    ],
+)
+def test_workflow_budget_bytes_environment_parsing(value: str | None, expected: int) -> None:
+    assert _workflow_max_bytes_from_environment(value) == expected
+
+
+def test_workflow_budget_bytes_transitive_default_parsing() -> None:
+    assert (
+        _workflow_max_bytes_from_environment(None, default=DEFAULT_MAX_TRANSITIVE_BYTES)
+        == DEFAULT_MAX_TRANSITIVE_BYTES
+    )
+    assert (
+        _workflow_max_bytes_from_environment("5242880", default=DEFAULT_MAX_TRANSITIVE_BYTES)
+        == 5242880
+    )
+    assert (
+        _workflow_max_bytes_from_environment("bogus", default=DEFAULT_MAX_TRANSITIVE_BYTES)
+        == DEFAULT_MAX_TRANSITIVE_BYTES
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_workflow", "expected_transitive"),
+    [
+        (None, DEFAULT_MAX_WORKFLOW_BYTES, DEFAULT_MAX_TRANSITIVE_BYTES),
+        (str(64 * 1024 * 1024), 64 * 1024 * 1024, 64 * 1024 * 1024),
+        ("134217728", 134217728, 134217728),
+        ("bogus", DEFAULT_MAX_WORKFLOW_BYTES, DEFAULT_MAX_TRANSITIVE_BYTES),
+    ],
+)
+def test_workflow_bytes_environment_reaches_graph_and_cli_budgets(
+    value: str | None, expected_workflow: int, expected_transitive: int
+) -> None:
+    env = os.environ.copy()
+    name = "SKILLSPECTOR_MAX_WORKFLOW_BYTES"
+    env.pop(name, None)
+    if value is not None:
+        env[name] = value
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json; from skillspector.state import WorkflowResourceBudget; "
+            "from skillspector.cli import _TransitiveBudget; "
+            "print(json.dumps([WorkflowResourceBudget().max_bytes, "
+            "_TransitiveBudget().max_bytes]))",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    assert json.loads(result.stdout) == [expected_workflow, expected_transitive]
 
 
 def test_build_context_reuses_supplied_stricter_transitive_budget(tmp_path: Path) -> None:

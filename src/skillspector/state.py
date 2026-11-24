@@ -73,7 +73,42 @@ def _workflow_max_seconds_from_environment(value: str | None) -> float:
 MAX_WORKFLOW_SECONDS = _workflow_max_seconds_from_environment(
     os.environ.get("SKILLSPECTOR_MAX_WORKFLOW_SECONDS")
 )
-MAX_WORKFLOW_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_WORKFLOW_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_TRANSITIVE_BYTES = 10 * 1024 * 1024
+
+
+def _workflow_max_bytes_from_environment(
+    value: str | None, *, default: int = DEFAULT_MAX_WORKFLOW_BYTES
+) -> int:
+    """Return a positive integer workflow byte budget or the safe default."""
+    if value is None:
+        return default
+    try:
+        byte_budget = int(value)
+    except ValueError:
+        logger.warning(
+            "SKILLSPECTOR_MAX_WORKFLOW_BYTES=%r is not an integer, using default %d bytes",
+            value,
+            default,
+        )
+        return default
+    if byte_budget <= 0:
+        logger.warning(
+            "SKILLSPECTOR_MAX_WORKFLOW_BYTES=%r must be a positive integer, using default %d bytes",
+            value,
+            default,
+        )
+        return default
+    return byte_budget
+
+
+MAX_WORKFLOW_BYTES = _workflow_max_bytes_from_environment(
+    os.environ.get("SKILLSPECTOR_MAX_WORKFLOW_BYTES")
+)
+MAX_TRANSITIVE_BYTES = _workflow_max_bytes_from_environment(
+    os.environ.get("SKILLSPECTOR_MAX_WORKFLOW_BYTES"),
+    default=DEFAULT_MAX_TRANSITIVE_BYTES,
+)
 MAX_WORKFLOW_ARTIFACTS = 10_000
 MAX_WORKFLOW_LIMITATION_RECORDS = 256
 
