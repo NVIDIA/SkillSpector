@@ -966,6 +966,8 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
 ```json
 {
   "skill": { "name": "...", "source": "...", "scanned_at": "<ISO 8601>" },
+  "execution_successful": true,
+  "analysis_completeness": { "status": "complete", "is_complete": true },
   "risk_assessment": { "score": 0, "severity": "LOW", "recommendation": "SAFE" },
   "components": [ { "path": "...", "type": "...", "lines": 0, "executable": false, "size_bytes": 0 } ],
   "issues": [ { "id": "...", "category": "...", "severity": "...", "confidence": 0.0, "location": { "file": "...", "start_line": 0 }, "surface": "code" } ],
@@ -1045,7 +1047,7 @@ import subprocess
 import sys
 
 scan = subprocess.run(
-    ["skillspector", "scan", sys.argv[1], "--no-llm", "--format", "json", "--fail-on-incomplete"],
+    ["skillspector", "scan", "--no-llm", "--format", "json", "--fail-on-incomplete", "--", sys.argv[1]],
     capture_output=True,
     text=True,
 )
