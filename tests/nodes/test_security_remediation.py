@@ -868,7 +868,7 @@ def test_manifest_runtime_uses_tighter_caller_deadline(tmp_path: Path) -> None:
     events: list[dict[str, object]] = []
     timestamps = iter((10.0, 10.2))
 
-    manifest = build_context_module._parse_manifest(
+    manifest, version_source = build_context_module._parse_manifest(
         tmp_path,
         raw_file_cache={"SKILL.md": raw},
         ledger_events=events,
@@ -877,6 +877,7 @@ def test_manifest_runtime_uses_tighter_caller_deadline(tmp_path: Path) -> None:
     )
 
     assert manifest == {}
+    assert version_source is None
     event = next(item for item in events if item.get("reason_code") == "manifest_parse_limit")
     assert event["observed_seconds"] == pytest.approx(0.2)
     assert event["limit_seconds"] == pytest.approx(0.1)
