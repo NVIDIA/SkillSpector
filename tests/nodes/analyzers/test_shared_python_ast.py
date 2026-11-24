@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import json
 import zipfile
+from pathlib import Path
 
 import pytest
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
@@ -31,12 +32,14 @@ from skillspector.python_ast import (
     ParsedPythonFile,
     PythonSourceClassification,
     classify_python_source,
+    decode_python_source,
     get_python_ast,
 )
 
 
-def _track_fixture_parses(monkeypatch: pytest.MonkeyPatch, fixture_source: str) -> list[str]:
-    """Count parses of the scanned source, including calls outside the cache."""
+def _track_fixture_parses(monkeypatch: pytest.MonkeyPatch, fixture_path: Path) -> list[str]:
+    """Count parses of the decoded fixture, including calls outside the cache."""
+    fixture_source = decode_python_source(fixture_path.read_bytes())
     original_parse = python_ast.ast.parse
     parsed_sources: list[str] = []
 
@@ -84,15 +87,16 @@ def test_long_output_flow_uses_complete_ast_source_identity() -> None:
 
 
 @pytest.mark.parametrize(
-    ("filename", "prefix"),
+    ("filename", "prefix", "newline"),
     [
-        pytest.param("script.py", "", id="py"),
-        pytest.param("script.pyw", "", id="pyw"),
-        pytest.param("script", "#!/usr/bin/env python3\n", id="env-shebang"),
+        pytest.param("script.py", "", "\n", id="py"),
+        pytest.param("script.py", "", "\r\n", id="crlf"),
+        pytest.param("script.pyw", "", "\n", id="pyw"),
+        pytest.param("script", "#!/usr/bin/env python3\n", "\n", id="env-shebang"),
     ],
 )
 def test_preparsed_python_is_reused_by_all_ast_analyzers(
-    tmp_path, monkeypatch, filename: str, prefix: str
+    tmp_path, monkeypatch, filename: str, prefix: str, newline: str
 ) -> None:
     """One scan parses each eligible Python file once before analyzer fan-out."""
     (tmp_path / filename).write_text(
@@ -104,10 +108,9 @@ def test_preparsed_python_is_reused_by_all_ast_analyzers(
         "subprocess.run(output, shell=use_shell)\n"
         "exec(payload)\n",
         encoding="utf-8",
+        newline=newline,
     )
-    parsed_sources = _track_fixture_parses(
-        monkeypatch, (tmp_path / filename).read_text(encoding="utf-8")
-    )
+    parsed_sources = _track_fixture_parses(monkeypatch, tmp_path / filename)
     state = build_context({"skill_path": str(tmp_path)})
 
     metadata = next(item for item in state["component_metadata"] if item["path"] == filename)
@@ -183,9 +186,7 @@ def test_ambiguous_python_source_is_analyzed_once_and_marks_coverage_partial(
         "exec(payload)\n",
         encoding="utf-8",
     )
-    parsed_sources = _track_fixture_parses(
-        monkeypatch, (tmp_path / filename).read_text(encoding="utf-8")
-    )
+    parsed_sources = _track_fixture_parses(monkeypatch, tmp_path / filename)
     state = build_context({"skill_path": str(tmp_path)})
 
     metadata = next(item for item in state["component_metadata"] if item["path"] == filename)
@@ -556,9 +557,7 @@ def test_uppercase_python_path_reuses_preparsed_ast_for_static_analyzers(
         "import os\nimport subprocess\nos.environ.copy()\nsubprocess.run(output)\n",
         encoding="utf-8",
     )
-    parsed_sources = _track_fixture_parses(
-        monkeypatch, (tmp_path / "script.PY").read_text(encoding="utf-8")
-    )
+    parsed_sources = _track_fixture_parses(monkeypatch, tmp_path / "script.PY")
     state = build_context({"skill_path": str(tmp_path)})
 
     data_findings = static_patterns_data_exfiltration.node(state)["findings"]
@@ -586,9 +585,7 @@ def test_graph_scan_parses_python_once_before_parallel_analyzers(tmp_path, monke
         "exec(payload)\n",
         encoding="utf-8",
     )
-    parsed_sources = _track_fixture_parses(
-        monkeypatch, (tmp_path / "script.py").read_text(encoding="utf-8")
-    )
+    parsed_sources = _track_fixture_parses(monkeypatch, tmp_path / "script.py")
 
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
 
