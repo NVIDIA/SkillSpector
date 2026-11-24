@@ -462,6 +462,20 @@ effect. Invalid, zero, negative, infinite, or NaN values safely keep the
 1080-second default. Caller-supplied budgets remain authoritative. External
 process limits, including CI job and integration timeouts, can stop a scan sooner.
 
+## Configuring the aggregate workflow byte budget
+
+The scanner bounds the bytes retained for analysis in one complete workflow to 64 MiB by
+default. Set `SKILLSPECTOR_MAX_WORKFLOW_BYTES` to a positive decimal integer number of
+bytes to change that aggregate budget. The same value also raises the CLI transitive
+traversal's byte ceiling (10 MiB by default), which is authoritative for the initial
+ingest when `--transitive` is set; when the variable is unset both keep their current
+defaults. The setting applies to direct, CLI, recursive, and multi-skill scans; artifact
+count ceilings and the per-ingest hard ceiling (`INGEST_MAX_BYTES`, 100 MiB) remain in
+effect, so an override above 100 MiB is still bounded at ingest. Invalid, zero, negative,
+or non-integer values safely keep the defaults. Caller-supplied budgets remain
+authoritative. The setting is resolved when the module is imported, so a new process is
+required after changing it.
+
 ## Configuring the TP4 batch limit
 
 TP4 description-behavior analysis allows up to 256 review batches per analyzer

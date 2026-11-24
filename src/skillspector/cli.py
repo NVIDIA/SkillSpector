@@ -77,7 +77,11 @@ from skillspector.semantic_runtime import (
     semantic_runtime_intent,
     semantic_runtime_ledger_event,
 )
-from skillspector.state import MAX_WORKFLOW_BYTES, MAX_WORKFLOW_SECONDS
+from skillspector.state import (
+    MAX_TRANSITIVE_BYTES,
+    MAX_WORKFLOW_BYTES,
+    MAX_WORKFLOW_SECONDS,
+)
 from skillspector.suppression import (
     Baseline,
     build_baseline_dict,
@@ -175,7 +179,7 @@ def _warning_line(message: object) -> Text:
 _PROGRESS_TREE_MAX_PATHS = 200
 _PROGRESS_TREE_MAX_NODES = 1_000
 _TRANSITIVE_MAX_TARGETS = 32
-_TRANSITIVE_MAX_BYTES = 10 * 1024 * 1024
+_TRANSITIVE_MAX_BYTES = MAX_TRANSITIVE_BYTES
 _TRANSITIVE_MAX_SECONDS = MAX_WORKFLOW_SECONDS
 _TRANSITIVE_MAX_ARTIFACTS = 10_000
 _TRANSITIVE_MAX_FINDINGS = 10_000
