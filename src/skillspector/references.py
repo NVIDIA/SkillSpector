@@ -17,6 +17,8 @@ from io import StringIO
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
+import yaml
+
 from skillspector.artifacts import ArtifactDisposition, BundleReference, ReferenceKind
 
 MAX_REFERENCE_SOURCE_BYTES = 1_000_000
@@ -24,6 +26,7 @@ MAX_RAW_REFERENCE_CANDIDATES = 4096
 MAX_ACCEPTED_REFERENCES = 256
 MAX_REFERENCE_RECORDS = 1024
 MAX_REFERENCE_RUNTIME_SECONDS = 2.0
+_MAX_VERSION_FRONTMATTER_CHARS = 64 * 1024
 _MAX_EVIDENCE = 160
 _MAX_MARKDOWN_DESTINATION_CHARS = 512
 _MARKDOWN_REFERENCE_START = re.compile(
@@ -45,8 +48,13 @@ _HTML_CONTEXT_START = re.compile(
     r"<!--|<\?|<!\[CDATA\[|<![A-Z]|</?([A-Za-z][A-Za-z0-9-]*)(?=[\s/>])",
     re.IGNORECASE,
 )
-# Only a complete, strict JSON VERSION field is proven metadata. Never
-# suppress numeric paths or other quoted references by value alone.
+_FRONTMATTER_VERSION = re.compile(
+    r"""^[ \t]*(?:version|'version'|"version"):[ \t]*(['"])"""
+    r"(?P<version>v?[0-9]+(?:\.[0-9]+)+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)"
+    r"\1(?=[ \t]*(?:#|\r?$))"
+)
+# Require the complete JSON VERSION field shape. Numeric paths elsewhere
+# retain their normal reference accounting.
 _JSON_VERSION_FIELD = re.compile(
     r'^[ \t]*"VERSION"[ \t]*:[ \t]*"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)"[ \t]*(?:,[ \t]*)?$'
 )
@@ -285,6 +293,46 @@ def _html_context_end(match: re.Match[str]) -> re.Pattern[str] | None:
     return None
 
 
+def _quoted_frontmatter_scalars(
+    text: str, *, deadline: float, clock: Callable[[], float]
+) -> set[tuple[int, int]]:
+    """Locate real quoted YAML scalars, conservatively retaining refs on failure.
+
+    Parse events rather than constructing YAML objects or expanding aliases.
+    The optional metadata exemption has bounded input, events, and runtime.
+    Unsupported or oversized frontmatter keeps normal reference accounting.
+    """
+    if not text.startswith(("---\n", "---\r\n")):
+        return set()
+    prefix = text[:_MAX_VERSION_FRONTMATTER_CHARS]
+    closing = re.search(r"^---[ \t]*\r?$", prefix[4:], re.MULTILINE)
+    if closing is None:
+        return set()
+    frontmatter = prefix[: closing.start() + 4]
+    # Every eligible field contains this literal. Skip YAML parsing otherwise.
+    if "version" not in frontmatter:
+        return set()
+    spans: set[tuple[int, int]] = set()
+    events = yaml.parse(frontmatter)
+    try:
+        for count, event in enumerate(events, 1):
+            if count >= MAX_RAW_REFERENCE_CANDIDATES or clock() >= deadline:
+                return set()
+            if (
+                isinstance(event, yaml.ScalarEvent)
+                and event.style in {"'", '"'}
+                and event.start_mark.line == event.end_mark.line
+            ):
+                # Absolute offsets bind the parsed scalar to the same source
+                # characters even when YAML recognizes extra line separators.
+                spans.add((event.start_mark.index + 1, event.end_mark.index - 1))
+    except yaml.YAMLError:
+        return set()
+    finally:
+        events.close()
+    return spans
+
+
 def _candidate_strings(
     text: str,
     *,
@@ -309,11 +357,14 @@ def _candidate_strings(
     in_frontmatter = False
     previous_line_blank = True
     source_offset = 0
+    quoted_scalars = _quoted_frontmatter_scalars(text, deadline=deadline, clock=clock)
     for line_number, line in enumerate(StringIO(text), 1):
         if clock() >= deadline:
             return candidates, ("runtime",)
         stripped_line = line.rstrip("\r\n")
         json_version_match = _JSON_VERSION_FIELD.fullmatch(stripped_line)
+        yaml_version_match = _FRONTMATTER_VERSION.match(stripped_line) if quoted_scalars else None
+        line_start = source_offset
         source_offset += len(line)
         following_line_blank = source_offset == len(text) or bool(
             re.match(r"[ \t]{0,3}(?:\r?\n|\Z)", text[source_offset : source_offset + 5])
@@ -450,6 +501,12 @@ def _candidate_strings(
             )
             if pattern_index == 0:
                 markdown_destination_span = (match.start, match.end)
+            is_yaml_version_metadata = (
+                reference_kind is ReferenceKind.QUOTED_OR_CODE
+                and yaml_version_match is not None
+                and (match.start, match.end) == yaml_version_match.span("version")
+                and (line_start + match.start, line_start + match.end) in quoted_scalars
+            )
             is_json_version_metadata = (
                 reference_kind is ReferenceKind.QUOTED_OR_CODE
                 and json_version_match is not None
@@ -458,6 +515,7 @@ def _candidate_strings(
             if (
                 not inside_destination
                 and not redundant_image_label
+                and not is_yaml_version_metadata
                 and not is_json_version_metadata
             ):
                 key = (line_number, match.start, raw)
