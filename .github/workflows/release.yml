@@ -51,6 +51,7 @@ jobs:
         run: |
           uv run --no-sync python -m build --no-isolation
           uv run --no-sync twine check dist/*
+          uv run --no-sync python scripts/release/public/check_distribution_assets.py dist/*.whl dist/*.tar.gz
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

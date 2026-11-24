@@ -62,8 +62,9 @@ A release PR must come from a branch in `NVIDIA/SkillSpector` and be merged
 into `main` with the `release:publish` label. Update the version in
 `pyproject.toml` and add its notes under `docs/release/` in the release PR.
 The [release workflow](.github/workflows/release.yml) builds and checks the
-wheel and source distribution from the merge commit, attaches both to the
-GitHub release, and passes those same files to the package index job.
+wheel and source distribution from the merge commit. It verifies the metadata
+and bundled YARA rules and provider registries before attaching both artifacts
+to the GitHub release and passing them to the package index job.
 
 Before enabling uploads, configure these GitHub Actions environments with
 `main` as the deployment branch and release maintainers as required reviewers:

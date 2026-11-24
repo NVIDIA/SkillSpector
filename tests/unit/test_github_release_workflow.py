@@ -51,6 +51,7 @@ def test_release_workflow_builds_and_attaches_supported_distributions() -> None:
 
     assert "uv run --no-sync python -m build --no-isolation" in workflow
     assert "uv run --no-sync twine check dist/*" in workflow
+    assert "check_distribution_assets.py dist/*.whl dist/*.tar.gz" in workflow
     assert "--asset dist/*.whl" in workflow
     assert "--asset dist/*.tar.gz" in workflow
 
