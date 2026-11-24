@@ -115,7 +115,8 @@ _EXPECTED_SUFFIXES: dict[str, frozenset[str]] = {
     "docx": frozenset({".docx", ".docm", ".dotx", ".dotm"}),
     "xlsx": frozenset({".xlsx", ".xlsm", ".xltx", ".xltm"}),
     "pptx": frozenset({".pptx", ".pptm", ".potx", ".potm", ".ppsx", ".ppsm"}),
-    "zip": frozenset({".zip"}),
+    # A Python wheel is a ZIP archive under its own standard suffix (PEP 427).
+    "zip": frozenset({".zip", ".whl"}),
     "tar": frozenset({".tar"}),
     "gzip": frozenset({".gz", ".tgz"}),
 }

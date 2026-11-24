@@ -113,6 +113,9 @@ analyzed disk descendant is not marked partial merely because the archive copy w
 SC9 is a deterministic HIGH finding when executable content is concealed inside an Office document
 container or a hidden/disguised artifact. Executability is established from an executable suffix,
 a shebang, or archive mode bits. A benign document without executable members does not produce SC9.
+A visible Python wheel (`.whl`) is a ZIP container under its expected suffix: its members are
+inspected like any ZIP member, and the wheel alone does not make them concealed. A dot-prefixed
+wheel, or a file named `.whl` that is not a ZIP archive, still conceals its executable members.
 
 SC9 reports evidence and risk; it does not execute the member or prescribe an installation decision.
 
