@@ -5,15 +5,16 @@ This release comes from `main` at `2d0c6ddcb`. The previous release used the 2.1
 ## Scanning and reports
 
 - Improve command and source boundaries in shell, Python, JavaScript, TypeScript, PowerShell, Markdown, and structured text. Scans retain source locations for unresolved command operands and other incomplete inspection. [#1151](https://github.com/NVIDIA/SkillSpector/pull/1151), [#1152](https://github.com/NVIDIA/SkillSpector/pull/1152), [#1153](https://github.com/NVIDIA/SkillSpector/pull/1153), [#1154](https://github.com/NVIDIA/SkillSpector/pull/1154), [#1127](https://github.com/NVIDIA/SkillSpector/pull/1127)
-- Keep host Git templates out of Git URL scans. Reports include the sanitized acquisition origin and list explicitly excluded recursive root directories without counting those directories against coverage. [#1161](https://github.com/NVIDIA/SkillSpector/pull/1161), [#1118](https://github.com/NVIDIA/SkillSpector/pull/1118), [#1180](https://github.com/NVIDIA/SkillSpector/pull/1180)
+- Keep host Git templates out of Git URL scans. Reports include the sanitized acquisition origin and list built-in recursive root exclusions such as `.git/` and `.venv/` without counting those directories against coverage. [#1161](https://github.com/NVIDIA/SkillSpector/pull/1161), [#1118](https://github.com/NVIDIA/SkillSpector/pull/1118), [#1180](https://github.com/NVIDIA/SkillSpector/pull/1180)
 - Point RP3 findings to the manifest's version field and include a bounded version snippet. Tag MCP tool-poisoning findings with MITRE ATLAS `AML.T0110`. [#1183](https://github.com/NVIDIA/SkillSpector/pull/1183), [#1134](https://github.com/NVIDIA/SkillSpector/pull/1134)
 - Read dependency declarations from Poetry, PDM, Hatch, and uv tables in `pyproject.toml`. Support `--yara-rules-dir` during baseline generation so scans and baselines can use the same additional rules. [#190](https://github.com/NVIDIA/SkillSpector/pull/190), [#1117](https://github.com/NVIDIA/SkillSpector/pull/1117)
+- Preserve handling for quoted YAML version metadata, including nested frontmatter. Real file references and quoted version-like text elsewhere in the document retain reference checks. [#525](https://github.com/NVIDIA/SkillSpector/pull/525)
 
 ## MCP and providers
 
 - Use the stable official MCP Registry API and accept UTF-8 BOMs in local Registry JSON. MCP callers can request `include_report=false` to omit the rendered report from the tool response. [#1130](https://github.com/NVIDIA/SkillSpector/pull/1130), [#1136](https://github.com/NVIDIA/SkillSpector/pull/1136), [#1103](https://github.com/NVIDIA/SkillSpector/pull/1103)
 - Add MiniMax regional provider support and update the NV Build default to GLM-5.3 Flash. [#366](https://github.com/NVIDIA/SkillSpector/pull/366), [#1009](https://github.com/NVIDIA/SkillSpector/pull/1009)
-- Refresh the locked versions of pyasn1, cryptography, and PyJWT for published dependency advisories. [#1148](https://github.com/NVIDIA/SkillSpector/pull/1148)
+- Refresh the locked versions of pyasn1, cryptography, PyJWT, LangGraph, and LangGraph Checkpoint for dependency advisories. [#1148](https://github.com/NVIDIA/SkillSpector/pull/1148), [#1095](https://github.com/NVIDIA/SkillSpector/pull/1095)
 
 ## Documentation and release packaging
 
