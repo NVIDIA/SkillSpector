@@ -205,8 +205,16 @@ skillspector scan ./my-skill/ --format sarif --output report.sarif
 
 ### Recursive Collection Scanning
 
-`--recursive` scans immediate subdirectories containing `SKILL.md` as independent
-skills, with a default aggregate limit of **32 skills**. To raise or lower it:
+Use `--recursive` to scan a local collection's immediate child directories as
+independent skills. A child can contain `SKILL.md`, `skill.md`, or a supported
+AISOP/AISP bundle, such as `.aisop/workflow.aisop.json`.
+
+If the scan root itself contains `SKILL.md` or `skill.md`, SkillSpector scans
+that root as one skill. To scan children independently, point the command at a
+collection root without a Markdown skill manifest. Recursive output combines
+the child results in one report.
+
+The default aggregate limit is **32 skills**. To raise or lower it:
 
 ```bash
 skillspector scan ./my-skills/ --recursive --max-skills 100 --no-llm --format json
@@ -216,9 +224,9 @@ skillspector scan ./my-skills/ --recursive --max-skills 100 --no-llm --format js
 does not mean unlimited. Discovery, byte, finding-record, time and report-size
 budgets still apply, so increasing the count does not guarantee complete coverage.
 When the count limit is reached, the CLI names the limit and suggests adjusting it
-or scanning sub-skills separately. Omitted skills remain visible in the aggregate
-report and coverage stays incomplete. Use `--fail-on-incomplete` in CI to fail on
-incomplete coverage; the default exit policy is unchanged.
+or scanning sub-skills separately. The aggregate report records the omission
+count and reason, and coverage stays incomplete. Use `--fail-on-incomplete` in
+CI to fail on incomplete coverage.
 
 ### Batch Scanning
 
@@ -1193,22 +1201,29 @@ Based on research from "Agent Skills in the Wild: An Empirical Study of Security
 
 ```python
 from skillspector import graph
+from skillspector.cleanup import cleanup_result
 
 # Invoke the LangGraph workflow
 result = graph.invoke({
     "input_path": "/path/to/skill",
     "output_format": "json",   # terminal, json, markdown, or sarif
-    "use_llm": True,           # False for static-only analysis
+    "use_llm": False,          # Set True to use a configured LLM provider
 })
 
-# Access results
-print(f"Risk Score: {result['risk_score']}/100")
-print(f"Severity: {result['risk_severity']}")
-print(f"Recommendation: {result['risk_recommendation']}")
+try:
+    print(f"Risk Score: {result['risk_score']}/100")
+    print(f"Severity: {result['risk_severity']}")
+    print(f"Recommendation: {result['risk_recommendation']}")
 
-for finding in result["filtered_findings"]:
-    print(f"[{finding['severity']}] {finding['rule_id']}: {finding['message']}")
+    for finding in result["filtered_findings"]:
+        print(f"[{finding.severity}] {finding.rule_id}: {finding.message}")
+finally:
+    cleanup_result(result)
 ```
+
+The graph returns Python state, including `Finding` objects in
+`filtered_findings`. Set `output_format` to choose the rendered report in
+`result["report_body"]`.
 
 ## License
 
