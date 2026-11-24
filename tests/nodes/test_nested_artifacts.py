@@ -400,7 +400,7 @@ def test_inventory_exceptions_reconcile_in_one_linear_pass() -> None:
     assert artifact["reason"] == LedgerReason.ARCHIVE_SIZE_LIMIT.value
 
 
-def _with_zip64_eocd(data: bytes) -> bytes:
+def _with_zip64_eocd(data: bytes, *, sentinels: bool = True) -> bytes:
     """Promote a small ordinary ZIP to a standards-shaped ZIP64 EOCD fixture."""
     eocd = data.rfind(b"PK\x05\x06")
     assert eocd >= 0
@@ -408,8 +408,9 @@ def _with_zip64_eocd(data: bytes) -> bytes:
     entries = int.from_bytes(encoded[10:12], "little")
     directory_size = int.from_bytes(encoded[12:16], "little")
     directory_offset = int.from_bytes(encoded[16:20], "little")
-    encoded[8:12] = b"\xff\xff\xff\xff"
-    encoded[12:20] = b"\xff" * 8
+    if sentinels:
+        encoded[8:12] = b"\xff\xff\xff\xff"
+        encoded[12:20] = b"\xff" * 8
     zip64_eocd = struct.pack(
         "<4sQHHIIQQQQ",
         b"PK\x06\x06",
@@ -919,9 +920,12 @@ def test_supplied_outer_bytes_preserve_exact_virtual_member_bytes(tmp_path: Path
     assert artifact["contains_nul"] is True
 
 
-def test_zip64_eocd_is_preflighted_before_member_inspection(tmp_path: Path) -> None:
+@pytest.mark.parametrize("sentinels", [True, False], ids=["required", "optional"])
+def test_zip64_eocd_is_preflighted_before_member_inspection(
+    tmp_path: Path, sentinels: bool
+) -> None:
     outer_path = "zip64.zip"
-    supplied = _with_zip64_eocd(_zip_bytes({"payload.txt": b"zip64 member"}))
+    supplied = _with_zip64_eocd(_zip_bytes({"payload.txt": b"zip64 member"}), sentinels=sentinels)
 
     result = inspect_nested_artifacts(
         tmp_path,
