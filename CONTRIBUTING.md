@@ -85,9 +85,10 @@ PR to verify the OIDC flow before selecting production for a subsequent
 release.
 
 If an upload is interrupted, rerun the failed index job while the build
-artifact is available, with the same index selected. The publisher skips
-files already present with identical bytes and uploads any missing files.
-A published filename with different bytes fails the upload. Ship a new
+artifact is available. The job uses the index recorded by the build and
+requires that index to match the repository variable. It skips files
+already present with identical bytes and uploads any missing files. A
+published filename with different bytes fails the upload. Ship a new
 version if the distributions need correction.
 
 ## Coding Standards

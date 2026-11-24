@@ -32,6 +32,7 @@ jobs:
       contents: write
     outputs:
       distribution-artifact: release-distributions-${{ github.run_attempt }}
+      distribution-index: ${{ vars.SKILLSPECTOR_PUBLISH_INDEX }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -77,11 +78,12 @@ jobs:
     if: >-
       github.repository == 'NVIDIA/SkillSpector' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      (vars.SKILLSPECTOR_PUBLISH_INDEX == 'pypi' || vars.SKILLSPECTOR_PUBLISH_INDEX == 'testpypi')
+      vars.SKILLSPECTOR_PUBLISH_INDEX == needs.publish.outputs.distribution-index &&
+      (needs.publish.outputs.distribution-index == 'pypi' || needs.publish.outputs.distribution-index == 'testpypi')
     runs-on: ubuntu-latest
     environment:
-      name: ${{ vars.SKILLSPECTOR_PUBLISH_INDEX == 'pypi' && 'pypi-production' || 'pypi-test' }}
-      url: ${{ vars.SKILLSPECTOR_PUBLISH_INDEX == 'pypi' && 'https://pypi.org/project/skillspector/' || 'https://test.pypi.org/project/skillspector/' }}
+      name: ${{ needs.publish.outputs.distribution-index == 'pypi' && 'pypi-production' || 'pypi-test' }}
+      url: ${{ needs.publish.outputs.distribution-index == 'pypi' && 'https://pypi.org/project/skillspector/' || 'https://test.pypi.org/project/skillspector/' }}
     permissions:
       id-token: write
     steps:
@@ -97,8 +99,8 @@ jobs:
           enable-cache: false
       - name: Upload distributions with Trusted Publishing
         env:
-          PUBLISH_URL: ${{ vars.SKILLSPECTOR_PUBLISH_INDEX == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
-          CHECK_URL: ${{ vars.SKILLSPECTOR_PUBLISH_INDEX == 'pypi' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
+          PUBLISH_URL: ${{ needs.publish.outputs.distribution-index == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+          CHECK_URL: ${{ needs.publish.outputs.distribution-index == 'pypi' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
         run: |
           uv publish --no-config --trusted-publishing always \
             --publish-url "$PUBLISH_URL" --check-url "$CHECK_URL" dist/*

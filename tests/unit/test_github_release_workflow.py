@@ -82,8 +82,6 @@ def test_index_publish_uses_only_artifacts_from_the_qualified_release_job() -> N
     index_job = workflow["jobs"]["publish-index"]
     assert index_job["needs"] == "publish"
     assert "github.repository == 'NVIDIA/SkillSpector'" in index_job["if"]
-    assert "vars.SKILLSPECTOR_PUBLISH_INDEX == 'pypi'" in index_job["if"]
-    assert "vars.SKILLSPECTOR_PUBLISH_INDEX == 'testpypi'" in index_job["if"]
 
     upload = next(
         step for step in release_job["steps"] if "actions/upload-artifact@" in step.get("uses", "")
@@ -112,3 +110,21 @@ def test_only_the_index_job_can_request_oidc_for_digest_checked_uploads() -> Non
     command = index_job["steps"][-1]["run"]
     assert "--trusted-publishing always" in command
     assert "--check-url" in command
+
+
+def test_index_retry_keeps_the_index_selected_for_the_release_artifacts() -> None:
+    workflow = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    release_job = workflow["jobs"]["publish"]
+    index_job = workflow["jobs"]["publish-index"]
+
+    selected_index = "needs.publish.outputs.distribution-index"
+    index_setting = "vars.SKILLSPECTOR_PUBLISH_INDEX"
+    assert release_job["outputs"].get("distribution-index") == "${{ " + index_setting + " }}"
+    assert f"{selected_index} == 'pypi'" in index_job["if"]
+    assert f"{selected_index} == 'testpypi'" in index_job["if"]
+    assert f"{index_setting} == {selected_index}" in index_job["if"]
+
+    endpoints = index_job["steps"][-1]["env"]
+    for selection in (*index_job["environment"].values(), *endpoints.values()):
+        assert selected_index in selection
+        assert index_setting not in selection
