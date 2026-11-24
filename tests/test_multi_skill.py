@@ -372,7 +372,7 @@ class TestDetectSkills:
         assert result.omitted_symlink_entries == 1
 
     def test_ignored_name_symlinks_do_not_mark_discovery_incomplete(self, tmp_path: Path) -> None:
-        """Symlinks with intentionally ignored names are skipped, not recorded.
+        """Symlinks with intentionally ignored names remain out of scope.
 
         Closes rng1995 review on #499: a symlinked `.git`, `.venv`, or
         `node_modules` must not make an otherwise complete scan incomplete,
@@ -416,6 +416,7 @@ class TestDetectSkills:
         assert result.complete is True
         assert result.limitations == ()
         assert {skill.name for skill in result.skills} == {"skill-c", "skill-d"}
+        assert result.excluded_root_paths == (".git/", "node_modules/")
 
     def test_eligible_dot_prefixed_symlink_is_not_silently_excluded(self, tmp_path: Path) -> None:
         """An eligible dot-prefixed symlinked skill is recorded, not skipped.
