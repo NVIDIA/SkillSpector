@@ -442,7 +442,8 @@ def _load_manifest(skill_dir: Path) -> dict:
     """Extract YAML frontmatter from SKILL.md as a manifest dict."""
     from skillspector.nodes.build_context import _parse_manifest
 
-    return _parse_manifest(skill_dir)
+    manifest, _ = _parse_manifest(skill_dir)
+    return manifest
 
 
 # ---------------------------------------------------------------------------
