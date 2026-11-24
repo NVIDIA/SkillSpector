@@ -1304,6 +1304,8 @@ class InputHandler:
             "clone",
             "--depth",
             "1",
+            # Keep host-local template files out of the scanned clone.
+            "--template=",
             url,
             str(clone_dir),
         ]
