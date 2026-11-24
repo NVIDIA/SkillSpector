@@ -80,9 +80,8 @@ chosen index. In each publisher registration use owner `NVIDIA`, repository
 environment. Use the existing project on PyPI and a
 [pending publisher](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)
 on TestPyPI if it has no project yet. Package uploads remain disabled while
-the repository variable is unset. Start with TestPyPI on an approved release
-PR to verify the OIDC flow before selecting production for a subsequent
-release.
+the repository variable is unset. Use TestPyPI to verify the OIDC flow and
+package installation before selecting production.
 
 If an upload is interrupted, rerun the failed index job while the build
 artifact is available. The job uses the index recorded by the build and
@@ -90,6 +89,12 @@ requires that index to match the repository variable. It skips files
 already present with identical bytes and uploads any missing files. A
 published filename with different bytes fails the upload. Ship a new
 version if the distributions need correction.
+
+To upload an existing GitHub release, set the variable to the intended index
+and run **Publish GitHub Release** manually from `main`. Supply the published
+release tag, the index, and the SHA-256 values of the approved wheel and source
+distribution. The workflow checks those values against the release metadata
+and the downloaded files before uploading the existing distributions.
 
 ## Coding Standards
 
