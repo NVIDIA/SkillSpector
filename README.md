@@ -205,8 +205,16 @@ skillspector scan ./my-skill/ --format sarif --output report.sarif
 
 ### Recursive Collection Scanning
 
-`--recursive` scans immediate subdirectories containing `SKILL.md` as independent
-skills, with a default aggregate limit of **32 skills**. To raise or lower it:
+Use `--recursive` to scan a local collection's immediate child directories as
+independent skills. A child can contain `SKILL.md`, `skill.md`, or a supported
+AISOP/AISP bundle, such as `.aisop/workflow.aisop.json`.
+
+If the scan root itself contains `SKILL.md` or `skill.md`, SkillSpector scans
+that root as one skill. To scan children independently, point the command at a
+collection root without a Markdown skill manifest. Recursive output combines
+the child results in one report.
+
+The default aggregate limit is **32 skills**. To raise or lower it:
 
 ```bash
 skillspector scan ./my-skills/ --recursive --max-skills 100 --no-llm --format json
@@ -216,9 +224,9 @@ skillspector scan ./my-skills/ --recursive --max-skills 100 --no-llm --format js
 does not mean unlimited. Discovery, byte, finding-record, time and report-size
 budgets still apply, so increasing the count does not guarantee complete coverage.
 When the count limit is reached, the CLI names the limit and suggests adjusting it
-or scanning sub-skills separately. Omitted skills remain visible in the aggregate
-report and coverage stays incomplete. Use `--fail-on-incomplete` in CI to fail on
-incomplete coverage; the default exit policy is unchanged.
+or scanning sub-skills separately. The aggregate report records the omission
+count and reason, and coverage stays incomplete. Use `--fail-on-incomplete` in
+CI to fail on incomplete coverage.
 
 ### Batch Scanning
 
