@@ -776,6 +776,7 @@ def test_anonymous_git_drops_ambient_auth_and_config(
         "HOME": str(tmp_path),
         "SSH_AUTH_SOCK": "/synthetic/agent",
         "GIT_ASKPASS": "/synthetic/askpass",
+        "GIT_TEMPLATE_DIR": "/synthetic/templates",
         "GIT_CONFIG_COUNT": "1",
         "GIT_CONFIG_KEY_0": "http.extraHeader",
         "GIT_CONFIG_VALUE_0": "Authorization: synthetic-secret",
@@ -839,6 +840,8 @@ def test_anonymous_git_drops_ambient_auth_and_config(
         assert "core.askPass=" in command
         assert "http.extraHeader=" in command
         assert "http.followRedirects=false" in command
+        if operation == "_clone_git":
+            assert "--template=" in command
         assert env["HOME"] == env["USERPROFILE"] == str(isolated_home)
         assert env["GIT_CONFIG_GLOBAL"] == env["GIT_CONFIG_SYSTEM"] == os.devnull
         assert env["GIT_CONFIG_NOSYSTEM"] == "1"
