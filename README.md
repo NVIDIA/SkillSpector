@@ -1034,7 +1034,48 @@ provenance instead of being rebased into the local skill directory.
 
 ### Recommended gate mapping
 
-When using SkillSpector as an install gate, map the recommendation to an action:
+For an install gate, check that the scan succeeded and completed the requested
+analysis before applying your recommendation policy. This example allows only
+complete, `SAFE` static scans:
+
+```bash
+python - ./my-skill <<'PYTHON'
+import json
+import subprocess
+import sys
+
+scan = subprocess.run(
+    ["skillspector", "scan", sys.argv[1], "--no-llm", "--format", "json", "--fail-on-incomplete"],
+    capture_output=True,
+    text=True,
+)
+if scan.returncode not in (0, 1):
+    raise SystemExit(scan.stderr.strip() or f"SkillSpector failed (exit {scan.returncode})")
+
+try:
+    report = json.loads(scan.stdout)
+except json.JSONDecodeError:
+    raise SystemExit("SkillSpector did not return a valid JSON report")
+
+if report.get("execution_successful") is not True:
+    raise SystemExit("SkillSpector could not complete the scan")
+if report.get("metadata", {}).get("llm_requested") is not False:
+    raise SystemExit("SkillSpector did not report the requested static-only scope")
+if report.get("analysis_completeness", {}).get("is_complete") is not True:
+    raise SystemExit("SkillSpector analysis is incomplete")
+if scan.returncode != 0 or report.get("risk_assessment", {}).get("recommendation") != "SAFE":
+    raise SystemExit("SkillSpector blocked installation")
+PYTHON
+```
+
+For a semantic gate, configure your provider, omit `--no-llm`, and require
+`metadata.llm_requested` to be `true`. Keep the completeness check so a provider
+failure blocks installation. For `--recursive` scans, the combined report carries
+execution and completeness at the top level and reports the recommendation and
+analysis scope for each child under `skills`. Check each child's requested scope
+and recommendation before allowing installation.
+
+Once execution and coverage pass, map the recommendation to an action:
 
 | `recommendation` | Suggested action |
 |------------------|------------------|
