@@ -2209,8 +2209,8 @@ class _BoundedManifestLoader(yaml.SafeLoader):
         )
         self._manifest_nodes = 0
         self._manifest_depth = 0
-        self._version_key_mark: yaml.Mark | None = None
-        self.version_marks: tuple[yaml.Mark, yaml.Mark, yaml.Mark] | None = None
+        self._version_key_event: yaml.NodeEvent | None = None
+        self.version_marks: tuple[yaml.NodeEvent, yaml.Mark, yaml.Mark] | None = None
 
     def flatten_mapping(self, node: yaml.MappingNode) -> None:
         """Reject YAML merge keys before SafeConstructor can amplify aliases."""
@@ -2241,15 +2241,15 @@ class _BoundedManifestLoader(yaml.SafeLoader):
             node = super().compose_node(parent, index)
             key = node if index is None else index
             if (
-                event is not None
+                isinstance(event, yaml.NodeEvent)
                 and isinstance(key, yaml.ScalarNode)
                 and key.tag in ("tag:yaml.org,2002:str", "tag:yaml.org,2002:value")
                 and key.value == "version"
             ):
                 if index is None:
-                    self._version_key_mark = event.start_mark
-                elif self._version_key_mark is not None:
-                    self.version_marks = (self._version_key_mark, event.start_mark, event.end_mark)
+                    self._version_key_event = event
+                elif self._version_key_event is not None:
+                    self.version_marks = (self._version_key_event, event.start_mark, event.end_mark)
             return node
         finally:
             self._manifest_depth -= 1
@@ -2618,7 +2618,7 @@ def _parse_manifest(
             return {}, None
         frontmatter = content[3 : end_match.start() + 3]
         loader: _BoundedManifestLoader | None = None
-        version_marks: tuple[yaml.Mark, yaml.Mark, yaml.Mark] | None = None
+        version_marks: tuple[yaml.NodeEvent, yaml.Mark, yaml.Mark] | None = None
         try:
             _check_runtime()
             loader = _BoundedManifestLoader(
@@ -2698,12 +2698,22 @@ def _parse_manifest(
         version = manifest.get("version")
         if version_marks is None or not isinstance(version, str):
             return manifest, None
-        key_mark, value_start, value_end = version_marks
+        key_event, value_start, value_end = version_marks
+        key_mark = key_event.start_mark
         snippet = None
-        if key_mark.line == value_end.line and value_end.index - key_mark.index <= 200:
+        if (
+            isinstance(key_event, yaml.ScalarEvent)
+            and key_event.anchor is None
+            and (
+                key_event.tag is None
+                or frontmatter.startswith(f"!<{key_event.tag}>", key_mark.index)
+            )
+            and key_mark.line == value_end.line
+            and value_end.index - key_mark.index <= 200
+        ):
             # Keep a literal source spelling when it exposes the same text as
-            # the parsed version. Encoded scalars and aliases use the parsed
-            # preview so YAML escapes cannot bypass report redaction.
+            # the parsed version. Use the parsed preview for encoded scalars
+            # and user-defined names in YAML anchors, aliases or tag handles.
             raw_value = frontmatter[value_start.index : value_end.index]
             if raw_value in (version, f"'{version}'", f'"{version}"'):
                 snippet = frontmatter[key_mark.index : value_end.index]

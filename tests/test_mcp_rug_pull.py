@@ -827,6 +827,31 @@ def test_rp3_version_snippet_cannot_reintroduce_yaml_escaped_credentials(tmp_pat
     assert "example.com" in issue["code_snippet"]
 
 
+@pytest.mark.parametrize(
+    ("frontmatter", "version_line"),
+    [
+        ("name: test-skill\n&{marker} version: latest", 3),
+        ("name: test-skill\n!<tag:yaml.org,2002:str> &{marker} version: latest", 3),
+        ("name: test-skill\ndescription: &{marker} version\n*{marker} : latest", 4),
+        ("%TAG !{marker}! tag:yaml.org,2002:\n--- {{!{marker}!str version: latest}}", 3),
+    ],
+)
+def test_rp3_version_snippet_omits_user_defined_yaml_names(tmp_path, frontmatter, version_line):
+    marker = "ghp_SYNTHETICMARKER000000000000000000001"
+    (tmp_path / "SKILL.md").write_text(
+        f"---\n{frontmatter.format(marker=marker)}\n---\n", encoding="utf-8"
+    )
+    result = node(build_context({"skill_path": str(tmp_path)}))
+    findings = [finding for finding in result["findings"] if finding.rule_id == "RP3"]
+    assert len(findings) == 1
+    assert findings[0].start_line == version_line
+
+    body = report({"filtered_findings": findings, "output_format": "json"})["report_body"]
+    issue = next(item for item in json.loads(body)["issues"] if item["id"] == "RP3")
+    assert issue["code_snippet"] == "latest"
+    assert marker not in body
+
+
 def test_lowercase_manifest_rp3_timeout_remains_partial(tmp_path, monkeypatch):
     (tmp_path / "skill.md").write_text(
         '---\nname: test-skill\nversion: "*"\n---\n', encoding="utf-8"
