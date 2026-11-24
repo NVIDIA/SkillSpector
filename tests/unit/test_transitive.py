@@ -539,6 +539,7 @@ def test_input_handler_rejects_oversized_transitive_git_clone(tmp_path: Path, mo
             "--depth",
             "1",
             "--filter=blob:limit=5",
+            "--template=",
             "https://github.com/org/large.git",
             str(tmp_path / "repo"),
         ]
