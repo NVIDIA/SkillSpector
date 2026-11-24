@@ -237,6 +237,14 @@ def merge_inspection_notices(
     return bounded_inspection_notices([*existing, *updates])
 
 
+class ManifestVersionSource(TypedDict):
+    """Source coordinates retained by the bounded manifest parser."""
+
+    path: str
+    line: int
+    snippet: str | None
+
+
 class SkillspectorState(TypedDict, total=False):
     """Graph state shared by all nodes."""
 
@@ -289,6 +297,7 @@ class SkillspectorState(TypedDict, total=False):
     # outside state because they are not checkpoint-serializable.
     python_ast_cache_key: str | None
     manifest: dict[str, object]
+    manifest_version_source: ManifestVersionSource | None
     previous_manifest: dict[str, object] | None
 
     # Accumulated canonical findings. Same-ID meta updates replace in place.
