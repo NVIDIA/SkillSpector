@@ -199,6 +199,8 @@ skillspector --version
 
 The CLI passes `input_path` to the graph. The **resolve_input** node (using [input_handler.py](../src/skillspector/input_handler.py)) resolves Git URL, file URL, .zip, single .md file, or directory to a local directory and sets `skill_path` (and `temp_dir_for_cleanup` when a temp dir was created). The CLI cleans up `temp_dir_for_cleanup` after invoke. Exit code 1 if risk_score > 50; exit code 2 on error. See [Integrating SkillSpector](../README.md#integrating-skillspector) for the full exit-code and JSON contract.
 
+Git URL scans disable Git templates for the temporary clone so host-local template files stay outside the scan. A local directory scan inspects the files already present under the selected path according to the normal scan rules.
+
 ### Programmatic
 
 ```python
