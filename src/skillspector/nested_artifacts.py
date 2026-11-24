@@ -290,7 +290,10 @@ def _central_directory_bounds(data: bytes) -> _CentralDirectory | None:
         or directory_size == 0xFFFFFFFF
         or directory_offset == 0xFFFFFFFF
     )
-    if needs_zip64:
+    # ZIP64 records can be present even when the classic fields have not overflowed.
+    if needs_zip64 or (
+        eocd_offset >= 20 and data[eocd_offset - 20 : eocd_offset - 16] == _ZIP64_LOCATOR_SIGNATURE
+    ):
         zip64_offset = _zip64_record_offset(data, locator_offset=eocd_offset - 20)
         if zip64_offset is None:
             return None
