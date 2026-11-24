@@ -543,6 +543,30 @@ class TestQueryResourceBounds:
         assert client.post.call_count == 2
         assert second[0][0].vuln_id == "OSV-1"
 
+    def test_package_with_more_than_16_advisories_retains_all_within_limit(self) -> None:
+        import skillspector.nodes.analyzers.osv_client as osv
+
+        assert osv.MAX_OSV_VULNS_PER_PACKAGE == 64
+        advisory_ids = [f"OSV-{i:03d}" for i in range(1, 26)]
+        client = self._client_for_batches(
+            [{"results": [{"vulns": [{"id": vuln_id} for vuln_id in advisory_ids]}]}]
+        )
+
+        def get_detail(url: str, timeout: float | None = None) -> MagicMock:
+            vuln_id = url.rsplit("/", 1)[-1]
+            detail = MagicMock()
+            detail.raise_for_status = MagicMock()
+            detail.json.return_value = {"id": vuln_id, "summary": f"summary for {vuln_id}"}
+            return detail
+
+        client.get.side_effect = get_detail
+
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=client):
+            results = query_batch([("lodash", "4.17.15")], ECOSYSTEM_NPM)
+
+        assert [item.vuln_id for item in results[0]] == advisory_ids
+        assert results.limitations == ()
+
     def test_budget_is_shared_across_separate_manifest_queries(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
