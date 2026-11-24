@@ -802,11 +802,31 @@ All detected patterns are listed in the tables above.
 
 ### Score Calculation
 
-- **CRITICAL issues**: +50 points
-- **HIGH issues**: +25 points
-- **MEDIUM issues**: +10 points
-- **LOW issues**: +5 points
-- **Executable scripts**: 1.3x multiplier
+For each skill, an active finding starts with base points for its severity.
+
+- **CRITICAL**: 50 points
+- **HIGH**: 25 points
+- **MEDIUM**: 10 points
+- **LOW**: 5 points
+
+The score scales each contribution by the finding's confidence, bounded
+between 0 and 1. Within each rule ID, findings with positive confidence are
+scored in descending severity order. The first three count at full, half,
+and quarter weight. Further findings with the same rule ID can still
+appear in the report without adding points.
+
+A 1.3× multiplier applies to a finding when its file is an executable
+component. The total is rounded down and capped at 100. Some conditions,
+such as an unapproved exclusion of executable content, impose a minimum score.
+
+In a single-skill JSON report, `risk_assessment.severity` is the band for the aggregate
+score. `risk_assessment.max_issue_severity` is the highest severity among
+the active findings, or `NONE` when there are none. For example, a report
+with one HIGH finding at 0.4 confidence in Markdown can show a score of 10,
+an aggregate severity of LOW, and a maximum issue severity of HIGH.
+
+Check [scan completeness](docs/scan-completeness.md) when using a report
+to make an installation decision.
 
 ### Severity Levels
 
