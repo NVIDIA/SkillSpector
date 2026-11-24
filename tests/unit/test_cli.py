@@ -3884,6 +3884,62 @@ def test_directory_discovery_warnings_do_not_corrupt_machine_stdout(
 
 
 @pytest.mark.parametrize("output_format", list(FormatChoice))
+def test_recursive_root_scope_exclusions_are_public(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output_format: FormatChoice
+) -> None:
+    for name in (".git", ".venv", ".review-helper", "normal"):
+        child = tmp_path / name
+        child.mkdir()
+        (child / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+    (tmp_path / "node_modules").write_text("A plain file at the collection root.", encoding="utf-8")
+    scanned: list[str] = []
+
+    def scan_child(*, input_path: str, **_kwargs: object) -> dict[str, object]:
+        scanned.append(Path(input_path).name)
+        return _bounded_recursive_result("clean", finding_count=0)
+
+    monkeypatch.setattr(cli, "_scan_skill", scan_child)
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "--recursive",
+            "--no-llm",
+            "--format",
+            output_format.value,
+            "--fail-on-incomplete",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert scanned == [".review-helper", "normal"]
+    if output_format is FormatChoice.json:
+        report = json.loads(result.stdout)
+        assert report["risk_recommendation"] == "SAFE"
+        completeness = report["analysis_completeness"]
+    elif output_format is FormatChoice.sarif:
+        aggregate = json.loads(result.stdout)["runs"][-1]
+        completeness = aggregate["invocations"][0]["properties"]["analysisCompleteness"]
+    else:
+        assert "Scope exclusions" in result.stdout
+        assert ".git/" in result.stdout
+        assert ".venv/" in result.stdout
+        assert "node_modules" not in result.stdout
+        return
+    assert completeness["status"] == "complete"
+    assert completeness["coverage_percent"] == 100
+    assert completeness["limitations"] == []
+    assert [
+        (row["path"], row["outcome"], row["reason_code"])
+        for row in completeness["scope_exclusions"]
+    ] == [
+        (".git/", "out_of_scope", "excluded_directory"),
+        (".venv/", "out_of_scope", "excluded_directory"),
+    ]
+
+
+@pytest.mark.parametrize("output_format", list(FormatChoice))
 @pytest.mark.parametrize("write_file", [False, True], ids=["stdout", "file"])
 def test_recursive_child_exception_is_sanitized_across_public_formats(
     monkeypatch: pytest.MonkeyPatch,

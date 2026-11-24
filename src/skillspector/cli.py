@@ -54,6 +54,8 @@ from skillspector.graph_proxy import graph
 from skillspector.input_handler import _normalize_root_owned_alias, validate_local_input_path
 from skillspector.inspection_ledger import (
     MAX_INSPECTION_LEDGER_EVENTS,
+    REASON_MESSAGES,
+    InspectionLedgerException,
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
@@ -2817,6 +2819,7 @@ def _multi_skill_analysis_completeness(
     failed_skills: int,
     omitted_skills: int,
     limitations: list[str],
+    excluded_root_paths: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Build one conservative machine-readable completeness summary for recursion."""
     is_complete = (
@@ -2825,7 +2828,7 @@ def _multi_skill_analysis_completeness(
     execution_successful = failed_skills == 0
     status = "failed" if not execution_successful else "complete" if is_complete else "partial"
     denominator = max(1, total_skills)
-    return {
+    completeness: dict[str, object] = {
         "is_complete": is_complete,
         "execution_successful": execution_successful,
         "status": status,
@@ -2837,6 +2840,23 @@ def _multi_skill_analysis_completeness(
         "limitations": limitations,
         "scope": "recursive_skills",
     }
+    if excluded_root_paths:
+        reason = LedgerReason.EXCLUDED_DIRECTORY
+        exclusions: list[InspectionLedgerException] = [
+            {
+                "outcome": LedgerOutcome.OUT_OF_SCOPE,
+                "phase": "multi_skill_discovery",
+                "reason_code": reason,
+                "message": REASON_MESSAGES[reason],
+                "path": path,
+                "start_line": None,
+                "end_line": None,
+                "fatal": False,
+            }
+            for path in excluded_root_paths
+        ]
+        completeness["scope_exclusions"] = exclusions
+    return completeness
 
 
 _RECURSIVE_SERIALIZED_OUTPUT_LIMIT_PREFIX = "recursive serialized report character budget "
@@ -2902,6 +2922,10 @@ def _multi_skill_text_completeness(completeness: dict[str, object]) -> str:
     elif status == "partial" and not limitations:
         limitations.append("One or more recursive skill scans were incomplete.")
     details = "\n".join(f"- {item}" for item in limitations)
+    exclusions = cast("list[InspectionLedgerException]", completeness.get("scope_exclusions", []))
+    if exclusions:
+        scope_details = "\n".join(f"- `{row['path']}` — {row['message']}" for row in exclusions)
+        details = "\n\n".join(filter(None, (details, f"Scope exclusions\n\n{scope_details}")))
     return f"--- Recursive Inspection Completeness ---\n\nStatus: {status}\n\n{details}"
 
 
@@ -3309,6 +3333,7 @@ def _scan_multi_skill(
         failed_skills=failed_skill_count,
         omitted_skills=skills_omitted_total,
         limitations=aggregate_limitations,
+        excluded_root_paths=detection.excluded_root_paths,
     )
     analysis_incomplete = not bool(aggregate_completeness["is_complete"])
     aggregate_risk_assessment = _multi_skill_risk_assessment(
@@ -3501,7 +3526,7 @@ def _scan_multi_skill(
         for skill, result in zip(processed_skills, results, strict=True):
             if "error" not in result:
                 sections.append(f"--- {skill.relative_path} ---\n\n{_result_body(result)}")
-        if analysis_incomplete:
+        if analysis_incomplete or detection.excluded_root_paths:
             sections.append(
                 _multi_skill_text_summary(
                     aggregate_completeness,
