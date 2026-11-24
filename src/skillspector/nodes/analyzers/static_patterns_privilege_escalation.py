@@ -188,7 +188,11 @@ PE6_PATTERNS = [
         0.5,
     ),
     (r"\bmklink\b", 0.5),
-    (r"\bNew-Item\b[^\n]{0,160}?-ItemType\s+(?:SymbolicLink|Junction|HardLink)\b", 0.5),
+    # PowerShell accepts the item type quoted or bare: -ItemType "SymbolicLink".
+    (
+        r"\bNew-Item\b[^\n]{0,160}?-ItemType\s+[\"']?(?:SymbolicLink|Junction|HardLink)(?![\w])",
+        0.5,
+    ),
 ]
 _PE6_SENSITIVE_TARGET = re.compile(
     r"(?:"
@@ -197,18 +201,61 @@ _PE6_SENSITIVE_TARGET = re.compile(
     r"|(?<![\w-])\.(?:claude|codex|gemini|cursor|windsurf|augment)(?![\w-])"
     r"|(?<![\w-])\.?mcp\.json(?![\w-])"
     r"|copilot-instructions\.md"
-    r"|settings(?:\.local)?\.json"
     r"|(?:^|/)etc/(?:passwd|shadow|sudoers|hosts|cron)"
     r")",
     re.IGNORECASE,
 )
-# An absolute POSIX path is recognised when it starts a shell argument or a string
-# literal (preceded by whitespace, a quote, `(`, `,` or `=`) and has at least one
-# directory component, which keeps `a / b` divisions and `./rel` paths out.
-_PE6_ESCAPING_TARGET = re.compile(
-    r"(?:~[/\\]|\$HOME\b|%USERPROFILE%|expanduser\s*\(|Path\s*\.\s*home\s*\(|\.\./"
-    r"|(?:^|[\s\"'(,=])/[A-Za-z0-9_.-]+/|[A-Za-z]:\\)"
+# PE6 severity is bound to the link call's own arguments, not to the whole line:
+# the call's parenthesised argument list, or the rest of a shell / PowerShell
+# command up to its terminator, capped at _PE6_MAX_ARGUMENT_WINDOW characters so
+# classification cost per match is constant and dense single-line files stay linear.
+_PE6_MAX_ARGUMENT_WINDOW = 512
+_PE6_COMMAND_END = re.compile(r"&&|\|\||[;|\n]")
+_PE6_STRING_LITERAL = re.compile(r"([\"'`])(.*?)\1")
+# A path argument escapes the workspace when it is absolute (POSIX root or any
+# absolute path, a Windows drive with either separator, a UNC share), home-relative,
+# or climbs out with "..".
+_PE6_ESCAPING_ARGUMENT = re.compile(
+    r"^(?:/|~(?:[/\\]|$)|\$HOME\b|\$\{HOME\}|%USERPROFILE%|\$env:USERPROFILE\b"
+    r"|[A-Za-z]:[\\/]|\\\\|//|\.\.(?:[/\\]|$))",
+    re.IGNORECASE,
 )
+_PE6_HOME_CALL = re.compile(r"expanduser\s*\(|Path\s*\.\s*home\s*\(")
+
+
+def _pe6_argument_window(content: str, start: int, end: int, line_end: int, call: bool) -> str:
+    """Return the bounded argument text of one link call or command."""
+    limit = min(line_end, end + _PE6_MAX_ARGUMENT_WINDOW)
+    window = content[end:limit]
+    if call:
+        depth = 1
+        for index, char in enumerate(window):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    return window[:index]
+        return window
+    terminator = _PE6_COMMAND_END.search(window)
+    return window[: terminator.start()] if terminator else window
+
+
+def _pe6_classify_arguments(window: str, call: bool) -> tuple[bool, bool]:
+    """Return (sensitive, escaping) for one call's argument window."""
+    sensitive = _PE6_SENSITIVE_TARGET.search(window) is not None
+    if call:
+        # In code, a path argument is a string literal; bare `/` is division or a
+        # pathlib join, never a root path.
+        values = [m.group(2) for m in _PE6_STRING_LITERAL.finditer(window)]
+        escaping = _PE6_HOME_CALL.search(window) is not None
+    else:
+        values = [token.strip("\"'`") for token in window.split()]
+        values = [v for v in values if v and not v.startswith("-")]
+        escaping = False
+    escaping = escaping or any(_PE6_ESCAPING_ARGUMENT.match(v) for v in values)
+    return sensitive, escaping
+
 
 _READ_ONLY_PASSWD_VOLUME = re.compile(
     r"\b(?:docker|podman)\s+run\b"
@@ -1183,7 +1230,7 @@ def analyze(
     file_type: str,
     python_ast: ParsedPythonFile | None = None,
 ) -> list[AnalyzerFinding]:
-    """Analyze content for privilege escalation patterns (PE1–PE5)."""
+    """Analyze content for privilege escalation patterns (PE1–PE6)."""
     findings: list[AnalyzerFinding] = []
     line_starts, line_ends = _source_line_metadata(content)
     content_lines = content.splitlines()
@@ -1441,19 +1488,19 @@ def analyze(
                 complete_match=match.group(0),
             )
     findings.extend(pe5_best.values())
-    # Collect best-confidence PE6 finding per line; several patterns can hit one
-    # `ln -s` / `os.symlink` statement.
-    pe6_best: dict[int, AnalyzerFinding] = {}
+    # Collect the best PE6 candidate per line. Classification only reads the call's
+    # bounded argument window, and the context string is built once per retained
+    # line, so a dense single-line file costs O(matches), not O(matches x line).
+    pe6_best: dict[int, tuple[float, Severity, str, re.Match[str]]] = {}
     for pattern, base_confidence in PE6_PATTERNS:
         for match in static_runner.iter_pattern_matches(
             pattern, content, re.IGNORECASE | re.MULTILINE
         ):
             line_num = line_number(match.start())
-            line_start = content.rfind("\n", 0, match.start()) + 1
-            line_end = content.find("\n", match.end())
-            line_text = content[line_start : len(content) if line_end == -1 else line_end]
-            sensitive = _PE6_SENSITIVE_TARGET.search(line_text) is not None
-            escaping = _PE6_ESCAPING_TARGET.search(line_text) is not None
+            line_end = line_ends[line_num - 1] if line_num - 1 < len(line_ends) else len(content)
+            call = match.group(0).rstrip().endswith("(")
+            window = _pe6_argument_window(content, match.start(), match.end(), line_end, call)
+            sensitive, escaping = _pe6_classify_arguments(window, call)
             confidence = base_confidence
             if sensitive:
                 confidence = min(0.95, confidence + 0.35)
@@ -1466,13 +1513,16 @@ def analyze(
             else:
                 severity = Severity.LOW
                 message = "Symlink Creation"
-            context = context_at(match.start())
-            finding_tags = list(tag)
-            if reference_material or _is_documentation_example(context, file_type):
-                finding_tags.extend(["contextual-triage", "likely-benign-context"])
-            if line_num in pe6_best and pe6_best[line_num].confidence >= confidence:
+            if line_num in pe6_best and pe6_best[line_num][0] >= confidence:
                 continue
-            pe6_best[line_num] = AnalyzerFinding(
+            pe6_best[line_num] = (confidence, severity, message, match)
+    for line_num, (confidence, severity, message, match) in sorted(pe6_best.items()):
+        context = context_at(match.start())
+        finding_tags = list(tag)
+        if reference_material or _is_documentation_example(context, file_type):
+            finding_tags.extend(["contextual-triage", "likely-benign-context"])
+        findings.append(
+            AnalyzerFinding(
                 rule_id="PE6",
                 message=message,
                 severity=severity,
@@ -1483,7 +1533,7 @@ def analyze(
                 matched_text=match.group(0)[:200],
                 complete_match=match.group(0),
             )
-    findings.extend(pe6_best.values())
+        )
     return findings
 
 

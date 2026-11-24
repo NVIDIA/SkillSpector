@@ -115,3 +115,60 @@ def test_pe6_division_and_relative_paths_do_not_count_as_absolute() -> None:
     findings = _pe6("os.symlink(src, dst)  # ratio = a / b\n")
     assert findings[0].severity == "LOW"
     assert _pe6("ln -s ./lib64 lib\n", "scripts/setup.sh")[0].severity == "LOW"
+
+
+def test_pe6_quoted_powershell_item_types_are_detected() -> None:
+    for item_type in ('"SymbolicLink"', "'Junction'"):
+        line = f'New-Item -ItemType {item_type} -Path cfg -Target "$env:USERPROFILE\\.claude"\n'
+        findings = _pe6(line, "scripts/setup.ps1")
+        assert len(findings) == 1, line
+        assert findings[0].severity == "HIGH", line
+
+
+def test_pe6_appsettings_json_is_not_agent_configuration() -> None:
+    findings = _pe6("ln -s ./appsettings.json ./current.json\n", "scripts/setup.sh")
+    assert findings[0].severity == "LOW"
+
+
+def test_pe6_root_and_windows_targets_are_medium() -> None:
+    assert _pe6("ln -s / ./root\n", "scripts/setup.sh")[0].severity == "MEDIUM"
+    assert _pe6("ln -s /root ./r\n", "scripts/setup.sh")[0].severity == "MEDIUM"
+    assert _pe6('os.symlink("/", "root")\n')[0].severity == "MEDIUM"
+    assert _pe6('os.symlink("C:/shared/data", "data")\n')[0].severity == "MEDIUM"
+
+
+def test_pe6_pathlib_division_in_arguments_is_not_a_root_target() -> None:
+    assert _pe6("os.symlink(base / name, dst)\n")[0].severity == "LOW"
+
+
+def test_pe6_sensitive_path_in_another_statement_does_not_raise_severity() -> None:
+    line = 'os.symlink("lib64", "lib"); print("see ~/.claude/settings.json")\n'
+    assert _pe6(line)[0].severity == "LOW"
+
+
+def test_pe6_dense_single_line_is_linear_and_builds_context_once(monkeypatch) -> None:
+    windows: list[int] = []
+    real_window = pe_module._pe6_argument_window
+
+    def recording_window(*args, **kwargs):
+        result = real_window(*args, **kwargs)
+        windows.append(len(result))
+        return result
+
+    contexts: list[int] = []
+    real_context = pe_module.get_context_from_lines
+
+    def recording_context(*args, **kwargs):
+        contexts.append(1)
+        return real_context(*args, **kwargs)
+
+    monkeypatch.setattr(pe_module, "_pe6_argument_window", recording_window)
+    monkeypatch.setattr(pe_module, "get_context_from_lines", recording_context)
+    content = 'fs.symlinkSync("a","b");' * 3000 + "\n"
+
+    findings = _pe6(content, "dist/bundle.js")
+
+    assert len(findings) == 1
+    assert len(windows) == 3000
+    assert max(windows) <= pe_module._PE6_MAX_ARGUMENT_WINDOW
+    assert len(contexts) == 1
