@@ -60,6 +60,18 @@ _E1_CURL_UPLOAD_PATTERN = (r"curl\s+[^|]*(?:-d|--data|--data-raw|--data-binary)\
 _E1_WGET_UPLOAD_PATTERN = (r"wget\s+[^|]*--post-(?:data|file)", 0.6)
 _E1_SHELL_PATTERNS = frozenset({_E1_CURL_UPLOAD_PATTERN, _E1_WGET_UPLOAD_PATTERN})
 
+# Go string literals consumed as whole tokens: interpreted ("...", with escapes)
+# and raw (`...`).
+_GO_STR = r"\"(?:[^\"\\\n]|\\.)*\"|`[^`]*`"
+# Arguments of a call, allowing one level of nested parentheses.
+_GO_CALL_ARGS = r"(?:" + _GO_STR + r"|[^()\"`]|\((?:" + _GO_STR + r"|[^()\"`])*\))*"
+# Upload method argument: ``http.MethodX`` or a delimiter-matched literal,
+# followed by the argument boundary. Case-sensitive, like Go.
+_GO_METHOD_ARG = (
+    r"(?:http\.(?-i:MethodPost|MethodPut|MethodPatch)\b"
+    r"|\"(?-i:POST|PUT|PATCH)\"|`(?-i:POST|PUT|PATCH)`)\s*,"
+)
+
 E1_CODE_PATTERNS = [
     (r"requests\s*\.\s*(?:post|put)\s*\(\s*['\"]https?://", 0.6),
     (r"requests\s*\.\s*(?:post|put)\s*\([^)]*json\s*=", 0.7),
@@ -69,6 +81,34 @@ E1_CODE_PATTERNS = [
     _E1_CURL_UPLOAD_PATTERN,
     _E1_WGET_UPLOAD_PATTERN,
     (r"https?://(?:api\.|data\.|collect\.|telemetry\.|analytics\.)[\w.-]+/", 0.5),
+    # Ruby HTTP clients.
+    (r"Net::HTTP\s*\.\s*post(?:_form)?\b", 0.6),
+    (r"Net::HTTP::(?:Post|Put|Patch)\s*\.\s*new\b", 0.6),
+    (r"\b(?:HTTParty|RestClient|Faraday)\s*\.\s*(?:post|put|patch)\b", 0.6),
+    # Go net/http. Go exports are capitalized, so the method names stay
+    # case-sensitive and JavaScript ``http.post(...)`` is not matched here.
+    (
+        r"\b(?:http\.(?-i:Post|PostForm)\s*\(|\w+\.(?-i:Post|PostForm)\s*\(\s*[\"`]https?://)",
+        0.6,
+    ),
+    # Go request constructors. The HTTP method is either an ``http.MethodX``
+    # constant or a string literal whose opening and closing delimiters match
+    # (``"POST"`` or a raw ``POST`` string) and which ends at the argument
+    # boundary, so ``POST"`` inside a raw string is not read as the verb.
+    (
+        r"\bhttp\.(?-i:NewRequest)\s*\(\s*" + _GO_METHOD_ARG,
+        0.6,
+    ),
+    # ``NewRequestWithContext`` takes a context first: a name, a selector such
+    # as ``r.Context()``, or a call such as ``context.Background()`` /
+    # ``context.WithValue(ctx, key, "trial(")``. String literals inside the
+    # call are consumed as whole tokens, so a parenthesis inside one cannot
+    # close or open the call.
+    (
+        r"\bhttp\.(?-i:NewRequestWithContext)\s*\(\s*"
+        r"[\w.]+(?:\s*\(" + _GO_CALL_ARGS + r"\))?\s*,\s*" + _GO_METHOD_ARG,
+        0.6,
+    ),
 ]
 E1_PROSE_PATTERNS = [
     (
