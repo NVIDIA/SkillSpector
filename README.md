@@ -673,6 +673,7 @@ remain unproved; literal absolute file destinations are still eligible.
 | PE1 | Excessive Permissions | LOW | Requesting access beyond stated functionality |
 | PE2 | Sudo/Root Execution | MEDIUM | Invoking elevated system privileges |
 | PE3 | Credential Access | HIGH | Reading SSH keys, tokens, passwords |
+| PE6 | Symlink Creation | LOW–HIGH | Creating symbolic links; HIGH when the link targets credential stores or agent configuration (SymJack-style approval-prompt redirection) |
 
 ### Supply Chain (10+ patterns)
 
@@ -687,6 +688,7 @@ remain unproved; literal absolute file destinations are still eligible.
 | SC8 | Shipped Python Bytecode | HIGH | `__pycache__` / `.pyc` present (discovery skips; malicious bytecode bypass) |
 | SC9 | Concealed Executable Artifact | HIGH | Executable nested in a document container or hidden/disguised artifact; root-level visible source helpers in manifested `.agents/skills/<name>/` and `.claude/skills/<name>/` folders are exempted but remain local-only and are marked as not LLM-reviewed |
 | SC10 | Dependency Source Redirection | HIGH | Package-manager source added, replaced, or unresolved |
+| SC11 | Shipped Symbolic Link | MEDIUM–HIGH | Symlink/junction inside the bundle (discovery never follows it); HIGH when it resolves outside the bundle, dangles, or targets credential/agent-config paths |
 
 ### Excessive Agency (5 patterns)
 

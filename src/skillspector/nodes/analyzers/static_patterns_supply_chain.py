@@ -21,6 +21,9 @@ SC5: Abandoned dependencies — flags known-abandoned or archived packages.
 SC6: Typosquatting — flags package names similar to popular packages.
 SC7: Untrusted container image — flags image signature / registry-verification bypass.
 SC8: Shipped Python bytecode — flags __pycache__/ and *.pyc/*.pyo that discovery skips.
+SC11: Shipped symlink/junction — flags links that discovery refuses to follow, so the
+      linked content is unscanned and an approved file operation on the link path can
+      reach a target outside the bundle (SymJack / GhostApproval, CWE-59 + CWE-451).
 SC9: Concealed executable artifact — flags executables nested in document or hidden artifacts.
 SC10: Dependency source redirection — flags noncanonical package registries and indexes.
 TR1–TR3: Trigger analysis — flags overly broad, shadowing, or baiting triggers.
@@ -37,8 +40,10 @@ import functools
 import io
 import json
 import os
+import posixpath
 import re
 import shlex
+import stat
 import sys
 import time
 import tomllib
@@ -3912,6 +3917,117 @@ MAX_SC8_TRAVERSAL_DEPTH = 64
 MAX_SC8_ANALYSIS_SECONDS = 5.0
 MAX_SC8_FINDINGS = 10_000
 MAX_SC8_LIMITATIONS = 256
+# SC11 walks SC8's pruned vendor/metadata trees (node_modules/, .git/, ...) for
+# link entries only. Those trees get their own entry budget and are visited after
+# every SC8-eligible tree, so a large vendor tree can never consume the budget that
+# protects bytecode coverage.
+MAX_SC11_LINK_ONLY_ENTRIES = 10_000
+# Bound on link-to-link hops followed (lexically, inside the skill root) when
+# classifying an internal link.
+MAX_SC11_LINK_HOPS = 8
+
+# SC11: symlink / junction shipped inside the bundle. The walker above already
+# refuses to follow links; SC11 turns that silent skip into a finding. Targets
+# that name credential stores or agent configuration are what the published
+# symlink-hijack chains (SymJack, GhostApproval) write through.
+_SC11_SENSITIVE_TARGET = re.compile(
+    r"(?:"
+    r"(?<![\w-])\.(?:ssh|aws|gnupg|kube|docker|azure|config/gcloud|npmrc|netrc|git-credentials)(?![\w-])"
+    r"|(?<![\w-])\.env(?:\.[\w-]+)?(?![\w-])"
+    r"|(?<![\w-])\.(?:claude|codex|gemini|cursor|windsurf|augment)(?![\w-])"
+    r"|(?<![\w-])\.?mcp\.json(?![\w-])"
+    r"|copilot-instructions\.md"
+    r"|(?:^|/)etc/(?:passwd|shadow|sudoers|hosts)"
+    r")",
+    re.IGNORECASE,
+)
+_SC11_WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:/")
+
+
+def _sc11_normalize_target(target: str) -> str:
+    """Normalize a raw link target to forward slashes without touching the filesystem.
+
+    Windows reparse targets can carry long-path / object-manager prefixes, which are
+    stripped; UNC forms become ``//host/share``.
+    """
+    for prefix in ("\\\\?\\UNC\\", "\\??\\UNC\\"):
+        if target.startswith(prefix):
+            return "//" + target[len(prefix) :].replace("\\", "/")
+    for prefix in ("\\\\?\\", "\\??\\"):
+        if target.startswith(prefix):
+            target = target[len(prefix) :]
+            break
+    return target.replace("\\", "/")
+
+
+def _sc11_is_absolute(target: str) -> bool:
+    return target.startswith("/") or bool(_SC11_WINDOWS_DRIVE.match(target))
+
+
+def _sc11_relative_to_root(target: str, root_text: str) -> str | None:
+    """Return *target* relative to the skill root if it lexically lies inside it."""
+    normalized = posixpath.normpath(target)
+    root_norm = posixpath.normpath(root_text)
+    fold = os.name == "nt"
+    cmp_target = normalized.casefold() if fold else normalized
+    cmp_root = root_norm.casefold() if fold else root_norm
+    if cmp_target == cmp_root:
+        return ""
+    if cmp_target.startswith(cmp_root.rstrip("/") + "/"):
+        return normalized[len(root_norm.rstrip("/")) + 1 :]
+    return None
+
+
+def _sc11_classify_link(
+    root: Path, root_text: str, link_rel: str, raw_target: str
+) -> tuple[str, str]:
+    """Classify a link as ``outside``, ``internal`` or ``dangling`` without leaving the root.
+
+    Outward and UNC targets are decided from the link text alone, so the scanner never
+    reads metadata outside the skill. Internal chains are followed with ``lstat`` on
+    paths that are lexically inside the root, for at most ``MAX_SC11_LINK_HOPS`` hops.
+    Returns ``(kind, evidence_path)`` where *evidence_path* is skill-relative for
+    internal/dangling links and the normalized link text for outward ones.
+    """
+    target = _sc11_normalize_target(raw_target)
+    current = link_rel
+    for _ in range(max(1, MAX_SC11_LINK_HOPS)):
+        if target.startswith("//"):
+            return "outside", target
+        if _sc11_is_absolute(target):
+            relative = _sc11_relative_to_root(target, root_text)
+            if relative is None:
+                return "outside", target
+        else:
+            relative = posixpath.normpath(posixpath.join(posixpath.dirname(current), target))
+            if relative == ".." or relative.startswith("../"):
+                return "outside", target
+            if relative == ".":
+                relative = ""
+        parts = [part for part in relative.split("/") if part]
+        walked: list[str] = []
+        next_target: str | None = None
+        for index, part in enumerate(parts):
+            candidate = root.joinpath(*walked, part)
+            try:
+                mode = os.lstat(candidate).st_mode
+                is_link = stat.S_ISLNK(mode) or candidate.is_junction()
+            except OSError:
+                return "dangling", relative or "."
+            if is_link:
+                try:
+                    inner = _sc11_normalize_target(os.readlink(candidate))
+                except OSError:
+                    return "dangling", relative or "."
+                remaining = "/".join(parts[index + 1 :])
+                next_target = posixpath.join(inner, remaining) if remaining else inner
+                current = "/".join([*walked, part])
+                break
+            walked.append(part)
+        if next_target is None:
+            return "internal", relative or "."
+        target = next_target
+    return "dangling", target
 
 
 @dataclass(frozen=True)
@@ -3968,7 +4084,14 @@ def _scan_shipped_bytecode(
     requested_finding_limit = MAX_SC8_FINDINGS if max_findings is None else max_findings
     finding_limit = max(0, min(requested_finding_limit, MAX_SC8_FINDINGS))
     discovered_entries = 0
-    stack: list[tuple[Path, str, int]] = [(root, "", 0)]
+    # The fourth element marks a links-only subtree: SC8 keeps pruning vendor and
+    # metadata trees for bytecode, but a shipped link hidden under node_modules/
+    # or .git/ is still a shipped link, so SC11 walks them without emitting SC8.
+    stack: list[tuple[Path, str, int, bool]] = [(root, "", 0, False)]
+    # Links-only subtrees are deferred until every SC8-eligible tree is walked and
+    # draw on their own budget (MAX_SC11_LINK_ONLY_ENTRIES).
+    links_stack: list[tuple[Path, str, int, bool]] = []
+    link_entries = 0
     stop_scan = False
 
     def scope_path(relative_directory: str) -> str:
@@ -4050,48 +4173,129 @@ def _scan_shipped_bytecode(
         findings.append(analyzer_finding_to_finding(analyzer_finding))
         return True
 
-    while stack and not stop_scan:
-        directory, relative_directory, depth = stack.pop()
+    # Lexical only: os.path.abspath does not touch the filesystem.
+    root_text = os.path.abspath(skill_path).replace("\\", "/")
+
+    def add_symlink_finding(relative_path: str, link_path: Path) -> bool:
+        """Emit SC11 for a link entry without probing anything outside the skill root."""
+        nonlocal stop_scan
+        try:
+            target = os.readlink(link_path)
+        except OSError as exc:
+            add_limitation(
+                _SupplementalLimitation(
+                    path=relative_path,
+                    reason=LedgerReason.STAT_ERROR,
+                    error_class=type(exc).__name__,
+                )
+            )
+            return True
+        kind, evidence = _sc11_classify_link(root, root_text, relative_path, target)
+        inside = kind != "outside"
+        dangling = kind == "dangling"
+        # Sensitivity is judged on the link text for outward links and on the
+        # skill-relative destination for internal ones, so the install location
+        # (e.g. ~/.claude/skills/demo) never makes an internal link sensitive.
+        sensitive = bool(_SC11_SENSITIVE_TARGET.search(evidence))
+        if len(findings) >= finding_limit:
+            add_limitation(
+                _SupplementalLimitation(
+                    path=relative_path,
+                    reason=LedgerReason.OUTPUT_LIMIT,
+                    observed_findings=len(findings) + 1,
+                    limit_findings=finding_limit,
+                )
+            )
+            stop_scan = True
+            return False
+        if sensitive:
+            severity, confidence = Severity.HIGH, 0.95
+            why = "link target names a credential store or agent configuration path"
+        elif not inside:
+            severity, confidence = Severity.HIGH, 0.9
+            why = "link resolves outside the skill bundle"
+        elif dangling:
+            severity, confidence = Severity.HIGH, 0.85
+            why = "link is dangling; it can be retargeted after install"
+        else:
+            severity, confidence = Severity.MEDIUM, 0.7
+            why = "link stays inside the bundle, but the linked content is not scanned"
+        analyzer_finding = AnalyzerFinding(
+            rule_id="SC11",
+            message=f"Skill ships a symbolic link ({why})",
+            severity=severity,
+            location=Location(file=relative_path, start_line=1),
+            confidence=confidence,
+            tags=[PatternCategory.SUPPLY_CHAIN.value],
+            matched_text=f"{relative_path} -> {target}"[:200],
+            context=(
+                "Discovery does not follow links, so linked content is unscanned. "
+                "Agent approval prompts may show the link path rather than its "
+                "destination. "
+                + (
+                    "The link points outside the skill bundle; its destination was not accessed."
+                    if not inside
+                    else f"Within the bundle it resolves to {evidence}."
+                )
+            )[:500],
+        )
+        findings.append(analyzer_finding_to_finding(analyzer_finding))
+        return True
+
+    while (stack or links_stack) and not stop_scan:
+        if stack:
+            directory, relative_directory, depth, links_only = stack.pop()
+        else:
+            directory, relative_directory, depth, links_only = links_stack.pop()
         if runtime_exhausted(relative_directory):
             break
-        remaining_entries = max(0, MAX_SC8_DISCOVERED_ENTRIES - discovered_entries)
+        used_entries = link_entries if links_only else discovered_entries
+        entry_cap = max(0, MAX_SC11_LINK_ONLY_ENTRIES if links_only else MAX_SC8_DISCOVERED_ENTRIES)
+        remaining_entries = max(0, entry_cap - used_entries)
         directory_limit = min(max(0, MAX_SC8_DIRECTORY_ENTRIES), remaining_entries)
         if directory_limit <= 0:
             add_limitation(
                 _SupplementalLimitation(
                     path=scope_path(relative_directory),
                     reason=LedgerReason.ARTIFACT_COUNT_LIMIT,
-                    observed_artifacts=discovered_entries + 1,
-                    limit_artifacts=max(0, MAX_SC8_DISCOVERED_ENTRIES),
+                    observed_artifacts=used_entries + 1,
+                    limit_artifacts=entry_cap,
                 )
             )
-            break
+            # Stop only the phase whose budget is spent.
+            if links_only:
+                links_stack.clear()
+            else:
+                stack.clear()
+            continue
 
         entries: list[tuple[str, bool, bool, bool, str | None]] = []
         directory_overflow = False
+        runtime_stop = False
         try:
             with os.scandir(directory) as scanner:
                 for entry in scanner:
                     if runtime_exhausted(relative_directory):
                         directory_overflow = True
+                        runtime_stop = True
                         break
                     if len(entries) >= directory_limit:
                         add_limitation(
                             _SupplementalLimitation(
                                 path=scope_path(relative_directory),
                                 reason=LedgerReason.ARTIFACT_COUNT_LIMIT,
-                                observed_artifacts=discovered_entries + len(entries) + 1,
+                                observed_artifacts=used_entries + len(entries) + 1,
                                 limit_artifacts=min(
-                                    max(0, MAX_SC8_DISCOVERED_ENTRIES),
-                                    discovered_entries + max(0, MAX_SC8_DIRECTORY_ENTRIES),
+                                    entry_cap,
+                                    used_entries + max(0, MAX_SC8_DIRECTORY_ENTRIES),
                                 ),
                             )
                         )
                         directory_overflow = True
                         break
                     try:
-                        is_link = entry.is_symlink()
-                        is_directory = entry.is_dir(follow_symlinks=False)
+                        is_link = entry.is_symlink() or Path(entry.path).is_junction()
+                        is_directory = not is_link and entry.is_dir(follow_symlinks=False)
                         is_file = entry.is_file(follow_symlinks=False)
                         error_class = None
                     except OSError as exc:
@@ -4110,16 +4314,26 @@ def _scan_shipped_bytecode(
             )
             continue
         if directory_overflow:
-            break
+            if runtime_stop:
+                break
+            if links_only:
+                links_stack.clear()
+            else:
+                stack.clear()
+            continue
 
-        child_directories: list[tuple[Path, str, int]] = []
+        child_directories: list[tuple[Path, str, int, bool]] = []
+        link_child_directories: list[tuple[Path, str, int, bool]] = []
         for name, is_directory, is_file, is_link, error_class in sorted(
             entries, key=lambda item: item[0]
         ):
             if runtime_exhausted(relative_directory):
                 stop_scan = True
                 break
-            discovered_entries += 1
+            if links_only:
+                link_entries += 1
+            else:
+                discovered_entries += 1
             relative_path = f"{relative_directory}/{name}" if relative_directory else name
             if error_class is not None:
                 add_limitation(
@@ -4131,12 +4345,17 @@ def _scan_shipped_bytecode(
                 )
                 continue
             if is_link:
+                if not add_symlink_finding(relative_path, directory / name):
+                    break
                 continue
             if is_directory:
-                if name == "__pycache__" and not add_finding(f"{relative_path}/", directory=True):
+                if (
+                    not links_only
+                    and name == "__pycache__"
+                    and not add_finding(f"{relative_path}/", directory=True)
+                ):
                     break
-                if name in _SC8_SKIP_DIRS:
-                    continue
+                child_links_only = links_only or name in _SC8_SKIP_DIRS
                 child_depth = depth + 1
                 if child_depth > max(0, MAX_SC8_TRAVERSAL_DEPTH):
                     add_limitation(
@@ -4148,18 +4367,21 @@ def _scan_shipped_bytecode(
                         )
                     )
                     continue
-                child_directories.append((directory / name, relative_path, child_depth))
+                (link_child_directories if child_links_only else child_directories).append(
+                    (directory / name, relative_path, child_depth, child_links_only)
+                )
                 continue
-            if is_file and name.lower().endswith(_SC8_BYTECODE_SUFFIXES):
+            if not links_only and is_file and name.lower().endswith(_SC8_BYTECODE_SUFFIXES):
                 if not add_finding(relative_path, directory=False):
                     break
         stack.extend(reversed(child_directories))
+        links_stack.extend(reversed(link_child_directories))
 
     return _ShippedBytecodeScanResult(findings, limitations)
 
 
 def _analyze_shipped_bytecode(skill_path: str) -> list[Finding]:
-    """Emit SC8 when a skill ships __pycache__ dirs or .pyc/.pyo files.
+    """Emit SC8 (bytecode) and SC11 (shipped symlink) from one bounded walk.
 
     ``build_context`` keeps bytecode out of content analysis and
     ``static_runner`` treats ``.pyc`` as binary. Presence alone is a HIGH

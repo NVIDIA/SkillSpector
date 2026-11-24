@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: privilege escalation (PE1–PE5). Node and analyze() in one module."""
+"""Static patterns: privilege escalation (PE1–PE6). Node and analyze() in one module."""
 
 from __future__ import annotations
 
@@ -171,6 +171,91 @@ PE5_PATTERNS = [
     (r"/proc/\d+/ns/", 0.85),
     (r"""\bunshare\b['",\s]+--(?:user|mount|pid)""", 0.85),
 ]
+# PE6: symbolic-link creation. A link planted in the workspace redirects later
+# approved file operations to its target, and agent approval prompts may show
+# the link path rather than the destination (SymJack, GhostApproval). Base
+# confidence is deliberately low: build scripts and virtual environments create
+# harmless links. The boosts below fire when the same line names a credential
+# store / agent configuration path, or when the target escapes the workspace.
+PE6_PATTERNS = [
+    (r"\bos\s*\.\s*symlink\s*\(", 0.5),
+    (r"\.symlink_to\s*\(", 0.5),
+    (r"\bos\s*\.\s*link\s*\(", 0.4),
+    (r"\bfs\s*\.\s*(?:symlink|symlinkSync|link|linkSync)\s*\(", 0.5),
+    # Option groups may precede the symbolic flag: `ln -f -s`, `ln --force -s`.
+    (
+        r"(?<![\w./-])ln\s+(?:(?:-[a-rt-zA-Z]+|--[a-z-]+)\s+)*(?:-[a-zA-Z]*s[a-zA-Z]*|--symbolic)\b",
+        0.5,
+    ),
+    (r"\bmklink\b", 0.5),
+    # PowerShell accepts the item type quoted or bare: -ItemType "SymbolicLink".
+    (
+        r"\bNew-Item\b[^\n]{0,160}?-ItemType\s+[\"']?(?:SymbolicLink|Junction|HardLink)(?![\w])",
+        0.5,
+    ),
+]
+_PE6_SENSITIVE_TARGET = re.compile(
+    r"(?:"
+    r"(?<![\w-])\.(?:ssh|aws|gnupg|kube|docker|azure|npmrc|netrc|git-credentials)(?![\w-])"
+    r"|(?<![\w-])\.env(?:\.[\w-]+)?(?![\w-])"
+    r"|(?<![\w-])\.(?:claude|codex|gemini|cursor|windsurf|augment)(?![\w-])"
+    r"|(?<![\w-])\.?mcp\.json(?![\w-])"
+    r"|copilot-instructions\.md"
+    r"|(?:^|/)etc/(?:passwd|shadow|sudoers|hosts|cron)"
+    r")",
+    re.IGNORECASE,
+)
+# PE6 severity is bound to the link call's own arguments, not to the whole line:
+# the call's parenthesised argument list, or the rest of a shell / PowerShell
+# command up to its terminator, capped at _PE6_MAX_ARGUMENT_WINDOW characters so
+# classification cost per match is constant and dense single-line files stay linear.
+_PE6_MAX_ARGUMENT_WINDOW = 512
+_PE6_COMMAND_END = re.compile(r"&&|\|\||[;|\n]")
+_PE6_STRING_LITERAL = re.compile(r"([\"'`])(.*?)\1")
+# A path argument escapes the workspace when it is absolute (POSIX root or any
+# absolute path, a Windows drive with either separator, a UNC share), home-relative,
+# or climbs out with "..".
+_PE6_ESCAPING_ARGUMENT = re.compile(
+    r"^(?:/|~(?:[/\\]|$)|\$HOME\b|\$\{HOME\}|%USERPROFILE%|\$env:USERPROFILE\b"
+    r"|[A-Za-z]:[\\/]|\\\\|//|\.\.(?:[/\\]|$))",
+    re.IGNORECASE,
+)
+_PE6_HOME_CALL = re.compile(r"expanduser\s*\(|Path\s*\.\s*home\s*\(")
+
+
+def _pe6_argument_window(content: str, start: int, end: int, line_end: int, call: bool) -> str:
+    """Return the bounded argument text of one link call or command."""
+    limit = min(line_end, end + _PE6_MAX_ARGUMENT_WINDOW)
+    window = content[end:limit]
+    if call:
+        depth = 1
+        for index, char in enumerate(window):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    return window[:index]
+        return window
+    terminator = _PE6_COMMAND_END.search(window)
+    return window[: terminator.start()] if terminator else window
+
+
+def _pe6_classify_arguments(window: str, call: bool) -> tuple[bool, bool]:
+    """Return (sensitive, escaping) for one call's argument window."""
+    sensitive = _PE6_SENSITIVE_TARGET.search(window) is not None
+    if call:
+        # In code, a path argument is a string literal; bare `/` is division or a
+        # pathlib join, never a root path.
+        values = [m.group(2) for m in _PE6_STRING_LITERAL.finditer(window)]
+        escaping = _PE6_HOME_CALL.search(window) is not None
+    else:
+        values = [token.strip("\"'`") for token in window.split()]
+        values = [v for v in values if v and not v.startswith("-")]
+        escaping = False
+    escaping = escaping or any(_PE6_ESCAPING_ARGUMENT.match(v) for v in values)
+    return sensitive, escaping
+
 
 _READ_ONLY_PASSWD_VOLUME = re.compile(
     r"\b(?:docker|podman)\s+run\b"
@@ -1145,7 +1230,7 @@ def analyze(
     file_type: str,
     python_ast: ParsedPythonFile | None = None,
 ) -> list[AnalyzerFinding]:
-    """Analyze content for privilege escalation patterns (PE1–PE5)."""
+    """Analyze content for privilege escalation patterns (PE1–PE6)."""
     findings: list[AnalyzerFinding] = []
     line_starts, line_ends = _source_line_metadata(content)
     content_lines = content.splitlines()
@@ -1403,6 +1488,52 @@ def analyze(
                 complete_match=match.group(0),
             )
     findings.extend(pe5_best.values())
+    # Collect the best PE6 candidate per line. Classification only reads the call's
+    # bounded argument window, and the context string is built once per retained
+    # line, so a dense single-line file costs O(matches), not O(matches x line).
+    pe6_best: dict[int, tuple[float, Severity, str, re.Match[str]]] = {}
+    for pattern, base_confidence in PE6_PATTERNS:
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
+            line_num = line_number(match.start())
+            line_end = line_ends[line_num - 1] if line_num - 1 < len(line_ends) else len(content)
+            call = match.group(0).rstrip().endswith("(")
+            window = _pe6_argument_window(content, match.start(), match.end(), line_end, call)
+            sensitive, escaping = _pe6_classify_arguments(window, call)
+            confidence = base_confidence
+            if sensitive:
+                confidence = min(0.95, confidence + 0.35)
+                severity = Severity.HIGH
+                message = "Symlink Creation Targeting Credentials or Agent Configuration"
+            elif escaping:
+                confidence = min(0.95, confidence + 0.15)
+                severity = Severity.MEDIUM
+                message = "Symlink Creation Targeting a Path Outside the Workspace"
+            else:
+                severity = Severity.LOW
+                message = "Symlink Creation"
+            if line_num in pe6_best and pe6_best[line_num][0] >= confidence:
+                continue
+            pe6_best[line_num] = (confidence, severity, message, match)
+    for line_num, (confidence, severity, message, match) in sorted(pe6_best.items()):
+        context = context_at(match.start())
+        finding_tags = list(tag)
+        if reference_material or _is_documentation_example(context, file_type):
+            finding_tags.extend(["contextual-triage", "likely-benign-context"])
+        findings.append(
+            AnalyzerFinding(
+                rule_id="PE6",
+                message=message,
+                severity=severity,
+                location=loc(line_num),
+                confidence=confidence,
+                tags=finding_tags,
+                context=context,
+                matched_text=match.group(0)[:200],
+                complete_match=match.group(0),
+            )
+        )
     return findings
 
 
