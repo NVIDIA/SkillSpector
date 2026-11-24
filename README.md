@@ -802,7 +802,8 @@ All detected patterns are listed in the tables above.
 
 ### Score Calculation
 
-For each skill, an active finding starts with base points for its severity.
+Each skill's score uses active findings after baseline suppression. Each
+active finding starts with base points for its severity.
 
 - **CRITICAL**: 50 points
 - **HIGH**: 25 points
@@ -819,23 +820,27 @@ A 1.3× multiplier applies to a finding when its file is an executable
 component. The total is rounded down and capped at 100. Some conditions,
 such as an unapproved exclusion of executable content, impose a minimum score.
 
-In a single-skill JSON report, `risk_assessment.severity` is the band for the aggregate
-score. `risk_assessment.max_issue_severity` is the highest severity among
-the active findings, or `NONE` when there are none. For example, a report
-with one HIGH finding at 0.4 confidence in Markdown can show a score of 10,
-an aggregate severity of LOW, and a maximum issue severity of HIGH.
+In a single-skill JSON report, `risk_assessment.severity` is the band for
+the aggregate score. `risk_assessment.max_issue_severity` is the highest
+severity in the report's `issues` list, or `NONE` when that list is empty.
+For example, a report with one HIGH finding at 0.4 confidence in Markdown
+can show a score of 10, an aggregate severity of LOW, and a maximum issue
+severity of HIGH.
 
 Check [scan completeness](docs/scan-completeness.md) when using a report
 to make an installation decision.
 
 ### Severity Levels
 
-| Score | Severity | Recommendation |
+| Score | Severity | Base Recommendation |
 |-------|----------|----------------|
 | 0-20 | LOW | SAFE |
 | 21-50 | MEDIUM | CAUTION |
 | 51-80 | HIGH | DO NOT INSTALL |
 | 81-100 | CRITICAL | DO NOT INSTALL |
+
+An incomplete or degraded scan can change a base recommendation of SAFE
+to CAUTION while keeping the score and severity.
 
 ## Example Output
 
