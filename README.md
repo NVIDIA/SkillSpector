@@ -612,12 +612,23 @@ claude mcp add skillspector -- skillspector mcp
 > - For remote access, put an authenticating reverse proxy (e.g. nginx + mTLS)
 >   in front of the loopback listener.
 > - Local paths and `file://` URLs are **automatically rejected** over HTTP to
->   prevent unauthenticated callers from reading arbitrary host files. Only
->   remote Git and `.zip` URLs are accepted.
+>   prevent unauthenticated callers from reading arbitrary host files.
 >
-> HTTP scans accept only credential-free `https://` targets. Git scans never use
-> the server's Git login or Git config. If a proxy or custom CA is needed, set
-> `HTTPS_PROXY`, `NO_PROXY` or `GIT_SSL_CAINFO` in the server environment.
+> HTTP scans accept only credential-free `https://` targets on allowed hosts.
+> Targets include public Git repositories, ZIP archives, and direct file URLs
+> such as a raw `SKILL.md`. These `scan_skill` arguments scan a public Markdown
+> file with static analysis:
+>
+> ```json
+> {
+>   "target": "https://raw.githubusercontent.com/NVIDIA/SkillSpector/main/tests/fixtures/safe_skill/SKILL.md",
+>   "use_llm": false
+> }
+> ```
+>
+> Git scans never use the server's Git login or Git config. If a proxy or custom
+> CA is needed, set `HTTPS_PROXY`, `NO_PROXY` or `GIT_SSL_CAINFO` in the server
+> environment.
 > Use stdio or the CLI for private repositories. Git redirects are rejected;
 > use the current repository URL after a rename or transfer.
 
