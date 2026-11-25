@@ -73,7 +73,8 @@ def _is_p9_skipped_path(file_path: str) -> bool:
 # earlier instructions accept a quantifier, a determiner and "prior". Keep
 # _obfuscated_instruction_right_context in artifacts.py on the same grammar.
 _P1_QUANTIFIER = r"(?:(?:all|any)\s+(?:of\s+)?)?"
-_P1_RULE_NOUN = r"(?:instructions?|rules?|guidelines?|guidance|constraints?)"
+# A whole word, as in the reconstruction matcher: "ruler" is not "rule".
+_P1_RULE_NOUN = r"(?:instructions?|rules?|guidelines?|guidance|constraints?)\b"
 P1_PATTERNS = [
     (rf"ignore\s+{_P1_QUANTIFIER}(?:(?:your|the)\s+)?(?:previous|prior)\s+instructions?", 0.8),
     (r"ignore\s+(?:all\s+)?(?:safety|security)\s+(?:rules?|constraints?|guidelines?)", 0.9),

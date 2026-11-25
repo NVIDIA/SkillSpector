@@ -84,6 +84,9 @@ def test_instruction_override_wording_reports_p1(override: str) -> None:
         "Disregard any prior version of the report.",
         "Disregard all of the previous drafts before you publish.",
         "Disregard your security scan results if the build failed.",
+        # A rule noun must be a whole word.
+        "Disregard your prior ruler measurements.",
+        "Disregard your security rulebook once the audit is closed.",
     ],
 )
 def test_ordinary_wording_stays_clean(content: str) -> None:
@@ -138,6 +141,7 @@ def test_disguised_disregard_match_covers_the_override(content: str, expected: s
         "disrega\u0301rd your previous estimate.",
         "disrega\u0301rd any prior version of the report.",
         "d i s r e g a r d your previous estimate.",
+        "d i s r e g a r d your prior ruler measurements.",
     ],
 )
 def test_disguised_action_needs_the_same_wording(content: str) -> None:
