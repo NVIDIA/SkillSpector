@@ -130,6 +130,7 @@ USES_RUNTIME_CHECK = True
 USES_PYTHON_IMPORT_BOUNDS = True
 USES_PREPARED_PARSER_ANALYSIS = True
 USES_RST_SOURCE_TYPE = True
+USES_BATCH_SOURCE_TYPE = True
 USES_SOLE_ORIGINAL_SHELL = True
 ANALYZE_USES_POSTPROCESS = True
 POSTPROCESS_USES_PYTHON_AST = True
@@ -4456,6 +4457,7 @@ def _has_shell_command_word_exhaustion(
     shell_fences: tuple[tuple[int, int], ...] = (),
     native_argument_spans: tuple[tuple[int, int], ...] = (),
     native_argument_work: list[int] | None = None,
+    batch_operand_starts: frozenset[int] = frozenset(),
 ) -> StaticParserDiagnostic | None:
     """Find candidate command words whose deterministic parse hit a safety bound.
 
@@ -4751,6 +4753,16 @@ def _has_shell_command_word_exhaustion(
                     # Opening/inner command candidates remain independent.
                     backtick_closers.add(end - 1)
         if parsed is None:
+            if (
+                start in batch_operand_starts
+                and word_diagnostics
+                and word_diagnostics[0].start == start
+                and word_diagnostics[0].cause is ParserCause.BOUNDARY_UNRESOLVED
+                and word_diagnostics[0].check is ParserCheck.COMMAND_WORD_BOUNDARY
+            ):
+                # CMD closes this directory operand at the quote after the
+                # backslash. Keep looking for independent raw diagnostics.
+                continue
             substitution_start = (
                 start + 1
                 if content[start : start + 1] in {"'", '"'} and content.startswith("$(", start + 1)
@@ -13240,13 +13252,27 @@ class _FiniteShellSource:
         return True
 
 
+@dataclass(frozen=True)
+class _BatchParserSource:
+    content: str
+
+
 def prepare_parser_analysis(
     content: str,
     file_type: str,
     check_runtime: Callable[[], None],
     *,
     sole_original_shell: bool = False,
-) -> JSONSourceOwnership | _YamlParserAnalysis | _PythonGeneratedText | _FiniteShellSource | None:
+) -> (
+    JSONSourceOwnership
+    | _YamlParserAnalysis
+    | _PythonGeneratedText
+    | _FiniteShellSource
+    | _BatchParserSource
+    | None
+):
+    if file_type == "batch":
+        return _BatchParserSource(content)
     if (
         file_type == "python"
         and ".textContent" in content
@@ -14956,7 +14982,7 @@ def bounded_parse_diagnostic(
     )
     if (
         complete_context
-        and file_type in {"other", "xml"}
+        and file_type in {"batch", "other", "xml"}
         and "wordprocessingml/" in content[:8192]
         and content.removeprefix("\ufeff").lstrip().startswith("<")
     ):
@@ -15155,6 +15181,63 @@ def bounded_parse_diagnostic(
                 return diagnostic.shifted(start + 1)
         return None
     return exhausted
+
+
+_CMD_IF_EXIST_QUOTED_PATH = re.compile(
+    r"^[ \t]*(?:@[ \t]*)?if[ \t]+(?:not[ \t]+)?exist[ \t]+"
+    r"""(?P<operand>"[^"\x00-\x1f$^&();<=>|\x60']*\\")[ \t]+[^ \t\r\n]""",
+    re.ASCII | re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _batch_shell_word_text(
+    content: str,
+    check_runtime: Callable[[], None],
+    source_view: SecurityTextView | None,
+    prepared_analysis: object | None,
+) -> tuple[str, frozenset[int]]:
+    """Keep CMD path delimiters out of the generic shell command-word walk."""
+    if '\\"' not in content:
+        return content, frozenset()
+    if source_view is None or source_view.name == "raw":
+        original = content
+        source_view = None
+    elif isinstance(prepared_analysis, _BatchParserSource) and source_view.name in {
+        "normalized",
+        "compact",
+        "obfuscated-instruction",
+    }:
+        original = prepared_analysis.content
+    else:
+        return content, frozenset()
+    pieces: list[str] = []
+    operand_starts: set[int] = set()
+    cursor = 0
+    for match in _CMD_IF_EXIST_QUOTED_PATH.finditer(content):
+        check_runtime()
+        line_start = match.start()
+        if source_view is not None:
+            line_start = source_view.source_offset(line_start)
+            source_end = source_view.source_end_offset(match.end() - 1)
+            if original[line_start:source_end] != match[0] or (
+                line_start and original[line_start - 1] != "\n"
+            ):
+                continue
+        preceding_end = line_start - 1  # LF before the physical line
+        if preceding_end > 0 and original[preceding_end - 1] == "\r":
+            preceding_end -= 1
+        if preceding_end > 0 and original[preceding_end - 1] == "^":
+            continue
+        start, end = match.span("operand")
+        # The path quotes cannot close a preceding shell quote. Keep offsets
+        # and the branch command intact; findings still use the original text.
+        pieces.extend((content[cursor:start], " " * (end - start)))
+        operand_starts.add(start)
+        cursor = end
+    if not pieces:
+        return content, frozenset()
+    pieces.append(content[cursor:])
+    return "".join(pieces), frozenset(operand_starts)
 
 
 def _has_bounded_parse_exhaustion(
@@ -15398,6 +15481,11 @@ def _has_bounded_parse_exhaustion(
     )
     if file_type == "python" and complete_context:
         shell_word_content = python_browser_template_shell_text(content, check_runtime)
+    batch_operand_starts: frozenset[int] = frozenset()
+    if file_type == "batch" and complete_context:
+        shell_word_content, batch_operand_starts = _batch_shell_word_text(
+            content, check_runtime, source_view, prepared_analysis
+        )
     if json_projection is not None:
         # Only validated host punctuation terminates command words. Every byte
         # inside strings stays in the parser and original finding views remain raw.
@@ -15490,7 +15578,19 @@ def _has_bounded_parse_exhaustion(
                     shell_word_content = "".join(view)
     # Perl ``eval BLOCK`` is recognized from its clause-initial ``eval`` and the
     # adjacent brace alone, so unlike quote ownership it needs no full context.
-    diagnostic = _has_shell_command_word_exhaustion(
+    # Raw command words and nested command strings can have their own quote
+    # context. Only exempt the boundary at a proven CMD operand.
+    raw_batch_diagnostic = (
+        _has_shell_command_word_exhaustion(
+            content,
+            check_runtime,
+            file_type=file_type,
+            batch_operand_starts=batch_operand_starts,
+        )
+        if batch_operand_starts
+        else None
+    )
+    diagnostic = raw_batch_diagnostic or _has_shell_command_word_exhaustion(
         shell_word_content,
         check_runtime,
         structural_quote_closers=structural_quote_closers,
