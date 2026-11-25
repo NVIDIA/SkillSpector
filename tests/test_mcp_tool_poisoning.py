@@ -2751,3 +2751,147 @@ class TestFullPipelineIntegration:
         findings = result.get("filtered_findings") or result.get("findings", [])
         rule_ids = {f.rule_id for f in findings}
         assert "TP4" not in rule_ids
+
+
+def test_tp4_token_ceiling_env_is_configurable(monkeypatch):
+    from skillspector.nodes.analyzers.mcp_tool_poisoning import _tp4_batch_token_ceiling
+
+    monkeypatch.delenv("SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_MAX_BATCH_INPUT_TOKENS", raising=False)
+    assert _tp4_batch_token_ceiling() == 32_000
+    monkeypatch.setenv("SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS", "20000")
+    assert _tp4_batch_token_ceiling() == 20_000
+    monkeypatch.setenv("SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS", "64000")
+    assert _tp4_batch_token_ceiling() == 32_000
+
+
+def test_tp4_prompts_honor_configured_byte_and_token_ceilings(monkeypatch: pytest.MonkeyPatch):
+    state = {
+        "manifest": {"name": "limits", "description": "Runs local calculations."},
+        "file_cache": {"tool.py": "".join(f"value_{index} = '漢字'\n" for index in range(2000))},
+        "component_metadata": [{"path": "tool.py", "type": "python"}],
+        "use_llm": True,
+        "model_config": {"default": "test-model"},
+    }
+    monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+    monkeypatch.setenv("SKILLSPECTOR_MAX_PROMPT_BYTES", "12000")
+    monkeypatch.setenv("SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS", "8000")
+    monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 100_000)
+    structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False} for _ in range(64)])
+
+    result = node(state)
+
+    assert structured.calls > 1
+    for prompt in structured.prompts:
+        assert len(prompt.encode("utf-8")) <= 12000
+    semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+    assert all(event["outcome"] is LedgerOutcome.COMPLETED for event in semantic)
+    covered: set[int] = set()
+    for event in semantic:
+        covered.update(range(event["start_line"], event["end_line"] + 1))
+    assert covered == set(range(1, 2001))
+
+
+def test_tp4_prompt_byte_ceiling_is_exact_and_others_run(monkeypatch: pytest.MonkeyPatch):
+    from skillspector.llm_utils import structured_output_instructions
+
+    def state() -> dict:
+        return {
+            "manifest": {"name": "limits", "description": "Runs local calculations."},
+            "file_cache": {"ok.py": "x = 1\n", "tool.py": "value = '漢字テキスト' * 40\n"},
+            "component_metadata": [
+                {"path": "ok.py", "type": "python"},
+                {"path": "tool.py", "type": "python"},
+            ],
+            "use_llm": True,
+            "model_config": {"default": "test-model"},
+        }
+
+    monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+    monkeypatch.setenv("SKILLSPECTOR_OUTPUT_LANGUAGE", "Japanese")
+    monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 100_000)
+    schema_bytes = len(
+        structured_output_instructions(mcp_tool_poisoning._TP4AnalysisResult).encode("utf-8")
+    )
+    uncapped = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False} for _ in range(4)])
+    node(state())
+    cap = max(len(prompt.encode("utf-8")) for prompt in uncapped.prompts) + schema_bytes
+
+    # A cap equal to the largest submitted input still sends every chunk.
+    monkeypatch.setenv("SKILLSPECTOR_MAX_PROMPT_BYTES", str(cap))
+    fits = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False} for _ in range(4)])
+    result = node(state())
+    assert fits.calls == 2
+    assert not any(
+        event["outcome"] is LedgerOutcome.PARTIAL for event in result["inspection_ledger"]
+    )
+
+    # One byte less and the larger file cannot fit; it is never sent but the other one is.
+    monkeypatch.setenv("SKILLSPECTOR_MAX_PROMPT_BYTES", str(cap - 1))
+    tight = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False} for _ in range(4)])
+    result = node(state())
+    assert tight.calls == 1
+    assert "### ok.py" in tight.prompts[0]
+    assert all(len(p.encode("utf-8")) + schema_bytes < cap for p in tight.prompts)
+    partial = [
+        event
+        for event in result["inspection_ledger"]
+        if event["outcome"] is LedgerOutcome.PARTIAL
+        and event["reason_code"] is LedgerReason.SIZE_LIMIT
+    ]
+    assert [event["path"] for event in partial] == ["tool.py"]
+
+
+def test_tp4_token_ceiling_counts_the_full_submitted_input(monkeypatch: pytest.MonkeyPatch):
+    from skillspector.llm_analyzer_base import REQUEST_FRAMING_TOKENS
+    from skillspector.llm_utils import structured_output_instructions
+
+    def state() -> dict:
+        return {
+            "manifest": {"name": "limits", "description": "Runs local calculations."},
+            "file_cache": {"ok.py": "x = 1\n", "tool.py": "value = '漢字テキスト' * 40\n"},
+            "component_metadata": [
+                {"path": "ok.py", "type": "python"},
+                {"path": "tool.py", "type": "python"},
+            ],
+            "use_llm": True,
+            "model_config": {"default": "test-model"},
+        }
+
+    monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_MAX_BATCH_INPUT_TOKENS", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS", raising=False)
+    monkeypatch.setenv("SKILLSPECTOR_OUTPUT_LANGUAGE", "Japanese")
+    monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 100_000)
+    schema = structured_output_instructions(mcp_tool_poisoning._TP4AnalysisResult)
+    uncapped = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False} for _ in range(4)])
+    node(state())
+    # The fake model has no known codec, so the shared guard counts UTF-8 bytes.
+    cap = max(
+        len((prompt + schema).encode("utf-8")) + REQUEST_FRAMING_TOKENS
+        for prompt in uncapped.prompts
+    )
+    assert all(mcp_tool_poisoning.estimate_tokens(p) < cap // 2 for p in uncapped.prompts)
+
+    # A cap equal to the largest full input still sends every chunk.
+    monkeypatch.setenv("SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS", str(cap))
+    fits = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False} for _ in range(4)])
+    result = node(state())
+    assert fits.calls == 2
+    assert not any(
+        event["outcome"] is LedgerOutcome.PARTIAL for event in result["inspection_ledger"]
+    )
+
+    # One token less and the larger file is never sent, though its raw estimate fits.
+    monkeypatch.setenv("SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS", str(cap - 1))
+    tight = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False} for _ in range(4)])
+    result = node(state())
+    assert tight.calls == 1
+    assert "### ok.py" in tight.prompts[0]
+    partial = [
+        event
+        for event in result["inspection_ledger"]
+        if event["outcome"] is LedgerOutcome.PARTIAL
+        and event["reason_code"] is LedgerReason.SIZE_LIMIT
+    ]
+    assert [event["path"] for event in partial] == ["tool.py"]

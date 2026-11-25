@@ -852,6 +852,46 @@ def _cli_max_input_bytes() -> int | None:
     return None
 
 
+class PromptSizeLimitError(LLMInputBudgetError):
+    """A built prompt is over a configured per-request limit and was not sent."""
+
+
+def optional_positive_int_env(name: str) -> int | None:
+    """Return the positive integer in environment variable *name*, or ``None``.
+
+    Unset or blank values return ``None``.  Invalid values are logged without echoing
+    the untrusted environment text and also return ``None``.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        logger.warning("Ignoring %s: not a positive integer", name)
+        return None
+    return value
+
+
+def cap_input_tokens(budget: int) -> int:
+    """Lower a model input *budget* to ``SKILLSPECTOR_MAX_BATCH_INPUT_TOKENS``, never raise it."""
+    configured = optional_positive_int_env("SKILLSPECTOR_MAX_BATCH_INPUT_TOKENS")
+    return min(budget, configured) if configured is not None else budget
+
+
+def max_prompt_bytes() -> int | None:
+    """Return the effective UTF-8 prompt byte cap, or ``None`` when there is none.
+
+    The stricter of ``SKILLSPECTOR_MAX_PROMPT_BYTES`` and the provider cap from
+    :func:`_cli_max_input_bytes`.  This bounds the prompt text, not the full
+    serialized HTTP request.
+    """
+    caps = (optional_positive_int_env("SKILLSPECTOR_MAX_PROMPT_BYTES"), _cli_max_input_bytes())
+    return min((cap for cap in caps if cap is not None), default=None)
+
+
 # ---------------------------------------------------------------------------
 # Default structured-output schemas (discovery mode)
 # ---------------------------------------------------------------------------
@@ -1554,6 +1594,8 @@ class LLMAnalyzerBase:
 
     response_schema: type | None = LLMAnalysisResult
     recovery_required_fields: tuple[str, ...] = ()
+    _input_budget_configured = False
+    _max_prompt_bytes: int | None = None
 
     def __init__(
         self,
@@ -1573,7 +1615,10 @@ class LLMAnalyzerBase:
         # batches (and formatting retries) bind the schema as an unforced
         # tool call instead of paying one rejected request per batch.
         self._use_structured_output_fallback = False
-        self._input_budget = get_max_input_tokens(model)
+        model_budget = get_max_input_tokens(model)
+        self._input_budget = cap_input_tokens(model_budget)
+        self._input_budget_configured = self._input_budget < model_budget
+        self._max_prompt_bytes = max_prompt_bytes()
         self._request_ordinal = 0
         self._request_ordinal_lock = threading.Lock()
         try:
@@ -1734,13 +1779,14 @@ class LLMAnalyzerBase:
         """Create one :class:`Batch` per file, splitting oversized files into chunks.
 
         Every batch accounts for the real prompt wrapper, findings and schema
-        as well as line prefixes. For CLI providers it must also stay under the
-        provider's byte cap (see :func:`_cli_max_input_bytes`).  The fixed part of
+        as well as line prefixes. When a prompt byte cap applies (a CLI provider's
+        cap or ``SKILLSPECTOR_MAX_PROMPT_BYTES``, see :func:`max_prompt_bytes`) it
+        must also stay under it.  The fixed part of
         the prompt is measured with :meth:`build_prompt` itself, called with
         *prompt_kwargs* (the same keyword arguments later passed to the run), so
         subclass prompt layouts are accounted for rather than estimated.
         """
-        max_input_bytes = _cli_max_input_bytes()
+        max_input_bytes = max_prompt_bytes()
 
         findings_by_file: dict[str, list[Finding]] = defaultdict(list)
         if findings:
@@ -2003,11 +2049,19 @@ class LLMAnalyzerBase:
         size = len(self._serialized_input(prompt).encode("utf-8", errors="replace"))
         count = self._count_prompt_tokens(prompt, chat_model=chat_model)
         byte_cap = _cli_max_input_bytes()
-        if count > self._input_budget or (byte_cap is not None and size > byte_cap):
+        over_tokens = count > self._input_budget
+        if (over_tokens and not self._input_budget_configured) or (
+            byte_cap is not None and size > byte_cap
+        ):
             raise LLMInputBudgetError(
                 "serialized LLM input exceeds its token or byte budget; "
                 "batch content retained but not submitted"
             )
+        if over_tokens:
+            raise PromptSizeLimitError(
+                f"prompt exceeds the {self._input_budget}-token limit; got {count} tokens"
+            )
+        self._check_prompt_bytes(prompt)
 
     def _record_failed_request(self, exc: BaseException, prompt: str, ordinal: int) -> None:
         # Diagnostics must never replace the original provider exception or report usage.
@@ -2019,7 +2073,15 @@ class LLMAnalyzerBase:
         except Exception:
             pass
 
+    def _check_prompt_bytes(self, prompt: str) -> None:
+        """Fail a request whose prompt exceeds :func:`max_prompt_bytes` before it is sent."""
+        cap = self._max_prompt_bytes
+        size = len(self._serialized_input(prompt).encode("utf-8", errors="replace"))
+        if cap is not None and size > cap:
+            raise PromptSizeLimitError(f"prompt exceeds the {cap}-byte limit; got {size} bytes")
+
     def _invoke_with_failure_diagnostic(self, runnable: object, prompt: str) -> object:
+        self._check_prompt_bytes(prompt)
         with self._request_ordinal_lock:
             self._request_ordinal += 1
             ordinal = self._request_ordinal
@@ -2030,6 +2092,7 @@ class LLMAnalyzerBase:
             raise
 
     async def _ainvoke_with_failure_diagnostic(self, runnable: object, prompt: str) -> object:
+        self._check_prompt_bytes(prompt)
         with self._request_ordinal_lock:
             self._request_ordinal += 1
             ordinal = self._request_ordinal
@@ -2519,6 +2582,10 @@ class LLMAnalyzerBase:
             outcome.failures.append(
                 BatchFailure(result.batch, type(exc).__name__, LedgerReason.RUNTIME_LIMIT)
             )
+        elif isinstance(exc, PromptSizeLimitError):
+            outcome.failures.append(
+                BatchFailure(result.batch, type(exc).__name__, LedgerReason.SIZE_LIMIT)
+            )
         else:
             outcome.failures.append(BatchFailure(result.batch, _provider_failure_class(exc)))
 
@@ -2589,7 +2656,7 @@ class LLMAnalyzerBase:
                     STRUCTURED_RESPONSE_MAX_RETRIES,
                 )
                 self._sleep_before_retry(delay)
-            except LLMRuntimeLimitError:
+            except (LLMRuntimeLimitError, PromptSizeLimitError):
                 raise
             except Exception as exc:
                 if isinstance(exc, LLMStructuredOutputUnavailableError):
@@ -2770,7 +2837,7 @@ class LLMAnalyzerBase:
                     STRUCTURED_RESPONSE_MAX_RETRIES,
                 )
                 await self._asleep_before_retry(delay)
-            except LLMRuntimeLimitError:
+            except (LLMRuntimeLimitError, PromptSizeLimitError):
                 raise
             except Exception as exc:
                 if isinstance(exc, LLMStructuredOutputUnavailableError):
@@ -2861,6 +2928,14 @@ class LLMAnalyzerBase:
                         batch=batch,
                         error_class=type(exc).__name__,
                         reason=LedgerReason.RUNTIME_LIMIT,
+                    )
+                )
+            except PromptSizeLimitError as exc:
+                outcome.failures.append(
+                    BatchFailure(
+                        batch=batch,
+                        error_class=type(exc).__name__,
+                        reason=LedgerReason.SIZE_LIMIT,
                     )
                 )
             except (ValueError, NotImplementedError):
@@ -3012,6 +3087,15 @@ class LLMAnalyzerBase:
                         batch=batch,
                         error_class=type(result).__name__,
                         reason=LedgerReason.RUNTIME_LIMIT,
+                    )
+                )
+                continue
+            if isinstance(result, PromptSizeLimitError):
+                outcome.failures.append(
+                    BatchFailure(
+                        batch=batch,
+                        error_class=type(result).__name__,
+                        reason=LedgerReason.SIZE_LIMIT,
                     )
                 )
                 continue

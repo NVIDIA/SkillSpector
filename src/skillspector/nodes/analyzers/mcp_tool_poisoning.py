@@ -45,9 +45,12 @@ from skillspector.llm_analyzer_base import (
     LLMAnalyzerBase,
     LLMRuntimeLimitError,
     append_output_language_instruction,
+    cap_input_tokens,
     estimate_tokens,
+    max_prompt_bytes,
+    optional_positive_int_env,
 )
-from skillspector.llm_utils import run_async
+from skillspector.llm_utils import run_async, structured_output_instructions
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding, compute_match_fingerprint
 from skillspector.nodes.analyzers.static_runner import MAX_FINDINGS_PER_ANALYZER
@@ -92,6 +95,18 @@ TP4_MAX_BATCH_INPUT_TOKENS = 32_000
 TP4_MIN_CODE_TOKENS = 64
 TP4_MAX_DECLARATION_CHARS = 16_384
 TP4_MAX_FINDINGS = 64
+
+
+def _tp4_batch_token_ceiling() -> int:
+    """Return TP4's per-request token ceiling before the model budget is applied.
+
+    ``SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS`` can lower, never raise, the
+    :data:`TP4_MAX_BATCH_INPUT_TOKENS` default.
+    """
+    configured = optional_positive_int_env("SKILLSPECTOR_TP4_MAX_BATCH_INPUT_TOKENS")
+    if configured is None:
+        return TP4_MAX_BATCH_INPUT_TOKENS
+    return min(configured, TP4_MAX_BATCH_INPUT_TOKENS)
 
 
 def _tp4_max_batches_from_environment(value: str | None) -> int:
@@ -941,8 +956,13 @@ class _TP4Analyzer(LLMAnalyzerBase):
         model: str,
         *,
         timeout: float | None | Callable[[], float | None] = None,
+        max_input_tokens: int | None = None,
     ) -> None:
         super().__init__(base_prompt="", model=model, node=ANALYZER_ID, timeout=timeout)
+        if max_input_tokens is not None and max_input_tokens < self._input_budget:
+            # A configured TP4 cap goes through the same full-input preflight.
+            self._input_budget = max_input_tokens
+            self._input_budget_configured = True
 
     def build_prompt(self, batch: Batch, **_kwargs: object) -> str:
         """Use TP4's purpose-built prompt without the generic file wrapper."""
@@ -1081,33 +1101,88 @@ def _bounded_utf8_prefix(text: str, max_bytes: int) -> tuple[str, int, bool]:
     return candidate, len(encoded), len(candidate) < len(text)
 
 
-def _tp4_line_chunks(content: str, max_tokens: int) -> Iterator[_TP4CodeChunk]:
-    """Yield bounded line-aligned chunks; oversized single lines fail closed."""
+def _tp4_serialized_bytes(prompt: str) -> int:
+    """UTF-8 bytes of a TP4 *prompt* as submitted, with language and schema instructions."""
+    serialized = append_output_language_instruction(prompt) + structured_output_instructions(
+        _TP4AnalysisResult
+    )
+    return len(serialized.encode("utf-8"))
+
+
+def _tp4_fitting_chunks(
+    lines: list[str], start_line: int, fits: Callable[[str], bool]
+) -> Iterator[_TP4CodeChunk]:
+    """Split *lines* into the longest leading runs whose code passes *fits*."""
+    start = 0
+    while start < len(lines):
+        best = None
+        if fits("".join(lines[start:])):
+            best = len(lines)
+        else:
+            low, high = start + 1, len(lines) - 1
+            while low <= high:
+                middle = (low + high) // 2
+                if fits("".join(lines[start:middle])):
+                    best, low = middle, middle + 1
+                else:
+                    high = middle - 1
+        # An unfit single line is still yielded so the planner records it.
+        end = best or start + 1
+        yield _TP4CodeChunk("".join(lines[start:end]), start_line + start, start_line + end - 1)
+        start = end
+
+
+def _tp4_line_chunks(
+    content: str,
+    max_tokens: int,
+    max_bytes: int | None = None,
+    fits: Callable[[str], bool] | None = None,
+) -> Iterator[_TP4CodeChunk]:
+    """Yield bounded line-aligned chunks; oversized single lines fail closed.
+
+    When *max_bytes* is set each chunk also stays within that many UTF-8 bytes.
+    When *fits* is set, chunks it rejects are split further at line boundaries.
+    """
+
+    def emit(chunk_lines: list[str], first_line: int) -> Iterator[_TP4CodeChunk]:
+        if fits is None:
+            yield _TP4CodeChunk("".join(chunk_lines), first_line, first_line + len(chunk_lines) - 1)
+        else:
+            yield from _tp4_fitting_chunks(chunk_lines, first_line, fits)
+
     lines = content.splitlines(keepends=True)
     current: list[str] = []
     current_tokens = 0
+    current_bytes = 0
     start_line = 1
     for line_number, line in enumerate(lines, start=1):
         line_tokens = max(1, (len(line) + 3) // 4)
-        if line_tokens > max_tokens:
+        line_bytes = len(line.encode("utf-8"))
+        if line_tokens > max_tokens or (max_bytes is not None and line_bytes > max_bytes):
             if current:
-                yield _TP4CodeChunk("".join(current), start_line, line_number - 1)
+                yield from emit(current, start_line)
                 current = []
                 current_tokens = 0
+                current_bytes = 0
             yield _TP4CodeChunk(None, line_number, line_number, len(line))
             start_line = line_number + 1
             continue
-        if current and current_tokens + line_tokens > max_tokens:
-            yield _TP4CodeChunk("".join(current), start_line, line_number - 1)
+        if current and (
+            current_tokens + line_tokens > max_tokens
+            or (max_bytes is not None and current_bytes + line_bytes > max_bytes)
+        ):
+            yield from emit(current, start_line)
             current = []
             current_tokens = 0
+            current_bytes = 0
             start_line = line_number
         if not current:
             start_line = line_number
         current.append(line)
         current_tokens += line_tokens
+        current_bytes += line_bytes
     if current:
-        yield _TP4CodeChunk("".join(current), start_line, len(lines))
+        yield from emit(current, start_line)
 
 
 def _tp4_partial_event(
@@ -1225,7 +1300,8 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
         model_config: dict = state.get("model_config") or {}
         model = model_config.get(ANALYZER_ID) or model_config.get("default")
         model = model or get_active_provider().resolve_model()
-        model_input_tokens = get_max_input_tokens(model)
+        model_budget = get_max_input_tokens(model)
+        model_input_tokens = cap_input_tokens(model_budget)
 
         description = description_value[:TP4_MAX_DECLARATION_CHARS]
         triggers_text = str(manifest.get("triggers") or [])[:TP4_MAX_DECLARATION_CHARS]
@@ -1243,7 +1319,29 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
             permissions=permissions_text,
         )
         overhead_tokens = estimate_tokens(prefix + _TP4_PROMPT_SUFFIX) + 16
-        batch_input_tokens = min(TP4_MAX_BATCH_INPUT_TOKENS, model_input_tokens)
+        batch_input_tokens = min(_tp4_batch_token_ceiling(), model_input_tokens)
+        # A configured token cap is checked on the full serialized input, as the preflight does.
+        configured_tokens = (
+            batch_input_tokens
+            if batch_input_tokens < min(TP4_MAX_BATCH_INPUT_TOKENS, model_budget)
+            else None
+        )
+        prompt_byte_cap = max_prompt_bytes()
+        timeout = (
+            (lambda: transitive_remaining_seconds(state)) if shared_remaining is not None else None
+        )
+
+        def get_analyzer() -> _TP4Analyzer:
+            nonlocal analyzer
+            if analyzer is None:
+                analyzer = _TP4Analyzer(model, timeout=timeout, max_input_tokens=configured_tokens)
+            return analyzer
+
+        def full_input_fits(prompt: str, path: str) -> bool:
+            tp4 = get_analyzer()
+            built = tp4.build_prompt(Batch(file_path=path, content=prompt))
+            return tp4._count_prompt_tokens(built) <= tp4._input_budget
+
         code_token_budget = batch_input_tokens - overhead_tokens
 
         llm_cache = state.get("llm_file_cache")
@@ -1310,7 +1408,21 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     )
                 )
                 return
-            for chunk in _tp4_line_chunks(candidate.content, code_token_budget):
+            header = f"### {candidate.path} ({candidate.language})\n"
+            code_byte_budget: int | None = None
+            if prompt_byte_cap is not None:
+                # Same augmented text the shared preflight checks, so a chunk that fits is kept.
+                fixed_bytes = _tp4_serialized_bytes(prefix + header + _TP4_PROMPT_SUFFIX)
+                code_byte_budget = max(0, prompt_byte_cap - fixed_bytes)
+            fits: Callable[[str], bool] | None = None
+            if configured_tokens is not None:
+
+                def fits(code: str, header: str = header) -> bool:
+                    return full_input_fits(prefix + header + code + _TP4_PROMPT_SUFFIX, path)
+
+            for chunk in _tp4_line_chunks(
+                candidate.content, code_token_budget, max_bytes=code_byte_budget, fits=fits
+            ):
                 chunk_start_line = candidate.start_line + chunk.start_line - 1
                 chunk_end_line = min(candidate.end_line, candidate.start_line + chunk.end_line - 1)
                 dynamic_remaining = transitive_remaining_seconds(state)
@@ -1356,12 +1468,10 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                         )
                     )
                     break
-                prompt = (
-                    prefix
-                    + f"### {candidate.path} ({candidate.language})\n{chunk.content}"
-                    + _TP4_PROMPT_SUFFIX
-                )
-                if estimate_tokens(prompt) > batch_input_tokens:
+                prompt = prefix + header + chunk.content + _TP4_PROMPT_SUFFIX
+                if estimate_tokens(prompt) > batch_input_tokens or (
+                    configured_tokens is not None and not full_input_fits(prompt, path)
+                ):
                     add_partial_once(
                         _tp4_partial_event(
                             path,
@@ -1374,6 +1484,19 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     )
                     continue
                 prompt_bytes = len(prompt.encode("utf-8"))
+                sent_bytes = _tp4_serialized_bytes(prompt)
+                if prompt_byte_cap is not None and sent_bytes > prompt_byte_cap:
+                    add_partial_once(
+                        _tp4_partial_event(
+                            path,
+                            LedgerReason.SIZE_LIMIT,
+                            start_line=chunk_start_line,
+                            end_line=chunk_end_line,
+                            observed_bytes=sent_bytes,
+                            limit_bytes=prompt_byte_cap,
+                        )
+                    )
+                    continue
                 if total_prompt_bytes + prompt_bytes > TP4_MAX_TOTAL_INPUT_BYTES:
                     stop_planning(
                         LedgerReason.TOTAL_BYTES_LIMIT,
@@ -1512,10 +1635,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
         if not batches:
             return result
 
-        timeout = (
-            (lambda: transitive_remaining_seconds(state)) if shared_remaining is not None else None
-        )
-        analyzer = _TP4Analyzer(model, timeout=timeout)
+        analyzer = get_analyzer()
         attempted = True
         # Fan out like the semantic analyzers do. The shared limiter still honours
         # SKILLSPECTOR_MAX_LLM_CONCURRENCY, and results keep the batch order.
