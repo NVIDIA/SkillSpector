@@ -126,28 +126,35 @@ _COMPILED_CAPABILITY_PATTERNS = {
 # io.ReadAll is deliberately absent: it consumes any io.Reader (a network
 # response body, an in-memory buffer), so on its own it proves nothing about
 # file access. A file opened with os.Open still counts through os.Open.
+# Each pattern matches one complete, case-sensitive direct invocation: the
+# exported Go name in full, followed by the call parenthesis. A bare
+# function reference such as ``var _ = os.Open`` is not a call and proves
+# nothing, and a longer identifier such as filepath.WalkFoo must not match
+# through the filepath.Walk prefix, so Walk and WalkDir are listed
+# explicitly and the parenthesis anchors the end of the name.
 _GO_CAPABILITY_PATTERNS: dict[str, list[str]] = {
     "file_read": [
-        r"os\.readfile",
-        r"os\.open\b",
-        r"os\.readdir",
-        r"filepath\.walk",
-        r"filepath\.glob",
-        r"ioutil\.readfile",
+        r"\bos\.ReadFile\s*\(",
+        r"\bos\.Open\s*\(",
+        r"\bos\.ReadDir\s*\(",
+        r"\bfilepath\.Walk\s*\(",
+        r"\bfilepath\.WalkDir\s*\(",
+        r"\bfilepath\.Glob\s*\(",
+        r"\bioutil\.ReadFile\s*\(",
     ],
     "file_write": [
-        r"os\.writefile",
-        r"os\.create\b",
-        r"os\.createtemp",
-        r"ioutil\.writefile",
+        r"\bos\.WriteFile\s*\(",
+        r"\bos\.Create\s*\(",
+        r"\bos\.CreateTemp\s*\(",
+        r"\bioutil\.WriteFile\s*\(",
     ],
     "env": [
-        r"os\.lookupenv",
-        r"os\.expandenv",
+        r"\bos\.LookupEnv\s*\(",
+        r"\bos\.ExpandEnv\s*\(",
     ],
 }
 _COMPILED_GO_CAPABILITY_PATTERNS = {
-    capability: tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns)
+    capability: tuple(re.compile(pattern) for pattern in patterns)
     for capability, patterns in _GO_CAPABILITY_PATTERNS.items()
 }
 

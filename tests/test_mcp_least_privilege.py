@@ -708,6 +708,15 @@ class TestLP4GoCapabilityPatterns:
                 "file_read",
                 'package main\n\nimport (\n\t"io/fs"\n\t"path/filepath"\n)\n\n'
                 "func main() {\n"
+                '\t_ = filepath.Walk(".", func(path string, info fs.FileInfo, '
+                "err error) error { return nil })\n}\n",
+                id="walk",
+            ),
+            pytest.param(
+                "file_read: config.json",
+                "file_read",
+                'package main\n\nimport (\n\t"io/fs"\n\t"path/filepath"\n)\n\n'
+                "func main() {\n"
                 '\t_ = filepath.WalkDir(".", func(path string, d fs.DirEntry, '
                 "err error) error { return nil })\n}\n",
                 id="walkdir",
@@ -751,6 +760,43 @@ class TestLP4GoCapabilityPatterns:
         assert lp4 == [], (
             f"Go {category} call should satisfy {permission}, got: "
             f"{[(f.rule_id, f.message) for f in findings]}"
+        )
+
+    @pytest.mark.parametrize(
+        "go_code",
+        [
+            pytest.param(
+                'package main\n\nimport "os"\n\nvar _ = os.Open\n\n'
+                'func main() {\n\tprintln("hello")\n}\n',
+                id="non_invoked_os_open",
+            ),
+            pytest.param(
+                'package main\n\nimport "os"\n\nvar opener = os.ReadFile\n\n'
+                "func main() {\n\t_ = opener\n}\n",
+                id="non_invoked_os_readfile",
+            ),
+            pytest.param(
+                'package main\n\nimport "path/filepath"\n\nfunc main() {\n'
+                '\tfilepath.WalkFoo(".")\n}\n',
+                id="unrelated_walk_suffix",
+            ),
+        ],
+    )
+    def test_go_non_invoked_reference_is_not_capability(self, go_code):
+        """A bare function reference never calls the API, so it is not
+        capability evidence: the declared file_read permission stays
+        over-declared (LP4) and no LP1 fires for file_read. The real-call
+        controls above (os.Open, os.ReadFile, filepath.Walk) still count."""
+        state = self._go_state(["file_read: config.json"], go_code)
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp4 = self._lp4_for_category(findings, "file_read")
+        assert len(lp4) == 1, (
+            f"Expected one LP4 for file_read, got: {[(f.rule_id, f.message) for f in findings]}"
+        )
+        lp1_read = [f for f in findings if f.rule_id == "LP1" and "file_read" in (f.message or "")]
+        assert lp1_read == [], (
+            f"Expected no LP1 for file_read, got: {[(f.rule_id, f.message) for f in findings]}"
         )
 
     def test_go_skill_without_capability_calls_still_lp4(self):
