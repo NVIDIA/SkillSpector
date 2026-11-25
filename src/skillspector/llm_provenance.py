@@ -14,7 +14,7 @@ from importlib.metadata import distribution, version
 
 from skillspector.inference_usage import looks_like_credential, provider_name, safe_reasoning_effort
 from skillspector.providers import get_active_provider, get_model_config_provider
-from skillspector.providers.chat_models import (
+from skillspector.providers._controls import (
     MAX_SAMPLING_SEED,
     MIN_SAMPLING_SEED,
     resolve_reasoning_effort,

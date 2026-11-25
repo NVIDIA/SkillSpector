@@ -49,8 +49,6 @@ from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langchain_core.utils.function_calling import convert_to_openai_tool
-from langchain_openai.chat_models.base import BaseChatOpenAI
-from openai import ContentFilterFinishReasonError, LengthFinishReasonError, pydantic_function_tool
 from pydantic import BaseModel
 
 from skillspector.constants import build_model_config
@@ -74,9 +72,7 @@ from skillspector.providers import (
     resolve_chat_model_credentials,
     resolve_provider_credentials,
 )
-from skillspector.providers.chat_models import UnsupportedControlError, resolve_reasoning_effort
-from skillspector.providers.gemini import GeminiProvider
-from skillspector.providers.openai import OpenAIProvider
+from skillspector.providers._controls import resolve_reasoning_effort
 from skillspector.structured_response import (
     MAX_RESPONSE_CHARS,
     ResponseIssue,
@@ -139,6 +135,8 @@ def _resolve_llm_credentials() -> tuple[str, str | None]:
 
 def _resolve_default_chat_model() -> str:
     """Return the default chat model for the endpoint that will be used."""
+    from skillspector.providers.openai import OpenAIProvider
+
     if has_provider_binding():
         return get_metadata_provider().resolve_model()
 
@@ -163,6 +161,8 @@ def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
     rejects a requested control makes the LLM unavailable, with the reason
     from :func:`unsupported_control_error`.
     """
+    from skillspector.providers.gemini import GeminiProvider
+
     try:
         provider = get_active_provider()
     except UnknownProviderError as exc:
@@ -205,6 +205,8 @@ def unsupported_control_error(timeout: float | None = 120) -> str | None:
     before any analysis.  Other failures, such as missing credentials, are
     left to the regular availability path.
     """
+    from skillspector.providers.chat_models import UnsupportedControlError
+
     if not any(
         os.environ.get(name, "").strip()
         for name in ("SKILLSPECTOR_TEMPERATURE", "SKILLSPECTOR_REASONING_EFFORT")
@@ -524,6 +526,8 @@ def _gateway_output_preference(llm: object, model: str) -> str | None:
     envelopes across analyzers. This shares TP4's existing workaround; aliases
     and other providers retain their own method choices.
     """
+    from langchain_openai.chat_models.base import BaseChatOpenAI
+
     if not (
         isinstance(llm, BaseChatOpenAI)
         and chat_model_provider_name(llm) == "openai"
@@ -606,6 +610,13 @@ def bind_structured_output(
     rejects ``response_format`` has already shown the configured method does
     not work, so recovery must not re-read it.
     """
+    from langchain_openai.chat_models.base import BaseChatOpenAI
+    from openai import (
+        ContentFilterFinishReasonError,
+        LengthFinishReasonError,
+        pydantic_function_tool,
+    )
+
     if force_method is not None:
         if force_method not in STRUCTURED_OUTPUT_METHODS:
             raise ValueError(
@@ -722,6 +733,8 @@ def bind_structured_output_fallback(
     ``method="function_calling"`` still forces one named tool call, which
     DeepSeek rejects the same way, so a method-only retry cannot recover.
     """
+    from langchain_openai.chat_models.base import BaseChatOpenAI
+
     if not isinstance(llm, BaseChatOpenAI):
         return None
     disabled = getattr(llm, "disabled_params", None)
