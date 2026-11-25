@@ -326,7 +326,7 @@ def _main_impl() -> None:
         type=int,
         default=4,
         metavar="N",
-        help="Number of parallel scan workers (default: 4).  "
+        help="Number of parallel scan workers (positive integer, default: 4).  "
         "Reduce to 1 for free-tier API keys, increase for enterprise tiers.  "
         "Skills that time out (90s of scanning, plus up to 90s for startup) "
         "are reported as errors; other workers continue.",
@@ -357,6 +357,8 @@ def _main_impl() -> None:
         help="Allow non-English scans without LLM (results will be incomplete).",
     )
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be a positive integer")
 
     # Structured reports must not share stdout with progress or diagnostics.
     progress_file = sys.stdout if args.format == "terminal" else sys.stderr

@@ -334,3 +334,36 @@ def test_batch_cli_validation_errors_go_to_stderr(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "is not a directory" in " ".join(captured.err.split())
+
+
+@pytest.mark.parametrize("workers", ["0", "-2"])
+def test_batch_cli_rejects_nonpositive_worker_counts(
+    batch_cli, monkeypatch: pytest.MonkeyPatch, capsys, tmp_path: Path, workers: str
+) -> None:
+    root, _ = batch_cli
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "batch_scan",
+            str(root),
+            "--no-llm",
+            "--format",
+            "json",
+            "--workers",
+            workers,
+            "--output",
+            str(output),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        batch_scan._main_impl()
+
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--workers must be a positive integer" in captured.err
+    assert "SkillSpector Batch Scan" not in captured.err
+    assert not output.exists()
