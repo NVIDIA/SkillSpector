@@ -1191,6 +1191,13 @@ def _python_inert_string_spans(
     for node in ast.walk(python_ast.tree):
         if not isinstance(node, ast.Expr):
             continue
+        # Only literal text that is never an argument to anything is inert:
+        # a bare string constant, or the literal parts of a bare f-string.
+        # An operand of a BinOp is handed to an operator method that user
+        # code can overload (``loader / "/etc/shadow"`` reaches
+        # ``__truediv__``), and an f-string replacement field or its format
+        # spec is handed to ``__format__``, so neither is recursed into and
+        # both keep their findings.
         pending: list[ast.AST] = [node.value]
         while pending:
             current = pending.pop()
@@ -1203,13 +1210,6 @@ def _python_inert_string_spans(
                     spans.append((start, end))
             elif isinstance(current, ast.JoinedStr):
                 pending.extend(current.values)
-            elif isinstance(current, ast.BinOp):
-                pending.extend((current.left, current.right))
-            elif isinstance(current, ast.FormattedValue):
-                # Only the format specification is literal text; the value
-                # itself is executed code and keeps its findings.
-                if current.format_spec is not None:
-                    pending.append(current.format_spec)
     return sorted(spans)
 
 

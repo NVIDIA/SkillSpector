@@ -167,20 +167,31 @@ def test_shell_command_string_with_credential_path_stays_visible():
 
 
 def test_shell_shebang_polyglot_keeps_detection():
-    source = (
-        "#!/bin/sh\n"
-        '""": "\n'
-        "cat ~/.ssh/id_rsa\n"
-        '# """\n'
-    )
+    source = '#!/bin/sh\n""": "\ncat ~/.ssh/id_rsa\n# """\n'
     assert pe3(source)
 
 
 def test_python_shebang_docstring_stays_suppressed():
-    source = (
-        "#!/usr/bin/env python3\n"
-        '""": "\n'
-        "cat ~/.ssh/id_rsa\n"
-        '# """\n'
-    )
+    source = '#!/usr/bin/env python3\n""": "\ncat ~/.ssh/id_rsa\n# """\n'
     assert pe3(source) == []
+
+
+def test_path_passed_to_overloaded_operator_stays_visible():
+    # A bare BinOp statement hands its operands to an operator method that
+    # user code can overload, so the literal is an argument, not a comment.
+    assert pe3('loader / "/etc/shadow"\n')
+    assert pe3('loader / "~/.ssh/id_rsa"\n')
+    assert pe3('"/etc/shadow" / loader\n')
+    assert pe3('prefix + "~/.ssh/id_rsa"\n')
+
+
+def test_bare_literal_concatenation_is_not_inert():
+    # Only a bare literal itself is exempt; a BinOp of two literals still
+    # dispatches through an operator method, so it keeps its finding.
+    assert pe3('"rotate " + "~/.ssh/id_rsa"\n')
+
+
+def test_fstring_format_spec_text_stays_visible():
+    # The evaluated format spec is passed to __format__, so literal text in
+    # it is an argument to user code, unlike the f-string's literal parts.
+    assert pe3('f"{value:/etc/shadow}"\n')
