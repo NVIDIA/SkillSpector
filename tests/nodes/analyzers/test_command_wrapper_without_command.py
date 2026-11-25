@@ -37,6 +37,38 @@ def test_optional_command_wrappers_without_executable_are_complete(
     assert not _exhausted(source + ending, "shell")
 
 
+@pytest.mark.parametrize("wrapper", ["command", "command -p", "command --", "command -p --"])
+@pytest.mark.parametrize(
+    "redirect", ["> /tmp/x.txt", "2>>'output log'", "<input >output", ">output # comment"]
+)
+def test_command_with_only_redirections_is_complete(wrapper: str, redirect: str) -> None:
+    source = f"{wrapper} {redirect}\n"
+
+    assert not _exhausted(source, "shell")
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["script.sh"], "file_cache": {"script.sh": source}}, [tm_module]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize("source", ["command >", "command >\necho ready", "command >'unclosed"])
+def test_command_redirection_requires_a_complete_target(source: str) -> None:
+    assert _exhausted(source, "shell")
+
+
+def test_command_redirection_count_is_bounded() -> None:
+    source = "command " + ">output " * (tm_module._SHELL_COMMAND_STRING_ARGUMENTS + 1)
+    assert _exhausted(source, "shell")
+
+
+@pytest.mark.parametrize("wrapper", ["command", "command --", "command -p"])
+def test_command_redirection_keeps_following_commands_visible(wrapper: str) -> None:
+    source = f"{wrapper} >output rm -rf /\n"
+    assert any(f.rule_id == "TM1" for f in tm_module.analyze(source, "script.sh", "shell"))
+    assert _exhausted(f'{wrapper} >output bash -c "$CMD"\n', "shell")
+    assert _exhausted(f'{wrapper} >output\nbash -c "$CMD"\n', "shell")
+
+
 @pytest.mark.parametrize("key", ["command", "builtin", "env"])
 def test_json_key_naming_optional_command_wrapper_is_complete(key: str) -> None:
     source = '# Output\n\n```json\n{"' + key + '": "echo ready"}\n```\n'
