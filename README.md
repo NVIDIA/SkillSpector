@@ -813,20 +813,45 @@ All detected patterns are listed in the tables above.
 
 ### Score Calculation
 
-- **CRITICAL issues**: +50 points
-- **HIGH issues**: +25 points
-- **MEDIUM issues**: +10 points
-- **LOW issues**: +5 points
-- **Executable scripts**: 1.3x multiplier
+Each skill's score uses active findings after baseline suppression. Each
+active finding starts with base points for its severity.
+
+- **CRITICAL**: 50 points
+- **HIGH**: 25 points
+- **MEDIUM**: 10 points
+- **LOW**: 5 points
+
+The score scales each contribution by the finding's confidence, bounded
+between 0 and 1. Within each rule ID, findings with positive confidence are
+scored in descending severity order. The first three count at full, half,
+and quarter weight. Further findings with the same rule ID can still
+appear in the report without adding points.
+
+A 1.3× multiplier applies to a finding when its file is an executable
+component. The total is rounded down and capped at 100. Some conditions,
+such as an unapproved exclusion of executable content, impose a minimum score.
+
+In a single-skill JSON report, `risk_assessment.severity` is the band for
+the aggregate `risk_assessment.score`. `risk_assessment.max_issue_severity` is the highest
+severity in the report's `issues` list, or `NONE` when that list is empty.
+For example, a report with one HIGH finding at 0.4 confidence in Markdown
+can show a score of 10, an aggregate severity of LOW, and a maximum issue
+severity of HIGH.
+
+Check [scan completeness](docs/scan-completeness.md) when using a report
+to make an installation decision.
 
 ### Severity Levels
 
-| Score | Severity | Recommendation |
+| Score | Severity | Base Recommendation |
 |-------|----------|----------------|
 | 0-20 | LOW | SAFE |
 | 21-50 | MEDIUM | CAUTION |
 | 51-80 | HIGH | DO NOT INSTALL |
 | 81-100 | CRITICAL | DO NOT INSTALL |
+
+An incomplete or degraded scan can change a base recommendation of SAFE
+to CAUTION while keeping the score and severity.
 
 ## Example Output
 
@@ -979,9 +1004,9 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
   "skill": { "name": "...", "source": "...", "scanned_at": "<ISO 8601>" },
   "execution_successful": true,
   "analysis_completeness": { "status": "complete", "is_complete": true },
-  "risk_assessment": { "score": 0, "severity": "LOW", "recommendation": "SAFE" },
+  "risk_assessment": { "score": 0, "severity": "LOW", "recommendation": "SAFE", "max_issue_severity": "NONE" },
   "components": [ { "path": "...", "type": "...", "lines": 0, "executable": false, "size_bytes": 0 } ],
-  "issues": [ { "id": "...", "category": "...", "severity": "...", "confidence": 0.0, "location": { "file": "...", "start_line": 0 }, "surface": "code" } ],
+  "issues": [],
   "metadata": {
     "has_executable_scripts": false,
     "skillspector_version": "...",
@@ -1007,7 +1032,8 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
 ```
 
 - `risk_assessment.severity` ∈ `LOW | MEDIUM | HIGH | CRITICAL`.
-- `risk_assessment.recommendation` ∈ `SAFE | CAUTION | DO_NOT_INSTALL`, mapped from severity: `LOW → SAFE`, `MEDIUM → CAUTION`, `HIGH`/`CRITICAL → DO_NOT_INSTALL`.
+- `risk_assessment.recommendation` ∈ `SAFE | CAUTION | DO_NOT_INSTALL`. See
+  [Severity Levels](#severity-levels) for the base mapping and coverage override.
 - `issues[].surface` and `suppressed[].surface` are advisory, heuristic labels for where a finding landed:
   `code | instructions | docs | tests | comments | config`. JSON expands compacted groups into one `issues[]` entry
   per occurrence, each with its own `surface`; SARIF emits `properties.surface` on each result. The label is
