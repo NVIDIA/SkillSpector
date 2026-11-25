@@ -16,7 +16,9 @@
 import json
 
 import pytest
+from typer.testing import CliRunner
 
+from skillspector.cli import app
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_supply_chain as supply_chain
 from skillspector.nodes.analyzers.osv_client import OsvQueryLimitation, QueryBatchResults
@@ -817,3 +819,125 @@ def test_npm_v1_self_link_does_not_replace_the_root_install_tree():
         "package.json": "{}",
     }
     assert supply_chain._collect_npm_locked_versions(cache, list(cache))["."]["ws"] == "8.20.0"
+
+
+_BOM_MANIFESTS = {
+    "package-lock.json": json.dumps(
+        {"lockfileVersion": 3, "packages": {"node_modules/lodash": {"version": "4.17.20"}}}
+    ),
+    "npm-shrinkwrap.json": json.dumps(
+        {"lockfileVersion": 1, "dependencies": {"lodash": {"version": "4.17.20"}}}
+    ),
+    "package.json": '{"name": "demo", "dependencies": {"lodash": "4.17.20"}}',
+    "Pipfile.lock": json.dumps({"_meta": {}, "default": {"pyyaml": {"version": "==5.3.1"}}}),
+    "Pipfile": '[packages]\npyyaml = "==5.3.1"\n',
+    "pyproject.toml": '[project]\nname = "demo"\ndependencies = ["pyyaml==5.3.1"]\n',
+    "uv.lock": 'version = 1\n[[package]]\nname = "pyyaml"\nversion = "5.3.1"\n',
+    "poetry.lock": '[[package]]\nname = "pyyaml"\nversion = "5.3.1"\n',
+}
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _scan_bundle_with_osv_capture(tmp_path, monkeypatch, files):
+    """Scan files written as bytes through the CLI and record what reached OSV."""
+    seen = []
+
+    def fake_query_batch(packages, ecosystem, **_kwargs):
+        seen.extend((ecosystem, name, version) for name, version in packages)
+        return [[] for _ in packages]
+
+    monkeypatch.setattr(supply_chain, "query_batch", fake_query_batch)
+    monkeypatch.setattr(supply_chain, "was_osv_reachable", lambda budget=None: True)
+    bundle = tmp_path / "skill"
+    bundle.mkdir()
+    (bundle / "SKILL.md").write_text(
+        "---\nname: dependency-review\n"
+        "description: Summarize project dependencies when the user asks for a review.\n"
+        "---\n# Dependency Review\nRead the bundled project dependency list.\n"
+    )
+    for name, data in files.items():
+        (bundle / name).write_bytes(data)
+    output = tmp_path / "report.json"
+    CliRunner().invoke(
+        app,
+        ["scan", str(bundle), "--no-llm", "--format", "json", "--output", str(output)],
+    )
+    return seen, json.loads(output.read_text())
+
+
+@pytest.mark.parametrize("filename", list(_BOM_MANIFESTS))
+def test_utf8_bom_manifest_versions_reach_osv(tmp_path, monkeypatch, filename):
+    """A leading UTF-8 BOM must not change what the scan reads from a manifest."""
+    ecosystem, name, version = (
+        ("npm", "lodash", "4.17.20") if filename.endswith(".json") else ("PyPI", "pyyaml", "5.3.1")
+    )
+    content = _UTF8_BOM + _BOM_MANIFESTS[filename].encode()
+
+    seen, report = _scan_bundle_with_osv_capture(tmp_path, monkeypatch, {filename: content})
+
+    assert (ecosystem, name, version) in seen, "BOM-prefixed manifest entry never reached OSV"
+    assert not any(
+        event["reason_code"] == LedgerReason.DEPENDENCY_PARSE_ERROR
+        for event in report["analysis_completeness"]["ledger_exceptions"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("manifest_name", "manifest", "lockfile", "ecosystem", "name", "version"),
+    [
+        (
+            "package.json",
+            '{"dependencies": {"lodash": "^4.17.0"}}',
+            "package-lock.json",
+            "npm",
+            "lodash",
+            "4.17.20",
+        ),
+        (
+            "package.json",
+            '{"dependencies": {"lodash": "^4.17.0"}}',
+            "npm-shrinkwrap.json",
+            "npm",
+            "lodash",
+            "4.17.20",
+        ),
+        ("Pipfile", '[packages]\npyyaml = "*"\n', "Pipfile.lock", "PyPI", "pyyaml", "5.3.1"),
+        (
+            "pyproject.toml",
+            '[project]\nname = "demo"\ndependencies = ["pyyaml"]\n',
+            "uv.lock",
+            "PyPI",
+            "pyyaml",
+            "5.3.1",
+        ),
+    ],
+    ids=["package-lock.json", "npm-shrinkwrap.json", "Pipfile.lock", "uv.lock"],
+)
+def test_utf8_bom_lockfile_still_pins_its_manifest(
+    tmp_path, monkeypatch, manifest_name, manifest, lockfile, ecosystem, name, version
+):
+    files = {
+        manifest_name: manifest.encode(),
+        lockfile: _UTF8_BOM + _BOM_MANIFESTS[lockfile].encode(),
+    }
+
+    seen, _report = _scan_bundle_with_osv_capture(tmp_path, monkeypatch, files)
+
+    # Without the lockfile's pin the manifest's range is sent with no version.
+    assert (ecosystem, name, None) not in seen, "BOM-prefixed lockfile never pinned its manifest"
+    assert (ecosystem, name, version) in seen
+
+
+def test_utf8_bom_strip_keeps_a_byte_order_mark_inside_the_manifest(tmp_path, monkeypatch):
+    # Only the leading mark is an encoding signature; a U+FEFF inside a package
+    # name is part of that name and must not be folded into another package.
+    manifest = '{"dependencies": {"lo\ufeffdash": "4.17.20"}}'
+
+    seen, _report = _scan_bundle_with_osv_capture(
+        tmp_path, monkeypatch, {"package.json": _UTF8_BOM + manifest.encode()}
+    )
+
+    assert ("npm", "lo\ufeffdash", "4.17.20") in seen, (
+        "BOM-prefixed manifest entry never reached OSV"
+    )
+    assert ("npm", "lodash", "4.17.20") not in seen, "a U+FEFF inside the manifest was removed"
