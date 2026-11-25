@@ -2253,6 +2253,367 @@ def _printf_invocation_has_following_operator(
                 return False
             return inner[cursor] in ";|&()<>"
 
+def _shell_operator_at(text: str, cursor: int) -> tuple[str, int] | None:
+    """Return the shell operator spelling at ``cursor`` and its end offset."""
+    if cursor >= len(text):
+        return None
+    for operator in ("&&", "||", ">>>", ">>", "<<<", "<<", ">&", "<&", "<>", "&>", ";;"):
+        if text.startswith(operator, cursor):
+            return operator, cursor + len(operator)
+    if text[cursor] in ";|&()<>":
+        return text[cursor], cursor + 1
+    return None
+
+
+def _is_safe_sed_script(script: str) -> bool:
+    """Return whether one decoded sed script is a bounded substitution or delete."""
+    if not script or len(script) > 256 or "\n" in script or "\r" in script:
+        return False
+    if script.startswith("s") and len(script) >= 4:
+        delimiter = script[1]
+        if delimiter.isalnum() or delimiter in " \t\\":
+            return False
+        parts: list[str] = []
+        current: list[str] = []
+        cursor = 2
+        while cursor < len(script) and len(parts) < 2:
+            character = script[cursor]
+            if character == "\\" and cursor + 1 < len(script):
+                current.extend((character, script[cursor + 1]))
+                cursor += 2
+                continue
+            if character == delimiter:
+                parts.append("".join(current))
+                current = []
+                cursor += 1
+                continue
+            current.append(character)
+            cursor += 1
+        if len(parts) != 2 or not parts[0] or len(parts[0]) > 128 or len(parts[1]) > 128:
+            return False
+        flags = script[cursor:]
+        return flags == "" or re.fullmatch(r"[0-9gp]+", flags) is not None
+    if script.startswith("/") and script.endswith("/d") and len(script) >= 4:
+        pattern = script[1:-2]
+        return (
+            0 < len(pattern) <= 128
+            and "/" not in pattern.replace("\\/", "")
+            and ";" not in pattern
+        )
+    return False
+
+
+def _is_bounded_printf_pipeline(
+    inner: str, check_runtime: Callable[[], None] | None = None
+) -> bool:
+    """Return whether ``inner`` is a bounded printf filter pipeline.
+
+    The first segment must be a printf invocation (optionally behind a
+    command, builtin, or env wrapper) with a static format and scalar
+    values. Each later segment must be a tr, head, grep, or sed filter
+    with static arguments only, joined by single pipes, with an optional
+    fixed echo tail. Runtime flags, file operands, redirections, lists,
+    and execution commands keep the existing coverage diagnostic.
+    """
+    runtime_check = check_runtime or (lambda: None)
+    if not inner or len(inner) > _PRINTF_STATIC_CHARS or "\n" in inner or "\r" in inner:
+        return False
+    segments: list[list[str]] = []
+    operators: list[str] = []
+    words: list[str] = []
+    cursor = 0
+    while True:
+        word, cursor, limited = _next_shell_invocation_word(inner, cursor, runtime_check)
+        if limited:
+            return False
+        if word is not None:
+            words.append(word)
+            if len(words) > 32:
+                return False
+            continue
+        if cursor >= len(inner):
+            segments.append(words)
+            break
+        if inner[cursor] == "#":
+            return False
+        found = _shell_operator_at(inner, cursor)
+        if found is None:
+            return False
+        operator, cursor = found
+        segments.append(words)
+        operators.append(operator)
+        words = []
+        if len(segments) > 8:
+            return False
+    if not segments or not segments[0]:
+        return False
+    if len(operators) >= 2 and operators[-2:] == ["&&", "||"]:
+        for segment in segments[-2:]:
+            if (
+                len(segment) != 2
+                or segment[0] != "echo"
+                or re.fullmatch(r"[A-Za-z0-9_]+", segment[1]) is None
+            ):
+                return False
+        segments = segments[:-2]
+        operators = operators[:-2]
+    if not segments or any(operator != "|" for operator in operators):
+        return False
+    if not 2 <= len(segments) <= 7:
+        return False
+    first = list(segments[0])
+    while first and first[0] in {"command", "builtin"}:
+        first = first[1:]
+        while first and first[0] in {"-p", "--"}:
+            first = first[1:]
+    if first and first[0] == "env":
+        first = first[1:]
+        while first and (
+            first[0] in {"-i", "--"}
+            or _SHELL_ASSIGNMENT_PREFIX_RE.match(first[0]) is not None
+        ):
+            first = first[1:]
+    if not first or first[0] != "printf":
+        return False
+    arguments = first[1:]
+    if arguments[:1] == ["--"]:
+        arguments = arguments[1:]
+    if not arguments or arguments[0].startswith("-"):
+        return False
+    format_word, values = arguments[0], arguments[1:]
+    if (
+        _DYNAMIC_SHELL_WORD_SENTINEL in format_word
+        or _RUNTIME_SHELL_PARAMETER_SENTINEL in format_word
+    ):
+        return False
+    if _PRINTF_FORMAT_WORD_RE.fullmatch(format_word) is None:
+        return False
+    for value in values:
+        if _DYNAMIC_SHELL_WORD_SENTINEL in value:
+            return False
+        if value == _RUNTIME_SHELL_PARAMETER_SENTINEL:
+            continue
+        if _RUNTIME_SHELL_PARAMETER_SENTINEL in value:
+            return False
+        if len(value) > 64 or _PRINTF_QUOTED_WORD_RE.fullmatch(value) is None:
+            return False
+    for segment in segments[1:]:
+        if not segment or any(
+            _DYNAMIC_SHELL_WORD_SENTINEL in word
+            or _RUNTIME_SHELL_PARAMETER_SENTINEL in word
+            for word in segment
+        ):
+            return False
+        command, args = segment[0], segment[1:]
+        if command == "tr":
+            if len(args) != 2 or any(
+                not 1 <= len(arg) <= 128 or arg.startswith("-") for arg in args
+            ):
+                return False
+        elif command == "head":
+            if len(args) != 1 or re.fullmatch(r"-[1-9][0-9]{0,2}", args[0]) is None:
+                return False
+        elif command == "grep":
+            if not args or len(args) > 5:
+                return False
+            pattern = args[-1]
+            flags = args[:-1]
+            if len(flags) > 4 or any(
+                re.fullmatch(r"-(?:[EFiqvx]{1,8}|m[1-9][0-9]{0,2})", flag) is None
+                for flag in flags
+            ):
+                return False
+            if not 1 <= len(pattern) <= 128 or pattern.startswith("-"):
+                return False
+        elif command == "sed":
+            scripts: list[str] = []
+            if args and args[0] != "-e":
+                if len(args) != 1:
+                    return False
+                scripts = args
+            else:
+                index = 0
+                while index < len(args):
+                    if args[index] != "-e" or index + 1 >= len(args):
+                        return False
+                    scripts.append(args[index + 1])
+                    index += 2
+                if not 1 <= len(scripts) <= 4:
+                    return False
+            if any(not _is_safe_sed_script(script) for script in scripts):
+                return False
+        else:
+            return False
+    return True
+
+
+def _is_printf_data_consumer_position(
+    content: str, start: int, check_runtime: Callable[[], None] | None = None
+) -> bool:
+    """Return whether the word at ``start`` is a proven printf data argument.
+
+    Parsed clause roles decide: assignment prefixes and clause prefix
+    words are skipped, the first remaining word must be printf (behind
+    an allowlisted wrapper), the target must be a value argument after
+    a static format, and the clause must carry no pipeline, list, or
+    redirection past the printf words. Command names, redirection
+    targets, test operands, unknown commands, and redefined filters
+    keep the existing coverage diagnostic.
+    """
+    runtime_check = check_runtime or (lambda: None)
+    if start < 0 or start >= len(content):
+        return False
+    segment_start = start
+    while segment_start > 0 and content[segment_start - 1] not in "\n\r;|&(){}":
+        segment_start -= 1
+    cursor = segment_start
+    command: str | None = None
+    wrapper: str | None = None
+    argument_index = -1
+    format_word: str | None = None
+    target_seen = False
+    expect_target = False
+    saw_redirection = False
+    words_seen = 0
+    while True:
+        gap_start = cursor
+        starts: list[int] = []
+        word, cursor, limited = _next_shell_invocation_word(
+            content, cursor, runtime_check, source_start=starts
+        )
+        if limited:
+            return False
+        if word is None:
+            if cursor >= len(content):
+                break
+            if content[cursor] == "#":
+                break
+            found = _shell_operator_at(content, cursor)
+            if found is None:
+                return False
+            operator, cursor = found
+            if operator in {"<", ">", ">>", "<<", "<<<", ">&", "<&", "<>", "&>"}:
+                if target_seen:
+                    return False
+                saw_redirection = True
+                expect_target = True
+                continue
+            break
+        word_start = starts[0] if starts else gap_start
+        gap = content[gap_start:word_start]
+        if "\n" in gap.replace("\\\r\n", "").replace("\\\n", ""):
+            break
+        words_seen += 1
+        if words_seen > 64:
+            return False
+        if expect_target:
+            expect_target = False
+            if word_start <= start < cursor:
+                return False
+            continue
+        if word_start <= start < cursor:
+            target_seen = True
+            if command is None or argument_index < 0 or format_word is None:
+                return False
+            break
+        if command is None:
+            if wrapper == "env":
+                if word in {"-i", "--"} or (
+                    _SHELL_ASSIGNMENT_PREFIX_RE.match(content, word_start) is not None
+                ):
+                    continue
+                if word != "printf":
+                    return False
+                command = "printf"
+                continue
+            if wrapper is not None:
+                if word in {"-p", "--"}:
+                    continue
+                if word != "printf":
+                    return False
+                command = "printf"
+                continue
+            if word in _SHELL_CLAUSE_PREFIX_WORDS or word in {"if", "while", "until"}:
+                continue
+            if _SHELL_ASSIGNMENT_PREFIX_RE.match(content, word_start) is not None:
+                continue
+            if word.isdigit():
+                peek = cursor
+                while peek < len(content) and content[peek] in " \t":
+                    peek += 1
+                if peek < len(content) and content[peek] in "<>":
+                    continue
+                return False
+            if word in {"command", "builtin", "env"}:
+                wrapper = word
+                continue
+            if word != "printf":
+                return False
+            command = "printf"
+            continue
+        if argument_index < 0:
+            if word == "--":
+                continue
+            if word.startswith("-"):
+                return False
+            if (
+                _DYNAMIC_SHELL_WORD_SENTINEL in word
+                or _RUNTIME_SHELL_PARAMETER_SENTINEL in word
+            ):
+                return False
+            if not word or len(word) > 128:
+                return False
+            format_word = word
+            argument_index = 0
+            continue
+        argument_index += 1
+    if (
+        not target_seen
+        or command != "printf"
+        or format_word is None
+        or argument_index < 0
+        or saw_redirection
+    ):
+        return False
+    if (
+        re.search(
+            r"(?:^|[;\n|&({])\s*(?:export\s+|local\s+|declare\s+|readonly\s+|typeset\s+)?PATH\+?=",
+            content,
+        )
+        is not None
+    ):
+        return False
+    if (
+        re.search(
+            r"(?:^|[;\n])\s*(?:function\s+)?(?:printf|sed|tr|head|grep)\s*\(\s*\)", content
+        )
+        is not None
+    ):
+        return False
+    if re.search(r"\balias\s+(?:printf|sed|tr|head|grep)=", content) is not None:
+        return False
+    while True:
+        gap_start = cursor
+        starts = []
+        word, cursor, limited = _next_shell_invocation_word(
+            content, cursor, runtime_check, source_start=starts
+        )
+        if limited:
+            return False
+        if word is not None:
+            word_start = starts[0] if starts else gap_start
+            gap = content[gap_start:word_start]
+            if "\n" in gap.replace("\\\r\n", "").replace("\\\n", ""):
+                return True
+            continue
+        if cursor >= len(content) or content[cursor] == "#":
+            return True
+        found = _shell_operator_at(content, cursor)
+        if found is None:
+            return False
+        operator, _ = found
+        return operator in {";", ")", "}"}
+
 
 def _static_printf_substitution(
     content: str,
@@ -2320,29 +2681,20 @@ def _static_printf_substitution(
                 inner_start + high,
                 ParserUncheckedScope.EXPRESSION,
             )
+            return None
     literal_result = quoted_result and not backtick and _has_literal_printf_arguments(inner)
-    if quoted_result and not backtick and not literal_result:
+    if quoted_result and not backtick and not literal_result and quoted_data_position:
         command, _, _ = _next_shell_invocation_word(inner, 0, runtime_check)
-        if command == "printf":
-            if _printf_invocation_has_following_operator(inner, runtime_check):
-                if quoted_data_position:
-                    # The printf output is piped (or listed/redirected) into
-                    # another command, so the substitution's value is that
-                    # command's runtime-dependent output, not a bounded printf
-                    # result. Return unresolved without a parse-limit
-                    # diagnostic. Scoped to proven quoted data arguments: a
-                    # quoted substitution in command position names the
-                    # executable, and an unquoted substitution in command
-                    # position supplies the command itself through word
-                    # splitting, so both keep their reconstruction
-                    # diagnostic instead.
-                    return None
-                # A quoted substitution in command position may name the
-                # executable: fall through so the operator in the inner
-                # text keeps its reconstruction diagnostic below.
-            else:
-                failed()
-                return None
+        if command == "printf" and _is_bounded_printf_pipeline(inner, runtime_check):
+            # The printf output is piped through bounded filters, so the
+            # substitution value is that pipeline runtime-dependent output,
+            # not a bounded printf result. Return unresolved without a
+            # parse-limit diagnostic. Scoped to proven quoted data
+            # arguments of a bounded printf consumer with a bounded inner
+            # pipeline: command names, unknown consumers, runtime filter
+            # controls, and bare printf values fall through so the bounded
+            # argument parser keeps its existing diagnostic and cause.
+            return None
     if "|" in inner and (pipeline := _SYMBOLIC_PRINTF_PIPELINE_RE.fullmatch(inner)):
         # A variable grep pattern can supply flags as well as change matching.
         # Preserve that uncertainty at the argument that controls the filter.
@@ -2385,14 +2737,15 @@ def _static_printf_substitution(
         and not literal_result
         and quoted_result
         and quoted_data_position
-        and _printf_invocation_has_following_operator(inner, runtime_check)
+        and _is_bounded_printf_pipeline(inner, runtime_check)
     ):
         # Same treatment for allowlisted wrappers (``command``/``builtin``/
         # ``env``) whose first word is not literally ``printf``. Scoped to
-        # proven quoted data arguments in ``$(...)`` only, in a non-command
-        # position: a backtick substitution keeps its runtime-command gap,
-        # as the quoted-result branch above does, and an unquoted
-        # substitution keeps its reconstruction diagnostic.
+        # proven quoted data arguments of a bounded printf consumer with a
+        # bounded inner pipeline in ``$(...)`` only: a backtick
+        # substitution keeps its runtime-command gap, as the quoted-result
+        # branch above does, and an unquoted substitution keeps its
+        # reconstruction diagnostic.
         return None
     if not recognized or (not literal_result and re.search(r"[;|&<>\r\n]", inner) is not None):
         if diagnostics is not None and invocation_diagnostics:
@@ -2651,21 +3004,21 @@ def _is_printf_substitution(
         and not backtick
         and quoted_result
         and quoted_data_position
-        and _printf_invocation_has_following_operator(inner, runtime_check)
+        and _is_bounded_printf_pipeline(inner, runtime_check)
     ):
-        # A pipeline, command list, or redirection after the printf words
-        # means the substitution's value is produced by another command,
-        # so this is not a bounded printf substitution: the value is
-        # runtime-dependent data, as for an ``echo`` pipeline, and its
-        # failure to resolve statically is not a coverage gap. Scoped to
-        # proven quoted data arguments in ``$(...)`` only, in a
-        # non-command position: a double-quoted substitution in command
-        # position names the executable, and an unquoted substitution in
-        # command position supplies the command itself through word
-        # splitting, so the outer-operand check has nothing left to
-        # inspect and the reconstruction diagnostic is kept. A backtick
-        # substitution is the runtime command itself, so its gap is
-        # preserved instead of being treated as resolved data.
+        # A bounded filter pipeline after the printf words means the
+        # substitution value is produced by another command, so this is
+        # not a bounded printf substitution: the value is runtime-dependent
+        # data, as for an ``echo`` pipeline, and its failure to resolve
+        # statically is not a coverage gap. Scoped to proven quoted data
+        # arguments of a bounded printf consumer with a bounded inner
+        # pipeline in ``$(...)`` only: a double-quoted substitution in
+        # command position names the executable, and an unquoted
+        # substitution in command position supplies the command itself
+        # through word splitting, so the outer-operand check has nothing
+        # left to inspect and the reconstruction diagnostic is kept. A
+        # backtick substitution is the runtime command itself, so its gap
+        # is preserved instead of being treated as resolved data.
         return False
     if recognized or not check_command_context:
         if recognized and diagnostics is not None:
@@ -2885,12 +3238,13 @@ def _parse_shell_command_word(
     if quoted_data_position is None:
         # Quoting alone never proves a data position: a shell executes a
         # double-quoted substitution in command position as the command
-        # name, so the quoted printf exemption also needs the enclosing
-        # word outside command position. A native argument is proven data
-        # by its caller; any other word is data only when it does not open
-        # a line or follow a command separator. A fragment parsed on its
-        # own (start 0) proves nothing, so it stays fail-closed.
-        quoted_data_position = native_argument or not _is_shell_command_position(content, start)
+        # name, including after assignment prefixes. A native argument is
+        # proven data by its caller; any other word needs parsed clause
+        # roles proving a bounded printf consumer. A fragment parsed on
+        # its own (start 0) proves nothing, so it stays fail-closed.
+        quoted_data_position = native_argument or _is_printf_data_consumer_position(
+            content, start, runtime_check
+        )
 
     output: list[str] = []
     wrapper_quote = enclosing_delimiter or (
@@ -2957,8 +3311,8 @@ def _parse_shell_command_word(
                             substitution_end,
                             runtime_check,
                             # The exemption needs a proven quoted data
-                            # argument: quoting here, and a non-command
-                            # position for the enclosing word, which travels
+                            # argument: quoting here, and a bounded printf
+                            # consumer for the enclosing word, which travels
                             # separately so a literal printf in command
                             # position still resolves to its value. A quoted
                             # substitution in command position names the
@@ -3084,11 +3438,11 @@ def _parse_shell_command_word(
                     # The reader started on this substitution, so it has no
                     # quote state of its own: the caller supplies the starts
                     # proven to sit inside a double-quoted span, and only
-                    # those keep the quoted-data exemption, and only in a
-                    # proven non-command position for the enclosing word,
-                    # which travels separately so a literal printf in
-                    # command position still resolves to its value. A bare
-                    # substitution keeps its reconstruction diagnostic.
+                    # those keep the quoted-data exemption, and only for a
+                    # proven bounded printf consumer, which travels
+                    # separately so a literal printf in command position
+                    # still resolves to its value. A bare substitution
+                    # keeps its reconstruction diagnostic.
                     quoted_result=quoted_substitution_starts is not None
                     and cursor in quoted_substitution_starts,
                     quoted_data_position=quoted_data_position,
@@ -4380,13 +4734,14 @@ def _quoted_candidate_is_complete(
         # The fragment starts on the substitution itself, so the reader has
         # no quote state: only a start proven to sit inside a double-quoted
         # span keeps the quoted-data exemption here. The fragment cannot
-        # prove the enclosing word's position, so the caller supplies it
-        # from the full source: a quoted substitution in command position
-        # names the executable and keeps its diagnostic.
+        # prove the enclosing word role, so the caller supplies it from
+        # the full source with parsed clause roles: a quoted substitution
+        # in command position names the executable and keeps its
+        # diagnostic.
         quoted_substitution_starts={0}
         if quote_limits is not None and start in quote_limits and content.startswith("$(", start)
         else None,
-        quoted_data_position=not _is_shell_command_position(content, start),
+        quoted_data_position=_is_printf_data_consumer_position(content, start, check_runtime),
     )
     if parsed is None or parsed.limited:
         return False
@@ -4686,9 +5041,9 @@ def _has_shell_command_word_exhaustion(
     # starts on such a substitution with no quote state of its own, so the
     # enclosing quoted word's exemption would otherwise be lost when the
     # substitution is revisited as an independent candidate. Only these
-    # starts keep the quoted-data exemption, and only in a proven
-    # non-command position for the enclosing word; a bare substitution
-    # keeps its reconstruction diagnostic.
+    # starts keep the quoted-data exemption, and only for a proven
+    # bounded printf consumer; a bare substitution keeps its
+    # reconstruction diagnostic.
     quoted_substitution_starts = frozenset(
         position for position in (quote_limits or {}) if content.startswith("$(", position)
     )
@@ -4930,15 +5285,18 @@ def _has_shell_command_word_exhaustion(
                     substitution_end,
                     # The exemption is for proven quoted data arguments
                     # only: a double quote immediately before the
-                    # substitution puts it in a quoted argument, and the
-                    # enclosing word must sit outside command position,
-                    # where a quoted substitution would name the executable.
-                    # The position travels separately from quoting, so a
-                    # literal printf in command position still resolves
-                    # to its value. A bare substitution in command
-                    # position keeps its reconstruction diagnostic.
+                    # substitution puts it in a quoted argument, and parsed
+                    # clause roles must prove a bounded printf consumer,
+                    # since a quoted substitution in command position
+                    # names the executable. The role travels separately
+                    # from quoting, so a literal printf in command
+                    # position still resolves to its value. A bare
+                    # substitution in command position keeps its
+                    # reconstruction diagnostic.
                     quoted_result=substitution_start == start + 1 and content[start] == '"',
-                    quoted_data_position=not _is_shell_command_position(content, start),
+                    quoted_data_position=_is_printf_data_consumer_position(
+                        content, start, check_runtime
+                    ),
                     check_runtime=check_runtime,
                 ):
                     if not _quoted_candidate_is_complete(
@@ -8497,10 +8855,42 @@ def _bounded_shell_tokens(
         )
         return tuple(tokens), limit, True
 
+    outer_printf = False
+    _outer_cursor = command_start
+    _outer_words: list[str] = []
+    for _ in range(6):
+        _outer_word, _outer_cursor, _outer_limited = _next_shell_invocation_word(
+            content, _outer_cursor, runtime_check
+        )
+        if _outer_limited or _outer_word is None:
+            break
+        _outer_words.append(_outer_word)
+        if _outer_word == "printf":
+            outer_printf = all(
+                word in {"command", "builtin", "env", "-p", "-i", "--"}
+                or _SHELL_ASSIGNMENT_PREFIX_RE.match(word) is not None
+                for word in _outer_words[:-1]
+            )
+            break
+        if _outer_word not in {"command", "builtin", "env", "-p", "-i", "--"} and (
+            _SHELL_ASSIGNMENT_PREFIX_RE.match(_outer_word) is None
+        ):
+            break
+
     def printf_value(
         start: int, end: int, *, backtick: bool = False, quoted: bool = False
     ) -> str | None:
         nonlocal parse_limited
+        _texts = [token.text for token in tokens]
+        _format_index = 1 if _texts[:1] == ["--"] else 0
+        _data_position = bool(
+            quoted
+            and outer_printf
+            and current_is_argument
+            and len(_texts) > _format_index
+            and "$DYNAMIC" not in _texts[_format_index]
+            and all(not text.startswith("-") or text == "--" for text in _texts)
+        )
         value, limited, diagnostic = _printf_substitution_result(
             content,
             start,
@@ -8508,9 +8898,10 @@ def _bounded_shell_tokens(
             runtime_check,
             backtick=backtick,
             quoted_result=quoted,
-            # This tokenizer only scans argument words (the command word
-            # sits before body_start), so a quoted pipeline here is data.
-            quoted_data_position=True,
+            # This tokenizer scans argument words after the command word.
+            # Only a value argument of a proven outer printf is data;
+            # unknown commands keep the existing coverage diagnostic.
+            quoted_data_position=_data_position,
             recognize_limit=not parse_limited,
             check_command_context=False,
         )

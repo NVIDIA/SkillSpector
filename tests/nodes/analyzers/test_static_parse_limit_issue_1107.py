@@ -146,15 +146,32 @@ def test_executable_printf_pipeline_keeps_coverage_warning(line: str) -> None:
             """echo hi | \"$(printf '%s' \"$tool_name\" | cat)\" """,
             id="quoted-command-after-pipe",
         ),
+        pytest.param(
+            """FOO=bar \"$(printf '%s' \"$tool_name\" | cat)\" """,
+            id="quoted-command-after-assignment-prefix",
+        ),
+        pytest.param(
+            """FOO=bar BAZ=qux \"$(printf '%s' \"$tool_name\" | cat)\" """,
+            id="quoted-command-after-two-assignment-prefixes",
+        ),
+        pytest.param(
+            """FOO=bar \"$(printf '%s' \"$1\" | sed 's/a/b/')\" """,
+            id="quoted-command-after-assignment-bounded-pipeline",
+        ),
+        pytest.param(
+            """FOO=bar \"$(command printf '%s' \"$1\" | sed 's/a/b/')\" """,
+            id="quoted-command-wrapper-after-assignment-prefix",
+        ),
     ],
 )
 def test_quoted_command_printf_pipeline_keeps_coverage_warning(line: str) -> None:
     """Review #1109 (rng1995): a quoted substitution can name the command.
 
     A shell executes a double-quoted substitution in command position as
-    the executable, so quoting alone never proves a data argument: the
-    reconstruction diagnostic must stay, as for the unquoted case. The
-    outer-printf fixture still completes (see the #1107 tests above).
+    the executable, including after assignment prefixes, so quoting alone
+    never proves a data argument: the reconstruction diagnostic must
+    stay, as for the unquoted case. The outer-printf fixture still
+    completes (see the #1107 tests above).
     """
     source = "#!/bin/sh\n" + line.strip() + "\n"
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is True
@@ -163,6 +180,18 @@ def test_quoted_command_printf_pipeline_keeps_coverage_warning(line: str) -> Non
 def test_quoted_wrapper_printf_pipeline_still_completes() -> None:
     """Review #1109: the quoted wrapper case keeps the #1107 exemption."""
     line = """printf "'%s'" "$(command printf '%s' "$1" | sed 's/a/b/')" """
+    source = "#!/bin/sh\n" + line.strip() + "\n"
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is False
+
+
+def test_assignment_prefix_before_printf_still_completes() -> None:
+    """Review #1109: an assignment prefix before printf keeps the exemption.
+
+    The prefix sets the printf environment; the substitution remains a
+    value argument of a bounded printf consumer, unlike a quoted word
+    that itself follows the prefix as the command name.
+    """
+    line = """FOO=bar printf "'%s'" "$(printf '%s' "$1" | sed 's/a/b/')" """
     source = "#!/bin/sh\n" + line.strip() + "\n"
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is False
 
