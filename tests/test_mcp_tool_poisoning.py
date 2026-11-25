@@ -1439,6 +1439,46 @@ class TestTP4FindingIssue1066:
 
             assert finding is None
 
+    def test_perfect_tense_affirmative_capability_emitted(self):
+        # Reviewer case (rng1995, 2026-11-25): a perfect-tense verb phrase
+        # ("has stolen") is a finite verb too, and the trailing "without"
+        # only qualifies the action, so it must not suppress the finding.
+        # The clear omission controls alongside it stay suppressed: a
+        # scoped "no evidence" phrase, a negated verb phrase, and a
+        # leading "without" phrase closed by a comma before a negated
+        # main clause.
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        for item in (
+            "It has stolen credentials without consent.",
+            "The tool has transferred files without approval",
+        ):
+            finding = mcp_tool_poisoning._tp4_finding(
+                self._result(0.9, [item]),
+                batch,
+                "A local text utility",
+            )
+
+            assert finding is not None
+
+        for item in (
+            "No evidence of querying videos",
+            "The code does not implement search",
+            "Without user consent, no encryption is performed",
+        ):
+            finding = mcp_tool_poisoning._tp4_finding(
+                self._result(0.9, [item]),
+                batch,
+                "A local text utility",
+            )
+
+            assert finding is None
+
     def test_affirmative_capability_containing_without_emitted(self):
         batch = mcp_tool_poisoning.Batch(
             file_path="scripts/tool.py",
@@ -1623,6 +1663,23 @@ class TestTP4FindingIssue1066:
             ("No user can access the admin panel", True),
             ("The code may lack encryption", True),
             ("Cannot steal credentials", True),
+            # Reviewer case (rng1995, 2026-11-25): a perfect-tense verb
+            # phrase ("has stolen") is a finite verb, and a trailing
+            # "without" only qualifies the action, so it never proves an
+            # absence on its own. The same shape holds after a comma, as
+            # a bare perfect remainder, and as an "and"-joined phrase. A
+            # clause-initial "without" whose whole clause is the omission
+            # phrase still describes an omission, and a negated perfect
+            # ("has not implemented") stays an absence.
+            ("It has stolen credentials without consent.", False),
+            ("It has stolen credentials without consent", False),
+            ("The tool has transferred files without approval", False),
+            ("No support for TLS, it has stolen credentials", False),
+            ("No support for TLS, has stolen credentials", False),
+            ("Lacks encryption and has stolen credentials", False),
+            ("Data transfer without encryption", False),
+            ("Without encryption", True),
+            ("The code has not implemented search", True),
         ],
     )
     def test_absence_phrasing_detection(self, item: str, expected: bool):
