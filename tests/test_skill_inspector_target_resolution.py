@@ -25,9 +25,13 @@ def test_step_1_names_the_install_channel_and_pins_the_version() -> None:
     text = _skill_text()
 
     assert "install channel" in text
-    assert "git clone --branch <tag>" in text
+    assert "refs/tags/<tag>" in text
+    assert "fully qualified tag ref" in text
+    assert "verify the checked-out commit matches that ref" in text
+    assert "rev-parse HEAD" in text
     assert "npm pack <pkg>@<version>" in text
-    assert "never a default-branch clone" in text
+    assert "Never use a default-branch clone" in text
+    assert "never use the ambiguous `git clone --branch <tag>`" in text
 
 
 def test_step_1_records_the_resolved_version_in_the_source_line() -> None:
