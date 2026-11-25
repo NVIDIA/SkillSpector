@@ -116,6 +116,24 @@ The upstream [wheel-build update](https://github.com/VirusTotal/yara-python/pull
 is separate from publishing a new release to PyPI. Check the published files
 before choosing a newer interpreter; a source build may still be required.
 
+### Windows Application Control (WDAC)
+
+On Windows endpoints managed by Windows Application Control, SkillSpector
+cannot start a scan when the policy blocks unsigned native modules. The
+scanner depends on compiled extensions (notably `ormsgpack`, pulled in
+transitively through `langgraph-checkpoint`, and `yara-python`, a direct
+dependency); when WDAC blocks one of their `.pyd` files at import, every
+scan fails. SkillSpector fails fast with a diagnostic naming the blocked
+module instead of running a scan that cannot complete.
+
+Workarounds until signed wheels are available (tracked in
+[NVIDIA/SkillSpector#1166](https://github.com/NVIDIA/SkillSpector/issues/1166)):
+
+- Run SkillSpector in WSL or the provided Docker image (see
+  [Docker](#docker-no-python-required)).
+- Ask your administrator to allowlist the SkillSpector install directory
+  (or the `ormsgpack` and `yara-python` wheels) in the WDAC policy.
+
 ### Docker (no Python required)
 
 Run SkillSpector without installing Python by building it locally from the included [Dockerfile](Dockerfile). The image is based on the Docker Official Python `3.12-slim-bookworm` image.
