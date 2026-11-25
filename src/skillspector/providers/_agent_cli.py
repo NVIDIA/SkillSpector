@@ -1124,6 +1124,43 @@ def _opencode_effective_policy_action(action: str, resource: object) -> str:
     return _OPENCODE_LEGACY_POLICY_ACTIONS.get(resource[:separator], action)
 
 
+def _opencode_managed_substitution(value: object) -> str | None:
+    """Return the first ``{env:...}``/``{file:...}`` token in *value*, if any.
+
+    Pinned OpenCode 2.2.6/2.2.7 expands file and environment references
+    in the raw config text before parsing (``ConfigVariable.substitute``
+    in ``config/variable.ts``, applied by ``loadFile`` and by
+    ``loadPreferences`` for the MDM plist), so the parsed document this
+    gate inspects is not the document the server acts on: a literal
+    action of ``{file:action.txt}`` becomes whatever that file contains,
+    including ``plugin.use``. The gate cannot evaluate those references
+    the way the child would (different environment, different working
+    directory, files that may change between check and start), so any
+    token that can reach plugin policy is refused instead. Keys are
+    scanned as well as values because substitution is textual and runs
+    before parsing: a token inside a key can reshape the structure the
+    decoder sees.
+    """
+    if isinstance(value, str):
+        for prefix in ("{env:", "{file:"):
+            start = value.find(prefix)
+            if start != -1:
+                end = value.find("}", start)
+                return value[start : end + 1] if end != -1 else value[start:]
+        return None
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found = _opencode_managed_substitution(key) or _opencode_managed_substitution(item)
+            if found is not None:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found = _opencode_managed_substitution(item)
+            if found is not None:
+                return found
+    return None
+
+
 def _refuse_opencode_managed_config(config: dict[str, Any], path: str, description: str) -> None:
     """Raise AgentCLIError when a managed config document configures plugins.
 
@@ -1138,7 +1175,38 @@ def _refuse_opencode_managed_config(config: dict[str, Any], path: str, descripti
     like a direct ``plugin.use`` rule (pinned policy.ts); a rule whose
     action is not a string, or an ``integration.use`` rule whose resource
     is not a string, is ambiguous managed policy and refuses too.
+    A ``{env:...}`` or ``{file:...}`` substitution anywhere in the
+    ``policies`` rules or the ``plugin``/``plugins`` values refuses as
+    well: both pinned releases expand those references before
+    recognizing the action (pinned ``config/variable.ts``), so a
+    file-derived action can resolve to a managed ``plugin.use`` allow
+    after this guard passes on the literal text, and an ancestor
+    project's plugin can then load during startup. The effective policy
+    cannot be established from the literal document, so the start is
+    refused rather than guessed at.
     """
+    for key in config:
+        token = _opencode_managed_substitution(key)
+        if token is not None:
+            raise AgentCLIError(
+                f"OpenCode {description} {path!r} uses substitution {token!r} "
+                "in a configuration key: OpenCode expands file and "
+                "environment references before parsing, so the effective "
+                "managed policy cannot be established from the literal "
+                "document; refusing to start a 2.x server"
+            )
+    for section in ("policies", "plugin", "plugins"):
+        if section not in config:
+            continue
+        token = _opencode_managed_substitution(config[section])
+        if token is not None:
+            raise AgentCLIError(
+                f"OpenCode {description} {path!r} uses substitution {token!r} "
+                f"in {section!r}: OpenCode expands file and environment "
+                "references before recognizing policy actions, so the "
+                "effective managed policy cannot be established from the "
+                "literal document; refusing to start a 2.x server"
+            )
     policies = config.get("policies", [])
     if not isinstance(policies, list):
         raise AgentCLIError(f"OpenCode {description} {path!r} has a non-list 'policies' value")
@@ -1360,7 +1428,12 @@ def _check_opencode_system_sources(env: dict[str, str] | None = None) -> None:
       pinned policy decoder converts to ``plugin.use``;
     - any plugin listed in ``plugin`` or ``plugins`` (add operations
       only: a ``-name`` removal entry configures no plugin);
-    - any entry under ``<system dir>/plugin`` or ``<system dir>/plugins``.
+    - any entry under ``<system dir>/plugin`` or ``<system dir>/plugins``;
+    - any ``{env:...}``/``{file:...}`` substitution in the ``policies``
+      rules or ``plugin``/``plugins`` values: both pinned releases
+      expand those references before recognizing the action (pinned
+      ``config/variable.ts``), so a file-derived action can resolve to
+      a managed ``plugin.use`` allow after a literal check passes.
 
     A missing source means no machine-wide plugin exists there and that
     part passes. A source that cannot be listed, read, or parsed fails

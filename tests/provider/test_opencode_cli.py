@@ -1131,6 +1131,31 @@ class TestOpencodeDenyAllPolicyV2:
             encoding="utf-8",
         )
 
+    @staticmethod
+    def _write_system_plugin_interpolated_allow(system_dir: Path) -> None:
+        """System dir whose allow action only exists after substitution.
+
+        P0 (review 6062028862, #1086): both pinned releases expand
+        {file:...} references in the raw config text before parsing
+        (config/variable.ts), so the literal action below becomes
+        "plugin.use" in the server while a literal check sees no allow
+        at all. The referenced file really carries "plugin.use". No
+        plugins/ directory and no listed plugin: the gate must refuse
+        on the interpolated rule alone, before any 2.x server starts,
+        or an ancestor project's plugin could load during startup.
+        """
+        (system_dir / "action.txt").write_text("plugin.use", encoding="utf-8")
+        (system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "{file:action.txt}", "resource": "*", "effect": "allow"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
     @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
     def test_2x_system_plugin_allow_fails_before_startup(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1215,6 +1240,49 @@ class TestOpencodeDenyAllPolicyV2:
         ok, reason = _opencode_auth_check(str(auth_binary))
         assert ok is False
         assert reason is not None and "system" in reason
+        assert list(auth_markers.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_2x_system_plugin_interpolated_allow_fails_before_startup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # P0 (review 6062028862, #1086): the pre-import marker regression
+        # for an interpolated managed rule. The allow action exists only
+        # after OpenCode expands {file:action.txt}, so auth, preflight
+        # and inference must all fail closed before any 2.x server
+        # starts: no probe markers at all, so no plugin code could have
+        # loaded.
+        system_dir = tmp_path / "system"
+        self._write_system_plugin_interpolated_allow(system_dir)
+        monkeypatch.setattr(
+            _agent_cli, "_opencode_system_config_dir", lambda _env=None: str(system_dir)
+        )
+
+        # Preflight: the gate fires before `debug agents --standalone`.
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode_v2(binary, markers)
+        argv = _build_opencode_argv(str(binary), "", 0)
+        env = _prepare_opencode_env({"PATH": os.environ.get("PATH", "")}, str(tmp_path), argv)
+        with pytest.raises(AgentCLIError, match="substitution"):
+            _preflight_opencode_policy(str(binary), argv, env, str(tmp_path))
+        assert list(markers.iterdir()) == []
+
+        # Inference: run_agent_cli fails in the preflight, never runs.
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+        with pytest.raises(AgentCLIError, match="substitution"):
+            run_agent_cli("opencode", "use every host tool", model="")
+        assert list(markers.iterdir()) == []
+
+        # Auth: the probe reports unavailable and never runs `auth list`.
+        auth_binary = tmp_path / "opencode-auth"
+        auth_markers = tmp_path / "auth-outside"
+        auth_markers.mkdir()
+        TestOpencodeAuthProbeIsolation._write_fake_auth_2x(auth_binary, auth_markers)
+        ok, reason = _opencode_auth_check(str(auth_binary))
+        assert ok is False
+        assert reason is not None and "substitution" in reason
         assert list(auth_markers.iterdir()) == []
 
     @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
@@ -1403,6 +1471,105 @@ class TestOpencodeSystemSources:
         (_system_dir / "opencode.json").write_text(
             json.dumps(
                 {"policies": [{"action": "integration.use", "resource": "*", "effect": "allow"}]}
+            ),
+            encoding="utf-8",
+        )
+        _check_opencode_system_sources()
+
+    def test_system_file_substituted_action_raises(self, _system_dir: Path) -> None:
+        # P0 (review 6062028862, #1086): pinned config/variable.ts expands
+        # {file:...} references in the raw text before parsing, so this
+        # literal action becomes "plugin.use" in the server even though
+        # the document the gate parses never contains that string. The
+        # referenced file really does carry the allow action; the gate
+        # must refuse on the substitution itself, not evaluate the file.
+        (_system_dir / "action.txt").write_text("plugin.use", encoding="utf-8")
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "{file:action.txt}", "resource": "*", "effect": "allow"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="substitution"):
+            _check_opencode_system_sources()
+
+    def test_system_env_substituted_action_raises(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "{env:OPENCODE_POLICY_ACTION}", "resource": "*", "effect": "allow"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="substitution"):
+            _check_opencode_system_sources()
+
+    def test_system_env_substituted_legacy_resource_raises(self, _system_dir: Path) -> None:
+        # An environment-derived resource can turn a legacy
+        # integration.use rule into a plugin.use allow after expansion,
+        # so a substituted resource refuses exactly like a substituted
+        # action.
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {
+                            "action": "integration.use",
+                            "resource": "{env:OPENCODE_POLICY_RESOURCE}",
+                            "effect": "allow",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="substitution"):
+            _check_opencode_system_sources()
+
+    def test_system_file_substituted_effect_raises(self, _system_dir: Path) -> None:
+        # A substituted effect can flip a literal deny into an allow
+        # after expansion, so it refuses even on a plugin.use rule.
+        (_system_dir / "effect.txt").write_text("allow", encoding="utf-8")
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "policies": [
+                        {"action": "plugin.use", "resource": "*", "effect": "{file:effect.txt}"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="substitution"):
+            _check_opencode_system_sources()
+
+    def test_system_substituted_plugin_entry_raises(self, _system_dir: Path) -> None:
+        (_system_dir / "opencode.json").write_text(
+            json.dumps({"plugins": ["{file:plugin-name.txt}"]}),
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="substitution"):
+            _check_opencode_system_sources()
+
+    def test_system_substitution_outside_policy_passes(self, _system_dir: Path) -> None:
+        # A substitution that cannot reach plugin policy (here a model
+        # name) does not refuse: the boundary is the effective plugin
+        # policy, not managed configuration in general.
+        (_system_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "model": "{env:OPENCODE_MODEL}",
+                    "policies": [
+                        {"action": "plugin.use", "resource": "*", "effect": "deny"}
+                    ],
+                }
             ),
             encoding="utf-8",
         )
