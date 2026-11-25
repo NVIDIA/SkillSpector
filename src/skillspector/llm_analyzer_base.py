@@ -41,9 +41,7 @@ from random import uniform
 from typing import Any, Literal, cast, get_args
 
 import tiktoken
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import BaseMessage
-from langchain_openai.chat_models.base import BaseChatOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from tiktoken import registry as tiktoken_registry
 
@@ -82,7 +80,6 @@ from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
 from skillspector.providers import UnknownProviderError, get_active_provider, has_cli_capability
 from skillspector.providers._agent_cli import MAX_INPUT_BYTES
-from skillspector.providers.gemini import GeminiProvider
 from skillspector.response_recovery import (
     parse_recovery_value,
     recover_payload,
@@ -189,6 +186,8 @@ REQUEST_FRAMING_TOKENS = 256
 
 def _input_token_counter_key(chat_model: object) -> tuple[object, ...]:
     """Retain the selected counter for equivalent client configurations."""
+    from langchain_openai.chat_models.base import BaseChatOpenAI
+
     if not isinstance(chat_model, BaseChatOpenAI):
         return ("conservative_utf8_bytes",)
     custom = getattr(chat_model, "custom_get_token_ids", None)
@@ -208,6 +207,7 @@ def _input_token_counter(chat_model: object) -> tuple[Callable[[str], int], str]
     A model label must not silently inherit another model's tokenizer. Byte
     length is a conservative bound for text when no verified codec is known.
     """
+    from langchain_openai.chat_models.base import BaseChatOpenAI
 
     def byte_bound(text: str) -> int:
         return len(text.encode("utf-8", errors="replace"))
@@ -620,6 +620,9 @@ def _uses_native_connection_retries(
     max_retries: int = API_CONNECTION_MAX_RETRIES,
 ) -> bool:
     """Set the native retry budget and report whether native retries remain enabled."""
+    from langchain_anthropic import ChatAnthropic
+    from langchain_openai.chat_models.base import BaseChatOpenAI
+
     if isinstance(chat_model, BaseChatOpenAI):
         for client in (chat_model.root_client, chat_model.root_async_client):
             if client is not None:
@@ -637,6 +640,9 @@ def _retarget_request_timeout(chat_model: object, timeout: float | None) -> bool
     Returns ``False`` for transports that keep no mutable deadline, so the caller can
     fall back to constructing a replacement model for that call.
     """
+    from langchain_anthropic import ChatAnthropic
+    from langchain_openai.chat_models.base import BaseChatOpenAI
+
     if isinstance(chat_model, BaseChatOpenAI):
         clients = (chat_model.root_client, chat_model.root_async_client)
         if any(client is None for client in clients):
@@ -1654,6 +1660,10 @@ class LLMAnalyzerBase:
         await asyncio.sleep(delay if remaining is None else min(delay, remaining))
 
     def _model_for_call(self) -> tuple[object, object | None]:
+        from langchain_openai.chat_models.base import BaseChatOpenAI
+
+        from skillspector.providers.gemini import GeminiProvider
+
         remaining = self._require_time_remaining()
         if not self._dynamic_timeout:
             return self._llm, self._structured_llm
