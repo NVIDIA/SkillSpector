@@ -33,7 +33,15 @@ Do not rely on the numeric score alone. A low score can miss semantic risk, and 
 
 1. Resolve the target.
 
-   Accept a local skill directory, downloaded archive, or repository URL. If the user provides a URL, clone or download it into a temporary directory before review. Do not run installer scripts from the target.
+   Accept a local skill directory, downloaded archive, or repository URL. Review the exact artefact that will be installed, not the default branch of the whole repository: a verdict is only valid for the artefact it examined.
+
+   Name the install channel (git tag or commit, publish branch, package registry tarball, or release binary) and fetch from that channel at the exact version the install pins. For a git tag, clone the repository and check out the fully qualified tag ref, for example `git clone <url> <dir> && git -C <dir> fetch origin refs/tags/<tag> && git -C <dir> checkout --detach refs/tags/<tag>`, then verify the checked-out commit matches that ref (`git -C <dir> rev-parse HEAD` equals `git -C <dir> rev-parse refs/tags/<tag>^{commit}`) before scanning. For a git commit, check out the full commit SHA the install pins and verify `HEAD` matches it the same way. Or use `npm pack <pkg>@<version>` for a registry tarball. Never use a default-branch clone, and never use the ambiguous `git clone --branch <tag>`, which prefers a same-named branch (`refs/heads/<tag>`) over the tag when both exist. If the user gives only a repository URL with no pinned version, ask which tag, commit, or release will be installed before reviewing. Record the resolved version or commit in the report's Source line, and make every line reference in the report point at that artefact.
+
+   When the target writes skill or instruction files at run time, locate the generator and review the rendered text, above all its trigger `description`: a file-based scan never sees text that only exists after the first run. Do not run the generator to obtain that text. When the rendered text depends on runtime inputs (configuration chosen on first run, environment values, or user selections), reconstruct it statically from the generator source by listing every input it branches on and reviewing each resulting variant, or ask for a rendered artifact produced outside this review and review that instead. If neither path yields the final text, record the missing coverage in the report and cap the verdict at `CAUTION`: the verdict does not cover the generated instruction text.
+
+   When installed hooks or scripts execute code outside the installed path (a globally installed CLI, a self-updater), list that code and either review it or state plainly that the verdict does not cover it.
+
+   Do not run installer scripts from the target.
 
 2. Run the static scan.
 
@@ -74,6 +82,8 @@ Do not rely on the numeric score alone. A low score can miss semantic risk, and 
    the report stays BOM-free.
 
    If the command exits non-zero, inspect any partial report and continue manually. Record that the static line was incomplete. On Windows, a non-zero exit from a command using `--output` is a platform refusal, not a scan failure: no partial report exists, so do not look for one or retry the same command.
+
+   When only a subset of the resolved artefact will be installed, scan that subset as its own target (`$TARGET` is the subset directory) and grep its bodies for directives to run project-local files (`./*.sh`, "NEVER SKIP", "always run"): a whole-repo pass can miss an instruction that only the installed subset carries.
 
 3. Read the SkillSpector report.
 
@@ -118,8 +128,8 @@ Do not rely on the numeric score alone. A low score can miss semantic risk, and 
 
    Use this rubric:
 
-   - `APPROVE`: no HIGH or CRITICAL findings, no unexplained sensitive behavior, and the source matches the stated purpose.
-   - `CAUTION`: sensitive behavior exists, but it is documented, necessary, bounded, and controllable by the user.
+   - `APPROVE`: no HIGH or CRITICAL findings, no unexplained sensitive behavior, the source matches the stated purpose, and any runtime-generated instruction text was either reconstructed statically or reviewed as a supplied rendered artifact.
+   - `CAUTION`: sensitive behavior exists, but it is documented, necessary, bounded, and controllable by the user. Use `CAUTION` as well when runtime-generated instruction text could not be obtained within the operating rules, and name the uncovered text in the report.
    - `REJECT`: malicious or deceptive behavior, unexplained HIGH or CRITICAL findings, hidden prompt injection, credential theft, unknown exfiltration, obfuscated execution, persistence, or a clear mismatch between description and behavior.
 
 ## Score Interpretation
@@ -160,7 +170,7 @@ Recommended report shape:
 ```text
 ## 🛡️ Skill Inspector: `{skill-name}`
 
-**Source:** {path-or-url}
+**Source:** {path-or-url} · {resolved version or commit}
 **Verdict:** {APPROVE | CAUTION | REJECT} {short meaning}
 **Risk:** {score}/100 · {severity} · {SkillSpector recommendation}
 **Install posture:** {one sentence about suitable and unsuitable use}
