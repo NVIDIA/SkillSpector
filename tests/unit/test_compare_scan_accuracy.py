@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import tarfile
+import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
@@ -1114,6 +1115,63 @@ def test_runtime_probe_hashes_installed_and_editable_dependency_bytes(
     editable_file.write_text("VALUE = 'editable-v2'\n", encoding="utf-8")
     editable_changed = probe()
     assert editable_changed["dependencies"] != original["dependencies"]
+
+
+@pytest.mark.parametrize(
+    ("editable_url", "expected_converter_input"),
+    [
+        ("file:///C:/PortableRegressionProbe", "/C:/PortableRegressionProbe"),
+        ("file:////portable-regression-probe", "////portable-regression-probe"),
+    ],
+    ids=["windows_drive", "empty_authority"],
+)
+def test_runtime_probe_preserves_file_url_structure_for_path_conversion(
+    tmp_path: Path,
+    monkeypatch,
+    editable_url: str,
+    expected_converter_input: str,
+) -> None:
+    installed_root = tmp_path / "site-packages"
+    installed_root.mkdir()
+    (installed_root / "dependency.py").write_text("VALUE = 1\n", encoding="utf-8")
+    editable_root = tmp_path / "editable-dependency"
+    editable_root.mkdir()
+    (editable_root / "source.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    class FakeDistribution:
+        metadata = {"Name": "example-dependency"}
+        version = "1.0"
+        files = ["dependency.py"]
+
+        def read_text(self, name: str) -> str | None:
+            if name == "RECORD":
+                return "dependency.py,,\n"
+            if name == "METADATA":
+                return "Name: example-dependency\nVersion: 1.0\n"
+            if name == "direct_url.json":
+                return json.dumps({"url": editable_url, "dir_info": {"editable": True}})
+            return None
+
+        def locate_file(self, package_path: object) -> Path:
+            return installed_root / str(package_path)
+
+    monkeypatch.setattr(importlib.metadata, "distributions", lambda: [FakeDistribution()])
+    converter_inputs: list[str] = []
+
+    def fake_url2pathname(value: str) -> str:
+        converter_inputs.append(value)
+        return str(editable_root)
+
+    monkeypatch.setattr(urllib.request, "url2pathname", fake_url2pathname)
+    rendered = io.StringIO()
+    with redirect_stdout(rendered):
+        exec(compare_scan_accuracy._RUNTIME_IDENTITY_PROBE, {})
+
+    payload = json.loads(rendered.getvalue())
+    dependency = payload["dependencies"][0]
+    assert converter_inputs == [expected_converter_input]
+    assert dependency["editable"] is True
+    assert dependency["editable_file_count"] == 1
 
 
 @pytest.mark.parametrize(
