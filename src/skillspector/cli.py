@@ -1981,6 +1981,24 @@ def _status_planned_work_count(statuses: list[dict[str, object]]) -> int:
     return total
 
 
+def _ledger_output_limit_event(
+    source: dict[str, object], observed_records: int, limit_records: int
+) -> dict[str, object]:
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        record_type=LedgerRecordType.SYSTEM,
+        phase="ledger_output",
+        path=str(source.get("path", "SKILL.md")),
+        reason=LedgerReason.OUTPUT_LIMIT,
+        observed_records=observed_records,
+        limit_records=limit_records,
+    )
+    identity = source.get("source_identity")
+    if isinstance(identity, str) and identity:
+        event["source_identity"] = identity
+    return dict(event)
+
+
 def _merge_bounded_ledger(
     existing: list[dict[str, object]],
     updates: list[dict[str, object]],
@@ -1998,16 +2016,8 @@ def _merge_bounded_ledger(
         prior_observed = observed_value if isinstance(observed_value, int) else len(existing)
         return [
             *existing[:-1][: effective_limit - 1],
-            dict(
-                ledger_event(
-                    outcome=LedgerOutcome.PARTIAL,
-                    record_type=LedgerRecordType.SYSTEM,
-                    phase="ledger_output",
-                    path=str(prior.get("path", "SKILL.md")),
-                    reason=LedgerReason.OUTPUT_LIMIT,
-                    observed_records=max(prior_observed, len(existing)) + len(updates),
-                    limit_records=effective_limit,
-                )
+            _ledger_output_limit_event(
+                prior, max(prior_observed, len(existing)) + len(updates), effective_limit
             ),
         ]
     combined = [*existing, *updates]
@@ -2018,17 +2028,7 @@ def _merge_bounded_ledger(
     overflow = combined[effective_limit - 1]
     return [
         *combined[: effective_limit - 1],
-        dict(
-            ledger_event(
-                outcome=LedgerOutcome.PARTIAL,
-                record_type=LedgerRecordType.SYSTEM,
-                phase="ledger_output",
-                path=str(overflow.get("path", "SKILL.md")),
-                reason=LedgerReason.OUTPUT_LIMIT,
-                observed_records=len(combined),
-                limit_records=effective_limit,
-            )
-        ),
+        _ledger_output_limit_event(overflow, len(combined), effective_limit),
     ]
 
 
@@ -2111,21 +2111,13 @@ def _ensure_required_failure_events(
     newly_observed = (
         0 if prior_sentinel is not None and failures_already_observed else len(missing_failures)
     )
-    sentinel_path = (
-        str(prior_sentinel.get("path", "SKILL.md"))
+    sentinel_source = (
+        prior_sentinel
         if prior_sentinel is not None and failures_already_observed
-        else str((incoming_failures or required_failures)[0].get("path", "SKILL.md"))
+        else (incoming_failures or required_failures)[0]
     )
-    sentinel = dict(
-        ledger_event(
-            outcome=LedgerOutcome.PARTIAL,
-            record_type=LedgerRecordType.SYSTEM,
-            phase="ledger_output",
-            path=sentinel_path,
-            reason=LedgerReason.OUTPUT_LIMIT,
-            observed_records=max(observed_records, len(events)) + newly_observed,
-            limit_records=effective_limit,
-        )
+    sentinel = _ledger_output_limit_event(
+        sentinel_source, max(observed_records, len(events)) + newly_observed, effective_limit
     )
     failure_slots = effective_limit - 1
     if failures_already_observed:
@@ -2270,6 +2262,7 @@ def _scan_transitive(
                     limitation,
                     phase="transitive_reference_extraction",
                     path=(limitation.source_scope or "SKILL.md"),
+                    source_identity=limitation.source_scope,
                 )
             ],
             limit=traversal.budget.max_ledger_events,
