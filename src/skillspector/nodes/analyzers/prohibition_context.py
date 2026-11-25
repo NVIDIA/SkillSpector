@@ -59,11 +59,13 @@ _CHINESE_DIRECT_PREFIX = re.compile(
 _CHINESE_SENTENCE_END = re.compile(rf"[.!?;。！？{LINE_BREAK_CHARS}]")
 _CHINESE_CLAUSE_BREAK = re.compile(rf"[.!?;。！？{LINE_BREAK_CHARS}]")
 _CHINESE_LEADING_QUALIFIER = re.compile(
-    r"(?:除非|如果|假如|只有|[仅僅][当當]|否则|[当當][^，。；：！？\n]{0,20}[时時]|在[^，。；：！？\n]{0,40}?(?:情况|条件)下)"
+    r"(?:除非|如果|假如|只有|[仅僅][当當]|否则|[当當][^，。；：！？\n]{0,20}[时時]|在[^，。；：！？\n]{0,40}?(?:情况|情況|条件|條件)下)"
 )
 # 仅当 / 当…时 differ between scripts (僅當 / 當…時 in Traditional),
 # so the pattern carries both spellings; a Traditional condition limits
-# the prohibition exactly as a simplified one does.
+# the prohibition exactly as a simplified one does. The same applies to
+# 情况 / 条件 (情況 / 條件 in Traditional) in the under-the-circumstances
+# alternative above.
 # Clause breaks for the leading-context check below. The ideographic comma
 # 、 and the fullwidth comma ， separate clauses in Chinese prose, so a
 # condition in an earlier clause does not govern the prohibition.
