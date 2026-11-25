@@ -1022,6 +1022,7 @@ def _build_sarif(
         # A rule-set row's path is a label, not an artifact; giving it a
         # physical location would attribute it to any real file of that name.
         if path and not scope:
+            source_identity = exception.get("source_identity")
             region = (
                 SarifRegion(
                     startLine=int(start_line),
@@ -1033,7 +1034,12 @@ def _build_sarif(
             locations = [
                 SarifLocation(
                     physicalLocation=SarifPhysicalLocation(
-                        artifactLocation=SarifArtifactLocation(uri=quote(path, safe="/!")),
+                        artifactLocation=SarifArtifactLocation(
+                            uri=quote(path, safe="/!"),
+                            properties={"sourceIdentity": source_identity}
+                            if source_identity
+                            else None,
+                        ),
                         region=region,
                     )
                 )
