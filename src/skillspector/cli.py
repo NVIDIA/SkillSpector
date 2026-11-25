@@ -50,12 +50,7 @@ from skillspector.cli_entry import create_app
 from skillspector.cli_entry import main as main
 from skillspector.cli_entry import version_callback as version_callback
 from skillspector.file_output import require_secure_file_output, write_text_no_follow
-from skillspector.graph_proxy import (
-    blocked_native_import,
-    format_blocked_native_import_diagnostic,
-    graph,
-    translate_graph_load_error,
-)
+from skillspector.graph_proxy import GraphLoadError, graph
 from skillspector.input_handler import _normalize_root_owned_alias, validate_local_input_path
 from skillspector.inspection_ledger import (
     MAX_INSPECTION_LEDGER_EVENTS,
@@ -1719,10 +1714,12 @@ def _run_graph_scan(
     trace_config["callbacks"] = [temp_dir_tracker]
     if not stream_progress:
         with temp_dir_tracker.removing_on_error():
-            try:
-                return cast(dict[str, object], graph.invoke(state, config=trace_config))
-            except (ImportError, OSError) as exc:
-                raise translate_graph_load_error(exc) from exc
+            # A workflow load failure surfaces as GraphLoadError from
+            # LazyGraph._get_compiled(). Errors raised while an already
+            # loaded workflow executes propagate unchanged, so a lazy
+            # component reached by one scan is never mistaken for a
+            # systemic load failure.
+            return cast(dict[str, object], graph.invoke(state, config=trace_config))
 
     analyzer_node_ids = _wired_analyzer_node_ids()
     total_analyzers = len(analyzer_node_ids)
@@ -1747,14 +1744,13 @@ def _run_graph_scan(
         num_files = 0
         analyzers_done = 0
 
-        try:
-            stream = graph.stream(
-                state,
-                config=trace_config,
-                stream_mode=["updates", "values"],
-            )
-        except (ImportError, OSError) as exc:
-            raise translate_graph_load_error(exc) from exc
+        # As above, only LazyGraph load failures arrive as GraphLoadError;
+        # execution errors from the stream propagate unchanged.
+        stream = graph.stream(
+            state,
+            config=trace_config,
+            stream_mode=["updates", "values"],
+        )
         for stream_mode, chunk in stream:
             if stream_mode == "values":
                 if isinstance(chunk, dict):
@@ -3272,9 +3268,14 @@ def _scan_multi_skill(
                 except Exception:
                     logger.warning("Recursive child result cleanup failed")
             error_message = _RECURSIVE_CHILD_SCAN_FAILED_MESSAGE
-            blocked_import = blocked_native_import(exc)
-            if blocked_import is not None:
-                diagnostic = format_blocked_native_import_diagnostic(blocked_import)
+            # Only a typed load failure from LazyGraph._get_compiled() is
+            # systemic: the workflow cannot load at all, so every remaining
+            # child would fail the same way. A native import failure raised
+            # while an already loaded workflow executes stays local to this
+            # child and keeps the generic message.
+            load_failure = exc if isinstance(exc, GraphLoadError) else None
+            if load_failure is not None:
+                diagnostic = str(load_failure)
                 error_message = f"{error_message} {diagnostic}"
                 aggregate_limitations.append(diagnostic)
             err_console.print(f"         [red]Error:[/red] {error_message}\n")
@@ -3282,9 +3283,7 @@ def _scan_multi_skill(
             failed_skill_count += 1
             results.append({"skill_name": skill.name, "error": error_message})
             processed_skills.append(skill)
-            if blocked_import is not None:
-                # The workflow cannot load, so every remaining child would
-                # fail the same way. Stop instead of repeating the failure.
+            if load_failure is not None:
                 break
 
     scanned_skill_count = complete_skill_count + partial_skill_count + failed_skill_count

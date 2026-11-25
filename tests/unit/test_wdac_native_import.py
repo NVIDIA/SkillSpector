@@ -22,7 +22,7 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
-from skillspector.cli import FormatChoice, _scan_multi_skill, app
+from skillspector.cli import FormatChoice, _run_graph_scan, _scan_multi_skill, app
 from skillspector.graph_proxy import (
     GraphLoadError,
     LazyGraph,
@@ -45,6 +45,22 @@ def _wdac_import_error(module: str, *, policy_blocked: bool = True) -> ImportErr
     else:
         text = f"DLL load failed while importing {module}: the specified module could not be found."
     return ImportError(text, name=module, path=f"{module}.pyd")
+
+
+def _graph_load_error(module: str) -> GraphLoadError:
+    """Simulate the typed load failure raised by LazyGraph._get_compiled()."""
+    translated = translate_graph_load_error(_wdac_import_error(module))
+    assert isinstance(translated, GraphLoadError)
+    return translated
+
+
+def _successful_child_result() -> dict[str, object]:
+    """Minimal successful child scan result for the recursive runner."""
+    return {
+        "report_body": json.dumps({"analysis_completeness": {"coverage_percent": 100}}),
+        "analysis_completeness": {"coverage_percent": 100},
+        "risk_score": 0,
+    }
 
 
 def test_blocked_native_import_detects_policy_blocked_dll() -> None:
@@ -127,8 +143,8 @@ def test_lazy_graph_import_failure_raises_graph_load_error(
 
 
 @pytest.mark.parametrize("module", ["ormsgpack", "yara"])
-def test_recursive_child_failure_surfaces_blocked_native_error(tmp_path: Path, module: str) -> None:
-    """First blocked child failure names the module and stops the remaining children."""
+def test_recursive_load_failure_surfaces_blocked_native_error(tmp_path: Path, module: str) -> None:
+    """A typed graph load failure names the module and stops the remaining children."""
     skills = [
         SkillDirectory(path=tmp_path / name, name=name, relative_path=name)
         for name in ("one", "two")
@@ -138,7 +154,7 @@ def test_recursive_child_failure_surfaces_blocked_native_error(tmp_path: Path, m
 
     with patch(
         "skillspector.cli.graph.invoke",
-        side_effect=_wdac_import_error(module),
+        side_effect=_graph_load_error(module),
     ):
         with pytest.raises(typer.Exit) as exit_info:
             _scan_multi_skill(
@@ -164,6 +180,53 @@ def test_recursive_child_failure_surfaces_blocked_native_error(tmp_path: Path, m
     assert "WSL" in error
     limitations = payload["analysis_completeness"]["limitations"]
     assert any(module in item for item in limitations)
+
+
+def test_recursive_execution_import_failure_stays_local_to_failed_child(
+    tmp_path: Path,
+) -> None:
+    """A DLL failure during execution of a loaded workflow does not abort siblings.
+
+    The graph already loaded, so a lazy component reached by the first child
+    fails with a raw ImportError. That failure stays local: the second child
+    still scans, the first child keeps the generic message, and no systemic
+    load limitation is recorded.
+    """
+    skills = [
+        SkillDirectory(path=tmp_path / name, name=name, relative_path=name)
+        for name in ("one", "two")
+    ]
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=skills)
+    output = tmp_path / "combined.json"
+
+    with patch(
+        "skillspector.cli.graph.invoke",
+        side_effect=[_wdac_import_error("ormsgpack"), _successful_child_result()],
+    ) as mock_invoke:
+        with pytest.raises(typer.Exit) as exit_info:
+            _scan_multi_skill(
+                detection,
+                FormatChoice.json,
+                output,
+                no_llm=True,
+                yara_rules_dir=None,
+                verbose=False,
+            )
+
+    assert exit_info.value.exit_code == 2
+    assert mock_invoke.call_count == 2
+    payload = json.loads(output.read_text())
+    assert payload["skills_scanned"] == 2
+    assert payload["skills_omitted"] == 0
+    assert [skill["name"] for skill in payload["skills"]] == ["one", "two"]
+    assert payload["skills"][0]["error"] == (
+        "A recursive child scan failed before complete inspection."
+    )
+    assert "error" not in payload["skills"][1]
+    limitations = payload["analysis_completeness"]["limitations"]
+    assert not any("ormsgpack" in item for item in limitations)
+    assert "DLL load failed while importing" not in output.read_text()
+    assert "Every scan fails" not in output.read_text()
 
 
 def test_recursive_child_failure_keeps_generic_message_for_other_errors(
@@ -196,14 +259,14 @@ def test_recursive_child_failure_keeps_generic_message_for_other_errors(
 
 
 def test_single_skill_scan_fails_fast_with_wdac_diagnostic(tmp_path: Path) -> None:
-    """A blocked graph import fails the scan with the diagnostic on stderr."""
+    """A blocked graph load fails the scan with the diagnostic on stderr."""
     skill_dir = tmp_path / "skill"
     skill_dir.mkdir()
     (skill_dir / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
 
     with patch(
         "skillspector.cli.graph.invoke",
-        side_effect=_wdac_import_error("ormsgpack"),
+        side_effect=_graph_load_error("ormsgpack"),
     ):
         result = runner.invoke(app, ["scan", str(skill_dir), "--no-llm"])
 
@@ -214,3 +277,22 @@ def test_single_skill_scan_fails_fast_with_wdac_diagnostic(tmp_path: Path) -> No
     assert "Windows Application Control" in stderr
     assert "WSL" in stderr
     assert "DLL load failed while importing" not in stderr
+
+
+def test_run_graph_scan_propagates_execution_import_error_unchanged() -> None:
+    """Execution-time import failures are not reinterpreted as load failures."""
+    error = _wdac_import_error("ormsgpack")
+    with patch("skillspector.cli.graph.invoke", side_effect=error):
+        with pytest.raises(ImportError) as exc_info:
+            _run_graph_scan("skill", FormatChoice.json, no_llm=True)
+    assert exc_info.value is error
+    assert not isinstance(exc_info.value, GraphLoadError)
+
+
+def test_run_graph_scan_propagates_graph_load_error() -> None:
+    """A typed load failure from LazyGraph reaches the caller as GraphLoadError."""
+    error = _graph_load_error("ormsgpack")
+    with patch("skillspector.cli.graph.invoke", side_effect=error):
+        with pytest.raises(GraphLoadError) as exc_info:
+            _run_graph_scan("skill", FormatChoice.json, no_llm=True)
+    assert exc_info.value is error
