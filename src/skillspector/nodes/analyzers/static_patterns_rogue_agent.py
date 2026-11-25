@@ -90,6 +90,36 @@ _RA1_CONSENT_GATE_PATTERN = re.compile(
     r"|\bwith\s+(?:the\s+)?user(?:'s)?\s+(?:approval|consent|confirmation|permission)\b",
     re.IGNORECASE,
 )
+# A gate exempts only when it governs the update itself. For an
+# "ask/offer ... before <action>" gate, the action after "before" must be
+# applying the update ("before it's applied", "before applying it",
+# "before proceeding"), not a different action joined in the same
+# sentence ("Apply the self-update now and ask before restarting" gates
+# the restart). The object of the application verb, when present, must be
+# the update or a pronoun for it, so "before applying the patch" does not
+# govern the update either.
+_RA1_UPDATE_APPLICATION_PATTERN = re.compile(
+    r"(?:you\s+|we\s+)?(?:applying|apply|updating|update|installing|install)\b"
+    r"(?:\s+(?:it|this(?:\s+(?:self[- ]?)?update)?|that(?:\s+(?:self[- ]?)?update)?"
+    r"|the\s+(?:self[- ]?)?update))?"
+    r"(?!\s+(?:the|a|an)\s+(?!(?:self[- ]?)?update\b))"
+    r"|it(?:'s|\s+is)\s+(?:applied|installed|updated)\b"
+    r"|the\s+(?:self[- ]?)?update\s+is\s+(?:applied|installed|updated)\b"
+    r"|(?:you\s+|we\s+)?proceed(?:ing)?\b(?!\s+to\s+(?!(?:apply|update|install)\b)\w+)",
+    re.IGNORECASE,
+)
+# For an approval gate ("only after user approval", "user runs ...",
+# "checked + offered"), ownership is proved by clauses: the gate's own
+# clause, split on punctuation and coordinating conjunctions, must not
+# carry a different action verb. "restart only after approval" gates the
+# restart, while a verbless adjunct ("only after user approval") next to
+# the update's clause gates the update.
+_RA1_CLAUSE_SPLIT_PATTERN = re.compile(r"[;,:—–]|\b(?:and|then)\b", re.IGNORECASE)
+_RA1_OTHER_ACTION_PATTERN = re.compile(
+    r"\b(?:restart|reboot|delet|remov|execut|start|stop|kill|deploy|launch|"
+    r"send|upload|download|writ|modif|upgrad|downgrad|rollback)\w*\b",
+    re.IGNORECASE,
+)
 RA1_CODE_PATTERNS = [
     # Python: writing to own file
     (r"open\s*\(\s*__file__\s*,\s*['\"]w", 0.95),
@@ -704,6 +734,15 @@ def _is_consent_gated_self_update(
     the offered/asked-before branches may not cross a sentence
     terminator, so consent in an earlier sentence cannot exempt a
     later imperative on the same long line.
+
+    Governing the update is proved per gate, not by proximity alone. A
+    gate that names the update governs it. An "ask/offer ... before"
+    gate governs it only when the action after "before" is applying
+    the update, so a second action joined in the same sentence ("Apply
+    the self-update now and ask before restarting") keeps its finding.
+    An approval gate governs it only when its own clause carries no
+    different action verb, so "restart only after approval" gates the
+    restart, not the update.
     """
     if _RA1_SELF_NOUN_PATTERN.fullmatch(match.group(0).strip()) is None:
         return False
@@ -733,11 +772,62 @@ def _is_consent_gated_self_update(
             between = line[local_end:gate_start]
         else:
             between = line[gate_end:local_start]
-        if ";" not in between:
+        names_update = re.search(r"update", gate.group(0), re.IGNORECASE) is not None
+        if ";" in between and not names_update:
+            continue
+        if names_update:
             return True
-        if re.search(r"update", gate.group(0), re.IGNORECASE) is not None:
+        if _gate_governs_update(span, gate, local_start - span_start):
             return True
     return False
+
+
+def _gate_governs_update(span: str, gate: re.Match[str], match_start: int) -> bool:
+    """Return True when a consent gate governs the update, not another action.
+
+    An "ask/offer ... before" gate (including "checked + offered"
+    followed by "before") governs the update only when the action after
+    "before" is applying the update. Any other gate governs it only
+    when its own clause carries no different action verb and neither
+    does any clause between the gate and the match, so a verbless
+    adjunct ("only after user approval") beside the update's clause
+    governs the update while "restart only after approval" does not.
+    """
+    following = span[gate.end() :]
+    complement: str | None = None
+    if gate.group(0).rstrip().lower().endswith("before"):
+        complement = following
+    else:
+        before = re.match(r"\s*before\b", following, re.IGNORECASE)
+        if before is not None:
+            complement = following[before.end() :]
+    if complement is not None:
+        return _RA1_UPDATE_APPLICATION_PATTERN.match(complement.lstrip()) is not None
+    clauses: list[tuple[int, int]] = []
+    clause_start = 0
+    for split in _RA1_CLAUSE_SPLIT_PATTERN.finditer(span):
+        clauses.append((clause_start, split.start()))
+        clause_start = split.end()
+    clauses.append((clause_start, len(span)))
+
+    def _clause_index(position: int) -> int:
+        for index, (start, end) in enumerate(clauses):
+            if start <= position < end:
+                return index
+        return len(clauses) - 1
+
+    gate_clause = _clause_index(gate.start())
+    match_clause = _clause_index(match_start)
+    if gate_clause == match_clause:
+        return True
+    low, high = min(gate_clause, match_clause), max(gate_clause, match_clause)
+    for index in range(low, high + 1):
+        if index == match_clause:
+            continue
+        start, end = clauses[index]
+        if _RA1_OTHER_ACTION_PATTERN.search(span[start:end]) is not None:
+            return False
+    return True
 
 
 def _is_negated_safety_constraint(

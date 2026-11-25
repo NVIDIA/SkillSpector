@@ -278,7 +278,10 @@ _RETROSPECTIVE_AR_NARRATIVE_PATTERNS = (
 #    refuse a user request.") is refusal suppression even though the same
 #    clause queues a worker. A pronoun object ("never refuse it") refers
 #    to the proven work item; any other object ("any request", "the user")
-#    keeps the finding.
+#    keeps the finding. The object parse must be complete and bounded:
+#    a longer object whose decisive head noun sits past the parse window
+#    ("never refuse the user task request") proves nothing and keeps its
+#    finding.
 _AR1_BARE_REFUSAL_PATTERN = re.compile(
     r"(?:never|do\s+not|don'?t)\s+(?:ever\s+)?(?:refuse|decline)",
     re.IGNORECASE,
@@ -294,23 +297,32 @@ _AR1_WORK_ITEM_PATTERN = re.compile(rf"\b{_AR1_WORK_ITEM_NOUNS}\b", re.IGNORECAS
 _AR1_CLAUSE_BOUNDARY_PATTERN = re.compile(r"[.;!?:|\u2014\u2013]")
 
 
+_AR1_REFUSAL_OBJECT_PATTERN = re.compile(
+    r"(?:(?:the|a|an|this|that|any)\s+)?([A-Za-z][\w'-]*)"
+    r"(?:\s+([A-Za-z][\w'-]*))?(?:\s+([A-Za-z][\w'-]*))?",
+    re.IGNORECASE,
+)
+
+
 def _refusal_object_head_noun(tail: str) -> str | None:
     """Return the head noun of the refusal's object phrase, if it parses as one.
 
-    The object is an optional determiner plus up to two words; the head is
-    the last word, so "the queued task" reads as a task and "the user
-    request" reads as a request. This errs toward flagging: a trailing
-    adverb after the object ("the worker immediately") reads as the head
-    and keeps the finding.
+    The object is an optional determiner plus up to three words; the head
+    is the last word, so "the queued task" reads as a task and "the user
+    request" reads as a request. The parse must be complete: if another
+    word follows the bounded object, the decisive head noun may still be
+    unconsumed ("the user task request" must not read as "task"), so the
+    parse proves nothing and returns None. This errs toward flagging: a
+    trailing adverb after the object ("the worker immediately") reads as
+    the head and keeps the finding.
     """
-    match = re.match(
-        r"(?:(?:the|a|an|this|that|any)\s+)?([A-Za-z][\w'-]*)(?:\s+([A-Za-z][\w'-]*))?",
-        tail,
-        re.IGNORECASE,
-    )
+    match = _AR1_REFUSAL_OBJECT_PATTERN.match(tail)
     if match is None:
         return None
-    return match.group(2) or match.group(1)
+    remainder = tail[match.end() :].lstrip()
+    if remainder and (remainder[0].isalpha() or remainder[0] == "_"):
+        return None
+    return match.group(3) or match.group(2) or match.group(1)
 
 
 def _refusal_object_is_work_item_or_absent(tail: str) -> bool:
@@ -333,7 +345,14 @@ def _refusal_object_is_work_item_or_absent(tail: str) -> bool:
         return False
     if first_word.group(0).lower() in {"and", "or", "but"}:
         return True
-    if re.match(r"(?:it|them)\b", stripped, re.IGNORECASE) is not None:
+    pronoun = re.match(r"(?:it|them)\b", stripped, re.IGNORECASE)
+    if pronoun is not None:
+        # The pronoun must be the whole object: a determiner right after
+        # it ("refuse it the request") means the object continues past
+        # the pronoun and is not unambiguously the work item.
+        after = stripped[pronoun.end() :].lstrip()
+        if re.match(r"(?:the|a|an|this|that|any)\b", after, re.IGNORECASE) is not None:
+            return False
         return True
     head = _refusal_object_head_noun(stripped)
     if head is None:
