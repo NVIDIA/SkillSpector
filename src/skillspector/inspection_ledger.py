@@ -1198,6 +1198,7 @@ def _exception(
     analyzers: Iterable[str] = (),
     fatal: bool,
     scope: str | None = None,
+    source_identity: object = None,
 ) -> InspectionLedgerException:
     """Build the public, safe projection of one exceptional ledger fact."""
     exception: InspectionLedgerException = {
@@ -1217,6 +1218,8 @@ def _exception(
         exception["error_class"] = error_class
     if scope:
         exception["scope"] = scope
+    if isinstance(source_identity, str) and source_identity:
+        exception["source_identity"] = source_identity
     return exception
 
 
@@ -1246,11 +1249,9 @@ def _exception_from_event(
         analyzers=[str(event.get("analyzer_id", ""))],
         fatal=fatal,
         scope=RULE_SET_SCOPE if _is_rule_set_record(event) else None,
+        source_identity=event.get("source_identity"),
     )
     exception.update(resource_measurements(event))
-    source_identity = event.get("source_identity")
-    if isinstance(source_identity, str) and source_identity:
-        exception["source_identity"] = source_identity
     parser_diagnostic = sanitize_parser_diagnostic(event.get("parser_diagnostic"))
     if parser_diagnostic is not None:
         exception["parser_diagnostic"] = parser_diagnostic
@@ -1406,7 +1407,7 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
     findings_by_id: dict[str, object] = {}
     accounting_exceptions: list[InspectionLedgerException] = []
 
-    def accounting_error(path: object = None) -> None:
+    def accounting_error(path: object, source_identity: object) -> None:
         accounting_exceptions.append(
             _exception(
                 outcome=LedgerOutcome.FAILED,
@@ -1414,13 +1415,16 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
                 reason=LedgerReason.FINDING_ACCOUNTING_ERROR,
                 path=_safe_path(path, components),
                 fatal=True,
+                source_identity=source_identity,
             )
         )
 
     for finding in findings:
         finding_id = str(getattr(finding, "finding_id", ""))
         if not finding_id or finding_id in findings_by_id:
-            accounting_error(getattr(finding, "file", None))
+            accounting_error(
+                getattr(finding, "file", None), getattr(finding, "source_identity", None)
+            )
             continue
         findings_by_id[finding_id] = finding
 
@@ -1436,32 +1440,33 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         input_ids = list(event.get("input_finding_ids", []))
         emitted_ids = list(event.get("emitted_finding_ids", []))
         is_meta = _is_meta_phase(phase)
+        event_location = (event.get("path"), event.get("source_identity"))
         is_producer = event.get("record_type") == LedgerRecordType.WORK_ITEM and not is_meta
         if is_producer:
             producer_rows_present = True
         if is_producer and input_ids:
-            accounting_error(event.get("path"))
+            accounting_error(*event_location)
         if (
             is_producer
             and outcome not in (LedgerOutcome.COMPLETED, LedgerOutcome.PARTIAL)
             and emitted_ids
         ):
-            accounting_error(event.get("path"))
+            accounting_error(*event_location)
         if (
             is_meta
             and outcome == LedgerOutcome.COMPLETED
             and not set(emitted_ids).issubset(input_ids)
         ):
-            accounting_error(event.get("path"))
+            accounting_error(*event_location)
         if (
             is_meta
             and outcome in (LedgerOutcome.FAILED, LedgerOutcome.SKIPPED, LedgerOutcome.PARTIAL)
             and emitted_ids != input_ids
         ):
-            accounting_error(event.get("path"))
+            accounting_error(*event_location)
         for finding_id in [*input_ids, *emitted_ids]:
             if finding_id not in findings_by_id:
-                accounting_error(event.get("path"))
+                accounting_error(*event_location)
         if is_producer and outcome in (LedgerOutcome.COMPLETED, LedgerOutcome.PARTIAL):
             for finding_id in emitted_ids:
                 producer_origins[finding_id] = producer_origins.get(finding_id, 0) + 1
@@ -1469,7 +1474,9 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
     if producer_rows_present and not ledger_output_limited:
         for finding_id, finding in findings_by_id.items():
             if producer_origins.get(finding_id, 0) != 1:
-                accounting_error(getattr(finding, "file", None))
+                accounting_error(
+                    getattr(finding, "file", None), getattr(finding, "source_identity", None)
+                )
 
     explicit_effective = state.get("effective_finding_ids")
     if isinstance(explicit_effective, list):
@@ -1481,7 +1488,10 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
     validated_effective: list[str] = []
     for finding_id in effective_ids:
         if finding_id in seen_effective or finding_id not in findings_by_id:
-            accounting_error(getattr(findings_by_id.get(finding_id), "file", None))
+            finding = findings_by_id.get(finding_id)
+            accounting_error(
+                getattr(finding, "file", None), getattr(finding, "source_identity", None)
+            )
             continue
         seen_effective.add(finding_id)
         validated_effective.append(finding_id)
@@ -1521,6 +1531,7 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
                         end_line=target.get("end_line"),
                         analyzers=[analyzer_id],
                         fatal=True,
+                        source_identity=status.get("source_identity"),
                     )
                 )
             else:
@@ -1579,6 +1590,7 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
                     reason=reason,
                     path=path,
                     fatal=True,
+                    source_identity=artifact.get("source_identity"),
                 )
             )
             fatal_reasons.add((path, reason))
