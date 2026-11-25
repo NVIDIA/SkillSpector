@@ -1406,6 +1406,26 @@ class _StaticScanMetrics(dict[str, int | float]):
     pattern_limits: tuple[_StaticResourceLimitError, ...] = ()
 
 
+def _parser_source_type(path: str, file_type: str, module: object) -> str:
+    # Finding applicability keeps its established inventory type.
+    if file_type != "other":
+        return file_type
+    lower_path = path.lower()
+    if lower_path.endswith(".rst") and getattr(module, "USES_RST_SOURCE_TYPE", False) is True:
+        return "rst"
+    if (
+        lower_path.endswith((".bat", ".cmd"))
+        and getattr(module, "USES_BATCH_SOURCE_TYPE", False) is True
+    ):
+        return "batch"
+    return {
+        "jsx": "javascript",
+        "tsx": "tsx",
+        "mts": "typescript",
+        "cts": "typescript",
+    }.get(lower_path.rsplit(".", 1)[-1], file_type)
+
+
 def _bounded_parser_incomplete(
     module: object,
     view: SecurityTextView,
@@ -1419,24 +1439,10 @@ def _bounded_parser_incomplete(
     python_import_bounds: PythonImportBounds | None = None,
     prepared_analysis: object | None = None,
 ) -> bool:
-    # Parser hooks consume the native dialect for the actual source path,
-    # including marker and derived views. Finding applicability keeps its
-    # established inventory type.
-    if file_type == "other":
-        suffix = path.lower().rsplit(".", 1)[-1]
-        file_type = {
-            "jsx": "javascript",
-            "tsx": "tsx",
-            "mts": "typescript",
-            "cts": "typescript",
-        }.get(suffix, file_type)
-    kwargs = {"file_type": file_type, "complete_context": complete_context}
-    if (
-        file_type == "other"
-        and path.lower().endswith(".rst")
-        and getattr(module, "USES_RST_SOURCE_TYPE", False) is True
-    ):
-        kwargs["file_type"] = "rst"
+    kwargs = {
+        "file_type": _parser_source_type(path, file_type, module),
+        "complete_context": complete_context,
+    }
     if vars(module).get("USES_PREPARED_PARSER_ANALYSIS") is True:
         kwargs.update(
             prepared_analysis=prepared_analysis,
@@ -3586,7 +3592,7 @@ def _scan_all_views_with_parser_diagnostics(
                 if prepare_parser is not None:
                     parser_analyses[id(module)] = prepare_parser(
                         content=content,
-                        file_type=parser_file_type,
+                        file_type=_parser_source_type(path, parser_file_type, module),
                         check_runtime=finding_budget.check_runtime,
                         **(
                             {"sole_original_shell": True}
