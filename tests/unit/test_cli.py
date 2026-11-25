@@ -3669,6 +3669,56 @@ def test_recursive_sarif_child_without_results_still_maps_base_id(tmp_path: Path
     assert run["results"] == []
 
 
+def test_recursive_sarif_scopes_local_notification_locations(tmp_path: Path) -> None:
+    from urllib.parse import unquote, urljoin, urlsplit
+
+    from skillspector.nodes.report import _build_sarif
+
+    skill = SkillDirectory(tmp_path / "my+skill café", "greeting", "my_skill_café")
+    source_identity = "external/" + "a" * 64
+    completeness = {
+        "is_complete": False,
+        "status": "partial",
+        "ledger_exceptions": [
+            {"path": "scripts/greeting helper.py", "reason_code": "size_limit"},
+            {
+                "path": f"{source_identity}/scripts/greeting helper.py",
+                "reason_code": "size_limit",
+                "source_identity": source_identity,
+            },
+        ],
+        "limitations": ["Review incomplete files."],
+    }
+    child_sarif = _build_sarif([], analysis_completeness=completeness)
+    aggregate = cli._multi_skill_analysis_completeness(
+        total_skills=1,
+        complete_skills=0,
+        partial_skills=1,
+        failed_skills=0,
+        omitted_skills=0,
+        limitations=[],
+    )
+
+    payload = cli._multi_skill_sarif_report([skill], [{"sarif_report": child_sarif}], aggregate)
+
+    validate_sarif_report(payload)
+    run = payload["runs"][0]
+    bases = run["originalUriBaseIds"]
+    local, external, general = run["invocations"][0]["toolExecutionNotifications"]
+    local_artifact = local["locations"][0]["physicalLocation"]["artifactLocation"]
+    external_artifact = external["locations"][0]["physicalLocation"]["artifactLocation"]
+    assert local_artifact["uriBaseId"] == "SKILLROOT"
+    resolved = urljoin(
+        urljoin(bases["SCANROOT"]["uri"], bases["SKILLROOT"]["uri"]), local_artifact["uri"]
+    )
+    assert Path(unquote(urlsplit(resolved).path)) == skill.path / "scripts/greeting helper.py"
+    assert external_artifact["uri"] == f"{source_identity}/scripts/greeting%20helper.py"
+    assert "uriBaseId" not in external_artifact
+    assert "locations" not in general
+    original_local = child_sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"][0]
+    assert "uriBaseId" not in original_local["locations"][0]["physicalLocation"]["artifactLocation"]
+
+
 def test_recursive_sarif_labels_actual_serialized_output_cap() -> None:
     """Only a real recursive output bound uses the output-limit reason code."""
     reason = "recursive serialized report character budget 1800 reached"

@@ -35,7 +35,7 @@ from pathlib import Path
 from stat import S_ISDIR
 from time import monotonic
 from typing import TYPE_CHECKING, Annotated, cast
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import typer
 from click.core import ParameterSource
@@ -1411,6 +1411,7 @@ def _transitive_limit_event(
     *,
     phase: str,
     path: str,
+    source_identity: str | None = None,
 ) -> dict[str, object]:
     observed_bytes: int | None = None
     limit_bytes: int | None = None
@@ -1436,24 +1437,25 @@ def _transitive_limit_event(
     else:
         observed_artifacts = int(limitation.observed)
         limit_artifacts = int(limitation.limit)
-    return dict(
-        ledger_event(
-            outcome=LedgerOutcome.PARTIAL,
-            record_type=LedgerRecordType.SYSTEM,
-            phase=phase,
-            path=path,
-            reason=LedgerReason.REFERENCE_EXTRACTION_LIMIT,
-            stage=limitation.resource,
-            observed_bytes=observed_bytes,
-            limit_bytes=limit_bytes,
-            observed_records=observed_records,
-            limit_records=limit_records,
-            observed_artifacts=observed_artifacts,
-            limit_artifacts=limit_artifacts,
-            observed_seconds=observed_seconds,
-            limit_seconds=limit_seconds,
-        )
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        record_type=LedgerRecordType.SYSTEM,
+        phase=phase,
+        path=path,
+        reason=LedgerReason.REFERENCE_EXTRACTION_LIMIT,
+        stage=limitation.resource,
+        observed_bytes=observed_bytes,
+        limit_bytes=limit_bytes,
+        observed_records=observed_records,
+        limit_records=limit_records,
+        observed_artifacts=observed_artifacts,
+        limit_artifacts=limit_artifacts,
+        observed_seconds=observed_seconds,
+        limit_seconds=limit_seconds,
     )
+    if source_identity is not None:
+        event["source_identity"] = source_identity
+    return dict(event)
 
 
 def _cache_transitive_result(
@@ -1546,6 +1548,7 @@ def _cache_transitive_result(
                 limitation,
                 phase="transitive_reference_extraction",
                 path=(limitation.source_scope or source_identity) + "/SKILL.md",
+                source_identity=source_identity,
             )
         )
     scoped_ledger = _merge_bounded_ledger(
@@ -2051,15 +2054,15 @@ def _distinct_failed_ledger_events(
 
 def _transitive_child_failure_event(source_identity: str) -> dict[str, object]:
     """Return one deterministic, payload-free fatal fact for an opaque child failure."""
-    return dict(
-        ledger_event(
-            outcome=LedgerOutcome.FAILED,
-            record_type=LedgerRecordType.SYSTEM,
-            phase="transitive_child_scan",
-            path=f"{source_identity}/SKILL.md",
-            reason=LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED,
-        )
+    event = ledger_event(
+        outcome=LedgerOutcome.FAILED,
+        record_type=LedgerRecordType.SYSTEM,
+        phase="transitive_child_scan",
+        path=f"{source_identity}/SKILL.md",
+        reason=LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED,
     )
+    event["source_identity"] = source_identity
+    return dict(event)
 
 
 def _ensure_required_failure_events(
@@ -2515,6 +2518,7 @@ def _scan_transitive(
                                 limitation,
                                 phase="transitive_frontier",
                                 path=cached.source_identity + "/SKILL.md",
+                                source_identity=cached.source_identity,
                             )
                         ],
                         limit=traversal.budget.max_ledger_events,
@@ -2968,6 +2972,34 @@ def _multi_skill_text_summary(
 _RECURSIVE_SARIF_URI_BASE_ID = "SKILLROOT"
 
 
+def _scope_recursive_sarif_locations(records: object) -> None:
+    """Base child-relative result and notification locations at the scanned skill."""
+    if not isinstance(records, list):
+        return
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for location in record.get("locations", []):
+            physical = location.get("physicalLocation") if isinstance(location, dict) else None
+            artifact = physical.get("artifactLocation") if isinstance(physical, dict) else None
+            if not isinstance(artifact, dict) or "uriBaseId" in artifact:
+                continue
+            provenance = artifact.get("properties")
+            if isinstance(provenance, dict) and any(
+                key in provenance
+                for key in ("sourceIdentity", "sourceUrl", "sourceDigest", "transitiveDepth")
+            ):
+                continue
+            uri = artifact.get("uri")
+            if (
+                isinstance(uri, str)
+                and uri
+                and not uri.startswith("/")
+                and not urlsplit(uri).scheme
+            ):
+                artifact["uriBaseId"] = _RECURSIVE_SARIF_URI_BASE_ID
+
+
 def _multi_skill_sarif_report(
     processed_skills: list[SkillDirectory],
     results: list[dict[str, object]],
@@ -2998,36 +3030,19 @@ def _multi_skill_sarif_report(
             }
             run["properties"] = run_properties
             # SARIF 2.1.0 sections 3.4.4 and 3.14.14: scope each child run's
-            # skill-relative URIs to its own skill directory so results from
-            # different skills stop collapsing onto one repo-root-relative
-            # path. Single-skill output is untouched: only recursive merges
-            # set uriBaseId.
+            # skill-relative URIs to its own skill directory so finding and
+            # diagnostic paths resolve to the right child.
             relative = quote(skill.path.name, safe="")
             if relative:
-                for result in run.get("results", []):
-                    if not isinstance(result, dict):
-                        continue
-                    for location in result.get("locations", []):
-                        physical = (
-                            location.get("physicalLocation") if isinstance(location, dict) else None
+                _scope_recursive_sarif_locations(run.get("results"))
+                for invocation in run.get("invocations", []):
+                    if isinstance(invocation, dict):
+                        _scope_recursive_sarif_locations(
+                            invocation.get("toolExecutionNotifications")
                         )
-                        artifact = (
-                            physical.get("artifactLocation") if isinstance(physical, dict) else None
-                        )
-                        if isinstance(artifact, dict):
-                            provenance = artifact.get("properties")
-                            if isinstance(provenance, dict) and any(
-                                key in provenance
-                                for key in (
-                                    "sourceIdentity",
-                                    "sourceUrl",
-                                    "sourceDigest",
-                                    "transitiveDepth",
-                                )
-                            ):
-                                continue
-                            artifact["uriBaseId"] = _RECURSIVE_SARIF_URI_BASE_ID
+                previous_bases = run.get("originalUriBaseIds")
                 run["originalUriBaseIds"] = {
+                    **(previous_bases if isinstance(previous_bases, dict) else {}),
                     "SCANROOT": {"uri": skill.path.parent.resolve().as_uri() + "/"},
                     _RECURSIVE_SARIF_URI_BASE_ID: {
                         "uri": f"{relative}/",
