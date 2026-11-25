@@ -318,8 +318,12 @@ class TestIgnoreListCodeFencesInMarkdown:
         assert _pe3_lines("```gitignore\n.env\n.npmrc\n", "SKILL.md") == []
 
     def test_ignore_list_fence_in_a_script_is_not_special(self) -> None:
-        content = '"""\n```gitignore\n.env\n```\n"""\nprint(open(".env").read())\n'
-        assert _pe3_lines(content, "scripts/show.py") == [3, 6]
+        # The fence used to sit in a docstring; #1144 silences PE3 matches in
+        # Python docstrings, so the fenced lines now live in a string literal
+        # instead. The fence still buys no exemption in a script: the .env
+        # entry fires, as does the real access below it.
+        content = 'text = """```gitignore\n.env\n```"""\nprint(open(".env").read())\n'
+        assert _pe3_lines(content, "scripts/show.py") == [2, 4]
 
 
 def _long_fenced(language: str) -> str:
