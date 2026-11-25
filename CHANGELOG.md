@@ -1,5 +1,6 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
+* fix(sc1): stop reporting the requirement ranges recorded inside `package-lock.json` and `npm-shrinkwrap.json` as unpinned dependencies; the lockfile pins every install, and `package.json` ranges are still reported (#1104)
 * fix(supply-chain): read JSON and TOML dependency manifests (`package.json`, `package-lock.json`, `npm-shrinkwrap.json`, `Pipfile`, `Pipfile.lock`, `pyproject.toml`, `uv.lock`, `poetry.lock`) that start with a UTF-8 byte-order mark instead of reporting a dependency parse error for them
 * fix(deps): bump the locked `pyasn1` from 0.6.4 to 0.6.5 (CVE-2026-119194, CVE-2026-119195, CVE-2026-119196, CVE-2026-119197), `cryptography` from 49.0.0 to 50.0.2 (CVE-2026-69247) and the `[mcp]` extra's `pyjwt` from 2.13.0 to 2.15.1 (CVE-2026-102268 and related advisories) (#1146)
 * fix(deps): bump the locked `langgraph` from 1.2.6 to 1.2.20 (and `langgraph-checkpoint` 4.1.1 to 4.3.1, which it requires) past GHSA-3fx2-cqw9-xr3c; the locked `langgraph-sdk` 0.4.10 was already patched (#1078)
