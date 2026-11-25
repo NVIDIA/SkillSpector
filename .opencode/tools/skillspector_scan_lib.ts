@@ -211,6 +211,10 @@ export function buildCliArgs(args: ScanArgs): string[] {
   // defaults to true: LLM analysis must stay strictly opt-in.
   const format = args.format ?? "json"
   const noLlm = args.noLlm ?? true
+  // The CLI would parse a dash-led target as one of its own options.
+  if (args.target.startsWith("-")) {
+    throw new Error(`Scan target must not start with "-": ${args.target} (write ./${args.target} for a path)`)
+  }
   const cliArgs = ["scan", args.target, "--format", format]
   if (noLlm) cliArgs.push("--no-llm")
   if (args.output) cliArgs.push("--output", args.output)

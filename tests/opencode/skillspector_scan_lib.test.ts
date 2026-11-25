@@ -54,6 +54,11 @@ describe("buildCliArgs", () => {
   it("keeps explicit --no-llm", () => {
     assert.ok(buildCliArgs({ target: "s", noLlm: true }).includes("--no-llm"))
   })
+
+  it("refuses a dash-led target the CLI would parse as an option", () => {
+    assert.throws(() => buildCliArgs({ target: "--output=/tmp/x" }), /must not start with "-"/)
+    assert.deepEqual(buildCliArgs({ target: "./-skill" }).slice(0, 2), ["scan", "./-skill"])
+  })
 })
 
 describe("truncate", () => {
