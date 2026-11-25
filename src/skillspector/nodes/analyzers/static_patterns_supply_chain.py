@@ -1353,6 +1353,29 @@ def _pinned_npm_version(spec: str) -> str | None:
     return None
 
 
+def _strip_leading_bom(content: str) -> str:
+    """Drop leading UTF-8 byte-order marks from dependency manifest text.
+
+    decode_text() decodes with plain "utf-8", which never strips a leading
+    byte-order mark. Left in place, U+FEFF makes the first requirement of a
+    requirements.txt unparseable, and json.loads() and tomllib.loads() reject
+    a JSON or TOML manifest outright, leaving the file to a dependency parse
+    error (a package.json keeps only what its line-scan fallback finds). pip
+    accepts the mark in requirements files, and npm, pipenv and uv accept it
+    in their own manifests and lockfiles. Only leading marks are removed: a
+    U+FEFF inside the file stays part of the text.
+
+    The strip is scoped to manifest parsing: decode_text() itself stays
+    untouched because other analyzers treat U+FEFF as a hidden-character
+    injection signal in file bodies. Removing it does not shift line numbers,
+    since the mark sits before the first line break.
+    """
+    # Single linear prefix strip: a per-character slicing loop would copy
+    # ~n(n-1)/2 characters for n leading BOMs before any parser limit is
+    # checked, with no cancellation point in this preprocessing step.
+    return content.lstrip("\ufeff")
+
+
 def _extract_packages_from_requirements(
     content: str,
     *,
@@ -1376,16 +1399,7 @@ def _extract_packages_from_requirements_detailed(
     largest_omitted: int | None = None
     if limit is not None and limit <= 0:
         return results, largest_omitted
-    # decode_text() decodes with plain "utf-8", which never strips a leading
-    # byte-order mark, so a BOM-prefixed requirements.txt would otherwise make
-    # the first requirement unparseable and silently drop it from SC4/OSV
-    # analysis. Strip leading BOMs here, scoped to manifest parsing only:
-    # decode_text() itself stays untouched because other analyzers treat
-    # U+FEFF as a hidden-character injection signal in file bodies.
-    # Single linear prefix strip: a per-character slicing loop here would
-    # copy ~n(n-1)/2 characters for n leading BOMs before any spec limit
-    # is checked, with no cancellation point in this preprocessing step.
-    content = content.lstrip("\ufeff")
+    content = _strip_leading_bom(content)
     for line_num, line in _logical_requirement_lines(content):
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("-"):
@@ -1521,6 +1535,7 @@ def _extract_packages_from_package_json(
     """
     if limit is not None and limit <= 0:
         return []
+    content = _strip_leading_bom(content)
     try:
         data = json.loads(content)
     except (ValueError, TypeError) as error:
@@ -1673,6 +1688,7 @@ def _extract_packages_from_pyproject(
     """
     if limit is not None and limit <= 0:
         return []
+    content = _strip_leading_bom(content)
     try:
         data = tomllib.loads(content)
     except (ValueError, RecursionError) as error:
@@ -1848,6 +1864,7 @@ def _extract_packages_from_pipenv(
     entry_limit = MAX_DEPENDENCY_PACKAGES_PER_FILE if limit is None else max(0, limit)
     if entry_limit == 0:
         return [], []
+    content = _strip_leading_bom(content)
     try:
         data = json.loads(content) if is_lockfile else tomllib.loads(content)
     except (ValueError, RecursionError) as error:
@@ -2038,6 +2055,7 @@ def _npm_lock_entries(
     entry per name would drop the others silently, and the dropped copy is as installed — and as
     exploitable — as the one that happened to be seen first.
     """
+    content = _strip_leading_bom(content)
     try:
         data = json.loads(content)
     except (ValueError, RecursionError) as error:
@@ -2115,6 +2133,7 @@ def _extract_packages_from_toml_lock(
     """Extract exact package versions from TOML lockfiles such as uv.lock and poetry.lock."""
     if limit is not None and limit <= 0:
         return []
+    content = _strip_leading_bom(content)
     try:
         data = tomllib.loads(content)
     except (ValueError, RecursionError) as error:
@@ -2338,7 +2357,7 @@ def _collect_npm_locked_versions(
             continue
         files_read += 1
         try:
-            data = json.loads(content)
+            data = json.loads(_strip_leading_bom(content))
         except (ValueError, TypeError, RecursionError):
             continue
         if not isinstance(data, dict):
