@@ -6,12 +6,13 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_left
 from collections.abc import Callable
 
 from tree_sitter import Node
 
 from skillspector.javascript_ast import JavaScriptProgram
-from skillspector.javascript_callables import _callable_member
+from skillspector.javascript_callables import _callable_member, _decoded_identifier_text
 
 _PATH_FUNCTIONS = frozenset(
     {
@@ -66,6 +67,30 @@ _FS_PATH_METHODS = frozenset(
 _FS_FD_METHODS = frozenset(
     {"close", "closeSync", "fsync", "fsyncSync", "read", "readSync", "write", "writeSync"}
 )
+
+
+def _regex_receiver_call(program: JavaScriptProgram, value: Node) -> Node | None:
+    """Return the .exec/.test member for a direct regex receiver, else None.
+
+    The call must take no template-string argument: a template argument
+    keeps the conservative reading, same as for a literal receiver.
+    """
+    member = value.parent
+    call = None if member is None else member.parent
+    arguments = None if call is None else call.child_by_field_name("arguments")
+    if (
+        member is not None
+        and member.type == "member_expression"
+        and member.child_by_field_name("object") == value
+        and _callable_member(program, member) in {"exec", "test"}
+        and call is not None
+        and call.type == "call_expression"
+        and call.child_by_field_name("function") == member
+        and arguments is not None
+        and arguments.type != "template_string"
+    ):
+        return member
+    return None
 
 
 def _local_regex_arguments(
@@ -443,7 +468,7 @@ def _ordinary_native_calls(
     references: dict[str, list[Node]] = {}
     bindings: dict[str, tuple[Node, str, str, bool]] = {}
     regex_calls: list[Node] = []
-    regex_bindings: dict[str, Node] = {}
+    regex_bindings: dict[str, list[Node]] = {}
     intrinsic_override = False
     module_unproven = False
     imports: dict[str, int] = {}
@@ -453,7 +478,6 @@ def _ordinary_native_calls(
     local_regex_calls: list[Node] = []
     regex_arguments: list[Node] = []
     regex_constructors: list[Node] = []
-    constructed_bindings: set[int] = set()
     override_names = {
         "RegExp",
         "Reflect",
@@ -490,7 +514,9 @@ def _ordinary_native_calls(
         }:
             references.setdefault(program.text(node), []).append(node)
         if node.type in {"identifier", "property_identifier", "string"}:
-            spelling = program.text(node).strip("\"'")
+            # The spelling is decoded first: {\u0052egExp} binds RegExp,
+            # and raw source spelling would miss the override name.
+            spelling = _decoded_identifier_text(program, node).strip("\"'")
             if spelling in {"Proxy", "__defineGetter__", "__defineSetter__"}:
                 process_options_unproven = True
             if spelling in {
@@ -552,6 +578,19 @@ def _ordinary_native_calls(
                     intrinsic_override = True
                     regexp_prototype_unproven = True
         if node.type in {
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        }:
+            # Shorthand bindings bind the name too: catch ({RegExp}) and
+            # for (const {RegExp} of ...) bind through
+            # shorthand_property_identifier_pattern, not identifier. Only the
+            # constructor-position identifier itself is exempted, and that
+            # exemption only matches identifier nodes, so a shorthand node
+            # spelling an override name always poisons.
+            if _decoded_identifier_text(program, node).strip("\"'") in override_names:
+                intrinsic_override = True
+                regexp_prototype_unproven = True
+        if node.type in {
             "assignment_expression",
             "augmented_assignment_expression",
             "update_expression",
@@ -573,6 +612,16 @@ def _ordinary_native_calls(
             and constructor.type == "identifier"
             and program.text(constructor) == "RegExp"
         ):
+            # A direct .exec/.test call on a constructed regex is owned
+            # like the literal form, and is not an escaping constructor.
+            # It rides local_regex_calls, not regex_calls: the RegExp
+            # constructor name itself sets intrinsic_override, which
+            # clears regex_calls, so a direct append would be wiped.
+            member = _regex_receiver_call(program, node)
+            if member is not None:
+                if _callable_member(program, member) == "exec":
+                    local_regex_calls.append(member)
+                continue
             owner = node.parent
             binding = None if owner is None else owner.child_by_field_name("name")
             declaration = None if owner is None else owner.parent
@@ -588,8 +637,7 @@ def _ordinary_native_calls(
                 and declaration.parent is not None
                 and declaration.parent.type in {"program", "statement_block"}
             ):
-                regex_bindings[program.text(binding)] = binding
-                constructed_bindings.add(binding.id)
+                regex_bindings.setdefault(program.text(binding), []).append(binding)
             else:
                 regex_constructors.append(node)
         if node.type == "regex":
@@ -621,7 +669,7 @@ def _ordinary_native_calls(
                     and declaration.parent is not None
                     and declaration.parent.type in {"program", "statement_block"}
                 ):
-                    regex_bindings[program.text(binding)] = binding
+                    regex_bindings.setdefault(program.text(binding), []).append(binding)
                 else:
                     intrinsic_override = True
                     regexp_prototype_unproven = True
@@ -699,51 +747,73 @@ def _ordinary_native_calls(
                     else:
                         module_unproven = True
             pending.extend(specifier.named_children)
-    for name, binding in regex_bindings.items():
-        named_calls: list[Node] = []
-        declarator = binding.parent
-        declaration = None if declarator is None else declarator.parent
-        scope = None if declaration is None else declaration.parent
-        for reference in references[name]:
-            check_runtime()
-            if scope is None or not scope.start_byte <= reference.start_byte < scope.end_byte:
-                regexp_prototype_unproven = True
-                break
-            if reference == binding:
+    for name, binding_nodes in regex_bindings.items():
+        # The proof belongs to one binding, so only references that can
+        # resolve to it count. A const inside a function body must not
+        # prove an outer or sibling receiver with the same name: the
+        # final `re` in `function local() { const re = /x/; re.test(t); }
+        # re.exec(...)` is outside that binding's scope, so it is skipped
+        # here and stays unowned. Every same-named binding is validated:
+        # a later binding must not overwrite an earlier one, or an escape
+        # of the earlier binding would go unchecked. References before the
+        # declaration are validated too, matching the old loop: a closure
+        # defined before the declaration can run after initialization, so
+        # a mutation or escape there refuses the proof like any other use.
+        # references[name] is in document order (program.nodes is a
+        # pre-order walk), so each binding slices only its own scope range
+        # instead of scanning every same-named reference in the file: with
+        # thousands of sibling blocks each defining `const re`, the old scan
+        # cost bindings times references. The slice visits exactly the
+        # references the old range check kept, so pre-declaration closures
+        # and every same-named binding are still validated the same way.
+        name_references = references[name]
+        reference_starts = [node.start_byte for node in name_references]
+        for binding in binding_nodes:
+            named_calls: list[Node] = []
+            declarator = binding.parent
+            declaration = None if declarator is None else declarator.parent
+            scope = None if declaration is None else declaration.parent
+            if scope is None or declarator is None:
                 continue
-            member = reference.parent
-            call = None if member is None else member.parent
-            method = None if member is None else _callable_member(program, member)
-            if (
-                member is not None
-                and member.type == "member_expression"
-                and member.child_by_field_name("object") == reference
-                and method == "lastIndex"
-                and call is not None
-                and call.type == "assignment_expression"
-                and call.child_by_field_name("left") == member
-                and (value := call.child_by_field_name("right")) is not None
-                and value.type == "number"
-            ):
-                continue
-            if not (
-                member is not None
-                and member.type == "member_expression"
-                and member.child_by_field_name("object") == reference
-                and method in {"test", "exec"}
-                and call is not None
-                and call.type == "call_expression"
-                and call.child_by_field_name("function") == member
-                and (arguments := call.child_by_field_name("arguments")) is not None
-                and arguments.type != "template_string"
-            ):
-                intrinsic_override = True
-                regexp_prototype_unproven = True
-                break
-            if method == "exec" and binding.id not in constructed_bindings:
-                named_calls.append(member)
-        else:
-            local_regex_calls.extend(named_calls)
+            first = bisect_left(reference_starts, scope.start_byte)
+            end = bisect_left(reference_starts, scope.end_byte)
+            for reference in name_references[first:end]:
+                check_runtime()
+                if reference == binding:
+                    continue
+                member = reference.parent
+                call = None if member is None else member.parent
+                method = None if member is None else _callable_member(program, member)
+                if (
+                    member is not None
+                    and member.type == "member_expression"
+                    and member.child_by_field_name("object") == reference
+                    and method == "lastIndex"
+                    and call is not None
+                    and call.type == "assignment_expression"
+                    and call.child_by_field_name("left") == member
+                    and (value := call.child_by_field_name("right")) is not None
+                    and value.type == "number"
+                ):
+                    continue
+                if not (
+                    member is not None
+                    and member.type == "member_expression"
+                    and member.child_by_field_name("object") == reference
+                    and method in {"test", "exec"}
+                    and call is not None
+                    and call.type == "call_expression"
+                    and call.child_by_field_name("function") == member
+                    and (arguments := call.child_by_field_name("arguments")) is not None
+                    and arguments.type != "template_string"
+                ):
+                    intrinsic_override = True
+                    regexp_prototype_unproven = True
+                    break
+                if method == "exec":
+                    named_calls.append(member)
+            else:
+                local_regex_calls.extend(named_calls)
     for reference in references.get("Object", ()):
         parent = reference.parent
         if (

@@ -2809,6 +2809,12 @@ def _has_shell_execution_call(
             value = node.child_by_field_name("right")
         elif node.type == "formal_parameters":
             target = node
+        elif node.type == "catch_clause":
+            # A catch parameter binds like a formal parameter, including
+            # destructured forms such as catch ({RegExp}). Without this, a
+            # caught arbitrary constructor could borrow the global RegExp
+            # proof in _ordinary_native_calls.
+            target = node.child_by_field_name("parameter")
         elif node.type == "arrow_function":
             target = node.child_by_field_name("parameter")
         elif node.type == "import_statement":
@@ -2895,7 +2901,11 @@ def _has_shell_execution_call(
                     pending_names.append(alias)
     for node in program.nodes:
         check_runtime()
-        if node.type in {"identifier", "shorthand_property_identifier"} or (
+        if node.type in {
+            "identifier",
+            "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern",
+        } or (
             node.type == "property_identifier"
             and node.parent is not None
             and node.parent.type == "member_expression"
@@ -2912,6 +2922,9 @@ def _has_shell_execution_call(
                 # separate nodes, including any later invocation or escape.
                 continue
             # Escaped names and extracted callable aliases are not resolved here.
+            # The pattern form is included too: catch ({\u0052egExp}) binds
+            # an escaped name, and it must fail closed like any other
+            # escaped identifier.
             if (
                 "\\" in spelling
                 or spelling == "Reflect"
