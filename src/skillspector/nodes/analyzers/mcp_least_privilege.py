@@ -118,6 +118,46 @@ _COMPILED_CAPABILITY_PATTERNS = {
     for capability, patterns in _CAPABILITY_PATTERNS.items()
 }
 
+# Go-only capability patterns, applied only to .go files (see _detect_capabilities).
+# The shared table above is language-agnostic, so a Go call such as os.Open
+# must not leak into Python files, where os.open takes open flags and a
+# write-only call would otherwise count as read evidence. os.Getenv stays in
+# the shared table: it was already covered there before this change.
+# io.ReadAll is deliberately absent: it consumes any io.Reader (a network
+# response body, an in-memory buffer), so on its own it proves nothing about
+# file access. A file opened with os.Open still counts through os.Open.
+# Each pattern matches one complete, case-sensitive direct invocation: the
+# exported Go name in full, followed by the call parenthesis. A bare
+# function reference such as ``var _ = os.Open`` is not a call and proves
+# nothing, and a longer identifier such as filepath.WalkFoo must not match
+# through the filepath.Walk prefix, so Walk and WalkDir are listed
+# explicitly and the parenthesis anchors the end of the name.
+_GO_CAPABILITY_PATTERNS: dict[str, list[str]] = {
+    "file_read": [
+        r"\bos\.ReadFile\s*\(",
+        r"\bos\.Open\s*\(",
+        r"\bos\.ReadDir\s*\(",
+        r"\bfilepath\.Walk\s*\(",
+        r"\bfilepath\.WalkDir\s*\(",
+        r"\bfilepath\.Glob\s*\(",
+        r"\bioutil\.ReadFile\s*\(",
+    ],
+    "file_write": [
+        r"\bos\.WriteFile\s*\(",
+        r"\bos\.Create\s*\(",
+        r"\bos\.CreateTemp\s*\(",
+        r"\bioutil\.WriteFile\s*\(",
+    ],
+    "env": [
+        r"\bos\.LookupEnv\s*\(",
+        r"\bos\.ExpandEnv\s*\(",
+    ],
+}
+_COMPILED_GO_CAPABILITY_PATTERNS = {
+    capability: tuple(re.compile(pattern) for pattern in patterns)
+    for capability, patterns in _GO_CAPABILITY_PATTERNS.items()
+}
+
 # Permission string → capability category mapping (case-insensitive word-boundary matching)
 _PERM_TO_CAPABILITY: dict[str, str] = {
     "bash": "shell",
@@ -287,8 +327,13 @@ def _detect_capabilities(
     budget: _LeastPrivilegeBudget | None = None,
     path: str = "SKILL.md",
 ) -> set[str]:
-    """Return capabilities using bounded windows and cooperative checks."""
+    """Return capabilities using bounded windows and cooperative checks.
+
+    Go-only patterns apply only to .go files, so a Go call never counts as
+    evidence in a Python or JavaScript file.
+    """
     found: set[str] = set()
+    is_go = Path(path).suffix.lower() == ".go"
     step = _CAPABILITY_WINDOW_CHARS - _CAPABILITY_WINDOW_OVERLAP_CHARS
     for start in range(0, max(1, len(content)), step):
         if budget is not None:
@@ -303,6 +348,16 @@ def _detect_capabilities(
                 if pattern.search(window) is not None:
                     found.add(capability)
                     break
+        if is_go:
+            for capability, patterns in _COMPILED_GO_CAPABILITY_PATTERNS.items():
+                if capability in found:
+                    continue
+                for pattern in patterns:
+                    if budget is not None:
+                        budget.check_runtime(path)
+                    if pattern.search(window) is not None:
+                        found.add(capability)
+                        break
         if start + _CAPABILITY_WINDOW_CHARS >= len(content):
             break
     return found
