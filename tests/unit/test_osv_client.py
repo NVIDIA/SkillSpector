@@ -453,6 +453,83 @@ class TestQueryResourceBounds:
         assert client.post.call_count == 2
         assert any(item.reason is LedgerReason.OUTPUT_LIMIT for item in results.limitations)
 
+    def test_separate_calls_never_share_a_batch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Regression baseline for #1174: a second call finds the batch budget spent."""
+        import skillspector.nodes.analyzers.osv_client as osv
+
+        monkeypatch.setattr(osv, "MAX_OSV_QUERIES_PER_BATCH", 4)
+        monkeypatch.setattr(osv, "MAX_OSV_QUERY_BATCHES", 1)
+        client = self._client_for_batches([{"results": [{"vulns": []}] * 3}])
+        budget = OsvQueryBudget.create()
+
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=client):
+            query_batch([(f"npm-{i}", "1.0.0") for i in range(3)], ECOSYSTEM_NPM, budget=budget)
+            pypi = query_batch([("requests", "2.31.0")], ECOSYSTEM_PYPI, budget=budget)
+
+        assert client.post.call_count == 1
+        assert any(item.reason is LedgerReason.OUTPUT_LIMIT for item in pypi.limitations)
+
+    def test_prefetch_packs_ecosystems_into_shared_batches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skillspector.nodes.analyzers.osv_client as osv
+
+        monkeypatch.setattr(osv, "MAX_OSV_QUERIES_PER_BATCH", 4)
+        monkeypatch.setattr(osv, "MAX_OSV_QUERY_BATCHES", 1)
+        client = self._client_for_batches([{"results": [{"vulns": []}] * 4}])
+        budget = OsvQueryBudget.create()
+        npm = [(f"npm-{i}", "1.0.0") for i in range(3)]
+
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=client):
+            osv.prefetch(
+                [(name, version, ECOSYSTEM_NPM) for name, version in npm]
+                + [("requests", "2.31.0", ECOSYSTEM_PYPI), ("npm-0", "1.0.0", ECOSYSTEM_NPM)],
+                budget=budget,
+            )
+            assert budget.packages_seen == 0
+            npm_results = query_batch(npm, ECOSYSTEM_NPM, budget=budget)
+            pypi_results = query_batch([("requests", "2.31.0")], ECOSYSTEM_PYPI, budget=budget)
+
+        assert client.post.call_count == 1
+        sent = client.post.call_args.kwargs["json"]["queries"]
+        assert [q["package"]["ecosystem"] for q in sent] == [ECOSYSTEM_NPM] * 3 + [ECOSYSTEM_PYPI]
+        assert npm_results == [[], [], []]
+        assert pypi_results == [[]]
+        assert npm_results.limitations == ()
+        assert pypi_results.limitations == ()
+        assert budget.packages_seen == 4
+
+    def test_prefetch_holds_partial_results_for_the_later_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A truncated result is never cached, so the later call reads the prefetch copy."""
+        import skillspector.nodes.analyzers.osv_client as osv
+
+        monkeypatch.setattr(osv, "MAX_OSV_VULNS_PER_PACKAGE", 1)
+        monkeypatch.setattr(osv, "MAX_OSV_QUERY_BATCHES", 1)
+        client = self._client_for_batches(
+            [{"results": [{"vulns": [{"id": "OSV-1"}, {"id": "OSV-2"}]}]}]
+        )
+        detail = MagicMock()
+        detail.raise_for_status = MagicMock()
+        detail.json.return_value = {"id": "OSV-1", "summary": "first"}
+        client.get.return_value = detail
+        budget = OsvQueryBudget.create()
+
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=client):
+            osv.prefetch([("demo", "1.0.0", ECOSYSTEM_PYPI)], budget=budget)
+            results = query_batch([("demo", "1.0.0")], ECOSYSTEM_PYPI, budget=budget)
+
+        assert client.post.call_count == 1
+        assert client.get.call_count == 1
+        assert [item.vuln_id for item in results[0]] == ["OSV-1"]
+        assert (
+            osv.OsvQueryLimitation(
+                reason=LedgerReason.OUTPUT_LIMIT, observed_records=2, limit_records=1
+            )
+            in results.limitations
+        )
+
     def test_response_byte_cap_returns_partial_metadata(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

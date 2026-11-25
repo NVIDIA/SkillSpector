@@ -74,7 +74,7 @@ from skillspector.state import (
     transitive_remaining_seconds,
 )
 
-from . import static_runner
+from . import osv_client, static_runner
 from .common import (
     LOGICAL_LINE_BREAK,
     get_context_from_lines,
@@ -3416,8 +3416,13 @@ def _analyze_dependencies_detailed(
     max_findings: int | None = None,
     timeout_seconds: float | None = None,
     osv_budget: OsvQueryBudget | None = None,
+    osv_prefetch: list[tuple[str, str | None, str]] | None = None,
 ) -> tuple[list[AnalyzerFinding], list[OsvQueryLimitation], int]:
-    """Run bounded dependency checks and return sanitized omission metadata."""
+    """Run bounded dependency checks and return sanitized omission metadata.
+
+    With *osv_prefetch*, only parse: append the file's bounded (name, version,
+    ecosystem) packages to the list and return no findings or limitations.
+    """
     findings: list[AnalyzerFinding] = []
     limitations: list[OsvQueryLimitation] = []
     tag = [PatternCategory.SUPPLY_CHAIN.value]
@@ -3566,6 +3571,10 @@ def _analyze_dependencies_detailed(
                 )
             )
         findings.extend(extra[:remaining])
+
+    if osv_prefetch is not None:
+        osv_prefetch.extend((name, version, ecosystem) for name, version, _ in packages)
+        return [], [], parsed_package_count
 
     # SC4: OSV lookup, then static fallback for uncovered packages.
     osv_findings, osv_covered, osv_limitations, local_checked = _sc4_from_osv_detailed(
@@ -4319,6 +4328,55 @@ def _analyze_concealed_executables(
     return findings
 
 
+def _prefetch_dependency_osv(
+    components: list[str],
+    file_cache: dict[str, str],
+    locked_versions: dict[tuple[str, bool], dict[str, str]],
+    npm_locked_versions: dict[str, Mapping[str, str | None]],
+    budget: OsvQueryBudget,
+) -> set[str]:
+    """Look up every manifest's packages in shared OSV batches before the per-file pass.
+
+    Without it, each file's lookup opens its own batches, so a large lockfile can
+    spend the whole batch budget and leave a later manifest with no lookup at all.
+    The file and package caps mirror the per-file pass; findings and limitations
+    stay with that pass, which reads the held results back. Returns the files
+    whose every package the prefetch looked up: those need no further OSV work,
+    so the per-file pass still reports them after the runtime limit.
+    """
+    packages: list[tuple[str, str | None, str]] = []
+    file_packages: dict[str, list[tuple[str, str | None, str]]] = {}
+    files_seen = 0
+    packages_seen = 0
+    for path in components:
+        if not _is_dependency_manifest(path):
+            continue
+        files_seen += 1
+        remaining_packages = MAX_DEPENDENCY_PACKAGES_PER_SCAN - packages_seen
+        if files_seen > max(0, MAX_DEPENDENCY_FILES_PER_SCAN) or remaining_packages <= 0:
+            break
+        content = file_cache.get(path)
+        if content is None:
+            continue
+        start = len(packages)
+        _, _, parsed = _analyze_dependencies_detailed(
+            content,
+            path,
+            locked_versions.get(_python_lock_scope(path)),
+            npm_locked_versions.get(str(Path(path).parent)),
+            max_packages=min(MAX_DEPENDENCY_PACKAGES_PER_FILE, remaining_packages),
+            osv_prefetch=packages,
+        )
+        packages_seen += parsed
+        file_packages[path] = packages[start:]
+    osv_client.prefetch(packages, budget=budget)
+    return {
+        path
+        for path, coords in file_packages.items()
+        if all(osv_client._cache_key(*coord) in budget.prefetched for coord in coords)
+    }
+
+
 # ---------------------------------------------------------------------------
 # Graph node
 # ---------------------------------------------------------------------------
@@ -4445,6 +4503,15 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     dependency_findings_seen = 0
     osv_budget = OsvQueryBudget.create(dependency_remaining_seconds())
     try:
+        # A replaced query_batch (a test or offline adapter) does not read the
+        # prefetched results, so only the real client prefetches.
+        osv_ready: set[str] = (
+            _prefetch_dependency_osv(
+                components, file_cache, locked_versions, npm_locked_versions, osv_budget
+            )
+            if query_batch is osv_client.query_batch
+            else set()
+        )
         for path in components:
             is_dep_file = _is_dependency_manifest(path)
             if not is_dep_file:
@@ -4492,7 +4559,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 )
                 break
             shared_remaining = dependency_remaining_seconds()
-            if shared_remaining <= 0:
+            if shared_remaining <= 0 and path not in osv_ready:
                 record_limitation(
                     path,
                     OsvQueryLimitation(
@@ -4502,6 +4569,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                     ),
                     f"{ANALYZER_ID}_dependencies",
                 )
+                # Files the prefetch fully looked up still report their results.
+                if osv_ready:
+                    continue
                 break
             content = file_cache.get(path)
             if content is None:
