@@ -92,6 +92,131 @@ def test_shell_execution_forms_keep_template_files_partial(source: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "export function check(value, max = Number.MAX_SAFE_INTEGER) {\n"
+            "  const n = Number(value);\n"
+            "  return n <= (max ?? Number.MAX_SAFE_INTEGER) ? `ok: ${n}` : `too large: ${n}`;\n"
+            "}\n"
+            "console.log(check(process.argv[2] ?? '0'));\n",
+            id="number-max-safe-integer-default",
+        ),
+        pytest.param(
+            "export function check(value, max) {\n"
+            "  const n = Number(value);\n"
+            "  return n <= (max ?? Number.MAX_SAFE_INTEGER) ? `ok: ${n}` : `too large: ${n}`;\n"
+            "}\n"
+            "console.log(check(process.argv[2] ?? '0'));\n",
+            id="plain-parameter-control",
+        ),
+        pytest.param(
+            "function defaultPath() { return 'a.json'; }\n"
+            "export function load(p = defaultPath()) { return `${p}:${defaultPath()}`; }\n",
+            id="helper-call-default",
+        ),
+        pytest.param(
+            "function defaultPath() { return 'a.json'; }\n"
+            "export function load(p) { return `${p ?? defaultPath()}`; }\n",
+            id="plain-parameter-helper-control",
+        ),
+        pytest.param(
+            "export function show({max = Number.MAX_SAFE_INTEGER} = {}) {\n"
+            "  const n = Number(max);\n"
+            "  return `max=${n}`;\n"
+            "}\n",
+            id="destructured-object-default",
+        ),
+        pytest.param(
+            "export function show([first = Number.MAX_SAFE_INTEGER] = []) {\n"
+            "  const n = Number(first);\n"
+            "  return `n=${n}`;\n"
+            "}\n",
+            id="destructured-array-default",
+        ),
+        pytest.param(
+            "const check = (value, max = Number.MAX_SAFE_INTEGER) => {\n"
+            "  const n = Number(value);\n"
+            "  return `n=${n}`;\n"
+            "};\n",
+            id="arrow-function-default",
+        ),
+        pytest.param(
+            "export function show(a, ...rest) {\n  const n = Number(a);\n  return `n=${n}`;\n}\n",
+            id="rest-parameter-control",
+        ),
+        pytest.param(
+            "class Checker {\n"
+            "  check(value, max = Number.MAX_SAFE_INTEGER) {\n"
+            "    const n = Number(value);\n"
+            "    return `n=${n}`;\n"
+            "  }\n"
+            "}\n",
+            id="class-method-default",
+        ),
+        pytest.param(
+            "export function show(a, b = a) {\n  const n = Number(a);\n  return `n=${n}`;\n}\n",
+            id="parameter-referenced-by-later-default",
+        ),
+    ],
+)
+def test_parameter_default_values_do_not_keep_template_files_partial(source: str) -> None:
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "export function run(cb) { return cb(`rm ${x}`); }",
+            id="uncertain-parameter-call",
+        ),
+        pytest.param(
+            "export function run(cb = getHandler()) { return cb(`rm ${x}`); }",
+            id="uncertain-parameter-with-default-call",
+        ),
+        pytest.param(
+            "export function run({handler = getHandler()} = {}) { return handler(`rm ${x}`); }",
+            id="uncertain-destructured-parameter-call",
+        ),
+        pytest.param(
+            "function f(x = eval) { return `v=${x}`; }",
+            id="shell-call-in-default-value",
+        ),
+        pytest.param(
+            "function f(p = cp.exec(`ls ${dir}`)) { return `v=${p}`; }",
+            id="shell-call-expression-in-default-value",
+        ),
+    ],
+)
+def test_uncertain_parameter_calls_keep_template_files_partial(source: str) -> None:
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is True
+    )
+
+
+def test_ledger_completes_parameter_default_value_template() -> None:
+    path = "scripts/check.mjs"
+    source = (
+        "export function check(value, max = Number.MAX_SAFE_INTEGER) {\n"
+        "  const n = Number(value);\n"
+        "  return n <= (max ?? Number.MAX_SAFE_INTEGER) ? `ok: ${n}` : `too large: ${n}`;\n"
+        "}\n"
+        "console.log(check(process.argv[2] ?? '0'));\n" + _PADDING
+    )
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: source}}, [tm]
+    )
+    row = result["inspection_ledger"][0]
+    assert row["outcome"] is LedgerOutcome.COMPLETED
+    assert "reason_code" not in row
+
+
+@pytest.mark.parametrize(
     "source", ["const value = `unterminated;", "const = `malformed ${value}`;"]
 )
 def test_unproven_javascript_keeps_conservative_parse_result(source: str) -> None:
@@ -769,12 +894,14 @@ def test_executor_member_reads_keep_existing_conservative_coverage(source: str) 
         "const match = /exec/.exec(text); const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);",
         "const NUMBER = /^[0-9]+$/; const valid = value => NUMBER.test(value); const match = /[0-9]+/.exec(text);",
         "import {posix} from 'node:path'; const path = posix.join(posix.dirname(source), `${name}.json`);",
+        "import path from 'node:path'; const pathName = path.join(root, `${name}.txt`);",
+        "import * as path from 'node:path'; const pathName = path.join(root, `${name}.txt`);",
         "import {win32 as p} from 'node:path'; const path = p.join(`${name}`, 'file');",
         "import {join as makePath} from 'path'; const path = makePath(`${name}`, 'file');",
         "import {join as run} from 'node:path'; const path = run(`${name}`, 'file');",
-        "function hash(values) { const r = (x, n) => (x >>> n) | (x << (32 - n)); return r(values[0], 7); } function other(r) { return r; }",
-        "function hash(values) { const run = x => x * 2; return run(values[0]); } function other(r) { return r; }",
-        "function first(values) { const r = x => x + 1; return r(values[0]); } function second(r) { return r; }",
+        "function hash(values) { const r = (x, n) => (x >>> n) | (x << (32 - n)); return r(35, 7); } function other(r) { return r; }",
+        "function hash(values) { const run = x => x * 2; return run(12); } function other(r) { return r; }",
+        "function first(values) { const r = x => x + 1; return r(12); } function second(r) { return r; }",
     ],
 )
 @pytest.mark.parametrize("suffix", ["", _PADDING], ids=["short", "padded"])
@@ -831,6 +958,8 @@ def test_proven_native_and_local_numeric_calls_retain_templates(
         "const eval = x => x + 1; eval(`${command}`);",
         "const run = x => x + 1; with (tools) { run(`${command}`); }",
         "import {join as run} from 'node:path'; const alias = run; alias(`${command}`);",
+        "import path from 'node:path'; path.join = executor; path.join(`${command}`);",
+        "import * as path from 'node:path'; const mutate = path.posix; mutate.join = executor; path.join(`${command}`);",
         "import {posix as p, posix as q} from 'node:path'; q.join = executor; p.join(`${command}`);",
         "import {posix as p} from 'node:path'; import {posix as q} from 'node:path'; q.join = executor; p.join(`${command}`);",
         "import path, {posix as p} from 'node:path'; path.posix.join = executor; p.join(`${command}`);",
@@ -854,3 +983,837 @@ def test_known_native_callee_cannot_hide_security_findings() -> None:
     assert any(
         finding.rule_id == "TM1" for finding in tm.analyze(source, "display.js", "javascript")
     )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_quoted_backtick_values_cannot_consume_later_host_code(newline: str) -> None:
+    source = newline.join(
+        [
+            "const values = [['`first` before', '`first` after']];",
+            "// " + ("padding " * 1000),
+            "const other = ['`second` before', '`second` after'];",
+        ]
+    )
+    assert not tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "exec(`${tool} -rf /`);",
+        "new Function(`${code}`);",
+        "import {exec} from 'node:child_process'; exec(`${command}`);",
+    ],
+)
+def test_completed_quoted_value_never_clears_later_runtime_uncertainty(suffix: str) -> None:
+    source = "const values = ['`name` before', '`name` after'];\n" + suffix
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript")
+
+
+def test_regex_refinement_preserves_neighbor_raw_high_commands() -> None:
+    source = (
+        "const values = ['`name` before', '`name` after'];\n"
+        "import {execSync} from 'node:child_process'; execSync('rm -rf /');\n"
+    )
+    assert any(
+        finding.rule_id == "TM1" for finding in tm.analyze(source, "control.mjs", "javascript")
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "const value = '`name`'; eval(`${value}${payload}`);",
+        "let value = '`name`'; value += `${payload}`; Function(value)();",
+        "const values = ['`name`']; eval(`${values[0]}${payload}`);",
+        "import {exec as launch} from 'node:child_process'; "
+        "const value = '`name`'; launch(`${value}${payload}`);",
+    ],
+)
+def test_regex_refinement_preserves_established_indirect_runtime_diagnostics(
+    source: str, monkeypatch
+) -> None:
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    after = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is not None
+    assert before.cause is tm.ParserCause.RUNTIME_DEPENDENT
+    assert after == before
+
+
+@pytest.mark.parametrize("value", ["`$TOOL -rf /`", "$(" + "a" * 5000])
+def test_ordinary_quoted_data_keeps_its_existing_complete_result(value, monkeypatch) -> None:
+    source = "const values = ['`name` before', '`name` after'];\nconst other = '" + value + "';"
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    after = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is None
+    assert after is None
+
+
+def test_plain_quoted_files_keep_no_backtick_fast_path(monkeypatch) -> None:
+    from skillspector import javascript_tokens
+
+    def must_not_parse(*args):
+        raise AssertionError("no-backtick source should not require a native parse")
+
+    monkeypatch.setattr(javascript_tokens, "parse_javascript_source", must_not_parse)
+    regexes: list[tuple[int, int]] = []
+    assert (
+        javascript_template_spans("const label = 'ordinary';", lambda: None, regex_literals=regexes)
+        is None
+    )
+    assert regexes == []
+
+
+_JS_REGEX_BOUNDARY_SOURCE = (
+    "const text = 'safe';\n"
+    "const captured = text.match(/read `([^`]+policy\\.md)` before review/);\n"
+    + "// "
+    + "padding " * 1024
+    + "\n"
+    + "for (const row of [['label', '`render_proof` passed']]) { inspect(row); }\n"
+)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_native_regex_origin_does_not_borrow_a_distant_string_boundary(newline, monkeypatch):
+    source = _JS_REGEX_BOUNDARY_SOURCE.replace("\n", newline)
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is not None
+    assert before.cause is tm.ParserCause.BOUNDARY_UNRESOLVED
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is None
+    owner = tm._JavaScriptTemplateOwnership(source, lambda: None)
+    start = source.index("/read")
+    end = source.index("/);", start) + 1
+    assert owner.regex_literal_end(source.index("`", start)) == end
+    assert owner.regex_literal_end(end) is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "eval(/read `([^`]+policy\\.md)` before review/);",
+        "new Function(/read `([^`]+policy\\.md)` before review/);",
+        "launch(/read `([^`]+policy\\.md)` before review/);",
+        "const rule = /read `([^`]+policy\\.md)` before review/; eval(rule.source);",
+        "const rule = /read `([^`]+policy\\.md)` before review/; eval(rule['source']);",
+    ],
+)
+def test_regex_unproved_consumers_do_not_receive_native_pattern_boundaries(source, monkeypatch):
+    regexes = []
+    javascript_template_spans(source, lambda: None, regex_literals=regexes)
+    assert regexes == []
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    after = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert after == before
+
+
+def test_regex_origin_keeps_later_executable_limits_and_raw_findings():
+    runtime = _JS_REGEX_BOUNDARY_SOURCE + "exec(`${tool} -rf /`);"
+    assert tm.has_bounded_parse_exhaustion(runtime, lambda: None, file_type="javascript")
+    high = _JS_REGEX_BOUNDARY_SOURCE + "exec('rm -rf /');"
+    assert any(f.rule_id == "TM1" for f in tm.analyze(high, "example.mjs", "javascript"))
+
+
+def test_regex_origin_keeps_later_overbudget_host_word(monkeypatch):
+    source = _JS_REGEX_BOUNDARY_SOURCE + "r" * (tm._SHELL_COMMAND_WORD_CHARS + 1) + ";\n"
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    after = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is not None
+    assert after is not None
+    assert after.cause is tm.ParserCause.RESOURCE_LIMIT
+    assert after.start >= len(_JS_REGEX_BOUNDARY_SOURCE)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import {exec} from 'node:child_process'; "
+        "const receiver={match(pattern){exec(String(pattern).slice(2,-1));}}; "
+        "receiver.match(/`$TOOL -rf \\//);",
+        "import cp from 'node:child_process'; cp.exec(/`$TOOL -rf \\//);",
+        "import {exec as launch} from 'node:child_process'; "
+        "const runner={exec:launch}; runner.exec(/`$TOOL -rf \\//);",
+        "const receiver={match(pattern){consume(pattern);}}; receiver.match(/`name/);",
+        "text.match = custom; text.match(/`name/);",
+        "text['match'] = custom; text.match(/`name/);",
+        "String.prototype.match = custom; text.match(/`name/);",
+        "RegExp.prototype.exec = custom; text.match(/`name/);",
+        "const rule = /`name/; use(rule['so'+'urce']);",
+    ],
+)
+def test_regex_execution_and_override_barriers_keep_existing_incompleteness(source, monkeypatch):
+    regexes = []
+    javascript_template_spans(source, lambda: None, regex_literals=regexes)
+    assert regexes == []
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    after = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "prefix,receiver",
+    [
+        ("import value from './runtime.mjs';", "value"),
+        ("const value = getValue();", "value"),
+        ("let value = 'safe'; value = getValue();", "value"),
+        ("const value = 'safe'; function shadow(value) {}", "value"),
+        ("function check(value) {", "value"),
+    ],
+)
+def test_unknown_or_shadowed_string_receivers_keep_the_regex_fallback(prefix, receiver):
+    source = prefix + receiver + ".match(/`$TOOL -rf \\//);"
+    if prefix.startswith("function"):
+        source += "}"
+    regexes = []
+    javascript_template_spans(source, lambda: None, regex_literals=regexes)
+    assert regexes == []
+
+
+def test_direct_primitive_string_can_prove_its_matching_regex_boundaries():
+    source = "'safe'.match(/`label/);"
+    regexes = []
+    javascript_template_spans(source, lambda: None, regex_literals=regexes)
+    start = source.index("/`label")
+    assert regexes == [(start, start + len("/`label/"))]
+
+
+def test_with_scope_cannot_borrow_a_top_level_primitive_string_binding(monkeypatch):
+    source = "const text='safe'; with (runtimeScope) { text.match(/`$TOOL -rf \\//); }"
+    regexes = []
+    javascript_template_spans(source, lambda: None, regex_literals=regexes)
+    assert regexes == []
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is not None
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") == before
+
+
+def test_quoted_backtick_data_keeps_the_no_regex_execution_fast_path(monkeypatch):
+    from skillspector import javascript_tokens
+
+    def must_not_analyze_execution(*args):
+        raise AssertionError("ordinary quoted data needs no regex execution proof")
+
+    monkeypatch.setattr(javascript_tokens, "_has_shell_execution_call", must_not_analyze_execution)
+    regexes = []
+    assert (
+        javascript_template_spans("const label='`name`';", lambda: None, regex_literals=regexes)
+        is None
+    )
+    assert regexes == []
+
+
+def test_native_matching_pattern_dollars_are_data_not_runtime_commands(monkeypatch):
+    source = "'safe'.match(/`$TOOL -rf \\//);"
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is not None
+    assert before.cause is tm.ParserCause.RUNTIME_DEPENDENT
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is None
+
+
+@pytest.mark.parametrize("comment", ["/* pattern */ ", "// pattern\n", "/* first */ /* second */ "])
+def test_first_regex_argument_can_follow_native_comments(comment, monkeypatch):
+    source = _JS_REGEX_BOUNDARY_SOURCE.replace("text.match(", "text.match(" + comment)
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is not None
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is None
+
+
+def test_comments_do_not_make_a_second_argument_a_matching_pattern(monkeypatch):
+    source = _JS_REGEX_BOUNDARY_SOURCE.replace(
+        "text.match(", "text.match(unresolved, /* pattern */ "
+    )
+    with monkeypatch.context() as baseline:
+        baseline.setattr(tm._JavaScriptTemplateOwnership, "regex_literal_end", lambda *args: None)
+        before = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert before is not None
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") == before
+
+
+def test_native_pattern_boundaries_cannot_hide_a_later_dynamic_consumer():
+    source = "'safe'.match(/`$TOOL -rf \\//);\nexec(`${tool} -rf /`);"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert diagnostic is not None
+    assert diagnostic.cause is tm.ParserCause.RUNTIME_DEPENDENT
+    assert any(
+        f.rule_id == "TM1"
+        for f in tm.analyze(source + "exec('rm -rf /');", "control.mjs", "javascript")
+    )
+
+
+@pytest.mark.parametrize(
+    ("dialect", "source"),
+    [
+        ("typescript", "interface Row { n: number }; const label = (r: Row) => `row ${r.n}`;"),
+        ("tsx", "type P = { n: number }; const Card = ({n}: P) => <i title={`row ${n}`}/>;"),
+    ],
+)
+def test_native_dialect_owns_typed_template_delimiters(dialect, source):
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type=dialect) is None
+    assert javascript_template_spans(source, lambda: None, dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "function go(f: (s: string) => void) { (f!) (`cmd ${arg}`); }",
+        "function go(f?: (s: string) => void) { (f as any)(`cmd ${arg}`); }",
+        "const f = globalThis[key] as Function; (f satisfies Function)(`cmd ${arg}`);",
+    ],
+)
+def test_type_annotations_preserve_uncertain_runtime_callables(source):
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="typescript") is not None
+
+
+def test_native_promise_settlers_own_data_but_unknown_callbacks_stay_visible():
+    source = "new Promise((send, fail) => { try { send(1); } catch (e) { fail(e); } }); const label = `count: ${n}`;"
+    assert javascript_template_spans(source, lambda: None)
+    for prefix in ("const Promise = makeRunner(); ", "globalThis.Promise = runner; "):
+        assert javascript_template_spans(prefix + source, lambda: None) is None
+    for body in ("send = other; send(1)", "function nested(send) {send(1)}", "eval(arg); send(1)"):
+        assert javascript_template_spans(source.replace("send(1)", body), lambda: None) is None
+
+
+@pytest.mark.parametrize(
+    "binding, method",
+    [
+        ("import {writeFileSync as save} from 'node:fs';", "save"),
+        ("import * as io from 'node:fs';", "io.writeFileSync"),
+        ("import io from 'node:fs/promises';", "io.writeFile"),
+    ],
+)
+def test_fs_paths_and_generated_contents_have_different_consumers(binding, method):
+    assert javascript_template_spans(f"{binding} {method}(`/tmp/${{name}}`, 'data');", lambda: None)
+    assert (
+        javascript_template_spans(f"{binding} {method}('/tmp/out', `${{command}}`);", lambda: None)
+        is None
+    )
+    assert (
+        javascript_template_spans(
+            f"{binding} import {{unknown}} from 'other'; {method}(unknown(`${{command}}`), 'data');",
+            lambda: None,
+        )
+        is None
+    )
+
+
+def test_parameter_field_reads_preserve_the_shell_role_of_other_bindings():
+    benign = "function label(run) { return `frame ${run.index} ${run.info.name}`; }"
+    assert javascript_template_spans(benign, lambda: None)
+    for expression in (
+        "run()",
+        "run.call(null, line)",
+        "run.launch(line)",
+        "run[key](line)",
+        "fn(run)",
+        "run = executor",
+    ):
+        source = benign.replace("return", expression + "; return")
+        assert javascript_template_spans(source, lambda: None) is None
+
+
+def test_js_runtime_witness_and_invalid_native_syntax_are_distinct():
+    source = "const label = `heading ${name}`; function go(callback) { callback(label); }"
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert diagnostic.check == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert diagnostic.start == source.index("callback(label)")
+    malformed = "let = ) ; const label = `heading ${name}`;"
+    diagnostic = tm.bounded_parse_diagnostic(malformed, lambda: None, file_type="javascript")
+    assert diagnostic.check == tm.ParserCheck.JAVASCRIPT_SYNTAX
+    assert diagnostic.cause == tm.ParserCause.MALFORMED_INPUT
+
+
+def test_native_tree_budget_reports_a_resource_limit(monkeypatch):
+    monkeypatch.setattr(js, "_MAX_NODES", 4)
+    diagnostic = tm.bounded_parse_diagnostic(
+        "const label = `heading ${name}`;", lambda: None, file_type="javascript"
+    )
+    assert diagnostic.check == tm.ParserCheck.JAVASCRIPT_SYNTAX
+    assert diagnostic.cause == tm.ParserCause.RESOURCE_LIMIT
+
+
+def test_array_accumulators_only_own_exact_non_callable_bindings():
+    source = "function group(i) { const all = []; let run = null; if (!run) run = [i]; run.push(i); if (run) all.push(run); run = null; return `group ${i}`; }"
+    assert javascript_template_spans(source, lambda: None)
+    for replacement in (
+        "run = callable",
+        "run.call(null, cmd)",
+        "const copy = run",
+        "for (run of callbacks) run(cmd)",
+        "eval(dynamic)",
+    ):
+        candidate = source.replace("run = null; return", replacement + "; return")
+        assert javascript_template_spans(candidate, lambda: None) is None
+
+
+def test_uncaught_native_error_only_owns_direct_scalar_messages():
+    source = (
+        "function f(items, i) { group.run.push(i); throw new Error(`bad item ${items[i].name}`); }"
+    )
+    assert javascript_template_spans(source, lambda: None) is None
+    ordinary = "const info = {name: 'plain'}; throw new Error(`bad item ${info.name}`);"
+    assert javascript_template_spans(ordinary, lambda: None)
+    for candidate in (
+        "let Error = receiver; " + source,
+        "try { f(a, b); } catch (e) { use(e); }" + source,
+        "globalThis.Error = handler; " + source,
+        "process.on('uncaughtException', handler); " + source,
+        source + " send(`value ${x}`);",
+        source.replace("items[i].name", "run(cmd)"),
+        source.replace("throw new Error", "return new Error"),
+        source + " import {exec} from 'node:child_process';",
+        source + " tool.exec(other);",
+    ):
+        assert javascript_template_spans(candidate, lambda: None) is None
+
+
+@pytest.mark.parametrize(
+    "initializer",
+    [
+        "{ get detail() { return read(value); } }",
+        "{ [Symbol.toPrimitive]() { return read(value); } }",
+        "{ toString() { return read(value); } }",
+        "new Proxy({}, { get() { return read(value); } })",
+    ],
+)
+def test_thrown_template_keeps_callbacks_in_accessors_and_coercions(initializer):
+    source = (
+        "export function fail(read, value) { const info = "
+        + initializer
+        + "; throw new Error(`bad ${info.detail} ${info}`); }"
+    )
+    result = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert result is not None and result.check == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert result.start == source.index("read(value)")
+
+
+@pytest.mark.parametrize(
+    ("value", "field"),
+    [
+        ("new Proxy({}, {get: read})", "info.detail"),
+        ("{[Symbol.toPrimitive]: read}", "info"),
+        ("{toString: read}", "info"),
+        ("{toString: null, valueOf: read}", "info"),
+    ],
+)
+def test_interpolation_invokes_registered_runtime_callbacks(value, field):
+    source = (
+        "export function fail(read) { const info = "
+        + value
+        + "; throw new Error(`bad ${"
+        + field
+        + "}`); }"
+    )
+    result = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert result is not None and result.start == source.index("${") + 2
+    assert not tm.bounded_parse_diagnostic(
+        source.replace("${" + field + "}", "${7}"), lambda: None, file_type="javascript"
+    )
+
+
+@pytest.mark.parametrize(
+    "initializer",
+    [
+        "{valueOf: read}",
+        "{'[Symbol.toPrimitive]': read}",
+        "{toString: read, toString() {return 'plain'}}",
+        "new Proxy({}, {get: read, get() {return 'plain'}})",
+    ],
+)
+def test_interpolation_keeps_plain_and_overridden_properties(initializer):
+    source = (
+        "export function fail(read) { const info = "
+        + initializer
+        + "; throw new Error(`bad ${info}`); }"
+    )
+    assert not tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+
+
+def test_a_thrown_literal_does_not_clear_an_independent_call():
+    source = "export function fail(read) { read(7); throw new Error(`bad ${7}`); }"
+    result = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert result is not None and result.start == source.index("read(7)")
+
+
+def test_dynamic_evaluator_is_attributed_even_after_a_regex_match():
+    source = "const got = /abc/.exec(text); other(/xyz/); const f = new Function(`return ${body}`);"
+    target = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert target is not None and target.cause == tm.ParserCause.RUNTIME_DEPENDENT
+    assert target.start == source.index("new Function")
+    shadowed = "const Function = receiver; " + source
+    target = tm.bounded_parse_diagnostic(shadowed, lambda: None, file_type="javascript")
+    assert target is not None and target.start != shadowed.index("new Function")
+
+
+def test_iteration_bindings_and_exported_markup_have_independent_roles():
+    idle = "for (const run of values) { count++; } const msg = `count ${count}`;"
+    assert not tm.bounded_parse_diagnostic(idle, lambda: None, file_type="javascript")
+    for body in ("run(input)", "store(run)", "run.call(null,input)"):
+        d = tm.bounded_parse_diagnostic(
+            idle.replace("count++", body), lambda: None, file_type="javascript"
+        )
+        assert d is not None
+    trace = "for (const run of values) { run.map(x=>x); } "
+    svg = 'export function draw(tone) { return `<g class="info" data-tone="${tone}"></g>`; }'
+    d = tm.bounded_parse_diagnostic(trace + svg, lambda: None, file_type="javascript")
+    assert d is not None and d.check == tm.ParserCheck.GENERATED_HTML_MARKUP
+    assert (trace + svg)[d.start : d.end] == "${tone}"
+    for altered in (
+        svg.replace("return", "tone = 'safe'; return"),
+        svg.replace("${tone}", "${escape(tone)}"),
+        svg.replace("export ", ""),
+    ):
+        actual = tm.bounded_parse_diagnostic(trace + altered, lambda: None, file_type="javascript")
+        assert actual is not None and actual.check != tm.ParserCheck.GENERATED_HTML_MARKUP
+
+
+def test_markup_parameter_preserves_dynamic_calls_and_tracks_multiple_attributes():
+    read = "for (const run of values) { run.map(f); } "
+    export = 'export function draw(tone) { return `<svg aria-label="${escape(title)}" data-tone="${tone}"></svg>`; }'
+    source = read + export
+    hit = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert hit is not None and source[hit.start : hit.end] == "${tone}"
+    for tail in (" run(cmd);", " import {spawn} from 'node:child_process';"):
+        other = tm.bounded_parse_diagnostic(source + tail, lambda: None, file_type="javascript")
+        assert other is not None and other.check != tm.ParserCheck.GENERATED_HTML_MARKUP
+    clean = tm.bounded_parse_diagnostic(export, lambda: None, file_type="javascript")
+    assert clean is None
+
+
+def test_local_helper_and_regex_do_not_mask_runtime_call_locations():
+    sources = [
+        (
+            "function first(helper) { return helper(x); } function more() { const helper = x => [x]; helper(1); } const msg = `ok ${x}`;",
+            "helper(x)",
+        ),
+        (
+            "other(/x/); /r/.exec(value); function work(id, data) { return run(id, `item ${data}`); }",
+            "run(id,",
+        ),
+    ]
+    for source, location in sources:
+        d = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+        assert d is not None and d.start == source.index(location)
+
+
+@pytest.mark.parametrize(
+    "definition,call",
+    [
+        ("const coords=[0,2]; function sample(get) {return get(1)}", "sample(i => coords[i])"),
+        ("const sample = (value, emit) => { if (emit) emit(value); }", "sample(1)"),
+        ("function sample(Kind) {return new Kind(4)}", "sample(Float64Array)"),
+        ("import * as v from './v.mjs'; const sample = v.scale;", "sample(2)"),
+    ],
+)
+def test_private_calls_use_source_bound_arguments(definition, call):
+    source = f"export const label = `item ${{i}}`; {definition}; {call};"
+    assert javascript_template_spans(source, lambda: None)
+    assert javascript_template_spans(source + " eval(userText);", lambda: None) is None
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "export {sample};",
+        "publish(sample);",
+        "sample(external);",
+        "sample(...args);",
+        "sample(i => runner(i));",
+        "sample(i => states[i]());",
+    ],
+)
+def test_private_callback_proof_requires_every_actual_caller(tail):
+    source = "export const label = `item ${i}`; function sample(get) {return get(1)}; sample(i => coords[i]); "
+    assert javascript_template_spans(source + tail, lambda: None) is None
+
+
+def test_private_calls_preserve_writes_guards_and_import_barriers():
+    for source in [
+        "function f(get) {get=other;return get(1)} f(x=>values[x])",
+        "function f(get) {arguments[0]=other;return get(1)} f(x=>values[x])",
+        "function f(a, record) {if (!record) record(a)} f(1)",
+        "function f(Kind) {return new Kind(4)} const Float64Array=ext; f(Float64Array)",
+        "import * as v from './v.js'; const f=v.runJob; f(`x ${arg}`)",
+        "import * as v from './v.js'; const f=v.exec; f(arg)",
+        "const v=runtime; const f=v.method; f(arg)",
+    ]:
+        assert (
+            javascript_template_spans("export const label=`item ${n}`;" + source, lambda: None)
+            is None
+        )
+
+
+def test_public_callback_witness_uses_exported_option_source():
+    source = (
+        "function elsewhere(a) {const step = x => [x]; step(3)} "
+        "function dummy(step){step(1)} "
+        "function mount({onChange=null}={}){ if (onChange) onChange(2); } "
+        "export const API={mount:mount};const label=`item ${val}`;"
+    )
+    hit = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert hit and hit.start == source.index("onChange(2)")
+
+
+def test_module_initialization_prefers_dynamic_markup_but_keeps_runtime_controls():
+    wrapper = "const wrap=(init,m)=>()=>m||(init((m={exports:{}}).exports,m),m); "
+    write = "const render=(node,markup)=>{if(node.namespaceURI){node.innerHTML=markup}}; const label=`id ${i}`;"
+    src = "(function(){" + wrapper + "wrap((exports,m)=>{});" + write + "})();"
+    hit = tm.bounded_parse_diagnostic(src, lambda: None, file_type="javascript")
+    assert hit and hit.check == tm.ParserCheck.GENERATED_HTML_MARKUP
+    assert src[hit.start : hit.end] == "node.innerHTML=markup"
+    for change in [
+        src.replace("m={exports:{}}", "m=chooseModule()"),
+        src.replace("wrap((exports,m)=>{})", "wrap(userSupplied)"),
+        src.replace("node.innerHTML=markup", "node.textContent=markup"),
+        src + " eval(unsafe);",
+    ]:
+        other = tm.bounded_parse_diagnostic(change, lambda: None, file_type="javascript")
+        assert other and other.check != tm.ParserCheck.GENERATED_HTML_MARKUP
+
+
+def test_fs_write_reports_embedded_executable_source_expression():
+    src = (
+        "import fs from 'node:fs/promises'; "
+        "const doc=`<!doctype html><script type='application/json'>${data}</script>"
+        "<script>${body.replace(/a/g,'b')}</script>`; fs.writeFile(dest,doc);"
+    )
+    hit = tm.bounded_parse_diagnostic(src, lambda: None, file_type="javascript")
+    assert hit and hit.check == tm.ParserCheck.GENERATED_HTML_MARKUP
+    assert src[hit.start : hit.end] == "${body.replace(/a/g,'b')}"
+    for change in [
+        src.replace("<script>", "<script type='application/json'>"),
+        src.replace("node:fs/promises", "./custom.js"),
+        src.replace("fs.writeFile(dest,doc)", "fs.writeFile(doc,dest)"),
+        src + " eval(userInput);",
+    ]:
+        other = tm.bounded_parse_diagnostic(change, lambda: None, file_type="javascript")
+        assert other is None or other.check != tm.ParserCheck.GENERATED_HTML_MARKUP
+
+
+def test_import_fallback_preserves_live_caller_stage_attribution():
+    source = (
+        "import {execFileSync} from 'node:child_process';"
+        "async function pipeline(items,...stages){return items.map(async (v)=>{for(const stage of stages){v=await stage(items)}})}"
+        "export const msg=`run ${id}`; runScript(body,{pipeline});"
+    )
+    hit = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert hit and hit.start == source.index("stage(items)")
+    for variant in [
+        source.replace("of stages", "of local"),
+        source.replace("v=await stage(items)", "{const stage=()=>1;v=await stage(items)}"),
+        source.replace("v=await stage(items)", "consume(stage);v=await stage(items)"),
+        source.replace("{pipeline}", "{}"),
+        source + " execFileSync(selected, []);",
+        source.replace("for(const stage", "stages=[];for(const stage"),
+        source + " eval(unsafe);",
+    ]:
+        other = tm.bounded_parse_diagnostic(variant, lambda: None, file_type="javascript")
+        assert other and other.start != variant.index("stage(items)")
+
+
+_REGEX_RULES = (
+    "const root = 'path';"
+    "const make = (pat, msg) => ({regex: pat instanceof RegExp ? pat : new RegExp(pat), msg});"
+    "const rules = [make(/a/, 'A'),make(root + 'x', 'X')];"
+    "const capture = /part (.*)/g;"
+    "function classify(text){for(const row of rules) if(row.regex.test(text)) return row.msg;"
+    "let match; while ((match = capture.exec(text))) {"
+    "match[1].trim().split(/ +/); if (/empty/.test(match[0])) break;}}"
+    "const result = capture.exec(`value ${arg}`);"
+)
+
+
+def test_closed_regex_rule_data_and_native_match_string_keep_raw_findings() -> None:
+    source = _REGEX_RULES + "const example = 'rm -rf /';"
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is None
+    assert any(
+        finding.rule_id == "TM1" for finding in tm.analyze(source, "sample.mjs", "javascript")
+    )
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("row.msg", "foreign(row)"),
+        ("row.msg", "foreign(row.regex)"),
+        ("row.msg", "row.regex"),
+        ("row.msg", "foreign.saved = row.regex"),
+        ("for(const row", "foreign(rules); for(const row"),
+        ("make(root + 'x', 'X')", "...incoming"),
+        ("make(root + 'x', 'X')", "make(incoming, 'X')"),
+        ("make(root + 'x', 'X')", "make(/x/, incoming)"),
+        (
+            "{regex: pat instanceof RegExp ? pat : new RegExp(pat), msg}",
+            "{regex: forward(pat), msg}",
+        ),
+        ("capture.exec(text)", "other.match(text)"),
+        ("match[1].trim().split", "other.value.split"),
+        ("match[1].trim().split", "other.value.trim().split"),
+        ("match[1].trim().split", "match = foreign(); match[1].trim().split"),
+        ("match[1].trim().split", "observe(match); match[1].trim().split"),
+        ("const result", "foreign(new RegExp('x')); const result"),
+        ("const result", "const extra = new RegExp('x'); foreign(extra); const result"),
+        ("const result", "observe(/x/); const result"),
+        ("const result", "let k = 'proto'; const p = /x/[k]; const result"),
+        ("const result", "Object.assign(RegExp.prototype, {exec: changed}); const result"),
+    ],
+)
+def test_regex_rule_proof_requires_closed_bindings_and_a_string_receiver(
+    old: str, new: str
+) -> None:
+    source = _REGEX_RULES.replace(old, new)
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is not None
+
+
+def test_regex_binding_cannot_cover_an_unrelated_scope() -> None:
+    source = "{const capture = /known/;} capture.exec(`value ${arg}`);"
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is not None
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "export function custom(fs,body){const doc=`<script>${body}</script>`;fs.writeFile(dest,doc)}",
+        "const doc=`<script>${body}</script>`;export function custom(doc){fs.writeFile(dest,doc)}",
+        "const doc=`<script>${body}</script>`;const custom=(doc)=>fs.writeFile(dest,doc);",
+        "const doc=`<script>${body}</script>`;expose(fs);fs.writeFile(dest,doc)",
+        "const doc=`<script>${body}</script>`;fs.writeFile=other;fs.writeFile(dest,doc)",
+    ],
+)
+def test_generated_script_witness_rejects_shadowed_or_escaped_fs_bindings(variant):
+    source = "import fs from 'node:fs/promises';" + variant
+    hit = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert hit is not None and hit.check != tm.ParserCheck.GENERATED_HTML_MARKUP
+
+
+@pytest.mark.parametrize(
+    "mutation", ["options={cb:local};", "options.cb=local;", "alter(options);"]
+)
+def test_external_option_witness_requires_unchanged_source(mutation):
+    from skillspector.javascript_ast import parse_javascript_source
+    from skillspector.javascript_callables import _external_option_callback
+
+    source = "export function start(options){const {cb}=options;return cb(2)}"
+    parsed = parse_javascript_source(source, lambda: None)
+    assert parsed is not None and _external_option_callback(parsed, lambda: None) is not None
+    changed = parse_javascript_source(
+        source.replace("const {cb}", mutation + "const {cb}"), lambda: None
+    )
+    assert changed is not None and _external_option_callback(changed, lambda: None) is None
+
+
+@pytest.mark.parametrize(
+    "setup, body, argument, expected",
+    [
+        ("const table=new Proxy({}, {get:hook});", "i=>table[i]", "1", False),
+        ("const table={get 1(){return hook()}};", "i=>table[i]", "1", False),
+        ("const table=[2,3];", "i=>table[i]", "1", True),
+        ("const table=[2,,3];", "i=>table[i]", "1", False),
+        ("const table=[2,3];", "i=>table[i]", "3", False),
+        ("const table=[2,3]; expose(table);", "i=>table[i]", "1", False),
+        ("const table=[2,3];", "i=>table[i]", "key", False),
+        ("", "i=>i+1", "key", False),
+        ("const y={[Symbol.toPrimitive]:hook};", "i=>i+1", "y", False),
+        ("const y=3;", "i=>i+1", "y", True),
+        ("", "i=>i===1", "key", True),
+    ],
+)
+def test_private_arrow_implicit_operations(setup, body, argument, expected):
+    source = (
+        "export function select(hook,key) {"
+        + setup
+        + f"function take(fn) {{return fn({argument})}}"
+        + "return `sample ${take("
+        + body
+        + ")}`; }"
+    )
+    assert bool(javascript_template_spans(source, lambda: None)) == expected
+
+
+@pytest.mark.parametrize(
+    "arg, safe",
+    [
+        ("1", True),
+        ("", True),
+        ("list", False),
+        ("{[Symbol.iterator]:step}", False),
+        ("{valueOf:step}", False),
+        ("...rest", False),
+    ],
+)
+def test_private_typed_constructor_only_owns_primitive_input(arg, safe):
+    source = (
+        "export function select(list,step,...rest){"
+        + "function make(Kind){return new Kind("
+        + arg
+        + ")}"
+        + "return `sample ${make(Uint8Array)}`;}"
+    )
+    assert bool(javascript_template_spans(source, lambda: None)) == safe
+
+
+@pytest.mark.parametrize("input_value, data", [("item", False), ("4", True), ("opts[0]", False)])
+def test_local_numeric_helper_checks_implicit_conversions(input_value, data):
+    source = (
+        "export function compute(handler,opts){const item={[Symbol.toPrimitive]:handler};"
+        "const run=(i)=>i+1; return `value ${run(" + input_value + ")}`;}"
+    )
+    assert bool(javascript_template_spans(source, lambda: None)) == data
+
+
+@pytest.mark.parametrize("value,data", [("2", True), ("{[Symbol.toPrimitive]:handler}", False)])
+def test_returned_private_value_reaches_interpolation(value, data):
+    source = (
+        "export function compute(handler){const v="
+        + value
+        + "; function take(fn){return fn(v)} return `value ${take(i=>i)}`;}"
+    )
+    assert bool(javascript_template_spans(source, lambda: None)) == data
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "function hash(values) { const r = (x, n) => (x >>> n) | (x << (32 - n)); return r(values[0], 7); } function other(r) { return r; }",
+        "function hash(values) { const run = x => x * 2; return run(values[0]); } function other(r) { return r; }",
+        "function first(values) { const r = x => x + 1; return r(values[0]); } function second(r) { return r; }",
+        "function first(values){const alias=values;const nested=alias;const r=x=>x+1;return r(nested[0]);}",
+    ],
+)
+def test_local_numeric_helpers_retain_unconstrained_operands(statement):
+    assert (
+        javascript_template_spans(statement + " console.log(`value ${key}`)", lambda: None) is None
+    )
+
+
+@pytest.mark.parametrize(
+    "usage, complete",
+    [
+        ("for(let i=0;i<16;i++) n(i);", True),
+        ("for(let i=0;i<16;i++) {i=props.input;n(i)}", False),
+        ("[1,2,3].map(i=>n(i))", True),
+        ("external.map(i=>n(i))", False),
+        ("Array.prototype.map = invoke; [1,2,3].map(i=>n(i))", False),
+        ("[1,external].map(i=>n(i))", False),
+    ],
+)
+def test_local_numeric_helpers_only_accept_source_bound_iterations(usage, complete):
+    source = "const n = x => x*2;" + usage + "; const mark=`value ${key}`;"
+    assert bool(javascript_template_spans(source, lambda: None)) == complete

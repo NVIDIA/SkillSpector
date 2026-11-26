@@ -213,6 +213,7 @@ def test_concatenated_fstrings_keep_runtime_operand_ambiguity() -> None:
     # parameter can leave a root path, while a replacement field supplies flags.
     # Concatenation must retain those possible operands even in report strings.
     assert _python(content) is True
+    assert _shell(content + '"$CMD" -rf /\n') is True
 
 
 _CONSTANT_CHECKOUT_SOURCE = """\
@@ -419,6 +420,139 @@ def test_constant_checkout_proof_preserves_real_shell_findings() -> None:
     assert _python(source) is True
     result = _ledger("scripts/report.py", source)
     assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+@pytest.mark.parametrize(
+    "expression,partial",
+    [
+        ('"$TOOL, $ROOT/path{cache}, harmless"', False),
+        ('f"$TOOL, $ROOT/path{{cache}}, harmless"', False),
+        ('("$TOOL, $ROOT/" f"{{cache}}, harmless")', False),
+        ('f"$TOOL, $ROOT/{choice}, harmless"', True),
+        ('f"$TOOL, $ROOT/{choice,choice}, harmless"', True),
+        ('("$TOOL, $ROOT/" f"{choice}, harmless")', True),
+        ('f"$TOOL, $ROOT/{{cache}}/{choice}, harmless"', True),
+        ('f"$TOOL -rf /{{cache}}, item"', True),
+        ('f"$TOOL, $ROOT/p\\N{SPACE}, harmless"', False),
+        ('rf"$TOOL, $ROOT/p\\N{SPACE}, harmless"', True),
+        ('f"$TOOL, $ROOT/p\\\\N{SPACE}, harmless"', True),
+        ('f"$TOOL \\N{HYPHEN-MINUS}n /"', False),
+        ('f"$TOOL \\N{HYPHEN-MINUS}rf \\N{SOLIDUS}"', True),
+        ('f"$TOOL -rf \\N{ASTERISK}"', True),
+        ('("$TOOL " "-rf " "/")', True),
+        ('("$TOOL " "-n " "/")', False),
+        ('("$TOOL " f"\'{choice}\' " "/")', True),
+        ("('$TOOL ' f'\"{choice}\" ' '/')", True),
+        ('("$TOOL " f"\'-r{choice}\' " "/")', True),
+        ('("$TOOL " "\'-r\' " f"\'{choice!s}\' " "/")', True),
+        ('("$TOOL " f"\'{choice:>3}\' " "/")', True),
+        ('("$TOOL -- " f"\'{choice}\' " "/")', False),
+        ('("$TOOL " f"\'--{choice}\' " "/")', False),
+        ('("$TOOL " "--force " f"\'--{choice}\' " "/")', True),
+        ('("$TOOL " f"\'{choice}\' " "relative")', False),
+        ('("$TOOL " f"\'{choice}\' " "/").replace("sample", "other")', True),
+        ('("$TOOL " f"{\'-n\'} " "/")', False),
+        ('("$TOOL " f"{\'-rf\'} " "/")', True),
+    ],
+)
+def test_python_shell_operands_require_native_brace_ownership(
+    expression: str, partial: bool
+) -> None:
+    content = (
+        "import subprocess\ndef run(choice):\n    command = "
+        + expression
+        + "\n    subprocess.run(command, shell=True)\n"
+    )
+    event = _ledger("run.py", content)["inspection_ledger"][0]
+    assert event["outcome"] is (LedgerOutcome.PARTIAL if partial else LedgerOutcome.COMPLETED)
+    if partial:
+        assert event["parser_diagnostic"]["check"] in {
+            "brace_syntax",
+            "command_argument_boundary",
+            "runtime_command_identity",
+        }
+
+
+@pytest.mark.parametrize("prefix", ["", "f", "r", "rf", "b"])
+@pytest.mark.parametrize("target", [r"\x2f", r"\057", r"\u002f", r"\U0000002f", r"\N{SOLIDUS}"])
+def test_python_escape_grammar_owns_generated_shell_target(prefix: str, target: str) -> None:
+    source = f'command = {prefix}"$TOOL -rf {target}"\n'
+    # These are the actual Python literal grammars. Raw strings preserve
+    # escapes; Unicode-only escapes in bytes literals preserve their spelling.
+    expected = "r" not in prefix and not (prefix == "b" and target[1] in "uUN")
+    assert _python(source) is expected
+
+
+def test_python_field_in_large_owner_keeps_quoted_option_role() -> None:
+    source = (
+        "def run(choice):\n"
+        '    command = f"""# ' + "a" * tm._ROOT_GLOB_COMMAND_CHARS + "\n"
+        "$TOOL '{choice}' /" + '"""\n'
+    )
+    assert _python(source)
+
+
+@pytest.mark.parametrize(
+    "field,partial",
+    [
+        ("{'-n'!s}", False),
+        ("{'-n':}", False),
+        ("{'-n':s}", False),
+        ("{'-n':>3}", False),
+        ("{0}", False),
+        ("{0:d}", False),
+        ("{'-rf'!s}", True),
+        ("{'-rfx':.3s}", True),
+        ("{choice!s}", True),
+        ("{choice:{width}}", True),
+        ("{'-rf':999999999}", True),
+    ],
+)
+def test_python_exact_literal_format_keeps_its_shell_option_role(field: str, partial: bool) -> None:
+    command = "f" + '"""' + "$TOOL '" + field + "' /" + '"""'
+    source = "def run(choice, width):\n    command = " + command + "\n"
+    assert _python(source) is partial
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        (
+            '"""\nFallback: {"<key>": <text>, "status_code": n}).\n'
+            " * A check is non-fatal: it's logged before the ordinary work resumes.\n"
+            ' - Any row `detail: "fast"` -> response:fast (+ reason)\n'
+            "A result that turns non-zero or records non-data continues with its current\n"
+            'state (non-blocking, matching the user\'s "non-2 stop is non-blocking");\n"""\n',
+            None,
+        ),
+        (
+            "items = {\"guide\": 'Read the record for '\n"
+            '    "`case-brief.txt`. This note is read-only and the result\'s display "\n'
+            "    'uses `01-review/detail-map.md`.'}\nprint(items[\"guide\"])\n",
+            None,
+        ),
+        ('command = ("$TOOL " "-rf " "/")', "runtime_command_identity"),
+        ('command = ("$TOOL " "-rf " "/\'open")', "command_argument_boundary"),
+        ('command = ("$TOOL " "$prefix-rf " "/\'open")', "command_argument_boundary"),
+    ],
+)
+def test_reconstructed_python_argument_boundary_needs_viable_options(
+    source: str, expected: str | None
+) -> None:
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="python")
+    assert (diagnostic.check.value if diagnostic else None) == expected
+
+
+def test_shell_literal_braces_keep_unrelated_runtime_command_visible() -> None:
+    literal = "$TOOL, $ROOT/path{cache}, harmless"
+    assert not _shell(literal)
+    hazard = "$WHICH -rf /"
+    diagnostic = tm.bounded_parse_diagnostic(
+        literal + "\n" + hazard, lambda: None, file_type="shell"
+    )
+    assert diagnostic is not None
+    assert diagnostic.start == len(literal) + 1
+    assert diagnostic.check.value == "runtime_command_identity"
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
@@ -1055,7 +1189,7 @@ def test_runtime_command_in_python_string_keeps_undecided_operands_partial(sourc
         pytest.param('X = "a `{b}` "[c]\n', None, id="subscript"),
         pytest.param(
             'X = f"a `{b}` {c} {{d}}" "{e}" f"{{{g}}}"\n',
-            "`{b}`  -rf {c} {{d}}{e}{{ -rf {g}}}",
+            "`{b}`  -rf {c} {d}{e}{ -rf {g}}",
             id="replacement-fields",
         ),
     ],

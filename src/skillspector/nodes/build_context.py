@@ -104,6 +104,7 @@ from skillspector.references import (
     resolve_bundle_references_with_metadata,
 )
 from skillspector.state import (
+    ManifestVersionSource,
     SkillspectorState,
     ensure_workflow_resource_budget,
     transitive_note_truncation,
@@ -2217,6 +2218,8 @@ class _BoundedManifestLoader(yaml.SafeLoader):
         )
         self._manifest_nodes = 0
         self._manifest_depth = 0
+        self._version_key_event: yaml.NodeEvent | None = None
+        self.version_marks: tuple[yaml.NodeEvent, yaml.Mark, yaml.Mark] | None = None
 
     def flatten_mapping(self, node: yaml.MappingNode) -> None:
         """Reject YAML merge keys before SafeConstructor can amplify aliases."""
@@ -2237,7 +2240,26 @@ class _BoundedManifestLoader(yaml.SafeLoader):
             self._manifest_depth -= 1
             raise _ManifestLimitError("depth", self._manifest_depth + 1)
         try:
-            return super().compose_node(parent, index)
+            # Inspect the top-level mapping's events so aliases retain the
+            # use site's coordinates, even when they reuse an anchored node.
+            event = (
+                self.peek_event()
+                if self._manifest_depth == 2 and isinstance(parent, yaml.MappingNode)
+                else None
+            )
+            node = super().compose_node(parent, index)
+            key = node if index is None else index
+            if (
+                isinstance(event, yaml.NodeEvent)
+                and isinstance(key, yaml.ScalarNode)
+                and key.tag in ("tag:yaml.org,2002:str", "tag:yaml.org,2002:value")
+                and key.value == "version"
+            ):
+                if index is None:
+                    self._version_key_event = event
+                elif self._version_key_event is not None:
+                    self.version_marks = (self._version_key_event, event.start_mark, event.end_mark)
+            return node
         finally:
             self._manifest_depth -= 1
 
@@ -2505,12 +2527,12 @@ def _parse_manifest(
     ledger_events: list[InspectionLedgerEvent] | None = None,
     clock: Callable[[], float] = monotonic,
     deadline: float | None = None,
-) -> dict[str, object]:
-    """Parse SKILL.md or skill.md YAML frontmatter into a manifest dict.
+) -> tuple[dict[str, object], ManifestVersionSource | None]:
+    """Parse bounded SKILL.md or skill.md frontmatter and retain the version source.
 
     Returns dict with name, description, version, triggers (list), permissions
-    (list), allowed-tools (list), parameters (list). Returns {} if no file or
-    parse fails.
+    (list), allowed-tools (list), parameters (list), along with the optional
+    version source. Returns an empty manifest if no file or parse fails.
     Parsing is restricted to a bounded byte prefix, including for direct helper
     callers that do not provide the bundle's already-bounded raw cache.
     """
@@ -2551,10 +2573,10 @@ def _parse_manifest(
                 observed=exc.observed,
                 runtime_limit=runtime_limit,
             )
-            return {}
+            return {}, None
         except (OSError, _FileOpenError, _UnsafeFileError):
             logger.debug("Could not read manifest file: %s", name)
-            return {}
+            return {}, None
         truncated = len(observed) > MAX_MANIFEST_FRONTMATTER_BYTES
         try:
             _check_runtime()
@@ -2568,7 +2590,7 @@ def _parse_manifest(
                 observed=exc.observed,
                 runtime_limit=runtime_limit,
             )
-            return {}
+            return {}, None
         while content.startswith("\ufeff"):
             # decode_text() decodes with plain "utf-8", which never strips a
             # leading byte-order mark (only "utf-8-sig" does), so a BOM-prefixed
@@ -2579,7 +2601,7 @@ def _parse_manifest(
             # in file bodies.
             content = content[1:]
         if not content.startswith("---"):
-            return {}
+            return {}, None
         end_match = re.search(r"\n---\s*\n", content[3:])
         try:
             _check_runtime()
@@ -2591,7 +2613,7 @@ def _parse_manifest(
                 observed=exc.observed,
                 runtime_limit=runtime_limit,
             )
-            return {}
+            return {}, None
         if not end_match:
             if truncated:
                 _record_manifest_limit(
@@ -2602,9 +2624,10 @@ def _parse_manifest(
                 )
             else:
                 _record_manifest_parse_error(ledger_events, path=name)
-            return {}
+            return {}, None
         frontmatter = content[3 : end_match.start() + 3]
         loader: _BoundedManifestLoader | None = None
+        version_marks: tuple[yaml.NodeEvent, yaml.Mark, yaml.Mark] | None = None
         try:
             _check_runtime()
             loader = _BoundedManifestLoader(
@@ -2615,6 +2638,7 @@ def _parse_manifest(
             )
             try:
                 data = loader.get_single_data()
+                version_marks = loader.version_marks
             except (ValueError, OverflowError, KeyError, AttributeError, IndexError) as exc:
                 # SafeLoader's bounded scalar constructors may still reject a
                 # syntactically valid scalar during conversion (for example,
@@ -2627,7 +2651,7 @@ def _parse_manifest(
                     path=name,
                     error_class=type(exc).__name__,
                 )
-                return {}
+                return {}, None
             _validate_manifest_graph(
                 data,
                 started_at=started_at,
@@ -2642,7 +2666,7 @@ def _parse_manifest(
                 observed=exc.observed,
                 runtime_limit=runtime_limit,
             )
-            return {}
+            return {}, None
         except (yaml.YAMLError, RecursionError) as exc:
             logger.debug("Manifest parse failed for %s", name)
             _record_manifest_parse_error(
@@ -2650,15 +2674,15 @@ def _parse_manifest(
                 path=name,
                 error_class=type(exc).__name__,
             )
-            return {}
+            return {}, None
         finally:
             if loader is not None:
                 loader.dispose()
         if not isinstance(data, dict):
             _record_manifest_parse_error(ledger_events, path=name)
-            return {}
+            return {}, None
         try:
-            return _project_manifest(
+            manifest = _project_manifest(
                 data,
                 started_at=started_at,
                 deadline=effective_deadline,
@@ -2672,15 +2696,40 @@ def _parse_manifest(
                 observed=exc.observed,
                 runtime_limit=runtime_limit,
             )
-            return {}
+            return {}, None
         except _ManifestSchemaError as exc:
             _record_manifest_parse_error(
                 ledger_events,
                 path=name,
                 error_class=type(exc).__name__,
             )
-            return {}
-    return {}
+            return {}, None
+        version = manifest.get("version")
+        if version_marks is None or not isinstance(version, str):
+            return manifest, None
+        key_event, value_start, value_end = version_marks
+        key_mark = key_event.start_mark
+        snippet = None
+        if (
+            isinstance(key_event, yaml.ScalarEvent)
+            and key_event.anchor is None
+            and (
+                key_event.tag is None
+                or frontmatter.startswith(f"!<{key_event.tag}>", key_mark.index)
+            )
+            and key_mark.line == value_end.line
+            and value_end.index - key_mark.index <= 200
+        ):
+            # Keep a literal source spelling when it exposes the same text as
+            # the parsed version. Use the parsed preview for encoded scalars
+            # and user-defined names in YAML anchors, aliases or tag handles.
+            raw_value = frontmatter[value_start.index : value_end.index]
+            if raw_value in (version, f"'{version}'", f'"{version}"'):
+                snippet = frontmatter[key_mark.index : value_end.index]
+        # The YAML input starts after the opening hyphens and retains the
+        # opening line break. Its line numbers need only a 1-based offset.
+        return manifest, {"path": name, "line": key_mark.line + 1, "snippet": snippet}
+    return {}, None
 
 
 def _decodes_as_declared_python(
@@ -3890,7 +3939,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     llm_components = sorted(llm_file_cache)
     file_cache = dict(llm_file_cache)
     manifest_events: list[InspectionLedgerEvent] = []
-    manifest = _parse_manifest(
+    manifest, manifest_version_source = _parse_manifest(
         skill_dir,
         raw_file_cache=raw_file_cache,
         ledger_events=manifest_events,
@@ -4142,6 +4191,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "ast_cache": {},
         "python_ast_cache_key": python_ast_cache_key,
         "manifest": manifest,
+        "manifest_version_source": manifest_version_source,
         "previous_manifest": None,
         "model_config": model_config,
         "llm_provenance": llm_provenance,

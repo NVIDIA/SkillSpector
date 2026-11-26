@@ -165,6 +165,7 @@ class SarifRun(BaseModel):
     column_kind: Literal["utf16CodeUnits", "unicodeCodePoints"] | None = Field(
         default=None, alias="columnKind"
     )
+    properties: dict[str, object] | None = None
     artifacts: list[SarifArtifact] | None = None
     invocations: list[SarifInvocation] | None = None
     # SARIF 2.1.0 section 3.14.14: resolves artifactLocation.uriBaseId

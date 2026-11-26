@@ -49,8 +49,6 @@ from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langchain_core.utils.function_calling import convert_to_openai_tool
-from langchain_openai.chat_models.base import BaseChatOpenAI
-from openai import ContentFilterFinishReasonError, LengthFinishReasonError, pydantic_function_tool
 from pydantic import BaseModel
 
 from skillspector.constants import build_model_config
@@ -74,9 +72,7 @@ from skillspector.providers import (
     resolve_chat_model_credentials,
     resolve_provider_credentials,
 )
-from skillspector.providers.chat_models import UnsupportedControlError, resolve_reasoning_effort
-from skillspector.providers.gemini import GeminiProvider
-from skillspector.providers.openai import OpenAIProvider
+from skillspector.providers._controls import resolve_reasoning_effort
 from skillspector.structured_response import (
     MAX_RESPONSE_CHARS,
     ResponseIssue,
@@ -139,6 +135,8 @@ def _resolve_llm_credentials() -> tuple[str, str | None]:
 
 def _resolve_default_chat_model() -> str:
     """Return the default chat model for the endpoint that will be used."""
+    from skillspector.providers.openai import OpenAIProvider
+
     if has_provider_binding():
         return get_metadata_provider().resolve_model()
 
@@ -163,6 +161,8 @@ def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
     rejects a requested control makes the LLM unavailable, with the reason
     from :func:`unsupported_control_error`.
     """
+    from skillspector.providers.gemini import GeminiProvider
+
     try:
         provider = get_active_provider()
     except UnknownProviderError as exc:
@@ -205,6 +205,8 @@ def unsupported_control_error(timeout: float | None = 120) -> str | None:
     before any analysis.  Other failures, such as missing credentials, are
     left to the regular availability path.
     """
+    from skillspector.providers.chat_models import UnsupportedControlError
+
     if not any(
         os.environ.get(name, "").strip()
         for name in ("SKILLSPECTOR_TEMPERATURE", "SKILLSPECTOR_REASONING_EFFORT")
@@ -458,6 +460,65 @@ class AgentCLIChatModel:
 STRUCTURED_OUTPUT_METHODS = ("function_calling", "json_schema")
 
 
+def _exception_chain(
+    exc: BaseException, stop_before: BaseException | None = None
+) -> list[BaseException]:
+    """Return *exc* followed by its causes, without looping on cycles.
+
+    *stop_before* ends the walk before that exception, so a retried
+    request is judged on its own failure rather than on the failure it
+    was recovering from.
+    """
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if current is stop_before:
+            break
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def is_structured_output_rejection(
+    exc: BaseException, *, stop_before: BaseException | None = None
+) -> bool:
+    """Return whether *exc* is a provider 400 rejecting the structured-output mechanism.
+
+    Gateways without JSON-schema structured output (DeepSeek and similar
+    OpenAI-compatible endpoints) answer the ``json_schema`` response format
+    with HTTP 400 naming ``response_format``; langchain-openai surfaces that
+    as ``OpenAIInvalidRequestError`` (a ``BadRequestError``). A gateway that
+    rejects a forced ``tool_choice`` the same way is the same failure class:
+    the structured-output mechanism, not the model or the prompt, was
+    refused. Only that shape qualifies: other 400s (unknown model, bad key,
+    context overflow) must not trigger a tool-calling retry.
+
+    *stop_before* ends the chain walk before that exception. A fallback
+    retry runs inside the handler for the initial rejection, so Python
+    links that rejection as the retry error's implicit context; callers
+    pass the initial rejection here so only the retried request's own
+    failure can classify it as a structured-output rejection.
+    """
+    for item in _exception_chain(exc, stop_before):
+        status = getattr(item, "status_code", None)
+        if status is None:
+            status = getattr(item, "status", None)
+        if status != 400:
+            continue
+        message = str(getattr(item, "message", "") or "")
+        body = getattr(item, "body", None)
+        if isinstance(body, Mapping):
+            error = body.get("error")
+            if isinstance(error, Mapping) and isinstance(error.get("message"), str):
+                message = f"{message} {error['message']}"
+        text = f"{message} {item}".lower()
+        if "response_format" in text or "tool_choice" in text:
+            return True
+    return False
+
+
 def _gateway_output_preference(llm: object, model: str) -> str | None:
     """Use the verified gateway method without overriding reasoning or explicit choices.
 
@@ -465,6 +526,8 @@ def _gateway_output_preference(llm: object, model: str) -> str | None:
     envelopes across analyzers. This shares TP4's existing workaround; aliases
     and other providers retain their own method choices.
     """
+    from langchain_openai.chat_models.base import BaseChatOpenAI
+
     if not (
         isinstance(llm, BaseChatOpenAI)
         and chat_model_provider_name(llm) == "openai"
@@ -531,6 +594,7 @@ def bind_structured_output(
     *,
     preferred_method: str | None = None,
     preserve_text: str | None = None,
+    force_method: str | None = None,
 ) -> object:
     """``llm.with_structured_output(schema)`` with the method *model* needs.
 
@@ -539,10 +603,31 @@ def bind_structured_output(
     disabled) and bound with a tool method gets the tool call asked for in
     the prompt, and a prose answer raises :class:`StructuredOutputParseError`,
     which the analyzers retry like any other malformed structured response.
+
+    ``force_method`` binds that method past the environment override and the
+    provider hint. It exists only for the structured-output rejection
+    fallback (:func:`bind_structured_output_fallback`): a gateway that
+    rejects ``response_format`` has already shown the configured method does
+    not work, so recovery must not re-read it.
     """
-    if preferred_method is None:
-        preferred_method = _gateway_output_preference(llm, model)
-    kwargs = structured_output_kwargs(model, provider, preferred_method=preferred_method)
+    from langchain_openai.chat_models.base import BaseChatOpenAI
+    from openai import (
+        ContentFilterFinishReasonError,
+        LengthFinishReasonError,
+        pydantic_function_tool,
+    )
+
+    if force_method is not None:
+        if force_method not in STRUCTURED_OUTPUT_METHODS:
+            raise ValueError(
+                "forced structured output method must be one of "
+                f"{', '.join(STRUCTURED_OUTPUT_METHODS)}; got {force_method!r}"
+            )
+        kwargs = {"method": force_method}
+    else:
+        if preferred_method is None:
+            preferred_method = _gateway_output_preference(llm, model)
+        kwargs = structured_output_kwargs(model, provider, preferred_method=preferred_method)
     if preserve_text is not None and not isinstance(llm, BaseChatModel):
         raise StructuredOutputParseError(
             "provider cannot verify lossless formatting", issue=ResponseIssue.FORMAT_CHANGED
@@ -625,6 +710,47 @@ def bind_structured_output(
     ):
         return _validate_tool_call_result(structured, schema, include_raw=include_raw)
     return structured
+
+
+def bind_structured_output_fallback(
+    llm: object,
+    schema: type,
+    model: str,
+    provider: object | None = None,
+    *,
+    preserve_text: str | None = None,
+) -> object | None:
+    """Rebind *schema* as an unforced tool call for gateways that reject ``json_schema``.
+
+    Returns ``None`` when *llm* is not an OpenAI-compatible chat model: only
+    those send ``response_format`` on the wire, so only they can hit this
+    rejection.
+
+    The copy disables ``tool_choice`` on the model, so LangChain binds the
+    schema as a tool without forcing a specific call (``tool_choice`` stays
+    ``auto`` on the wire) and :func:`bind_structured_output` asks for the
+    call in the prompt. That is the shape DeepSeek accepts: plain
+    ``method="function_calling"`` still forces one named tool call, which
+    DeepSeek rejects the same way, so a method-only retry cannot recover.
+    """
+    from langchain_openai.chat_models.base import BaseChatOpenAI
+
+    if not isinstance(llm, BaseChatOpenAI):
+        return None
+    disabled = getattr(llm, "disabled_params", None)
+    merged = {**(disabled if isinstance(disabled, dict) else {}), "tool_choice": None}
+    try:
+        unforced_llm = llm.model_copy(update={"disabled_params": merged})
+    except Exception:
+        return None
+    return bind_structured_output(
+        unforced_llm,
+        schema,
+        model,
+        provider,
+        force_method="function_calling",
+        preserve_text=preserve_text,
+    )
 
 
 def _binds_unforced_tool_call(llm: object, method: str | None) -> bool:

@@ -25,6 +25,10 @@ MAX_INSPECTION_LEDGER_EVENTS: Final = bounded_capacity(
 )
 MAX_FINDING_OUTPUT_RECORDS: Final = 10_000
 MAX_EFFECTIVE_FINDINGS: Final = MAX_FINDING_OUTPUT_RECORDS
+UNSUPPORTED_PROSE_COMMAND_PATTERN: Final = "unsupported_prose_command_pattern"
+UNSUPPORTED_PROSE_COMMAND_NOTICE: Final = (
+    "This command pattern is not allowed for inspection; put the command in a code block."
+)
 RESOURCE_MEASUREMENT_UNITS: Final = (
     "characters",
     "bytes",
@@ -85,6 +89,7 @@ class LedgerReason(StrEnum):
     SYNTAX_ERROR = "syntax_error"
     LLM_BATCH_FAILED = "llm_batch_failed"
     LLM_STRUCTURED_RESPONSE_INVALID = "llm_structured_response_invalid"
+    LLM_STRUCTURED_OUTPUT_REJECTED = "llm_structured_output_rejected"
     LLM_RESPONSE_REFUSED = "llm_response_refused"
     LLM_RESPONSE_TRUNCATED = "llm_response_truncated"
     LLM_RESPONSE_INCOMPLETE = "llm_response_incomplete"
@@ -155,6 +160,7 @@ class LedgerReason(StrEnum):
     OUTPUT_LIMIT = "output_limit"
     TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
+    JSON_QUOTE_OWNERSHIP_LIMIT = "json_quote_ownership_limit"
     PYTHON_SOURCE_AMBIGUOUS = "python_source_ambiguous"
     PYTHON_SOURCE_DECODE_ERROR = "python_source_decode_error"
     INLINE_IMAGE_DECODE_ERROR = "inline_image_decode_error"
@@ -433,6 +439,10 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
         "LLM response could not be validated after bounded recovery."
     ),
+    LedgerReason.LLM_STRUCTURED_OUTPUT_REJECTED: (
+        "Provider rejected structured output (response_format unsupported; "
+        "tool-calling fallback also rejected)."
+    ),
     LedgerReason.LLM_RESPONSE_REFUSED: "The model declined to complete this assessment.",
     LedgerReason.LLM_RESPONSE_TRUNCATED: "The model's answer was cut short by its output limit.",
     LedgerReason.LLM_RESPONSE_INCOMPLETE: "The model did not finish this assessment.",
@@ -564,6 +574,12 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.INLINE_IMAGE_DECODE_ERROR: (
         "An inline data: image URI could not be decoded under its declared encoding."
     ),
+    LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT: (
+        "JSON quote ownership was not validated because a candidate source span exceeds "
+        "the character limit. JSON validity remains unverified; other instruction uncertainty "
+        "may remain. Split the document into smaller complete JSON values without dropping "
+        "required content, then rescan. Increasing the scan timeout does not raise this limit."
+    ),
     LedgerReason.OBFUSCATED_INSTRUCTION_TEXT: (
         "Obfuscated instruction text could not be fully evaluated by the deterministic layer."
     ),
@@ -632,11 +648,18 @@ class ParserCheck(StrEnum):
     COMMAND_ARGUMENT_CHARACTERS = "command_argument_characters"
     COMMAND_WORD_BOUNDARY = "command_word_boundary"
     COMMAND_ARGUMENT_BOUNDARY = "command_argument_boundary"
+    COMMAND_REDIRECTION_TARGET = "command_redirection_target"
+    DOCUMENTED_COMMAND_OPERAND = "documented_command_operand"
     COMMAND_IDENTITY = "runtime_command_identity"
+    GENERATED_TEXT_DESTINATION = "generated_text_destination"
     PRINTF_INPUT_CHARACTERS = "printf_input_characters"
     PRINTF_ARGUMENT_COUNT = "printf_argument_count"
     PRINTF_ARGUMENT_CHARACTERS = "printf_argument_characters"
     PRINTF_OUTPUT_CHARACTERS = "printf_output_characters"
+    SSH_ARGUMENTS = "ssh_arguments"
+    SHELL_FILTER_ARGUMENT = "shell_filter_argument"
+    SHELL_SCRIPT_PATH = "shell_script_path"
+    SHELL_ARITHMETIC = "shell_arithmetic"
     PRINTF_FORMAT = "printf_format"
     PRINTF_INVOCATION = "printf_invocation"
     WRAPPER_DEPTH = "wrapper_depth"
@@ -645,12 +668,15 @@ class ParserCheck(StrEnum):
     COMMAND_STRING_DEPTH = "command_string_depth"
     COMMAND_STRING_RUNTIME = "command_string_runtime"
     COMMAND_STRING_EFFECTS = "command_string_effects"
+    JSON_STRING_DECODING = "json_string_decoding"
     STARTUP_PROOF_CHARACTERS = "startup_proof_characters"
     BRACE_CHARACTERS = "brace_characters"
     BRACE_ALTERNATIVES = "brace_alternatives"
     BRACE_PRODUCTS = "brace_products"
     BRACE_ROUNDS = "brace_rounds"
     BRACE_SYNTAX = "brace_syntax"
+    JAVASCRIPT_SYNTAX = "javascript_syntax"
+    GENERATED_HTML_MARKUP = "generated_html_markup"
     MARKDOWN_LITERAL_OWNERSHIP = "markdown_literal_ownership"
     HEREDOC_HEADER = "heredoc_header"
     HEREDOC_COUNT = "heredoc_count"
@@ -787,6 +813,8 @@ class InspectionLedgerEvent(ResourceMeasurements):
     message: NotRequired[str]
     error_class: NotRequired[str]
     stage: NotRequired[str]
+    source_start_offset: NotRequired[int]
+    source_end_offset: NotRequired[int]
     parser_diagnostic: NotRequired[ParserDiagnostic]
 
 
@@ -816,6 +844,8 @@ class InspectionLedgerException(ResourceMeasurements):
     error_class: NotRequired[str]
     analyzers: NotRequired[list[str]]
     fatal: NotRequired[bool]
+    source_start_offset: NotRequired[int]
+    source_end_offset: NotRequired[int]
     scope: NotRequired[str]
     source_identity: NotRequired[str]
     parser_diagnostic: NotRequired[ParserDiagnostic]
@@ -846,6 +876,55 @@ class AnalysisCompleteness(TypedDict):
     dependency_inspection: NotRequired[dict[str, object]]
     policy_accepted: NotRequired[bool]
     warnings: NotRequired[list[dict[str, object]]]
+    notices: NotRequired[list[dict[str, object]]]
+
+
+def bounded_inspection_notices(rows: object) -> list[dict[str, object]]:
+    """Keep documentation notices separate from inspection gaps and findings."""
+    if not isinstance(rows, list) or MAX_FINDING_OUTPUT_RECORDS <= 0:
+        return []
+    notices: dict[tuple[str, int, int], dict[str, object]] = {}
+    for row in rows[:MAX_INSPECTION_LEDGER_EVENTS]:
+        if (
+            not isinstance(row, Mapping)
+            or row.get("reason_code") != UNSUPPORTED_PROSE_COMMAND_PATTERN
+        ):
+            continue
+        path = row.get("path")
+        if not isinstance(path, str):
+            continue
+        try:
+            path = _normalize_relative_path(path)
+        except ValueError:
+            continue
+        start, end = row.get("source_start_offset"), row.get("source_end_offset")
+        first, last = row.get("start_line"), row.get("end_line")
+        if not (
+            type(start) is int
+            and type(end) is int
+            and 0 <= start < end < (1 << 63)
+            and type(first) is int
+            and type(last) is int
+            and 1 <= first <= last < (1 << 63)
+        ):
+            continue
+        key = (path, start, end)
+        notices.setdefault(
+            key,
+            {
+                "reason_code": UNSUPPORTED_PROSE_COMMAND_PATTERN,
+                "message": UNSUPPORTED_PROSE_COMMAND_NOTICE,
+                "phase": "documentation",
+                "path": path,
+                "start_line": first,
+                "end_line": last,
+                "source_start_offset": start,
+                "source_end_offset": end,
+            },
+        )
+        if len(notices) >= MAX_FINDING_OUTPUT_RECORDS:
+            break
+    return list(notices.values())
 
 
 def _normalize_relative_path(path: str, *, scope_boundary: bool = False) -> str:
@@ -1124,6 +1203,7 @@ def _exception(
     analyzers: Iterable[str] = (),
     fatal: bool,
     scope: str | None = None,
+    source_identity: object = None,
 ) -> InspectionLedgerException:
     """Build the public, safe projection of one exceptional ledger fact."""
     exception: InspectionLedgerException = {
@@ -1143,6 +1223,8 @@ def _exception(
         exception["error_class"] = error_class
     if scope:
         exception["scope"] = scope
+    if isinstance(source_identity, str) and source_identity:
+        exception["source_identity"] = source_identity
     return exception
 
 
@@ -1172,14 +1254,37 @@ def _exception_from_event(
         analyzers=[str(event.get("analyzer_id", ""))],
         fatal=fatal,
         scope=RULE_SET_SCOPE if _is_rule_set_record(event) else None,
+        source_identity=event.get("source_identity"),
     )
     exception.update(resource_measurements(event))
-    source_identity = event.get("source_identity")
-    if isinstance(source_identity, str) and source_identity:
-        exception["source_identity"] = source_identity
     parser_diagnostic = sanitize_parser_diagnostic(event.get("parser_diagnostic"))
     if parser_diagnostic is not None:
         exception["parser_diagnostic"] = parser_diagnostic
+    if exception["reason_code"] is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT:
+        # Copy only consistent numeric evidence, never an arbitrary message or
+        # source payload from graph state. Keep distinct spans distinct when
+        # the public projection groups contributing analyzers below.
+        start = event.get("source_start_offset")
+        end = event.get("source_end_offset")
+        observed = event.get("observed_characters")
+        limit = event.get("limit_characters")
+        if (
+            type(start) is int
+            and type(end) is int
+            and type(observed) is int
+            and type(limit) is int
+            and 0 <= start < end <= (1 << 63) - 1
+            and observed == end - start
+            and observed > limit > 0
+        ):
+            exception["source_start_offset"] = start
+            exception["source_end_offset"] = end
+            exception["observed_characters"] = observed
+            exception["limit_characters"] = limit
+            exception["message"] += (
+                f" Observed source character span [{start}, {end}) "
+                f"({observed} characters; limit {limit})."
+            )
     return exception
 
 
@@ -1328,7 +1433,7 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
     findings_by_id: dict[str, object] = {}
     accounting_exceptions: list[InspectionLedgerException] = []
 
-    def accounting_error(path: object = None) -> None:
+    def accounting_error(path: object, source_identity: object) -> None:
         accounting_exceptions.append(
             _exception(
                 outcome=LedgerOutcome.FAILED,
@@ -1336,13 +1441,16 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
                 reason=LedgerReason.FINDING_ACCOUNTING_ERROR,
                 path=_safe_path(path, components),
                 fatal=True,
+                source_identity=source_identity,
             )
         )
 
     for finding in findings:
         finding_id = str(getattr(finding, "finding_id", ""))
         if not finding_id or finding_id in findings_by_id:
-            accounting_error(getattr(finding, "file", None))
+            accounting_error(
+                getattr(finding, "file", None), getattr(finding, "source_identity", None)
+            )
             continue
         findings_by_id[finding_id] = finding
 
@@ -1358,32 +1466,33 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         input_ids = list(event.get("input_finding_ids", []))
         emitted_ids = list(event.get("emitted_finding_ids", []))
         is_meta = _is_meta_phase(phase)
+        event_location = (event.get("path"), event.get("source_identity"))
         is_producer = event.get("record_type") == LedgerRecordType.WORK_ITEM and not is_meta
         if is_producer:
             producer_rows_present = True
         if is_producer and input_ids:
-            accounting_error(event.get("path"))
+            accounting_error(*event_location)
         if (
             is_producer
             and outcome not in (LedgerOutcome.COMPLETED, LedgerOutcome.PARTIAL)
             and emitted_ids
         ):
-            accounting_error(event.get("path"))
+            accounting_error(*event_location)
         if (
             is_meta
             and outcome == LedgerOutcome.COMPLETED
             and not set(emitted_ids).issubset(input_ids)
         ):
-            accounting_error(event.get("path"))
+            accounting_error(*event_location)
         if (
             is_meta
             and outcome in (LedgerOutcome.FAILED, LedgerOutcome.SKIPPED, LedgerOutcome.PARTIAL)
             and emitted_ids != input_ids
         ):
-            accounting_error(event.get("path"))
+            accounting_error(*event_location)
         for finding_id in [*input_ids, *emitted_ids]:
             if finding_id not in findings_by_id:
-                accounting_error(event.get("path"))
+                accounting_error(*event_location)
         if is_producer and outcome in (LedgerOutcome.COMPLETED, LedgerOutcome.PARTIAL):
             for finding_id in emitted_ids:
                 producer_origins[finding_id] = producer_origins.get(finding_id, 0) + 1
@@ -1391,7 +1500,9 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
     if producer_rows_present and not ledger_output_limited:
         for finding_id, finding in findings_by_id.items():
             if producer_origins.get(finding_id, 0) != 1:
-                accounting_error(getattr(finding, "file", None))
+                accounting_error(
+                    getattr(finding, "file", None), getattr(finding, "source_identity", None)
+                )
 
     explicit_effective = state.get("effective_finding_ids")
     if isinstance(explicit_effective, list):
@@ -1403,7 +1514,10 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
     validated_effective: list[str] = []
     for finding_id in effective_ids:
         if finding_id in seen_effective or finding_id not in findings_by_id:
-            accounting_error(getattr(findings_by_id.get(finding_id), "file", None))
+            finding = findings_by_id.get(finding_id)
+            accounting_error(
+                getattr(finding, "file", None), getattr(finding, "source_identity", None)
+            )
             continue
         seen_effective.add(finding_id)
         validated_effective.append(finding_id)
@@ -1443,6 +1557,7 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
                         end_line=target.get("end_line"),
                         analyzers=[analyzer_id],
                         fatal=True,
+                        source_identity=status.get("source_identity"),
                     )
                 )
             else:
@@ -1501,6 +1616,7 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
                     reason=reason,
                     path=path,
                     fatal=True,
+                    source_identity=artifact.get("source_identity"),
                 )
             )
             fatal_reasons.add((path, reason))
@@ -1673,6 +1789,9 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_before_filtering": len(findings_by_id),
         "findings_after_filtering": len(validated_effective),
     }
+    notices = bounded_inspection_notices(state.get("inspection_notices"))
+    if notices:
+        completeness["notices"] = notices
     patterns = state.get("exclude_patterns", [])
     dependency_inspection = state.get("dependency_inspection")
     if isinstance(dependency_inspection, dict):

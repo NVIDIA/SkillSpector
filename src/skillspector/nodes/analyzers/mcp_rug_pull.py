@@ -40,6 +40,7 @@ from skillspector.logging_config import get_logger
 from skillspector.models import Finding, compute_match_fingerprint
 from skillspector.state import (
     AnalyzerNodeResponse,
+    ManifestVersionSource,
     SkillspectorState,
     transitive_remaining_seconds,
 )
@@ -126,9 +127,28 @@ class _RugPullBudget:
 
 # RP1: Unpinned MCP server references in code or manifest
 _RP1_NPX_CMD = re.compile(
-    r"npx\s+(?:-+\w+\s+)*((?:@?[a-zA-Z][\w.-]*/)?[a-zA-Z][\w.-]*)",
+    r"\bp?npx[ \t]+(?:-+\w+[ \t]+)*((?:@?[a-zA-Z][\w.-]*/)?[a-zA-Z][\w.-]*)",
     re.IGNORECASE,
 )
+_RP1_CONFIG_RUNNER = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<item>-[ \t]+)?(?:command|cmd)[ \t]*:[ \t]*"
+    r"(?P<quote>[\"'])?(?P<runner>(?:[^\s\"'#]*/)?p?npx)"
+    r"(?(quote)(?P=quote)|(?=[ \t]|$))[ \t]*(?:#.*)?$",
+    re.IGNORECASE,
+)
+_RP1_CONFIG_ARGS = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<item>-[ \t]+)?(?:args|\"args\"|'args')[ \t]*:[ \t]*(?P<value>.*)$",
+    re.IGNORECASE,
+)
+_RP1_CONFIG_KEY = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<item>-[ \t]+)?(?:[\w-]+|\"[^\"]+\"|'[^']+')[ \t]*:(?=[ \t]|$)"
+)
+_RP1_CONFIG_ARG_TOKEN = re.compile(r"[\"']([^\"']*)[\"']|([^\s,\[\]#]+)")
+_RP1_CONFIG_MAX_LINES = 8
+# Structural windows count sibling keys, not the physical lines in their values.
+# Independently bound physical traversal and argument collection per command.
+_RP1_CONFIG_MAX_PHYSICAL_LINES = 256
+_RP1_CONFIG_MAX_ARG_LINES = 128
 _RP1_UVX_CMD = re.compile(
     r"(?:uvx|uv\s+tool\s+run)\s+(?:-+\w+\s+)*([a-zA-Z][\w.-]*)",
     re.IGNORECASE,
@@ -161,6 +181,145 @@ def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
 def _find_line(content: str, pos: int) -> int:
     """Return 1-based line number for character position *pos*."""
     return content.count("\n", 0, pos) + 1
+
+
+def _strip_yaml_comment(line: str) -> str:
+    """Remove an unquoted YAML comment without treating quoted hashes as comments."""
+    quote = ""
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if quote == '"' and char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                if quote == "'" and index + 1 < len(line) and line[index + 1] == "'":
+                    index += 2
+                    continue
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+        index += 1
+    return line
+
+
+def _iter_config_npx_commands(
+    content: str, budget: _RugPullBudget, file_path: str
+) -> Iterator[tuple[int, str, str]]:
+    """Find bounded YAML MCP command/args pairs that run an npx-style runner."""
+    lines = content.splitlines(keepends=True)
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+
+    for command_index, command_line in enumerate(lines):
+        budget.check_runtime(file_path)
+        command = _RP1_CONFIG_RUNNER.fullmatch(command_line.rstrip("\r\n"))
+        if command is None:
+            continue
+
+        # The key in "- command:" starts after the sequence marker. Sibling
+        # keys align with that column, not with the marker's indentation.
+        command_indent = len(command.group("indent")) + len(command.group("item") or "")
+        args_index: int | None = None
+        args_match: re.Match[str] | None = None
+        for direction in (-1, 1):
+            if direction == -1 and command.group("item"):
+                continue  # This command is already the first key in its list item.
+            sibling_count = 0
+            for distance in range(1, _RP1_CONFIG_MAX_PHYSICAL_LINES + 1):
+                index = command_index + direction * distance
+                if not 0 <= index < len(lines):
+                    break
+                budget.check_runtime(file_path)
+                candidate_line = lines[index].rstrip("\r\n")
+                stripped = candidate_line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                indent = len(candidate_line) - len(candidate_line.lstrip(" \t"))
+                key = _RP1_CONFIG_KEY.match(candidate_line)
+                key_indent = (
+                    len(key.group("indent")) + len(key.group("item") or "")
+                    if key is not None
+                    else indent
+                )
+                # Backward traversal may reach the first key of this list item.
+                # Forward traversal must never enter the next item, even when
+                # its key has the same effective column.
+                first_item_key = key is not None and key.group("item") is not None
+                if indent < command_indent and not (
+                    direction == -1 and first_item_key and key_indent == command_indent
+                ):
+                    break
+                if key_indent == command_indent:
+                    if key is None:
+                        # An indentless sequence belongs to a sibling value,
+                        # not a new server mapping. In backward searches, a
+                        # flow sequence's closing bracket also continues that
+                        # sibling value; mapping/list boundaries still apply.
+                        flow_end = direction == -1 and _strip_yaml_comment(stripped).strip() == "]"
+                        if not flow_end and not stripped.startswith("- ") and stripped != "-":
+                            break
+                    else:
+                        sibling_count += 1
+                        if sibling_count > _RP1_CONFIG_MAX_LINES:
+                            break
+                        candidate_args = _RP1_CONFIG_ARGS.fullmatch(candidate_line)
+                        if candidate_args is not None:
+                            args_index = index
+                            args_match = candidate_args
+                            break
+                if direction == -1 and first_item_key and key_indent == command_indent:
+                    break
+            if args_match is not None:
+                break
+
+        if args_index is None or args_match is None:
+            continue
+
+        args_indent = len(args_match.group("indent")) + len(args_match.group("item") or "")
+        args_lines = [_strip_yaml_comment(args_match.group("value"))]
+        for index in range(
+            args_index + 1, min(len(lines), args_index + _RP1_CONFIG_MAX_ARG_LINES + 1)
+        ):
+            budget.check_runtime(file_path)
+            candidate_line = lines[index].rstrip("\r\n")
+            stripped = candidate_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(candidate_line) - len(candidate_line.lstrip(" \t"))
+            indentless_item = indent == args_indent and (
+                stripped.startswith("- ") or stripped == "-"
+            )
+            if indent < args_indent or (indent == args_indent and not indentless_item):
+                break
+            # A mapping item is not a scalar package argument and may start
+            # another server; never consume its keys as command arguments.
+            if indentless_item and _RP1_CONFIG_KEY.match(candidate_line):
+                break
+            args_lines.append(_strip_yaml_comment(candidate_line.lstrip(" \t")))
+
+        args_text = " ".join(args_lines)
+        for token_match in _RP1_CONFIG_ARG_TOKEN.finditer(args_text):
+            quoted_token = token_match.group(1)
+            token = quoted_token if quoted_token is not None else token_match.group(2)
+            if token.startswith("-"):
+                continue
+            if not token:
+                # The first positional argument is empty, not a package name.
+                # Do not shift a later argument into its position or invent RP1.
+                break
+            start = offsets[command_index]
+            # Only the runner and package justify this finding. A contiguous
+            # source slice could expose credentials in unrelated sibling keys.
+            full_match = f"{command.group('runner')} {token}"
+            yield start, full_match, token
+            break
 
 
 def _normalize_string_list(
@@ -311,6 +470,35 @@ def _check_rp1(
                     config, budget, file_path, content
                 ):
                     _check_rp1_npx(command_line, file_path, budget, command_line_number)
+
+        # YAML MCP configs often place the runner and package in separate fields.
+        for start, full_match, package in _iter_config_npx_commands(content, budget, file_path):
+            budget.check_runtime(file_path)
+            if _VERSION_PIN_RE.search(package):
+                continue
+            line_num = _find_line(content, start)
+            budget.emit(
+                Finding(
+                    rule_id="RP1",
+                    message=(
+                        f"MCP server referenced without pinned version: '{full_match[:200]}'."
+                    ),
+                    severity="MEDIUM",
+                    confidence=0.70,
+                    file=file_path,
+                    start_line=line_num,
+                    category=_CATEGORY,
+                    tags=list(_TAGS),
+                    matched_text=full_match[:200],
+                    match_fingerprint=compute_match_fingerprint("RP1", full_match),
+                    explanation=(
+                        "npx-style MCP commands without a version suffix "
+                        "create a rug-pull risk if the upstream server is "
+                        "compromised and publishes a malicious update."
+                    ),
+                    remediation="Pin the version in the args list: @scope/server@1.2.3",
+                )
+            )
 
         # uvx without ==version
         for m in _RP1_UVX_CMD.finditer(content):
@@ -487,15 +675,19 @@ def _check_rp2(manifest: dict, budget: _RugPullBudget) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _check_rp3(manifest: dict, budget: _RugPullBudget) -> None:
+def _check_rp3(
+    manifest: dict, budget: _RugPullBudget, source: ManifestVersionSource | None
+) -> None:
     """Detect when skill version is unpinned or uses broad constraints."""
-    budget.check_runtime("SKILL.md")
+    path, line = (source["path"], source["line"]) if source is not None else ("SKILL.md", 1)
+    budget.check_runtime(path)
     version_value = manifest.get("version") if isinstance(manifest, dict) else None
     if not version_value or not isinstance(version_value, str):
         return
 
     version_str = str(version_value).strip()
     version_preview = version_str[:200]
+    snippet = (source["snippet"] or version_preview) if source is not None else None
     if version_str in ("*", "latest", "any"):
         budget.emit(
             Finding(
@@ -503,8 +695,9 @@ def _check_rp3(manifest: dict, budget: _RugPullBudget) -> None:
                 message=f"Skill version is unpinned: '{version_preview}'.",
                 severity="LOW",
                 confidence=0.80,
-                file="SKILL.md",
-                start_line=1,
+                file=path,
+                start_line=line,
+                code_snippet=snippet,
                 category=_CATEGORY,
                 tags=list(_TAGS),
                 matched_text=version_preview,
@@ -523,8 +716,9 @@ def _check_rp3(manifest: dict, budget: _RugPullBudget) -> None:
                 message=f"Skill version constraint may be too broad: '{version_preview}'.",
                 severity="LOW",
                 confidence=0.40 if version_str.startswith(">=") else 0.50,
-                file="SKILL.md",
-                start_line=1,
+                file=path,
+                start_line=line,
+                code_snippet=snippet,
                 category=_CATEGORY,
                 tags=list(_TAGS),
                 matched_text=version_preview,
@@ -730,18 +924,22 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             ],
         }
 
+    version_source = state.get("manifest_version_source")
+    manifest_paths = {"SKILL.md"} if manifest else set()
+    if manifest and version_source is not None:
+        manifest_paths.add(version_source["path"])
+
     budget = _RugPullBudget(state)
     resource_limit: _RugPullResourceLimitError | None = None
     try:
         _check_rp1(manifest, file_cache, budget)
         if manifest:
             _check_rp2(manifest, budget)
-            _check_rp3(manifest, budget)
+            _check_rp3(manifest, budget, version_source)
         if manifest and previous_manifest:
             _check_manifest_changes(manifest, previous_manifest, budget)
         budget.completed_paths.update(file_cache)
-        if manifest:
-            budget.completed_paths.add("SKILL.md")
+        budget.completed_paths.update(manifest_paths)
     except _RugPullResourceLimitError as exc:
         resource_limit = exc
 
@@ -750,13 +948,13 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     for finding in findings:
         findings_by_path.setdefault(finding.file, []).append(finding.finding_id)
 
-    planned_paths = list(file_cache)
-    if manifest and "SKILL.md" not in planned_paths:
-        planned_paths.append("SKILL.md")
+    planned_paths = [*file_cache, *sorted(manifest_paths.difference(file_cache))]
     events = []
     for path in planned_paths:
         emitted_ids = findings_by_path.get(path, [])
-        if resource_limit is None or path in budget.completed_paths:
+        if resource_limit is None or (
+            path in budget.completed_paths and path not in manifest_paths
+        ):
             events.append(
                 ledger_event(
                     analyzer_id=ANALYZER_ID,

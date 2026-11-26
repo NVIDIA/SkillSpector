@@ -24,6 +24,11 @@ from skillspector.mcp_registry import (
     scan_registry,
 )
 
+OFFICIAL_URLS = (
+    "https://registry.modelcontextprotocol.io/v0.1/servers",
+    "https://registry.modelcontextprotocol.io/v0/servers",
+)
+
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "mcp_registry"
 
 
@@ -140,7 +145,8 @@ def test_contract_isolation_uses_normalized_snapshots() -> None:
     assert all("server" not in server["snapshot"] for server in report["servers"])
 
 
-def test_registry_url_scan_follows_next_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+def test_registry_url_scan_follows_next_cursor(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
     page_one = {
         "servers": [{"server": {"name": "page/one"}}],
         "metadata": {"nextCursor": "cursor-2"},
@@ -154,11 +160,66 @@ def test_registry_url_scan_follows_next_cursor(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr("skillspector.mcp_registry.httpx.get", fake_get)
 
-    report = scan_registry(REGISTRY_URL)
+    report = scan_registry(url)
 
+    assert report["source"] == url
+    assert all(snapshot["source"] == url for snapshot in report["snapshots"])
     assert report["server_count"] == 2
     assert [server["snapshot"]["name"] for server in report["servers"]] == ["page/one", "page/two"]
-    assert calls == [(REGISTRY_URL, None), (REGISTRY_URL, {"cursor": "cursor-2"})]
+    assert calls == [(url, None), (url, {"cursor": "cursor-2"})]
+
+
+def test_registry_defaults_and_named_lookups_use_stable_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_get(url: str, **kwargs: Any) -> _Response:
+        calls.append(url)
+        return _Response(one_server(pinned_server()))
+
+    monkeypatch.setattr(mcp_registry.httpx, "get", fake_get)
+    assert scan_registry()["server_count"] == 1
+    assert scan_registry("safe/example")["server_count"] == 1
+    assert calls == [OFFICIAL_URLS[0], f"{OFFICIAL_URLS[0]}/safe%2Fexample/versions"]
+
+
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda url: url + "/",
+        lambda url: url + "/extra",
+        lambda url: url + "?limit=1",
+        lambda url: url + "?",
+        lambda url: url + "#fragment",
+        lambda url: url + "#",
+        lambda url: url.replace("https:", "http:"),
+        lambda url: url.replace(".io/", ".io:443/"),
+        lambda url: url.replace(".io/", ".io:8443/"),
+        lambda url: url.replace("https://", "https://user@"),
+        lambda url: url.replace(".io/", ".io.evil.invalid/"),
+        lambda url: url.replace(".io/", ".io./"),
+        lambda url: url.replace("/servers", "/%73ervers"),
+        lambda url: url.replace("/servers", "/other/../servers"),
+    ],
+)
+def test_official_registry_url_neighbors_are_rejected_before_http(
+    monkeypatch: pytest.MonkeyPatch, url: str, change: Any
+) -> None:
+    monkeypatch.setattr(mcp_registry.httpx, "get", lambda *a, **kw: pytest.fail("must not fetch"))
+    with pytest.raises(ValueError, match="only the official registry URL is supported"):
+        scan_registry(change(url))
+
+
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+@pytest.mark.parametrize("response", [[], {"servers": {}}, {"servers": [None]}])
+def test_official_registry_urls_preserve_invalid_response_errors(
+    monkeypatch: pytest.MonkeyPatch, url: str, response: Any
+) -> None:
+    monkeypatch.setattr(mcp_registry.httpx, "get", lambda *a, **kw: _Response(response))
+    with pytest.raises(ValueError, match="MCP Registry"):
+        scan_registry(url)
 
 
 def test_untrusted_registry_url_is_rejected() -> None:
@@ -172,8 +233,10 @@ def test_server_identifier_scan_follows_next_cursor(monkeypatch: pytest.MonkeyPa
         "metadata": {"nextCursor": "cursor-2"},
     }
     page_two = {"servers": [{"server": {"name": "page/two"}}], "metadata": {}}
+    calls: list[tuple[str, dict[str, str] | None]] = []
 
     def fake_get(url: str, *, params: dict[str, str] | None = None, timeout: int) -> _Response:
+        calls.append((url, params))
         return _Response(page_one if params is None else page_two)
 
     monkeypatch.setattr("skillspector.mcp_registry.httpx.get", fake_get)
@@ -182,6 +245,105 @@ def test_server_identifier_scan_follows_next_cursor(monkeypatch: pytest.MonkeyPa
 
     assert report["server_count"] == 1
     assert report["servers"][0]["snapshot"]["name"] == "page/two"
+    assert report["source"] == "page/two"
+    assert report["snapshots"][0]["source"] == "page/two"
+    assert calls == [
+        (f"{REGISTRY_URL}/page%2Ftwo/versions", None),
+        (f"{REGISTRY_URL}/page%2Ftwo/versions", {"cursor": "cursor-2"}),
+    ]
+
+
+@pytest.mark.parametrize(
+    "name, encoded",
+    [
+        ("org.example/server", "org.example%2Fserver"),
+        ("//other.invalid/a?x=1#%", "%2F%2Fother.invalid%2Fa%3Fx%3D1%23%25"),
+        ("org.example/../工具", "org.example%2F..%2F%E5%B7%A5%E5%85%B7"),
+    ],
+)
+def test_server_identifier_is_one_official_url_component(
+    monkeypatch: pytest.MonkeyPatch, name: str, encoded: str
+) -> None:
+    calls: list[str] = []
+
+    def fake_get(url: str, *, params: dict[str, str] | None = None, timeout: int) -> _Response:
+        calls.append(url)
+        return _Response(one_server(pinned_server(name=name)))
+
+    monkeypatch.setattr(mcp_registry.httpx, "get", fake_get)
+    report = scan_registry(name)
+    assert calls == [f"{REGISTRY_URL}/{encoded}/versions"]
+    assert report["snapshots"][0]["name"] == name
+
+
+@pytest.mark.parametrize("name", ["", ".", ".."])
+def test_server_identifier_rejects_empty_or_dot_segments_without_fetching(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    monkeypatch.setattr(mcp_registry.httpx, "get", lambda *a, **kw: pytest.fail("must not fetch"))
+    with pytest.raises(ValueError, match="server identifier was not found"):
+        scan_registry(name)
+
+
+@pytest.mark.parametrize("official", [{"status": "deprecated"}, {"isLatest": False}])
+def test_server_identifier_without_latest_retains_all_matching_versions(
+    monkeypatch: pytest.MonkeyPatch, official: dict[str, Any]
+) -> None:
+    page = {
+        "servers": [
+            one_server(pinned_server(name="same/server", version=version), official)["servers"][0]
+            for version in ["2.0.0", "1.0.0"]
+        ]
+        + one_server(pinned_server(name="other/server"), {"isLatest": True})["servers"]
+    }
+    monkeypatch.setattr(mcp_registry.httpx, "get", lambda *a, **kw: _Response(page))
+    report = scan_registry("same/server")
+    assert [s["version"] for s in report["snapshots"]] == ["2.0.0", "1.0.0"]
+    assert all(s["name"] == "same/server" for s in report["snapshots"])
+    if official.get("status") == "deprecated":
+        assert sum(f["id"] == "MCP-OFFICIAL-STATUS" for f in report["findings"]) == 2
+
+
+@pytest.mark.parametrize("entries", [[], [{"server": {"name": "other/server"}}], [None]])
+def test_server_identifier_rejects_response_without_requested_identity(
+    monkeypatch: pytest.MonkeyPatch, entries: list[Any]
+) -> None:
+    monkeypatch.setattr(mcp_registry.httpx, "get", lambda *a, **kw: _Response({"servers": entries}))
+    with pytest.raises(ValueError, match="server identifier was not found"):
+        scan_registry("missing/server")
+
+
+@pytest.mark.parametrize("status", [404, 429, 503])
+def test_server_identifier_http_errors_do_not_fall_back_to_catalog(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    calls: list[str] = []
+
+    def fake_get(url: str, *, params: dict[str, str] | None = None, timeout: int) -> httpx.Response:
+        calls.append(url)
+        return httpx.Response(status, request=httpx.Request("GET", url, params=params))
+
+    monkeypatch.setattr(mcp_registry.httpx, "get", fake_get)
+    match = "server identifier was not found" if status == 404 else f"{status}"
+    with pytest.raises(ValueError, match=match):
+        scan_registry("missing/server")
+    assert calls == [f"{REGISTRY_URL}/missing%2Fserver/versions"]
+
+
+def test_server_identifier_later_page_404_remains_acquisition_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_get(url: str, *, params: dict[str, str] | None = None, timeout: int) -> httpx.Response:
+        page = one_server(pinned_server(name="page/two"))
+        page["metadata"] = {"nextCursor": "next"}
+        return httpx.Response(
+            404 if params else 200, json=page, request=httpx.Request("GET", url, params=params)
+        )
+
+    monkeypatch.setattr(mcp_registry.httpx, "get", fake_get)
+    with pytest.raises(ValueError, match="404") as failure:
+        scan_registry("page/two")
+    assert "server identifier was not found" not in str(failure.value)
 
 
 def test_server_identifier_scan_selects_latest_version(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -382,7 +544,8 @@ def test_error_on_invalid_repository_shape() -> None:
         )
 
 
-def test_error_on_repeated_next_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+def test_error_on_repeated_next_cursor(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
     page = {"servers": [{"server": {"name": "page/one"}}], "metadata": {"nextCursor": "cursor-1"}}
 
     def fake_get(url: str, *, params: dict[str, str] | None = None, timeout: int) -> _Response:
@@ -391,17 +554,18 @@ def test_error_on_repeated_next_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("skillspector.mcp_registry.httpx.get", fake_get)
 
     with pytest.raises(ValueError, match="repeated pagination cursor"):
-        scan_registry(REGISTRY_URL)
+        scan_registry(url)
 
 
-def test_error_on_http_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("url", OFFICIAL_URLS)
+def test_error_on_http_failure(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
     def fake_get(url: str, *, params: dict[str, str] | None = None, timeout: int) -> _Response:
         raise httpx.HTTPError("network down")
 
     monkeypatch.setattr("skillspector.mcp_registry.httpx.get", fake_get)
 
     with pytest.raises(ValueError, match="MCP Registry source failed"):
-        scan_registry(REGISTRY_URL)
+        scan_registry(url)
 
 
 def test_scan_registry_scans_partial_paginated_capture(tmp_path: Path) -> None:
@@ -508,6 +672,75 @@ def test_local_registry_accepts_exact_byte_limit(
     capture.write_bytes(raw)
     monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_BYTES", len(raw), raising=False)
     assert scan_registry(str(capture))["server_count"] == 1
+
+
+@pytest.mark.parametrize("prefix", [b"", b"\xef\xbb\xbf"])
+def test_local_registry_utf8_signature_preserves_snapshot_and_comparison(
+    tmp_path: Path, prefix: bytes
+) -> None:
+    capture = tmp_path / "registry.json"
+    data = one_server(pinned_server(name="example/ü", description="keep\ufeffthis"))
+    raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    capture.write_bytes(raw)
+    original = scan_registry(str(capture))
+    previous = tmp_path / "previous.json"
+    previous.write_bytes(prefix + json.dumps(original, ensure_ascii=False).encode("utf-8"))
+    capture.write_bytes(prefix + raw)
+    current = scan_registry(str(capture), compare_path=previous)
+    assert current["comparison"] == {
+        "added": [],
+        "removed": [],
+        "changed": [],
+        "unmodeled_changes": [],
+        "unchanged_count": 1,
+    }
+    assert current["findings"] == original["findings"]
+    assert current["risk_score"] == original["risk_score"]
+    assert current["snapshots"][0]["description"] == "keep\ufeffthis"
+    assert current["snapshots"][0]["record_hash"] == original["snapshots"][0]["record_hash"]
+
+
+def test_local_registry_utf8_signature_counts_toward_byte_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "registry.json"
+    raw = b'\xef\xbb\xbf{"servers": []}'
+    capture.write_bytes(raw)
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_BYTES", len(raw))
+    assert scan_registry(str(capture))["server_count"] == 0
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_BYTES", len(raw) - 1)
+    with pytest.raises(ValueError, match="input exceeds"):
+        scan_registry(str(capture))
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'\xef\xbb\xbf\xef\xbb\xbf{"servers": []}',
+        b' \xef\xbb\xbf{"servers": []}',
+        b'\xef\xbb{"servers": []}',
+        b'\xef\xbb\xbf{"servers": []}\xff',
+        '{"servers": []}'.encode("utf-16"),
+        '{"servers": []}'.encode("utf-32"),
+    ],
+)
+def test_local_registry_rejects_other_signatures_and_invalid_utf8(
+    tmp_path: Path, raw: bytes
+) -> None:
+    capture = tmp_path / "registry.json"
+    capture.write_bytes(raw)
+    with pytest.raises(ValueError):
+        scan_registry(str(capture))
+
+
+def test_local_registry_utf8_signature_keeps_depth_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "registry.json"
+    capture.write_bytes(b'\xef\xbb\xbf{"servers": [], "extra": [[[]]]}')
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_DEPTH", 3)
+    with pytest.raises(ValueError, match="nesting exceeds 3 levels"):
+        scan_registry(str(capture))
 
 
 def test_local_registry_bounds_depth_before_parsing(

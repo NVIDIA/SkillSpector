@@ -40,7 +40,7 @@ from skillspector.python_tokens import python_literal_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import SourceLocationIndex, get_context, get_line_number, is_code_example
+from .common import SourceLocationIndex, get_context_from_lines, is_code_example
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -188,14 +188,14 @@ _AR2_DIRECT_INTENT_PATTERNS = (
 )
 _BENIGN_AR_SCHEMA_FIELD_PATTERN = re.compile(
     r"""
-    ^\s*(?:\[\])?\s+(?:field|key|property|array|list|entry)\b
+    ^(?:\s*\[\])?\s+(?:field|key|property|array|list|entry)\b
     |
-    ^\s*(?:\[\])?\s+(?:in|of)\s+(?:the\s+)?(?:json(?:\s+output)?|output|response)\s+schema\b
+    ^(?:\s*\[\])?\s+(?:in|of)\s+(?:the\s+)?(?:json(?:\s+output)?|output|response)\s+schema\b
     |
-    ^\s*(?:\[\])?\s+(?:in|of)\s+(?:the\s+)?(?:warnings?|disclaimers?|caveats?)\b(?:\[\])?\s+
+    ^(?:\s*\[\])?\s+(?:in|of)\s+(?:the\s+)?(?:warnings?|disclaimers?|caveats?)\b(?:\[\])?\s+
     (?:field|key|property|array|list|entry)\b
     |
-    ^\s*(?:\[\])?\s+in\s+(?:the\s+)?errors\[\]\s+array\b
+    ^(?:\s*\[\])?\s+in\s+(?:the\s+)?errors\[\]\s+array\b
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -319,6 +319,51 @@ _AR2_AGENT_ADDRESS_PATTERN = re.compile(
 _AR2_REPORT_PREFIX_CHARS = 160
 # A comment block reaching this many lines on either side of the match keeps it.
 _AR2_COMMENT_BLOCK_MAX_LINES = 64
+
+_AR2_JUDGE_ONLY_PATTERN = re.compile(r"(?:do\s+not|don'?t|never)\s+judge", re.IGNORECASE)
+_AR2_TECHNICAL_CRITERION = r"(?:correctness|accuracy|quality|testability|readiness|performance)"
+_AR2_TASK_JUDGMENT_OBJECT_PATTERN = re.compile(
+    r"\s+(?:(?:the|this|that|its|their)\s+)?"
+    r"(?:(?:change|code|implementation|requirement|test|output|result|proposal|design|document)"
+    r"['’]s\s+)?"
+    rf"(?:technical\s+)?{_AR2_TECHNICAL_CRITERION}"
+    rf"(?:\s+(?:beyond|outside)\s+(?:(?:its|their|the)\s+)?{_AR2_TECHNICAL_CRITERION})?\s*\Z",
+    re.IGNORECASE,
+)
+_AR2_OBSERVATION_SUBJECT_PATTERN = re.compile(
+    r"\b(?:observations|measurements|metrics|logs|results|data)\s+"
+    r"(?:(?:describe|report|record)\s*;\s*(?:they|these)\s+)?\Z",
+    re.IGNORECASE,
+)
+
+
+_AR2_JUDGMENT_CONTEXT_CHARS = 512
+_AR2_JUDGMENT_BOUNDARY_PATTERN = re.compile(r"[;!?]|\.(?=\s|$)|\n[ \t]*\n")
+
+
+def _is_task_judgment(content: str, match: re.Match[str]) -> bool:
+    """Separate bounded technical assessment prose from safety judgment suppression."""
+    if not _AR2_JUDGE_ONLY_PATTERN.fullmatch(match.group(0)):
+        return False
+    start, end = match.span()
+    limit = min(len(content), end + _AR2_JUDGMENT_CONTEXT_CHARS)
+    boundary = _AR2_JUDGMENT_BOUNDARY_PATTERN.search(content, end, limit)
+    if boundary is None and limit < len(content):
+        return False
+    clause_end = boundary.start() if boundary is not None else limit
+    prefix_start = max(0, start - _AR2_JUDGMENT_CONTEXT_CHARS)
+    clause_start = prefix_start
+    for boundary in _AR2_JUDGMENT_BOUNDARY_PATTERN.finditer(content, prefix_start, start):
+        clause_start = boundary.end()
+    if clause_start == prefix_start and prefix_start > 0:
+        return False
+    suffix = content[end:clause_end]
+    if _AR2_TASK_JUDGMENT_OBJECT_PATTERN.fullmatch(suffix):
+        return True
+    return bool(
+        not suffix.strip()
+        and _AR2_OBSERVATION_SUBJECT_PATTERN.search(content, max(0, start - 96), start)
+    )
 
 
 def _is_directly_instructive(context: str, matched_text: str) -> bool:
@@ -566,6 +611,7 @@ def analyze(
     """Analyze content for anti-refusal statements (AR1-AR3)."""
     findings: list[AnalyzerFinding] = []
     locations = SourceLocationIndex(content, file_path)
+    lines = content.splitlines()
     tag = [PatternCategory.ANTI_REFUSAL.value]
     python_comments = (
         _PythonComments(content, check_runtime or _no_runtime_check)
@@ -578,17 +624,18 @@ def analyze(
             for match in static_runner.iter_paragraph_matches(
                 pattern, content, re.IGNORECASE | re.MULTILINE
             ):
+                if rule_id == "AR2" and _is_task_judgment(content, match):
+                    continue
                 if (
                     rule_id == "AR2"
                     and python_comments is not None
                     and _is_descriptive_python_comment(python_comments, match)
                 ):
                     continue
-                lines = content.splitlines()
-                line_num = get_line_number(content, match.start())
+                line_num, column = locations.line_and_column(match.start())
                 match_line = lines[line_num - 1] if lines else content
                 previous_line = lines[line_num - 2] if line_num > 1 else None
-                context = get_context(content, match.start(), context_lines=3)
+                context = get_context_from_lines(lines, line_num, window=3, column=column)
                 security_review_context = bool(
                     _MODE_ENABLED_RE.fullmatch(match.group(0))
                     and _SECURITY_REVIEW_CONTEXT_RE.search(context)

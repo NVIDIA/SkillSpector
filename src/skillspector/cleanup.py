@@ -13,6 +13,7 @@ from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
 
+from skillspector.artifacts import _token_gap_span_cache_clear
 from skillspector.python_ast import clear_python_ast_cache
 
 
@@ -111,6 +112,9 @@ def cleanup_result(result: dict[str, object]) -> None:
     """Release scan-local resources and remove a temp dir if set."""
     python_ast_cache_key = result.get("python_ast_cache_key")
     clear_python_ast_cache(python_ast_cache_key if isinstance(python_ast_cache_key, str) else None)
+    # The token-gap span cache is process-global and keyed by full input
+    # text; a finished scan must not leave whole artifacts retained in it.
+    _token_gap_span_cache_clear()
     temp_dir = result.get("temp_dir_for_cleanup")
     if temp_dir and isinstance(temp_dir, str):
         remove_temp_tree(temp_dir)

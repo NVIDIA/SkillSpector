@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OSV.dev API client for live vulnerability lookups (SC4).
+"""OSV.dev API and local snapshot lookups (SC4).
 
 Queries the OSV.dev batch API to check whether dependencies have known
 vulnerabilities.  Falls back to a small static list when the API is
@@ -28,7 +28,9 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from contextlib import ExitStack
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -36,6 +38,17 @@ import httpx
 
 from skillspector.inspection_ledger import LedgerReason
 from skillspector.logging_config import get_logger
+
+from .osv_local_db import (
+    SNAPSHOT_ERRORS,
+    SnapshotIndex,
+    SnapshotLimitation,
+    SnapshotLimitError,
+    SnapshotMetadata,
+    matches_version,
+    open_snapshot,
+    validate_version,
+)
 
 logger = get_logger(__name__)
 
@@ -61,7 +74,11 @@ MAX_OSV_QUERIES_PER_BATCH = 64
 MAX_OSV_DETAIL_REQUESTS = 64
 MAX_OSV_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_OSV_RESULTS = 256
-MAX_OSV_VULNS_PER_PACKAGE = 16
+# Per-package advisories retained for one locked version. Widely used packages
+# can carry more than a dozen advisories for one release, and truncating them
+# makes the manifest partial; the aggregate detail and result budgets above
+# still apply.
+MAX_OSV_VULNS_PER_PACKAGE = 64
 MAX_OSV_LIMITATIONS = 16
 MAX_OSV_CACHE_ENTRIES = 4_096
 MAX_OSV_PACKAGE_NAME_CHARS = 256
@@ -113,9 +130,11 @@ class QueryBatchResults(list[list[VulnResult]]):
         values: list[list[VulnResult]],
         *,
         limitations: tuple[OsvQueryLimitation, ...] = (),
+        local_checked: frozenset[int] | None = None,
     ) -> None:
         super().__init__(values)
         self.limitations = limitations
+        self.local_checked = local_checked
 
 
 @dataclass
@@ -139,6 +158,48 @@ class OsvQueryBudget:
     limitations: list[OsvQueryLimitation] | None = None
     limitation_generation: int = 0
     last_limitation: OsvQueryLimitation | None = None
+    # Call-scoped reachability for this budget's own query_batch() calls, so
+    # concurrent scans (same process, different budgets) can't overwrite each
+    # other's reachability outcome. See was_osv_reachable().
+    query_ok: bool | None = None
+    local_db_path: str | None = field(default_factory=lambda: os.getenv("SKILLSPECTOR_OSV_DB_PATH"))
+    _snapshots: dict[str, SnapshotIndex | OsvQueryLimitation] = field(default_factory=dict)
+    _stack: ExitStack = field(default_factory=ExitStack)
+
+    def close(self) -> None:
+        self._stack.close()
+        self._snapshots.clear()
+
+    def snapshot_metadata(self) -> list[SnapshotMetadata]:
+        return [
+            snapshot.metadata
+            for snapshot in self._snapshots.values()
+            if isinstance(snapshot, SnapshotIndex)
+        ]
+
+    def get_snapshot(self, ecosystem: str) -> SnapshotIndex | OsvQueryLimitation:
+        if not self.local_db_path:
+            return OsvQueryLimitation(
+                LedgerReason.OPAQUE_CONTENT, error_class="InvalidOsvDatabasePath"
+            )
+        if ecosystem not in (ECOSYSTEM_PYPI, ECOSYSTEM_NPM):
+            return OsvQueryLimitation(
+                LedgerReason.OPAQUE_CONTENT, error_class="UnsupportedOsvEcosystem"
+            )
+        if ecosystem not in self._snapshots:
+            try:
+                with ExitStack() as opened:
+                    index = open_snapshot(Path(self.local_db_path), ecosystem, opened)
+                    index.build(self.remaining_seconds)
+                    self._stack.enter_context(opened.pop_all())
+                self._snapshots[ecosystem] = index
+            except SnapshotLimitError as exc:
+                self._snapshots[ecosystem] = _snapshot_limitation(exc.limitation)
+            except SNAPSHOT_ERRORS as exc:
+                self._snapshots[ecosystem] = OsvQueryLimitation(
+                    LedgerReason.ANALYZER_RUNTIME_ERROR, error_class=type(exc).__name__
+                )
+        return self._snapshots[ecosystem]
 
     @classmethod
     def create(cls, timeout_seconds: float | None = None) -> OsvQueryBudget:
@@ -556,6 +617,149 @@ def _fetch_vuln_details(
     return results
 
 
+def _snapshot_limitation(limit: SnapshotLimitation) -> OsvQueryLimitation:
+    if limit.reason in (LedgerReason.ARCHIVE_MEMBER_LIMIT, LedgerReason.OUTPUT_LIMIT):
+        return OsvQueryLimitation(
+            limit.reason, observed_records=limit.observed, limit_records=limit.limit
+        )
+    return OsvQueryLimitation(limit.reason, observed_bytes=limit.observed, limit_bytes=limit.limit)
+
+
+def _query_snapshot(
+    packages: list[tuple[int, str, str | None]],
+    ecosystem: str,
+    results: list[list[VulnResult]],
+    budget: OsvQueryBudget,
+) -> frozenset[int]:
+    """Match retained coordinates without consulting HTTP or the remote cache."""
+    if budget.remaining_seconds() <= 0:
+        budget.note_runtime_limit()
+        return frozenset()
+    snapshot = budget.get_snapshot(ecosystem)
+    if isinstance(snapshot, OsvQueryLimitation):
+        budget.note(snapshot)
+        budget.query_ok = False
+        return frozenset()
+    if not _snapshot_unchanged(snapshot, budget):
+        return frozenset()
+    complete_index = not (
+        snapshot.malformed
+        or snapshot.ecosystem_mismatch
+        or snapshot.limitation
+        or snapshot.timed_out
+    )
+    budget.query_ok = complete_index
+    if snapshot.ecosystem_mismatch:
+        budget.note(
+            OsvQueryLimitation(
+                LedgerReason.DEPENDENCY_PARSE_ERROR, error_class="OsvSnapshotEcosystemMismatch"
+            )
+        )
+    if snapshot.malformed:
+        budget.note(
+            OsvQueryLimitation(LedgerReason.DEPENDENCY_PARSE_ERROR, error_class="InvalidOsvRecord")
+        )
+    if snapshot.limitation is not None:
+        budget.note(_snapshot_limitation(snapshot.limitation))
+    if snapshot.timed_out:
+        budget.note_runtime_limit()
+        return frozenset()
+
+    checked = set()
+    for index, name, version in packages:
+        if budget.remaining_seconds() <= 0:
+            budget.note_runtime_limit()
+            break
+        complete = complete_index and version is not None
+        if version is None:
+            budget.note(
+                OsvQueryLimitation(
+                    LedgerReason.OPAQUE_CONTENT, error_class="UnresolvedOsvPackageVersion"
+                )
+            )
+        else:
+            try:
+                validate_version(version, ecosystem)
+            except ValueError:
+                budget.note(
+                    OsvQueryLimitation(
+                        LedgerReason.OPAQUE_CONTENT, error_class="UnsupportedOsvPackageVersion"
+                    )
+                )
+                continue
+        try:
+            seen_ids: set[str] = set()
+            for record, entries in snapshot.records(name):
+                if budget.remaining_seconds() <= 0:
+                    budget.note_runtime_limit()
+                    complete = False
+                    break
+                if version is not None:
+                    matched, supported = matches_version(entries, version, ecosystem)
+                    if not supported:
+                        budget.note(
+                            OsvQueryLimitation(
+                                LedgerReason.OPAQUE_CONTENT, error_class="UnsupportedOsvRecord"
+                            )
+                        )
+                        complete = False
+                    if not matched:
+                        continue
+                if record["id"] in seen_ids:
+                    continue
+                count, limit = (
+                    (len(results[index]), MAX_OSV_VULNS_PER_PACKAGE)
+                    if len(results[index]) >= MAX_OSV_VULNS_PER_PACKAGE
+                    else (budget.results_retained, budget.max_results)
+                )
+                if count >= limit:
+                    budget.note(
+                        OsvQueryLimitation(
+                            LedgerReason.OUTPUT_LIMIT,
+                            observed_records=count + 1,
+                            limit_records=limit,
+                        )
+                    )
+                    complete = False
+                    break
+                seen_ids.add(record["id"])
+                results[index].append(_parse_vuln(record))
+                budget.results_retained += 1
+        except SnapshotLimitError as exc:
+            budget.note(_snapshot_limitation(exc.limitation))
+            complete = False
+        except SNAPSHOT_ERRORS as exc:
+            budget.note(
+                OsvQueryLimitation(
+                    LedgerReason.DEPENDENCY_PARSE_ERROR, error_class=type(exc).__name__
+                )
+            )
+            complete = False
+        if complete and budget.remaining_seconds() > 0:
+            checked.add(index)
+        elif budget.remaining_seconds() <= 0:
+            budget.note_runtime_limit()
+            break
+    if _snapshot_unchanged(snapshot, budget):
+        return frozenset(checked)
+    budget.results_retained -= sum(map(len, results))
+    for matches in results:
+        matches.clear()
+    return frozenset()
+
+
+def _snapshot_unchanged(snapshot: SnapshotIndex, budget: OsvQueryBudget) -> bool:
+    try:
+        if snapshot.unchanged():
+            return True
+        error = "OsvSnapshotChanged"
+    except OSError as exc:
+        error = type(exc).__name__
+    budget.note(OsvQueryLimitation(LedgerReason.ANALYZER_RUNTIME_ERROR, error_class=error))
+    budget.query_ok = False
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -568,7 +772,7 @@ def query_batch(
     timeout_seconds: float | None = None,
     budget: OsvQueryBudget | None = None,
 ) -> QueryBatchResults:
-    """Query OSV.dev for vulnerabilities across a batch of packages.
+    """Query the configured OSV source for vulnerabilities across a batch of packages.
 
     Args:
         packages: List of (name, version_or_None) tuples.
@@ -577,11 +781,12 @@ def query_batch(
     Returns:
         A bounded list parallel to the retained prefix of *packages* where
         each element is a (possibly empty) list of :class:`VulnResult`.
-        ``result.limitations`` describes any omitted work without provider
-        payloads or exception text.
+        ``result.limitations`` describes omitted work. For local lookups,
+        ``result.local_checked`` identifies which input indices were fully
+        checked, including coordinates with no matching advisories.
 
-    Raises nothing — on network/API failure returns empty lists for all
-    packages (caller should fall back to static data).
+    A scan-owned budget should be closed after its last lookup. If a lookup
+    fails, the caller can use static fallback for uncovered packages.
     """
     global _last_query_ok
 
@@ -606,6 +811,7 @@ def query_batch(
     if not retained_packages:
         return QueryBatchResults(
             all_results,
+            local_checked=frozenset() if active_budget.local_db_path is not None else None,
             limitations=_limitations_since(
                 active_budget,
                 start_index=limitations_start,
@@ -615,6 +821,7 @@ def query_batch(
 
     uncached_indices: list[int] = []
     uncached_queries: list[dict] = []
+    local_packages: list[tuple[int, str, str | None]] = []
 
     for i, (name, version) in enumerate(retained_packages):
         if not isinstance(name, str) or (version is not None and not isinstance(version, str)):
@@ -643,6 +850,9 @@ def query_batch(
                 )
             )
             continue
+        if active_budget.local_db_path is not None:
+            local_packages.append((i, name, version or None))
+            continue
         key = _cache_key(name, version, ecosystem)
         cached = _get_cached(key)
         if cached is not None:
@@ -650,6 +860,26 @@ def query_batch(
         else:
             uncached_indices.append(i)
             uncached_queries.append(_build_query(name, version, ecosystem))
+
+    if active_budget.local_db_path is not None:
+        try:
+            checked = (
+                _query_snapshot(local_packages, ecosystem, all_results, active_budget)
+                if local_packages
+                else frozenset()
+            )
+            return QueryBatchResults(
+                all_results,
+                limitations=_limitations_since(
+                    active_budget,
+                    start_index=limitations_start,
+                    start_generation=limitations_generation,
+                ),
+                local_checked=checked,
+            )
+        finally:
+            if budget is None:
+                active_budget.close()
 
     if not uncached_queries:
         return QueryBatchResults(
@@ -661,8 +891,10 @@ def query_batch(
             ),
         )
 
-    provider_failed = False
     successful_batches = 0
+    # This call's own outcome. Never derived from _last_query_ok, which other
+    # scans in the same process can overwrite at any time.
+    query_ok = False
     try:
         with httpx.Client(timeout=max(0.001, active_budget.remaining_seconds())) as client:
             for start in range(0, len(uncached_queries), active_budget.max_queries_per_batch):
@@ -784,16 +1016,15 @@ def query_batch(
                     if active_budget.limitation_generation == package_generation:
                         _put_cache(_cache_key(name, version, ecosystem), vuln_details)
 
-        _last_query_ok = successful_batches > 0
+        query_ok = successful_batches > 0
     except _OsvLimitReachedError:
         # The exact limit is already recorded on the result.  Keep completed
         # prefix results and let static fallback cover the remainder.
-        _last_query_ok = successful_batches > 0
+        query_ok = successful_batches > 0
     except httpx.TimeoutException:
         logger.warning("OSV.dev API request timed out, falling back to static data")
         active_budget.note_runtime_limit()
-        provider_failed = True
-        _last_query_ok = False
+        query_ok = False
     except (
         httpx.InvalidURL,
         httpx.HTTPError,
@@ -809,11 +1040,10 @@ def query_batch(
                 error_class=type(exc).__name__,
             )
         )
-        provider_failed = True
-        _last_query_ok = False
+        query_ok = False
 
-    if not provider_failed and _last_query_ok:
-        _last_query_ok = True
+    active_budget.query_ok = query_ok
+    _last_query_ok = query_ok  # legacy fallback only; written, never read here
     return QueryBatchResults(
         all_results,
         limitations=_limitations_since(
@@ -825,9 +1055,21 @@ def query_batch(
 
 
 def is_available() -> bool:
-    """Run a bounded connectivity check against the OSV.dev API."""
+    """Check the configured snapshot or probe the live OSV.dev API."""
+    budget = OsvQueryBudget.create(timeout_seconds=15.0)
+    if budget.local_db_path is not None:
+        try:
+            # A single ecosystem may be provisioned for a Python- or npm-only scan.
+            for ecosystem in (ECOSYSTEM_PYPI, ECOSYSTEM_NPM):
+                checked = query_batch(
+                    [("skillspector-osv-availability-probe", "1.0.0")], ecosystem, budget=budget
+                )
+                if checked.local_checked:
+                    return True
+            return False
+        finally:
+            budget.close()
     try:
-        budget = OsvQueryBudget.create(timeout_seconds=15.0)
         with httpx.Client(timeout=max(0.001, budget.remaining_seconds())) as client:
             payload = _request_json_bounded(
                 client,
@@ -849,10 +1091,22 @@ def is_available() -> bool:
         return False
 
 
-def was_osv_reachable() -> bool:
-    """Return True if the last query_batch() call succeeded.
+def was_osv_reachable(budget: OsvQueryBudget | None = None) -> bool:
+    """Return True unless the provider lookup for this scan failed.
+
+    With a ``budget`` the answer is call-scoped: it reflects only the
+    ``query_batch()`` calls made with that budget, so concurrent scans in one
+    process cannot affect each other.  A budget whose calls never reached the
+    provider (nothing to look up, everything cached, or a budget limit hit
+    first) has no failed lookup, so it reports True.
+
+    Without a budget it falls back to the module-level flag of the most recent
+    call, which is shared across scans and therefore only reliable when a
+    single scan runs at a time.
 
     Callers can use this to decide whether to surface a fallback warning
     when query_batch returns empty results.
     """
+    if budget is not None:
+        return budget.query_ok is not False
     return _last_query_ok

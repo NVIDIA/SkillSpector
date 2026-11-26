@@ -16,7 +16,7 @@
 """Static patterns: supply chain (SC1–SC10) and trigger analysis (TR1–TR3).
 
 SC1–SC3: regex-based pattern matching (original implementation).
-SC4: Known vulnerable dependencies — live OSV.dev lookup with static fallback.
+SC4: Known vulnerable dependencies — OSV lookup with static fallback.
 SC5: Abandoned dependencies — flags known-abandoned or archived packages.
 SC6: Typosquatting — flags package names similar to popular packages.
 SC7: Untrusted container image — flags image signature / registry-verification bypass.
@@ -43,9 +43,10 @@ import sys
 import time
 import tomllib
 from bisect import bisect_right
-from collections.abc import Callable, Iterator
+from collections import ChainMap
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
@@ -406,21 +407,22 @@ SC3_PROSE_PATTERNS = [
 SC3_PATTERNS = SC3_CODE_PATTERNS + SC3_PROSE_PATTERNS
 # Shell decode-to-execute chains run on every file type, like SC2, because
 # SKILL.md instructions and hook configs carry shell commands too.
+# These two exact rules retain the audited bounded native path. Additional
+# shell rules default to the interruptible matcher until separately reviewed.
+_SC3_BOUNDED_PIPE_PATTERN = (
+    rf"{_SC3_SHELL_DECODER}(?:{_SC3_HERE_STRING}\\?['\"]?"
+    rf"[A-Za-z0-9+/=]{{0,{_MAX_SHELL_LITERAL_CHARS}}}+)?+{_SC3_PIPE_SEGMENT}"
+    rf"(?:\|(?!\|)&?{_SC3_PIPE_SEGMENT}){{0,3}}?{_SC3_PIPE_EXECUTOR}"
+)
+_SC3_BOUNDED_SUBSTITUTION_PATTERN = (
+    rf"{_SC3_SUBSTITUTION_EXECUTOR}[^()`\n]{{0,{_MAX_SHELL_LITERAL_CHARS}}}?"
+    rf"{_SC3_SHELL_DECODER}"
+)
 SC3_SHELL_PATTERNS = [
-    (
-        # A here-string literal can outgrow a pipeline stage, so it is consumed
-        # whole, and possessively, before the first stage.
-        rf"{_SC3_SHELL_DECODER}(?:{_SC3_HERE_STRING}\\?['\"]?"
-        rf"[A-Za-z0-9+/=]{{0,{_MAX_SHELL_LITERAL_CHARS}}}+)?+{_SC3_PIPE_SEGMENT}"
-        rf"(?:\|(?!\|)&?{_SC3_PIPE_SEGMENT}){{0,3}}?{_SC3_PIPE_EXECUTOR}",
-        0.9,
-    ),
-    (
-        rf"{_SC3_SUBSTITUTION_EXECUTOR}[^()`\n]{{0,{_MAX_SHELL_LITERAL_CHARS}}}?"
-        rf"{_SC3_SHELL_DECODER}",
-        0.9,
-    ),
+    (_SC3_BOUNDED_PIPE_PATTERN, 0.9),
+    (_SC3_BOUNDED_SUBSTITUTION_PATTERN, 0.9),
 ]
+
 
 # SC7: Untrusted Container Image — pulling images with signature/registry
 # verification turned off. These flags disable image trust regardless of the
@@ -579,8 +581,6 @@ _POPULAR_PYPI: frozenset[str] = frozenset(
         "discord.py",
         "python-dotenv",
         "pycryptodome",
-        "perseus-ctx",
-        "mimir-mcp",
     }
 )
 
@@ -1351,6 +1351,29 @@ def _pinned_npm_version(spec: str) -> str | None:
     return None
 
 
+def _strip_leading_bom(content: str) -> str:
+    """Drop leading UTF-8 byte-order marks from dependency manifest text.
+
+    decode_text() decodes with plain "utf-8", which never strips a leading
+    byte-order mark. Left in place, U+FEFF makes the first requirement of a
+    requirements.txt unparseable, and json.loads() and tomllib.loads() reject
+    a JSON or TOML manifest outright, leaving the file to a dependency parse
+    error (a package.json keeps only what its line-scan fallback finds). pip
+    accepts the mark in requirements files, and npm, pipenv and uv accept it
+    in their own manifests and lockfiles. Only leading marks are removed: a
+    U+FEFF inside the file stays part of the text.
+
+    The strip is scoped to manifest parsing: decode_text() itself stays
+    untouched because other analyzers treat U+FEFF as a hidden-character
+    injection signal in file bodies. Removing it does not shift line numbers,
+    since the mark sits before the first line break.
+    """
+    # Single linear prefix strip: a per-character slicing loop would copy
+    # ~n(n-1)/2 characters for n leading BOMs before any parser limit is
+    # checked, with no cancellation point in this preprocessing step.
+    return content.lstrip("\ufeff")
+
+
 def _extract_packages_from_requirements(
     content: str,
     *,
@@ -1374,16 +1397,7 @@ def _extract_packages_from_requirements_detailed(
     largest_omitted: int | None = None
     if limit is not None and limit <= 0:
         return results, largest_omitted
-    # decode_text() decodes with plain "utf-8", which never strips a leading
-    # byte-order mark, so a BOM-prefixed requirements.txt would otherwise make
-    # the first requirement unparseable and silently drop it from SC4/OSV
-    # analysis. Strip leading BOMs here, scoped to manifest parsing only:
-    # decode_text() itself stays untouched because other analyzers treat
-    # U+FEFF as a hidden-character injection signal in file bodies.
-    # Single linear prefix strip: a per-character slicing loop here would
-    # copy ~n(n-1)/2 characters for n leading BOMs before any spec limit
-    # is checked, with no cancellation point in this preprocessing step.
-    content = content.lstrip("\ufeff")
+    content = _strip_leading_bom(content)
     for line_num, line in _logical_requirement_lines(content):
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("-"):
@@ -1519,6 +1533,7 @@ def _extract_packages_from_package_json(
     """
     if limit is not None and limit <= 0:
         return []
+    content = _strip_leading_bom(content)
     try:
         data = json.loads(content)
     except (ValueError, TypeError) as error:
@@ -1563,6 +1578,97 @@ def _extract_packages_from_package_json(
     ]
 
 
+# A single concrete version: no whitespace, ``||`` disjunctions, commas or wildcards.
+_POETRY_CONCRETE_VERSION_RE = re.compile(r"[0-9][A-Za-z0-9.!+_-]*")
+
+
+def _poetry_constraint_spec(name: str, constraint: object) -> str:
+    """Render a Poetry ``name = constraint`` entry as a PEP 508 string.
+
+    Poetry treats a bare version (``"2.31.0"``) as an exact pin, so it becomes
+    ``name==2.31.0`` and reaches ``_pinned_version``. Ranges and Poetry-only operators
+    (``^2.28``, ``~2.28``, ``*``, ``>=1,<2``, ``1.2.3 || 1.2.4``) admit many releases and stay unpinned, as do
+    git/path/url dependencies and multiple-constraint lists. Lockfile reconciliation fills
+    exact versions from ``poetry.lock`` when present.
+    """
+    if isinstance(constraint, dict):
+        constraint = constraint.get("version")
+    if not isinstance(constraint, str):
+        return name
+    version = constraint.strip()
+    if version.startswith("=="):
+        version = version[2:].strip()
+    if _POETRY_CONCRETE_VERSION_RE.fullmatch(version):
+        return f"{name}=={version}"
+    return name
+
+
+def _collect_tool_table_specs(
+    tool: dict[str, object],
+    extend_specs: Callable[[object], None],
+    hints: dict[str, re.Pattern[str]],
+    *,
+    full: Callable[[], bool],
+) -> None:
+    """Feed Poetry/PDM/Hatch/uv dependency tables through the bounded ``extend_specs``.
+
+    Reads ``[tool.poetry.dependencies]``, ``[tool.poetry.dev-dependencies]``,
+    ``[tool.poetry.group.<name>.dependencies]``, ``[tool.pdm.dev-dependencies]``,
+    ``[tool.hatch.envs.<name>.dependencies]`` and ``[tool.uv.dev-dependencies]``.
+    Poetry's ``python`` key constrains the interpreter, not a package, and is skipped.
+    """
+
+    def poetry_table(table: object) -> None:
+        if not isinstance(table, dict):
+            return
+        for name, constraint in table.items():
+            if full():
+                return
+            if not isinstance(name, str) or name.lower() == "python":
+                continue
+            spec = _poetry_constraint_spec(name, constraint)
+            hints.setdefault(
+                spec,
+                re.compile(rf"(?m)^[ \t]*[\"']?{re.escape(name)}[\"']?[ \t]*="),
+            )
+            extend_specs([spec])
+
+    poetry = tool.get("poetry")
+    if isinstance(poetry, dict):
+        poetry_table(poetry.get("dependencies"))
+        poetry_table(poetry.get("dev-dependencies"))
+        groups = poetry.get("group")
+        if isinstance(groups, dict):
+            for group in groups.values():
+                if full():
+                    break
+                if isinstance(group, dict):
+                    poetry_table(group.get("dependencies"))
+
+    pdm = tool.get("pdm")
+    if isinstance(pdm, dict):
+        dev = pdm.get("dev-dependencies")
+        if isinstance(dev, dict):
+            for group in dev.values():
+                if full():
+                    break
+                extend_specs(group)
+
+    hatch = tool.get("hatch")
+    if isinstance(hatch, dict):
+        envs = hatch.get("envs")
+        if isinstance(envs, dict):
+            for env in envs.values():
+                if full():
+                    break
+                if isinstance(env, dict):
+                    extend_specs(env.get("dependencies"))
+
+    uv = tool.get("uv")
+    if isinstance(uv, dict):
+        extend_specs(uv.get("dev-dependencies"))
+
+
 def _extract_packages_from_pyproject(
     content: str,
     *,
@@ -1572,12 +1678,15 @@ def _extract_packages_from_pyproject(
     """Extract (package_name, version_or_None, line_number) from pyproject.toml.
 
     Reads PEP 621 ``[project]`` ``dependencies`` / ``optional-dependencies``,
-    PEP 735 ``[dependency-groups]``, and ``[build-system].requires``. Standard
+    PEP 735 ``[dependency-groups]``, ``[build-system].requires`` and the
+    tool-specific tables of Poetry, PDM, Hatch and uv (see
+    ``_collect_tool_table_specs``). Standard
     metadata keys (``requires-python``, ``name``, ``version``, ...) are not
     dependencies and must not be looked up as packages.
     """
     if limit is not None and limit <= 0:
         return []
+    content = _strip_leading_bom(content)
     try:
         data = tomllib.loads(content)
     except (ValueError, RecursionError) as error:
@@ -1586,6 +1695,7 @@ def _extract_packages_from_pyproject(
         return []
 
     specs: list[str] = []
+    hints: dict[str, re.Pattern[str]] = {}
 
     def extend_specs(values: object) -> None:
         if not isinstance(values, list):
@@ -1616,6 +1726,14 @@ def _extract_packages_from_pyproject(
     build_system = data.get("build-system")
     if isinstance(build_system, dict) and (limit is None or len(specs) < max(0, limit)):
         extend_specs(build_system.get("requires"))
+    tool = data.get("tool")
+    if isinstance(tool, dict):
+        _collect_tool_table_specs(
+            tool,
+            extend_specs,
+            hints,
+            full=lambda: limit is not None and len(specs) >= max(0, limit),
+        )
 
     results: list[tuple[str, str | None, int]] = []
     for spec in specs:
@@ -1623,7 +1741,12 @@ def _extract_packages_from_pyproject(
         if not requirement:
             continue
         name, version = requirement
-        idx = content.find(spec)
+        hint = hints.get(spec)
+        if hint is not None:
+            match = hint.search(content)
+            idx = match.start() if match else -1
+        else:
+            idx = content.find(spec)
         line_num = get_line_number(content, idx) if idx >= 0 else 1
         results.append((name, version, line_num))
         if limit is not None and len(results) >= max(0, limit):
@@ -1739,6 +1862,7 @@ def _extract_packages_from_pipenv(
     entry_limit = MAX_DEPENDENCY_PACKAGES_PER_FILE if limit is None else max(0, limit)
     if entry_limit == 0:
         return [], []
+    content = _strip_leading_bom(content)
     try:
         data = json.loads(content) if is_lockfile else tomllib.loads(content)
     except (ValueError, RecursionError) as error:
@@ -1929,6 +2053,7 @@ def _npm_lock_entries(
     entry per name would drop the others silently, and the dropped copy is as installed — and as
     exploitable — as the one that happened to be seen first.
     """
+    content = _strip_leading_bom(content)
     try:
         data = json.loads(content)
     except (ValueError, RecursionError) as error:
@@ -2006,6 +2131,7 @@ def _extract_packages_from_toml_lock(
     """Extract exact package versions from TOML lockfiles such as uv.lock and poetry.lock."""
     if limit is not None and limit <= 0:
         return []
+    content = _strip_leading_bom(content)
     try:
         data = tomllib.loads(content)
     except (ValueError, RecursionError) as error:
@@ -2036,7 +2162,7 @@ def _extract_packages_from_toml_lock(
 
 def _apply_locked_versions(
     packages: list[tuple[str, str | None, int]],
-    locked_versions: dict[str, str] | None,
+    locked_versions: Mapping[str, str | None] | None,
     normalize: Callable[[str], str] = _normalize_package_name,
 ) -> list[tuple[str, str | None, int]]:
     """Prefer lockfile versions for manifest dependencies without exact versions."""
@@ -2189,20 +2315,29 @@ def _collect_npm_locked_versions(
     *,
     max_files: int | None = None,
     timeout_seconds: float | None = None,
-) -> dict[str, str]:
-    """Build package -> exact version map from npm lockfiles in the project.
+) -> dict[str, Mapping[str, str | None]]:
+    """Resolve manifest pins within their own lockfile's installation tree.
 
-    Kept separate from the Python map: the two ecosystems share package names (``semver``,
-    ``packaging``, ``requests`` all exist in both), so a single map would resolve a PyPI
-    dependency against an npm version, and vice versa.
-
-    Bounded by the same file count and clock the Python collector is bounded by. A lockfile is
-    attacker-shaped input — a skill can ship one — and an unbounded parse next to a bounded one
-    is not half-safe, it is the way in: the cap that matters is the smallest one, and here that
-    would have been no cap at all.
+    Workspace manifests may use hoisted installs from their lock root, but unrelated
+    projects must never borrow those pins. Keep each lockfile's independent vulnerability
+    scan separate: nested installs still need auditing even when no manifest resolves to them.
     """
-    locked_versions: dict[str, str] = {}
-    depths: dict[str, int] = {}
+    locked_versions: dict[str, Mapping[str, str | None]] = {}
+    owners = {
+        str(Path(path).parent): len(Path(path).parent.parts)
+        for path in components
+        if _is_npm_lockfile(path)
+    }
+    shrinkwrap_dirs = {
+        str(Path(path).parent)
+        for path in components
+        if _dependency_filename(path) == "npm-shrinkwrap.json"
+    }
+    manifest_dirs = {
+        str(Path(path).parent)
+        for path in components
+        if _dependency_filename(path) == "package.json"
+    }
     started_at = time.monotonic()
     files_read = 0
     for path in components:
@@ -2212,18 +2347,96 @@ def _collect_npm_locked_versions(
             break
         if timeout_seconds is not None and time.monotonic() - started_at >= timeout_seconds:
             break
+        root = Path(path).parent
+        if _dependency_filename(path) == "package-lock.json" and str(root) in shrinkwrap_dirs:
+            continue  # npm gives shrinkwrap precedence when both files exist.
         content = file_cache.get(path)
         if content is None:
             continue
         files_read += 1
-        for name, version, _line_num, depth in _npm_lock_entries(content):
-            key = _normalize_npm_package_name(name)
-            # A manifest range names a *direct* dependency, so it resolves to the top-level
-            # install. Nested copies exist for other packages' constraints; answering with one
-            # would report a version this manifest never asked for.
-            if key not in depths or depth < depths[key]:
-                locked_versions[key] = version
-                depths[key] = depth
+        try:
+            data = json.loads(_strip_leading_bom(content))
+        except (ValueError, TypeError, RecursionError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        installs: dict[PurePosixPath, dict[str, str | None]] = {}
+        projects = {PurePosixPath(".")}
+        packages = data.get("packages")
+        if isinstance(packages, dict):
+            for location, entry in packages.items():
+                relative = PurePosixPath(location)
+                if (
+                    not location
+                    or relative.is_absolute()
+                    or ".." in relative.parts
+                    or "\\" in location
+                ):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if str(root / relative) in manifest_dirs:
+                    projects.add(relative)
+                owner, separator, name = location.rpartition("node_modules/")
+                if not separator or (owner and not owner.endswith("/")):
+                    continue
+                version = entry.get("version")
+                registry_name = entry.get("name")
+                pinned = (
+                    isinstance(version, str)
+                    and version.strip()
+                    and not entry.get("link")
+                    and not (
+                        isinstance(registry_name, str)
+                        and registry_name.strip()
+                        and registry_name != name
+                    )
+                )
+                # Every occupied install slot shadows its ancestors, as Node's module
+                # lookup does. An alias, a local `link: true` install or a slot without
+                # a version stays unresolved (None), so ChainMap cannot borrow an unrelated
+                # ancestor's registry pin for it; any other slot records its own version.
+                installs.setdefault(PurePosixPath(owner), {})[_normalize_npm_package_name(name)] = (
+                    version.strip() if pinned else None
+                )
+        elif isinstance(data.get("dependencies"), dict):
+            trees = {PurePosixPath("."): data["dependencies"]}
+            for entry in data["dependencies"].values():
+                version = entry.get("version") if isinstance(entry, dict) else None
+                if not isinstance(version, str) or not version.startswith("file:"):
+                    continue
+                location = version[5:]
+                relative = PurePosixPath(location)
+                if (
+                    not location
+                    or relative == PurePosixPath(".")
+                    or relative.is_absolute()
+                    or ".." in relative.parts
+                    or "\\" in location
+                    or str(root / relative) not in manifest_dirs
+                ):
+                    continue
+                # v1 records workspace links here instead of in the packages table.
+                projects.add(relative)
+                trees[relative] = entry.get("dependencies", {})
+            for project, dependencies in trees.items():
+                if isinstance(dependencies, dict):
+                    installs[project] = {
+                        _normalize_npm_package_name(name): entry["version"].strip()
+                        for name, entry in dependencies.items()
+                        if isinstance(entry, dict)
+                        and isinstance(entry.get("version"), str)
+                        and entry["version"].strip()
+                    }
+        for project in projects:
+            scope = str(root / project)
+            depth = len(root.parts)
+            if depth < owners.get(scope, -1):
+                continue
+            owners[scope] = depth
+            locked_versions[scope] = ChainMap(
+                *(installs[parent] for parent in (project, *project.parents) if parent in installs)
+            )
     return locked_versions
 
 
@@ -2409,7 +2622,9 @@ def _iter_sc2_shell_matches(
     covered = 0
     for start, end in command_ranges:
         if end is None:
-            yield from compiled.finditer(content, max(start, covered))
+            yield from static_runner.iter_pattern_matches(
+                compiled, content, start=max(start, covered)
+            )
             return
         if start < covered:
             continue
@@ -2448,7 +2663,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             matches = (
                 static_runner.iter_paragraph_matches
                 if (pattern, confidence) in SC1_PROSE_PATTERNS
-                else re.finditer
+                else static_runner.iter_pattern_matches
             )
             for match in matches(pattern, content, re.MULTILINE):
                 line_num = line_number(match.start())
@@ -2473,7 +2688,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 pattern, content, re.IGNORECASE | re.MULTILINE
             )
         else:
-            matches = re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE)
+            matches = static_runner.iter_pattern_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            )
         for match in matches:
             line_num = line_number(match.start())
             mt = match.group(0)
@@ -2587,10 +2804,15 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     if has_shell_decoder:
         sc3_patterns = sc3_patterns + SC3_SHELL_PATTERNS
     for pattern, confidence in sc3_patterns:
+        # Shell-decoder rules already bound every stage/literal and use atomic
+        # or possessive ambiguous groups. Keep their audited native matcher;
+        # the interruptible engine adds enough cost to reject dense input.
         matches = (
-            static_runner.iter_paragraph_matches
+            re.finditer
+            if pattern in (_SC3_BOUNDED_PIPE_PATTERN, _SC3_BOUNDED_SUBSTITUTION_PATTERN)
+            else static_runner.iter_paragraph_matches
             if (pattern, confidence) in SC3_PROSE_PATTERNS
-            else re.finditer
+            else static_runner.iter_pattern_matches
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = line_number(match.start())
@@ -2609,7 +2831,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     # SC7: untrusted container image. Example filtering is delegated to the runner.
     for pattern, confidence in SC7_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_pattern_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = line_number(match.start())
             findings.append(
                 AnalyzerFinding(
@@ -2996,7 +3220,7 @@ def _sc4_from_osv(
         one vulnerability.  Callers can use this to decide which packages
         still need a fallback lookup.
     """
-    findings, covered, _limitations = _sc4_from_osv_detailed(
+    findings, covered, _limitations, _local_checked = _sc4_from_osv_detailed(
         packages,
         ecosystem,
         file_path,
@@ -3013,7 +3237,7 @@ def _sc4_from_osv_detailed(
     *,
     timeout_seconds: float | None = None,
     budget: OsvQueryBudget | None = None,
-) -> tuple[list[AnalyzerFinding], set[str], list[OsvQueryLimitation]]:
+) -> tuple[list[AnalyzerFinding], set[str], list[OsvQueryLimitation], frozenset[int] | None]:
     """Run a bounded OSV lookup and retain its non-fatal limitation metadata."""
     pkg_pairs = [(name, version) for name, version, _ in packages]
     if budget is not None:
@@ -3097,7 +3321,10 @@ def _sc4_from_osv_detailed(
     limitations = (
         list(osv_results.limitations) if isinstance(osv_results, QueryBatchResults) else []
     )
-    return findings, covered, limitations
+    local_checked = (
+        osv_results.local_checked if isinstance(osv_results, QueryBatchResults) else None
+    )
+    return findings, covered, limitations, local_checked
 
 
 def _sc4_from_fallback(
@@ -3167,7 +3394,7 @@ def _analyze_dependencies(
     content: str,
     file_path: str,
     locked_versions: dict[str, str] | None = None,
-    npm_locked_versions: dict[str, str] | None = None,
+    npm_locked_versions: Mapping[str, str | None] | None = None,
 ) -> list[AnalyzerFinding]:
     """Run SC4/SC5/SC6 checks on dependency files."""
     findings, _limitations, _packages_seen = _analyze_dependencies_detailed(
@@ -3183,7 +3410,7 @@ def _analyze_dependencies_detailed(
     content: str,
     file_path: str,
     locked_versions: dict[str, str] | None = None,
-    npm_locked_versions: dict[str, str] | None = None,
+    npm_locked_versions: Mapping[str, str | None] | None = None,
     *,
     max_packages: int | None = None,
     max_findings: int | None = None,
@@ -3340,8 +3567,8 @@ def _analyze_dependencies_detailed(
             )
         findings.extend(extra[:remaining])
 
-    # SC4: Live OSV.dev lookup, then static fallback for uncovered packages
-    osv_findings, osv_covered, osv_limitations = _sc4_from_osv_detailed(
+    # SC4: OSV lookup, then static fallback for uncovered packages.
+    osv_findings, osv_covered, osv_limitations, local_checked = _sc4_from_osv_detailed(
         packages,
         ecosystem,
         file_path,
@@ -3351,13 +3578,25 @@ def _analyze_dependencies_detailed(
     )
     limitations.extend(osv_limitations)
     retain(osv_findings)
-    uncovered_packages = [p for p in packages if p[0].lower().replace("_", "-") not in osv_covered]
+    if local_checked is None:
+        uncovered_packages = [
+            p for p in packages if p[0].lower().replace("_", "-") not in osv_covered
+        ]
+    else:
+        # An empty, completed snapshot lookup is a valid result. Coverage is
+        # per coordinate so a match for one version cannot cover another.
+        uncovered_packages = [pkg for i, pkg in enumerate(packages) if i not in local_checked]
     fallback_findings = _sc4_from_fallback(uncovered_packages, fallback_db, file_path, tag)
     if fallback_findings:
         logger.debug(
             "SC4: using static fallback for %d uncovered packages", len(uncovered_packages)
         )
-    elif uncovered_packages and not osv_findings and not was_osv_reachable():
+    elif (
+        local_checked is None
+        and uncovered_packages
+        and not osv_findings
+        and not was_osv_reachable(osv_budget)
+    ):
         # OSV.dev was unreachable and fallback found nothing — surface the gap
         retain(
             [
@@ -4205,92 +4444,100 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     dependency_packages_seen = 0
     dependency_findings_seen = 0
     osv_budget = OsvQueryBudget.create(dependency_remaining_seconds())
-    for path in components:
-        is_dep_file = _is_dependency_manifest(path)
-        if not is_dep_file:
-            continue
-        dependency_files_seen += 1
-        if dependency_files_seen > max(0, MAX_DEPENDENCY_FILES_PER_SCAN):
-            record_limitation(
-                path,
-                OsvQueryLimitation(
-                    reason=LedgerReason.OUTPUT_LIMIT,
-                    observed_records=dependency_files_seen,
-                    limit_records=max(0, MAX_DEPENDENCY_FILES_PER_SCAN),
-                ),
-                f"{ANALYZER_ID}_dependencies",
-            )
-            break
-        remaining_packages = max(
-            0,
-            MAX_DEPENDENCY_PACKAGES_PER_SCAN - dependency_packages_seen,
-        )
-        remaining_dependency_findings = max(
-            0,
-            min(
-                MAX_DEPENDENCY_FINDINGS_PER_SCAN - dependency_findings_seen,
-                MAX_FINDING_OUTPUT_RECORDS - len(findings),
-            ),
-        )
-        if remaining_packages <= 0 or remaining_dependency_findings <= 0:
-            record_limitation(
-                path,
-                OsvQueryLimitation(
-                    reason=LedgerReason.OUTPUT_LIMIT,
-                    observed_records=(
-                        dependency_packages_seen + 1
-                        if remaining_packages <= 0
-                        else dependency_findings_seen + 1
+    try:
+        for path in components:
+            is_dep_file = _is_dependency_manifest(path)
+            if not is_dep_file:
+                continue
+            dependency_files_seen += 1
+            if dependency_files_seen > max(0, MAX_DEPENDENCY_FILES_PER_SCAN):
+                record_limitation(
+                    path,
+                    OsvQueryLimitation(
+                        reason=LedgerReason.OUTPUT_LIMIT,
+                        observed_records=dependency_files_seen,
+                        limit_records=max(0, MAX_DEPENDENCY_FILES_PER_SCAN),
                     ),
-                    limit_records=(
-                        MAX_DEPENDENCY_PACKAGES_PER_SCAN
-                        if remaining_packages <= 0
-                        else MAX_DEPENDENCY_FINDINGS_PER_SCAN
+                    f"{ANALYZER_ID}_dependencies",
+                )
+                break
+            remaining_packages = max(
+                0,
+                MAX_DEPENDENCY_PACKAGES_PER_SCAN - dependency_packages_seen,
+            )
+            remaining_dependency_findings = max(
+                0,
+                min(
+                    MAX_DEPENDENCY_FINDINGS_PER_SCAN - dependency_findings_seen,
+                    MAX_FINDING_OUTPUT_RECORDS - len(findings),
+                ),
+            )
+            if remaining_packages <= 0 or remaining_dependency_findings <= 0:
+                record_limitation(
+                    path,
+                    OsvQueryLimitation(
+                        reason=LedgerReason.OUTPUT_LIMIT,
+                        observed_records=(
+                            dependency_packages_seen + 1
+                            if remaining_packages <= 0
+                            else dependency_findings_seen + 1
+                        ),
+                        limit_records=(
+                            MAX_DEPENDENCY_PACKAGES_PER_SCAN
+                            if remaining_packages <= 0
+                            else MAX_DEPENDENCY_FINDINGS_PER_SCAN
+                        ),
                     ),
-                ),
-                f"{ANALYZER_ID}_dependencies",
-            )
-            break
-        shared_remaining = dependency_remaining_seconds()
-        if shared_remaining <= 0:
-            record_limitation(
+                    f"{ANALYZER_ID}_dependencies",
+                )
+                break
+            shared_remaining = dependency_remaining_seconds()
+            if shared_remaining <= 0:
+                record_limitation(
+                    path,
+                    OsvQueryLimitation(
+                        reason=LedgerReason.RUNTIME_LIMIT,
+                        observed_seconds=max(0.0, time.monotonic() - dependency_started_at),
+                        limit_seconds=dependency_runtime_limit,
+                    ),
+                    f"{ANALYZER_ID}_dependencies",
+                )
+                break
+            content = file_cache.get(path)
+            if content is None:
+                continue
+            dep_findings, dependency_limitations, packages_seen = _analyze_dependencies_detailed(
+                content,
                 path,
-                OsvQueryLimitation(
-                    reason=LedgerReason.RUNTIME_LIMIT,
-                    observed_seconds=max(0.0, time.monotonic() - dependency_started_at),
-                    limit_seconds=dependency_runtime_limit,
-                ),
-                f"{ANALYZER_ID}_dependencies",
+                locked_versions.get(_python_lock_scope(path)),
+                npm_locked_versions.get(str(Path(path).parent)),
+                max_packages=min(MAX_DEPENDENCY_PACKAGES_PER_FILE, remaining_packages),
+                max_findings=min(MAX_DEPENDENCY_FINDINGS_PER_FILE, remaining_dependency_findings),
+                timeout_seconds=shared_remaining,
+                osv_budget=osv_budget,
             )
-            break
-        content = file_cache.get(path)
-        if content is None:
-            continue
-        dep_findings, dependency_limitations, packages_seen = _analyze_dependencies_detailed(
-            content,
-            path,
-            locked_versions.get(_python_lock_scope(path)),
-            npm_locked_versions,
-            max_packages=min(MAX_DEPENDENCY_PACKAGES_PER_FILE, remaining_packages),
-            max_findings=min(MAX_DEPENDENCY_FINDINGS_PER_FILE, remaining_dependency_findings),
-            timeout_seconds=shared_remaining,
-            osv_budget=osv_budget,
-        )
-        dependency_packages_seen += packages_seen
-        dependency_findings = [analyzer_finding_to_finding(af) for af in dep_findings]
-        dependency_findings_seen += len(dependency_findings)
-        findings.extend(dependency_findings)
-        record_extra_findings(
-            path,
-            dependency_findings,
-            f"{ANALYZER_ID}_dependencies",
-        )
-        for limitation in dependency_limitations:
-            record_limitation(
+            dependency_packages_seen += packages_seen
+            dependency_findings = [analyzer_finding_to_finding(af) for af in dep_findings]
+            dependency_findings_seen += len(dependency_findings)
+            findings.extend(dependency_findings)
+            record_extra_findings(
                 path,
-                limitation,
+                dependency_findings,
                 f"{ANALYZER_ID}_dependencies",
             )
+            for limitation in dependency_limitations:
+                record_limitation(
+                    path,
+                    limitation,
+                    f"{ANALYZER_ID}_dependencies",
+                )
+        if osv_budget.local_db_path is not None:
+            response["osv_lookup"] = {
+                "source": "local",
+                "snapshots": osv_budget.snapshot_metadata(),
+            }
+    finally:
+        osv_budget.close()
 
     # TR1–TR3: trigger analysis from manifest
     manifest: dict[str, object] = state.get("manifest") or {}

@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from importlib import import_module
 from urllib.parse import urlparse
 
@@ -32,11 +31,26 @@ from skillspector.inference_usage import (
     register_chat_model_controls,
     retained_chat_model_controls,
 )
+
+# Keep the existing import surface while provenance uses the lightweight module.
+from skillspector.providers._controls import (
+    MAX_SAMPLING_SEED as MAX_SAMPLING_SEED,
+)
+from skillspector.providers._controls import (
+    MIN_SAMPLING_SEED as MIN_SAMPLING_SEED,
+)
+from skillspector.providers._controls import (
+    resolve_reasoning_effort as resolve_reasoning_effort,
+)
+from skillspector.providers._controls import (
+    resolve_seed as resolve_seed,
+)
+from skillspector.providers._controls import (
+    resolve_temperature as resolve_temperature,
+)
 from skillspector.providers.structured_output import is_gpt_6_1_sol, rejects_sampling_controls
 
 logger = logging.getLogger(__name__)
-MIN_SAMPLING_SEED = -(1 << 63)
-MAX_SAMPLING_SEED = (1 << 63) - 1
 
 # Reasoning efforts GPT-6.1 Sol accepts; it rejects ``none`` and ``minimal``.
 GPT_6_1_SOL_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -77,40 +91,6 @@ def prepare_openai_chat_model_imports() -> None:
 
 class UnsupportedControlError(ValueError):
     """A requested sampling or reasoning control the model rejects, raised before any request."""
-
-
-def resolve_reasoning_effort() -> str | None:
-    """Resolve the optional provider- and model-dependent reasoning effort."""
-    reasoning_effort = os.environ.get("SKILLSPECTOR_REASONING_EFFORT", "").strip()
-    return reasoning_effort or None
-
-
-def resolve_temperature() -> float | None:
-    """Resolve the optional temperature using the provider validation contract."""
-    raw_temperature = os.environ.get("SKILLSPECTOR_TEMPERATURE", "").strip()
-    if not raw_temperature:
-        return None
-    try:
-        temperature = float(raw_temperature)
-    except ValueError as exc:
-        raise ValueError("SKILLSPECTOR_TEMPERATURE must be a number between 0 and 1") from exc
-    if not 0 <= temperature <= 1:
-        raise ValueError("SKILLSPECTOR_TEMPERATURE must be between 0 and 1")
-    return temperature
-
-
-def resolve_seed() -> int | None:
-    """Resolve the optional seed within the portable signed 64-bit contract."""
-    raw_seed = os.environ.get("SKILLSPECTOR_SEED", "").strip()
-    if not raw_seed:
-        return None
-    try:
-        seed = int(raw_seed)
-    except ValueError as exc:
-        raise ValueError("SKILLSPECTOR_SEED must be an integer") from exc
-    if not MIN_SAMPLING_SEED <= seed <= MAX_SAMPLING_SEED:
-        raise ValueError("SKILLSPECTOR_SEED must be a signed 64-bit integer")
-    return seed
 
 
 def resolve_sampling_parameters(
@@ -219,6 +199,7 @@ def create_openai_compatible_chat_model(
     default_headers: dict[str, str] | None = None,
     forced_tool_choice: bool = True,
     default_reasoning_effort: str | None = None,
+    chat_model_class: type[ChatOpenAI] | None = None,
 ) -> BaseChatModel | None:
     """Create ``ChatOpenAI`` for providers serving OpenAI-compatible endpoints.
 
@@ -248,7 +229,7 @@ def create_openai_compatible_chat_model(
         model, include_seed=True, reasoning_effort=reasoning_effort
     )
     kwargs.update(sampling_parameters)
-    chat_model = ChatOpenAI(**kwargs)
+    chat_model = (chat_model_class or ChatOpenAI)(**kwargs)
     register_chat_model_controls(
         chat_model,
         retained_chat_model_controls(

@@ -34,12 +34,11 @@ from hashlib import sha256
 from pathlib import Path
 from stat import S_ISDIR
 from time import monotonic
-from typing import Annotated, cast
-from urllib.parse import quote
+from typing import TYPE_CHECKING, Annotated, cast
+from urllib.parse import quote, urlsplit
 
 import typer
 from click.core import ParameterSource
-from langchain_core.runnables import RunnableConfig
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.text import Text
@@ -50,12 +49,13 @@ from skillspector.cleanup import TempDirTracker, cleanup_result
 from skillspector.cli_entry import create_app
 from skillspector.cli_entry import main as main
 from skillspector.cli_entry import version_callback as version_callback
-from skillspector.constants import RISK_THRESHOLD
 from skillspector.file_output import require_secure_file_output, write_text_no_follow
 from skillspector.graph_proxy import graph
-from skillspector.input_handler import validate_local_input_path
+from skillspector.input_handler import _normalize_root_owned_alias, validate_local_input_path
 from skillspector.inspection_ledger import (
     MAX_INSPECTION_LEDGER_EVENTS,
+    REASON_MESSAGES,
+    InspectionLedgerException,
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
@@ -63,7 +63,6 @@ from skillspector.inspection_ledger import (
     inspection_work_id,
     ledger_event,
 )
-from skillspector.llm_utils import unsupported_control_error
 from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
 from skillspector.models import OCCURRENCE_FINDING_ID_KEY, Finding
@@ -73,9 +72,8 @@ from skillspector.multi_skill import (
     _manifest_file,
     detect_skills,
 )
-from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
-from skillspector.nodes.report import report, risk_severity_and_recommendation
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
+from skillspector.scan_policy import RISK_THRESHOLD
 from skillspector.semantic_runtime import (
     has_semantic_runtime_event,
     semantic_runtime_intent,
@@ -94,7 +92,44 @@ from skillspector.suppression import (
 )
 from skillspector.terminal_text import visible_terminal_text as _visible_terminal_text
 
+if TYPE_CHECKING:
+    from langchain_core.runnables import RunnableConfig
+
+    from skillspector.state import SkillspectorState
+
 logger = get_logger(__name__)
+
+
+def __getattr__(name: str) -> object:
+    """Keep analyzer compatibility exports lazy until a scan needs them."""
+    if name in {"ANALYZER_MODULES", "ANALYZER_NODE_IDS"}:
+        from skillspector.nodes import analyzers
+
+        value = getattr(analyzers, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def report(state: SkillspectorState) -> dict[str, object]:
+    """Load the scanner report builder only for actual skill reports."""
+    from skillspector.nodes.report import report as build_report
+
+    return build_report(state)
+
+
+def unsupported_control_error(timeout: float | None = 120) -> str | None:
+    """Keep the preflight hook patchable without loading providers for help."""
+    from skillspector.llm_utils import unsupported_control_error as check_controls
+
+    return check_controls(timeout=timeout)
+
+
+def risk_severity_and_recommendation(score: int) -> tuple[str, str]:
+    """Keep recursive verdict policy patchable while deferring report imports."""
+    from skillspector.nodes.report import risk_severity_and_recommendation as assess_score
+
+    return assess_score(score)
 
 
 def _ensure_utf8_streams() -> None:
@@ -317,6 +352,7 @@ def _scan_state(
     show_suppressed: bool = False,
     source_local_only: bool = False,
     exclude_patterns: list[str] | None = None,
+    use_shipped_baseline: bool = False,
 ) -> dict[str, object]:
     """Build initial graph state from scan CLI args."""
     state: dict[str, object] = {
@@ -328,6 +364,9 @@ def _scan_state(
     }
     if exclude_patterns:
         state["exclude_patterns"] = list(exclude_patterns)
+    if use_shipped_baseline:
+        state["use_shipped_baseline"] = True
+        state["show_suppressed"] = show_suppressed
     if yara_rules_dir is not None:
         state["yara_rules_dir"] = yara_rules_dir
     if baseline is not None:
@@ -336,6 +375,34 @@ def _scan_state(
         state["baseline_path"] = os.path.abspath(baseline.expanduser())
         state["show_suppressed"] = show_suppressed
     return state
+
+
+def _shipped_baseline_notice(shipped: Path | None, input_path: Path, apply: bool) -> None:
+    if shipped is not None:
+        if apply:
+            err_console.print(_literal_line("Applying author-shipped baseline", "yellow", shipped))
+            err_console.print(
+                "[dim]Suppressed findings do not count toward the risk score; "
+                "use --show-suppressed to list them.[/dim]"
+            )
+        else:
+            err_console.print(
+                _literal_line("Shipped baseline detected (not applied)", "yellow", shipped)
+            )
+            err_console.print(
+                "[dim]Review it, then re-run with --use-shipped-baseline to apply its "
+                "suppressions. Findings and risk score are unaffected until you opt in.[/dim]"
+            )
+    elif apply:
+        err_console.print(
+            Text(
+                _visible_terminal_text(
+                    f"--use-shipped-baseline: no shipped baseline found in {input_path}; "
+                    "scanning without a baseline."
+                ),
+                style="dim",
+            )
+        )
 
 
 def _result_body(result: dict) -> str:
@@ -351,7 +418,12 @@ def _validate_report_destination(input_path: Path, output: Path | None) -> None:
         return
     if input_path.is_dir():
         input_path = _manifest_file(input_path) or input_path
-    if input_path.is_file() and output.exists() and output.samefile(input_path):
+    # The writer collapses lexical aliases (including missing/..). Retain the
+    # original-path check too: a symlink followed by .. can name a different file.
+    if input_path.is_file() and any(
+        candidate.exists() and candidate.samefile(input_path)
+        for candidate in (output, _normalize_root_owned_alias(output))
+    ):
         raise ValueError("--output points to the input file. Choose a different output path.")
     # Reject an existing directory output before any scan work starts:
     # write_text_no_follow() would refuse it only after the analysis has
@@ -530,7 +602,9 @@ def scan(
         typer.Option(
             "--recursive",
             "-r",
-            help="Scan immediate subdirectories that each contain a SKILL.md as independent skills.",
+            help="Scan immediate child directories with SKILL.md, skill.md, or a supported "
+            "AISOP/AISP bundle as independent skills. A Markdown skill manifest at the scan "
+            "root selects a single-skill scan.",
         ),
     ] = False,
     max_skills: Annotated[
@@ -564,7 +638,7 @@ def scan(
         typer.Option(
             "--use-shipped-baseline",
             help="Apply a baseline shipped at the top level of the scanned skill "
-            "directory (.skillspector-baseline.yaml). Off by default: a skill "
+            "directory or local ZIP (.skillspector-baseline.yaml). Off by default: a skill "
             "author's baseline can suppress findings in your scan, so a discovered "
             "baseline is only reported until you opt in. Ignored when --baseline "
             "is given. Not supported for recursive multi-skill scans; scan each "
@@ -666,7 +740,7 @@ def scan(
     Environment variables:
 
         SKILLSPECTOR_PROVIDER  Active LLM provider: openai | anthropic |
-                               anthropic_proxy | bedrock | nv_build |
+                               anthropic_proxy | bedrock | minimax | nv_build |
                                nv_inference | ollama | azure_openai |
                                openai_compatible | gemini | claude_cli |
                                gemini_cli | opencode_cli. Defaults to the NVIDIA path
@@ -680,6 +754,7 @@ def scan(
 
         OPENAI_API_KEY [+ OPENAI_BASE_URL]   for SKILLSPECTOR_PROVIDER=openai
         ANTHROPIC_API_KEY                    for SKILLSPECTOR_PROVIDER=anthropic
+        MINIMAX_API_KEY                      for SKILLSPECTOR_PROVIDER=minimax
         ANTHROPIC_PROXY_API_KEY +
           ANTHROPIC_PROXY_ENDPOINT_URL       for anthropic_proxy
         AWS_PROFILE (optional) + AWS_REGION  for SKILLSPECTOR_PROVIDER=bedrock
@@ -896,40 +971,27 @@ def scan(
                 f"this directory. Use --recursive to scan each independently."
             )
 
-    shipped: Path | None = None
-    if baseline is None and resolved_path.is_dir():
-        shipped = discover_baseline(resolved_path)
-    if shipped is not None:
+    zip_baseline = (
+        use_shipped_baseline
+        and baseline is None
+        and resolved_path.is_file()
+        and resolved_path.suffix.lower() == ".zip"
+    )
+    if baseline is None and not zip_baseline:
+        shipped = discover_baseline(resolved_path) if resolved_path.is_dir() else None
+        _shipped_baseline_notice(shipped, resolved_path, use_shipped_baseline)
         if use_shipped_baseline:
             baseline = shipped
-            err_console.print(_literal_line("Applying author-shipped baseline", "yellow", shipped))
-            err_console.print(
-                "[dim]Suppressed findings do not count toward the risk score; "
-                "use --show-suppressed to list them.[/dim]"
-            )
-        else:
-            err_console.print(
-                _literal_line("Shipped baseline detected (not applied)", "yellow", shipped)
-            )
-            err_console.print(
-                "[dim]Review it, then re-run with --use-shipped-baseline to apply its "
-                "suppressions. Findings and risk score are unaffected until you opt in.[/dim]"
-            )
-    elif use_shipped_baseline and baseline is None:
-        err_console.print(
-            Text(
-                _visible_terminal_text(
-                    f"--use-shipped-baseline: no shipped baseline found in {resolved_path}; scanning without a baseline."
-                ),
-                style="dim",
-            )
-        )
 
     result = None
     try:
+        if baseline is not None:
+            _validate_report_destination(baseline, output)
         scan_skill = partial(_scan_skill, exclude_patterns=exclude) if exclude else _scan_skill
         if inspect_dependencies:
             scan_skill = partial(scan_skill, inspect_dependencies=True)
+        if zip_baseline:
+            scan_skill = partial(scan_skill, use_shipped_baseline=True)
         result = scan_skill(
             input_path=input_path,
             format=format,
@@ -1349,6 +1411,7 @@ def _transitive_limit_event(
     *,
     phase: str,
     path: str,
+    source_identity: str | None = None,
 ) -> dict[str, object]:
     observed_bytes: int | None = None
     limit_bytes: int | None = None
@@ -1374,24 +1437,25 @@ def _transitive_limit_event(
     else:
         observed_artifacts = int(limitation.observed)
         limit_artifacts = int(limitation.limit)
-    return dict(
-        ledger_event(
-            outcome=LedgerOutcome.PARTIAL,
-            record_type=LedgerRecordType.SYSTEM,
-            phase=phase,
-            path=path,
-            reason=LedgerReason.REFERENCE_EXTRACTION_LIMIT,
-            stage=limitation.resource,
-            observed_bytes=observed_bytes,
-            limit_bytes=limit_bytes,
-            observed_records=observed_records,
-            limit_records=limit_records,
-            observed_artifacts=observed_artifacts,
-            limit_artifacts=limit_artifacts,
-            observed_seconds=observed_seconds,
-            limit_seconds=limit_seconds,
-        )
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        record_type=LedgerRecordType.SYSTEM,
+        phase=phase,
+        path=path,
+        reason=LedgerReason.REFERENCE_EXTRACTION_LIMIT,
+        stage=limitation.resource,
+        observed_bytes=observed_bytes,
+        limit_bytes=limit_bytes,
+        observed_records=observed_records,
+        limit_records=limit_records,
+        observed_artifacts=observed_artifacts,
+        limit_artifacts=limit_artifacts,
+        observed_seconds=observed_seconds,
+        limit_seconds=limit_seconds,
     )
+    if source_identity is not None:
+        event["source_identity"] = source_identity
+    return dict(event)
 
 
 def _cache_transitive_result(
@@ -1484,6 +1548,7 @@ def _cache_transitive_result(
                 limitation,
                 phase="transitive_reference_extraction",
                 path=(limitation.source_scope or source_identity) + "/SKILL.md",
+                source_identity=source_identity,
             )
         )
     scoped_ledger = _merge_bounded_ledger(
@@ -1610,10 +1675,11 @@ def _discovered_files_tree(paths: list[str]) -> Tree:
 
 def _wired_analyzer_node_ids() -> frozenset[str]:
     """Return only analyzers present in the compiled graph."""
+    node_ids = sys.modules[__name__].ANALYZER_NODE_IDS
     graph_nodes = getattr(graph, "nodes", {})
     if not isinstance(graph_nodes, dict):
-        return frozenset(ANALYZER_NODE_IDS)
-    return frozenset(node_id for node_id in ANALYZER_NODE_IDS if node_id in graph_nodes)
+        return frozenset(node_ids)
+    return frozenset(node_id for node_id in node_ids if node_id in graph_nodes)
 
 
 def _run_graph_scan(
@@ -1629,6 +1695,7 @@ def _run_graph_scan(
     stream_progress: bool = False,
     exclude_patterns: list[str] | None = None,
     inspect_dependencies: bool = False,
+    use_shipped_baseline: bool = False,
 ) -> dict[str, object]:
     state = _scan_state(
         input_path=input_path,
@@ -1639,6 +1706,7 @@ def _run_graph_scan(
         show_suppressed=show_suppressed,
         source_local_only=source_local_only,
         exclude_patterns=exclude_patterns,
+        use_shipped_baseline=use_shipped_baseline,
     )
     if inspect_dependencies:
         state["inspect_dependencies"] = True
@@ -1744,6 +1812,7 @@ def _run_graph_scan_for_source(
     stream_progress: bool = False,
     exclude_patterns: list[str] | None = None,
     inspect_dependencies: bool = False,
+    use_shipped_baseline: bool = False,
 ) -> dict[str, object]:
     """Invoke a scan without widening the legacy call contract for public sources."""
     run_graph_scan = (
@@ -1753,6 +1822,8 @@ def _run_graph_scan_for_source(
         run_graph_scan = partial(run_graph_scan, exclude_patterns=exclude_patterns)
     if inspect_dependencies:
         run_graph_scan = partial(run_graph_scan, inspect_dependencies=True)
+    if use_shipped_baseline:
+        run_graph_scan = partial(run_graph_scan, use_shipped_baseline=True)
     if initial_inspection_ledger is not None:
         if source_local_only:
             return run_graph_scan(
@@ -1910,6 +1981,24 @@ def _status_planned_work_count(statuses: list[dict[str, object]]) -> int:
     return total
 
 
+def _ledger_output_limit_event(
+    source: dict[str, object], observed_records: int, limit_records: int
+) -> dict[str, object]:
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        record_type=LedgerRecordType.SYSTEM,
+        phase="ledger_output",
+        path=str(source.get("path", "SKILL.md")),
+        reason=LedgerReason.OUTPUT_LIMIT,
+        observed_records=observed_records,
+        limit_records=limit_records,
+    )
+    identity = source.get("source_identity")
+    if isinstance(identity, str) and identity:
+        event["source_identity"] = identity
+    return dict(event)
+
+
 def _merge_bounded_ledger(
     existing: list[dict[str, object]],
     updates: list[dict[str, object]],
@@ -1927,16 +2016,8 @@ def _merge_bounded_ledger(
         prior_observed = observed_value if isinstance(observed_value, int) else len(existing)
         return [
             *existing[:-1][: effective_limit - 1],
-            dict(
-                ledger_event(
-                    outcome=LedgerOutcome.PARTIAL,
-                    record_type=LedgerRecordType.SYSTEM,
-                    phase="ledger_output",
-                    path=str(prior.get("path", "SKILL.md")),
-                    reason=LedgerReason.OUTPUT_LIMIT,
-                    observed_records=max(prior_observed, len(existing)) + len(updates),
-                    limit_records=effective_limit,
-                )
+            _ledger_output_limit_event(
+                prior, max(prior_observed, len(existing)) + len(updates), effective_limit
             ),
         ]
     combined = [*existing, *updates]
@@ -1947,17 +2028,7 @@ def _merge_bounded_ledger(
     overflow = combined[effective_limit - 1]
     return [
         *combined[: effective_limit - 1],
-        dict(
-            ledger_event(
-                outcome=LedgerOutcome.PARTIAL,
-                record_type=LedgerRecordType.SYSTEM,
-                phase="ledger_output",
-                path=str(overflow.get("path", "SKILL.md")),
-                reason=LedgerReason.OUTPUT_LIMIT,
-                observed_records=len(combined),
-                limit_records=effective_limit,
-            )
-        ),
+        _ledger_output_limit_event(overflow, len(combined), effective_limit),
     ]
 
 
@@ -1983,15 +2054,15 @@ def _distinct_failed_ledger_events(
 
 def _transitive_child_failure_event(source_identity: str) -> dict[str, object]:
     """Return one deterministic, payload-free fatal fact for an opaque child failure."""
-    return dict(
-        ledger_event(
-            outcome=LedgerOutcome.FAILED,
-            record_type=LedgerRecordType.SYSTEM,
-            phase="transitive_child_scan",
-            path=f"{source_identity}/SKILL.md",
-            reason=LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED,
-        )
+    event = ledger_event(
+        outcome=LedgerOutcome.FAILED,
+        record_type=LedgerRecordType.SYSTEM,
+        phase="transitive_child_scan",
+        path=f"{source_identity}/SKILL.md",
+        reason=LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED,
     )
+    event["source_identity"] = source_identity
+    return dict(event)
 
 
 def _ensure_required_failure_events(
@@ -2040,21 +2111,13 @@ def _ensure_required_failure_events(
     newly_observed = (
         0 if prior_sentinel is not None and failures_already_observed else len(missing_failures)
     )
-    sentinel_path = (
-        str(prior_sentinel.get("path", "SKILL.md"))
+    sentinel_source = (
+        prior_sentinel
         if prior_sentinel is not None and failures_already_observed
-        else str((incoming_failures or required_failures)[0].get("path", "SKILL.md"))
+        else (incoming_failures or required_failures)[0]
     )
-    sentinel = dict(
-        ledger_event(
-            outcome=LedgerOutcome.PARTIAL,
-            record_type=LedgerRecordType.SYSTEM,
-            phase="ledger_output",
-            path=sentinel_path,
-            reason=LedgerReason.OUTPUT_LIMIT,
-            observed_records=max(observed_records, len(events)) + newly_observed,
-            limit_records=effective_limit,
-        )
+    sentinel = _ledger_output_limit_event(
+        sentinel_source, max(observed_records, len(events)) + newly_observed, effective_limit
     )
     failure_slots = effective_limit - 1
     if failures_already_observed:
@@ -2199,6 +2262,7 @@ def _scan_transitive(
                     limitation,
                     phase="transitive_reference_extraction",
                     path=(limitation.source_scope or "SKILL.md"),
+                    source_identity=limitation.source_scope,
                 )
             ],
             limit=traversal.budget.max_ledger_events,
@@ -2447,6 +2511,7 @@ def _scan_transitive(
                                 limitation,
                                 phase="transitive_frontier",
                                 path=cached.source_identity + "/SKILL.md",
+                                source_identity=cached.source_identity,
                             )
                         ],
                         limit=traversal.budget.max_ledger_events,
@@ -2555,7 +2620,7 @@ def _scan_transitive(
         requested=llm_requested,
         enabled=llm_enabled,
         result=merged_result,
-        discovered_modules=ANALYZER_MODULES,
+        discovered_modules=sys.modules[__name__].ANALYZER_MODULES,
     )
     pre_runtime_failure_events = _distinct_failed_ledger_events(merged_inspection_ledger)
     if runtime_event is not None and not has_semantic_runtime_event(
@@ -2624,6 +2689,7 @@ def _scan_skill(
     source_local_only: bool = False,
     exclude_patterns: list[str] | None = None,
     inspect_dependencies: bool = False,
+    use_shipped_baseline: bool = False,
 ) -> dict[str, object]:
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     active_visited: set[str] = set()
@@ -2645,6 +2711,8 @@ def _scan_skill(
         run_for_source = partial(run_for_source, inspect_dependencies=True)
     if exclude_patterns:
         run_for_source = partial(run_for_source, exclude_patterns=exclude_patterns)
+    if use_shipped_baseline:
+        run_for_source = partial(run_for_source, use_shipped_baseline=True)
     if pre_scan_ledger_events:
         result = run_for_source(
             input_path=input_path,
@@ -2670,6 +2738,15 @@ def _scan_skill(
             source_local_only=source_local_only,
             stream_progress=stream_progress,
         )
+    if use_shipped_baseline:
+        try:
+            selected = result.get("baseline_path")
+            _shipped_baseline_notice(
+                Path(selected) if isinstance(selected, str) else None, Path(input_path), True
+            )
+        except BaseException:
+            cleanup_result(result)
+            raise
     if not transitive_enabled:
         return result
     if transitive_traversal is None:  # Defensive: transitive scans initialize before root work.
@@ -2739,6 +2816,7 @@ def _multi_skill_analysis_completeness(
     failed_skills: int,
     omitted_skills: int,
     limitations: list[str],
+    excluded_root_paths: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Build one conservative machine-readable completeness summary for recursion."""
     is_complete = (
@@ -2747,7 +2825,7 @@ def _multi_skill_analysis_completeness(
     execution_successful = failed_skills == 0
     status = "failed" if not execution_successful else "complete" if is_complete else "partial"
     denominator = max(1, total_skills)
-    return {
+    completeness: dict[str, object] = {
         "is_complete": is_complete,
         "execution_successful": execution_successful,
         "status": status,
@@ -2759,6 +2837,23 @@ def _multi_skill_analysis_completeness(
         "limitations": limitations,
         "scope": "recursive_skills",
     }
+    if excluded_root_paths:
+        reason = LedgerReason.EXCLUDED_DIRECTORY
+        exclusions: list[InspectionLedgerException] = [
+            {
+                "outcome": LedgerOutcome.OUT_OF_SCOPE,
+                "phase": "multi_skill_discovery",
+                "reason_code": reason,
+                "message": REASON_MESSAGES[reason],
+                "path": path,
+                "start_line": None,
+                "end_line": None,
+                "fatal": False,
+            }
+            for path in excluded_root_paths
+        ]
+        completeness["scope_exclusions"] = exclusions
+    return completeness
 
 
 _RECURSIVE_SERIALIZED_OUTPUT_LIMIT_PREFIX = "recursive serialized report character budget "
@@ -2824,6 +2919,10 @@ def _multi_skill_text_completeness(completeness: dict[str, object]) -> str:
     elif status == "partial" and not limitations:
         limitations.append("One or more recursive skill scans were incomplete.")
     details = "\n".join(f"- {item}" for item in limitations)
+    exclusions = cast("list[InspectionLedgerException]", completeness.get("scope_exclusions", []))
+    if exclusions:
+        scope_details = "\n".join(f"- `{row['path']}` — {row['message']}" for row in exclusions)
+        details = "\n\n".join(filter(None, (details, f"Scope exclusions\n\n{scope_details}")))
     return f"--- Recursive Inspection Completeness ---\n\nStatus: {status}\n\n{details}"
 
 
@@ -2866,6 +2965,34 @@ def _multi_skill_text_summary(
 _RECURSIVE_SARIF_URI_BASE_ID = "SKILLROOT"
 
 
+def _scope_recursive_sarif_locations(records: object) -> None:
+    """Base child-relative result and notification locations at the scanned skill."""
+    if not isinstance(records, list):
+        return
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for location in record.get("locations", []):
+            physical = location.get("physicalLocation") if isinstance(location, dict) else None
+            artifact = physical.get("artifactLocation") if isinstance(physical, dict) else None
+            if not isinstance(artifact, dict) or "uriBaseId" in artifact:
+                continue
+            provenance = artifact.get("properties")
+            if isinstance(provenance, dict) and any(
+                key in provenance
+                for key in ("sourceIdentity", "sourceUrl", "sourceDigest", "transitiveDepth")
+            ):
+                continue
+            uri = artifact.get("uri")
+            if (
+                isinstance(uri, str)
+                and uri
+                and not uri.startswith("/")
+                and not urlsplit(uri).scheme
+            ):
+                artifact["uriBaseId"] = _RECURSIVE_SARIF_URI_BASE_ID
+
+
 def _multi_skill_sarif_report(
     processed_skills: list[SkillDirectory],
     results: list[dict[str, object]],
@@ -2896,36 +3023,19 @@ def _multi_skill_sarif_report(
             }
             run["properties"] = run_properties
             # SARIF 2.1.0 sections 3.4.4 and 3.14.14: scope each child run's
-            # skill-relative URIs to its own skill directory so results from
-            # different skills stop collapsing onto one repo-root-relative
-            # path. Single-skill output is untouched: only recursive merges
-            # set uriBaseId.
+            # skill-relative URIs to its own skill directory so finding and
+            # diagnostic paths resolve to the right child.
             relative = quote(skill.path.name, safe="")
             if relative:
-                for result in run.get("results", []):
-                    if not isinstance(result, dict):
-                        continue
-                    for location in result.get("locations", []):
-                        physical = (
-                            location.get("physicalLocation") if isinstance(location, dict) else None
+                _scope_recursive_sarif_locations(run.get("results"))
+                for invocation in run.get("invocations", []):
+                    if isinstance(invocation, dict):
+                        _scope_recursive_sarif_locations(
+                            invocation.get("toolExecutionNotifications")
                         )
-                        artifact = (
-                            physical.get("artifactLocation") if isinstance(physical, dict) else None
-                        )
-                        if isinstance(artifact, dict):
-                            provenance = artifact.get("properties")
-                            if isinstance(provenance, dict) and any(
-                                key in provenance
-                                for key in (
-                                    "sourceIdentity",
-                                    "sourceUrl",
-                                    "sourceDigest",
-                                    "transitiveDepth",
-                                )
-                            ):
-                                continue
-                            artifact["uriBaseId"] = _RECURSIVE_SARIF_URI_BASE_ID
+                previous_bases = run.get("originalUriBaseIds")
                 run["originalUriBaseIds"] = {
+                    **(previous_bases if isinstance(previous_bases, dict) else {}),
                     "SCANROOT": {"uri": skill.path.parent.resolve().as_uri() + "/"},
                     _RECURSIVE_SARIF_URI_BASE_ID: {
                         "uri": f"{relative}/",
@@ -3231,6 +3341,7 @@ def _scan_multi_skill(
         failed_skills=failed_skill_count,
         omitted_skills=skills_omitted_total,
         limitations=aggregate_limitations,
+        excluded_root_paths=detection.excluded_root_paths,
     )
     analysis_incomplete = not bool(aggregate_completeness["is_complete"])
     aggregate_risk_assessment = _multi_skill_risk_assessment(
@@ -3423,7 +3534,7 @@ def _scan_multi_skill(
         for skill, result in zip(processed_skills, results, strict=True):
             if "error" not in result:
                 sections.append(f"--- {skill.relative_path} ---\n\n{_result_body(result)}")
-        if analysis_incomplete:
+        if analysis_incomplete or detection.excluded_root_paths:
             sections.append(
                 _multi_skill_text_summary(
                     aggregate_completeness,
@@ -3538,6 +3649,13 @@ def baseline(
             help="Skip LLM analysis when generating the baseline (static analysis only).",
         ),
     ] = False,
+    yara_rules_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--yara-rules-dir",
+            help="Directory containing additional YARA rule files (.yar/.yara) to load alongside built-in rules.",
+        ),
+    ] = None,
     reason: Annotated[
         str,
         typer.Option(
@@ -3568,12 +3686,17 @@ def baseline(
         to_stdout = str(output) == "-"
         if not to_stdout:
             require_secure_file_output()
-            _validate_report_destination(Path(input_path.strip()), output)
+            _validate_report_destination(Path(input_path), output)
         if verbose:
             set_level("DEBUG")
             err_console.print("[dim]Scanning to build baseline...[/dim]")
         # output_format is irrelevant here; we consume findings, not report_body.
-        state = _scan_state(input_path, FormatChoice.json, no_llm)
+        state = _scan_state(
+            input_path,
+            FormatChoice.json,
+            no_llm,
+            yara_rules_dir=str(yara_rules_dir.resolve()) if yara_rules_dir else None,
+        )
         if not to_stdout:
             state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)

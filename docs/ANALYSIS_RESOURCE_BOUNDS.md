@@ -103,6 +103,86 @@ charged for each projected occurrence, so a compact alias graph cannot amplify t
 manifest past these limits. A malformed or incomplete claimed frontmatter leaves the manifest
 empty, marks the primary artifact `partial`, and records an allowlisted parse error or limit reason.
 
+## JSON quote ownership
+
+Standalone `.json` artifacts also have a separate, **2,097,152-character** host-syntax
+prepass for command-parser completeness. It reuses the iterative grammar to prove the
+entire original document, then treats only JSON punctuation outside strings as word
+boundaries. The proof carries through bounded windows only with ordered source mappings
+and intact original quote delimiters. String contents and all finding views stay visible;
+individual command-word, reconstruction, archive, output, and runtime limits still apply.
+This allowance does not expand the Markdown/frontmatter quote-ownership limits below.
+Concrete destructive commands inside original JSON strings retain an explicit incomplete
+interpretation until their finding provenance is supported. Existing raw and reconstructed
+findings remain visible; structural syntax ownership cannot turn that gap into a clean scan.
+
+The deterministic instruction parser can distinguish structural JSON quotes from instruction
+delimiters only after validating a complete JSON value within **131,072 source characters**.
+This is a structural capacity limit, independent of file-size and scan-time allowances.
+Candidates through 65,536 characters keep the established bounded JSON decoder path. Larger
+candidates use an iterative syntax validator that does not allocate decoded strings, numbers,
+arrays, or objects. A failed small-input decode is never retried through the larger-input path.
+
+The inclusive ceiling counts characters, not UTF-8 bytes or decoded JSON string lengths:
+
+- Standalone JSON includes surrounding whitespace. After bounded frontmatter, only the body
+  following the closing delimiter is counted.
+- An explicitly labeled, closed JSON fence counts its body, including newlines and raw list or
+  blockquote prefixes. Opening and closing fence lines are excluded.
+- Unicode characters count once; each source character of an escape such as `\u0061` counts.
+  The frontmatter boundary search has its own 65,536-character prefix bound.
+
+The iterative validator reads one complete value and trailing JSON whitespace. It rejects
+invalid escapes, raw controls inside strings, malformed numbers, unmatched delimiters, missing
+separators, trailing commas, and additional values. No quotes acquire ownership before validation
+reaches the end. Validation retains a byte per open container in a non-recursive grammar stack;
+the source ceiling therefore bounds nesting storage, token count, and the number of quote spans.
+There is no separate decoded-value allocation or integer-conversion cost. Deadline/cancellation
+checks occur within whitespace, string, number, and container processing, with fewer than 256
+validation characters between checks. The normalized fence-validation copy has a separate
+524,288-character ceiling to account for tabs expanding into at most four columns. Quote offsets
+continue to refer to the original source. The later quote-span collection is also bounded by
+the source characters and retains its existing runtime checks.
+
+This validates structural quote ownership; it does not exempt string contents from security
+analysis. Real commands and reconstructed instructions still pass through the existing analyzers.
+The unchanged 256,000-character analysis windows and their bounded context remain separate limits.
+A JSON value that straddles a window or exceeds another parser/runtime allowance may remain
+incomplete, even when its total size is below the JSON ownership ceiling. No unvalidated window
+fragment is treated as a complete value.
+
+When marker reconstruction is already incomplete and its first unresolved directive lies in an
+oversized JSON candidate, the ledger reports `json_quote_ownership_limit`. Its message identifies
+the zero-based, end-exclusive source character span `[start, end)`, observed character count,
+limit, and next step; the ledger also retains `observed_characters` and `limit_characters`.
+The exception's `path` identifies the source artifact. It does not assert that the candidate is
+valid JSON or that capacity is the only unresolved instruction issue. Invalid, truncated, and
+oversized candidates never acquire quote ownership. Unrelated parser failures retain their
+existing reason codes; an unclosed fence cannot establish a complete JSON body boundary.
+
+To resolve a capacity limitation, split the input into smaller **complete** JSON values or
+documents, preserve all required content and references, and rescan. Do not truncate the input
+or remove a required reference. Raising the timeout cannot raise this structural ceiling.
+Findings remain visible, and unresolved coverage remains incomplete: CLI `--fail-on-incomplete`
+returns nonzero and the MCP installation gate rejects it, even after successful semantic analysis.
+JSON with no unresolved instruction parsing may still complete without needing quote ownership.
+
+This extends the supported candidate size from 65,536 to 131,072 characters with a different,
+bounded validation algorithm. Previously incomplete valid examples can now complete when the
+remaining analysis also succeeds. Consumers that enumerate ledger reasons must recognize
+`json_quote_ownership_limit` for unresolved candidates exceeding the current ceiling, while
+continuing to reject incomplete reports regardless of reason. Do not add the old generic
+`obfuscated_instruction_text` as a second exception merely to preserve an exact-string predicate.
+That generic reason remains available for separate unresolved instruction parsing.
+
+Historical expectations tied to the 65,536-character ceiling must be retained as versioned
+compatibility evidence. A proposed successor contract may require complete analysis for an
+otherwise supported 65,537-character benign value and move the size-boundary rejection control to
+131,073 characters. Such a dataset migration needs explicit acceptance; it does not retroactively
+turn an old failed contract into a pass or weaken an existing expected-complete requirement.
+Further increases require new resource measurements and review, including dense strings, deep
+nesting, malformed input, cancellation, and analysis-window interactions.
+
 ## Intra-bundle references
 
 Reference extraction from the primary instructions is independently bounded:
@@ -149,6 +229,7 @@ malicious evasion. Keep required references and use the reason to choose the fix
 |---|---|
 | `dependency_parse_error` | Correct the malformed dependency manifest or lockfile, then rerun the scan. |
 | `static_parse_limit` | Inspect the expression and analyzer. If valid source is misinterpreted, correct or update the scanner and rerun. |
+| `json_quote_ownership_limit` | Use the reported source span and 131,072-character bound to split complete JSON values while retaining required content, then rescan. |
 | `read_error`, `stat_error`, `file_disappeared`, `missing_file_cache` | Ensure the resolved target remains readable throughout the scan. |
 | `size_limit`, `runtime_limit` | Review the reported bounds and input size; distinguish a scanner performance problem from a legitimate resource ceiling. |
 | `binary_content`, `opaque_content` | Provide inspectable source or analysis support for the referenced format. |
@@ -308,6 +389,7 @@ removes the rejected partial checkout.
 | Static findings | 10,000 | One artifact |
 | Static findings | 10,000 | One analyzer |
 | Static-analysis time | 300 seconds | One artifact, within the workflow deadline |
+| Timed static-pattern matching CPU | 0.25 seconds | One rule per content window, shared across paragraphs, within the artifact and workflow deadlines |
 | YARA rule-directory entries | 10,000 | Built-in and optional directories combined |
 | YARA rule files | 1,024 | One rule load |
 | YARA rule source bytes | 1 MiB | One rule file |
@@ -400,6 +482,49 @@ Static pattern analysis and YARA matching allow up to 300 seconds per artifact b
 default. Set `SKILLSPECTOR_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT` to a positive
 finite number of seconds to change that allowance. Invalid, zero, negative,
 infinite, or NaN values log a warning and retain the 300-second default.
+
+The shared matcher has a fixed 0.25-second matching CPU limit per rule and content window.
+Paragraph-matched rules share this allowance across all their paragraphs.
+Ranges of eight characters or fewer use batched native searches. Longer ranges
+retain the interruptible engine; timer setup can make paragraph-dense windows
+roughly two to three times slower than untimed matching. This keeps their
+backtracking bounded rather than extending the native exception to larger inputs.
+Raising the artifact allowance does not raise this limit. It covers routed rules
+in prompt injection, tool misuse, data exfiltration, supply chain, agent snooping,
+excessive agency, memory poisoning, and rogue agents. Through paragraph matching,
+it also covers prose rules in harmful content, system prompt leakage, output
+handling, anti-refusal, privilege escalation, and SSRF. Output-handling and
+privilege-escalation code patterns also use the timed matcher. Other code rules (SSRF endpoint/request patterns,
+harmful-content substance names, and deserialization DS1–DS4) and helper-specific
+searches remain outside it. The anti-refusal schema-field helper uses a linear
+whitespace prefix so its benign-context check cannot backtrack quadratically.
+
+Audited command/option patterns use a linear, command-segment search that preserves
+unbounded command spans and the original greedy matches. The SC3 shell-decoder
+rules keep their native matcher: their literals, stages and options already have
+explicit length/count bounds and atomic or possessive ambiguous groups. Memory poisoning's
+2–20-character repetition rule uses Python's native engine: failed candidates
+examine at most 20 copies, and successful candidates consume the repeated run.
+The variable shell-flag rule also retains Python’s native backreference semantics.
+It checks assignment headers separately, considers every eligible call in the
+four-line assignment gap, and stops its native search 4,096 characters after
+the last eligible call head. This is a conservative bound: an unterminated tail
+reports `static_parse_limit` even if no later `shell=` exists. In-window matches
+are retained. Both variable-name passes share one accumulated matching allowance,
+and each analyzer window computes them once. Whole-artifact reconciliation gets
+0.25 seconds per 256,000 characters. A local variable-shell limit is reported after
+the other lexical tool-misuse rules, security views, raw windows, and Python scope
+reconciliation finish. It does not suppress those findings or their counterevidence.
+The artifact deadline and finding-output ceiling still stop inspection immediately.
+The repetition rule is bounded by the 256,000-character inspection window and the
+artifact deadline, rather than the slower engine's per-search timer.
+
+Matching CPU accounting excludes caller work and other threads. The interruptible
+engine itself measures process CPU, however, so native work in competing threads
+can interrupt a search early. Retrying discards progress and can still exhaust the
+matching allowance under sustained contention. If a search expires, its ledger
+event keeps the observed time and limit, and that analyzer records partial coverage
+for the artifact while retaining findings already produced.
 
 ## Configuring the dependency-source deadline
 

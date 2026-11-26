@@ -25,6 +25,38 @@ SEMANTIC_RUNTIME_INCOMPLETE_MESSAGE = (
     "Requested semantic analysis did not produce complete per-source runtime telemetry."
 )
 
+# Call-log error carried when every batch of an analyzer run failed because
+# the gateway rejects structured output in both shapes (json_schema response
+# format and tool calling). The exact string is the contract between the
+# analyzer nodes that record it and the availability accounting below; keep
+# it stable and free of provider-specific detail.
+STRUCTURED_OUTPUT_UNAVAILABLE_ERROR = (
+    "structured output rejected by provider (response_format unsupported; "
+    "tool-calling fallback also rejected)"
+)
+
+
+def all_llm_calls_failed_with_structured_output_rejection(
+    call_log: object,
+) -> bool:
+    """Return whether every recorded LLM call failed with a structured-output rejection.
+
+    True only when the log is non-empty, no call succeeded, and every failed
+    record carries the structured-output rejection error. A partial failure
+    is a coverage gap, not an unavailable LLM, and stays out of this rule.
+    """
+    if not isinstance(call_log, list) or not call_log:
+        return False
+    for record in call_log:
+        if not isinstance(record, Mapping):
+            return False
+        if record.get("ok") is True:
+            return False
+        if record.get("error") != STRUCTURED_OUTPUT_UNAVAILABLE_ERROR:
+            return False
+    return True
+
+
 _ROOT_SOURCE_SCOPE = "<root>"
 
 
@@ -97,10 +129,18 @@ def llm_runtime_available(
     preflight_available: bool,
     result: Mapping[str, object],
 ) -> bool:
-    """Return provider availability after applying meta-analysis runtime evidence."""
+    """Return provider availability after applying meta-analysis runtime evidence.
+
+    A run where every recorded LLM call failed because the gateway rejects
+    structured output is not an available LLM: preflight only proves the
+    credentials resolve and the model constructs, while the call log proves
+    the provider cannot serve a single assessment.
+    """
     if not preflight_available:
         return False
     call_log = result.get("llm_call_log")
+    if all_llm_calls_failed_with_structured_output_rejection(call_log):
+        return False
     if not isinstance(call_log, list):
         return True
     meta_analyzer_records = [

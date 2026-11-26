@@ -14,7 +14,7 @@ from importlib.metadata import distribution, version
 
 from skillspector.inference_usage import looks_like_credential, provider_name, safe_reasoning_effort
 from skillspector.providers import get_active_provider, get_model_config_provider
-from skillspector.providers.chat_models import (
+from skillspector.providers._controls import (
     MAX_SAMPLING_SEED,
     MIN_SAMPLING_SEED,
     resolve_reasoning_effort,
@@ -37,6 +37,7 @@ _TEMPERATURE_ADAPTERS = frozenset(
         "anthropic_proxy",
         "azure_openai",
         "bedrock",
+        "minimax",
         "nv_build",
         "nv_inference",
         "ollama",
@@ -45,12 +46,13 @@ _TEMPERATURE_ADAPTERS = frozenset(
     }
 )
 _SEED_ADAPTERS = frozenset(
-    {"azure_openai", "nv_build", "nv_inference", "ollama", "openai", "openai_compatible"}
+    {"azure_openai", "minimax", "nv_build", "nv_inference", "ollama", "openai", "openai_compatible"}
 )
 _REASONING_EFFORT_ADAPTERS = frozenset(
     {
         "anthropic",
         "anthropic_proxy",
+        "minimax",
         "nv_build",
         "nv_inference",
         "ollama",

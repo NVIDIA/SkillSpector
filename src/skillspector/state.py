@@ -36,6 +36,7 @@ from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
+    bounded_inspection_notices,
     ledger_event,
 )
 from skillspector.logging_config import get_logger
@@ -230,6 +231,20 @@ def merge_inspection_ledger(
     ]
 
 
+def merge_inspection_notices(
+    existing: list[dict[str, object]], updates: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    return bounded_inspection_notices([*existing, *updates])
+
+
+class ManifestVersionSource(TypedDict):
+    """Source coordinates retained by the bounded manifest parser."""
+
+    path: str
+    line: int
+    snippet: str | None
+
+
 class SkillspectorState(TypedDict, total=False):
     """Graph state shared by all nodes."""
 
@@ -237,6 +252,8 @@ class SkillspectorState(TypedDict, total=False):
     input_path: str | None
     # Only trusted local transports may use the operator's Git credentials.
     allow_git_credentials: bool
+    # Sanitized report-only acquisition identity; never used to resolve findings.
+    input_origin: dict[str, str] | None
     skill_path: str | None
     # Relative identity of a wrapped/downloaded explicit file, distinct from passive assets.
     primary_file_path: str | None
@@ -290,12 +307,15 @@ class SkillspectorState(TypedDict, total=False):
     # outside state because they are not checkpoint-serializable.
     python_ast_cache_key: str | None
     manifest: dict[str, object]
+    manifest_version_source: ManifestVersionSource | None
     previous_manifest: dict[str, object] | None
 
     # Accumulated canonical findings. Same-ID meta updates replace in place.
     findings: Annotated[list[Finding], merge_findings_by_id]
     inspection_ledger: Annotated[list[InspectionLedgerEvent], merge_inspection_ledger]
+    inspection_notices: Annotated[list[dict[str, object]], merge_inspection_notices]
     analyzer_status_events: Annotated[list[AnalyzerStatusEvent], operator.add]
+    osv_lookup: dict[str, object]
     effective_finding_ids: list[str]
     # Whether meta-analysis had provider-eligible findings when it ran.  This
     # snapshot prevents later coverage findings from being mistaken for work
@@ -332,6 +352,8 @@ class SkillspectorState(TypedDict, total=False):
     # When it is inside the scan target, build_context excludes only that file
     # so waiver text cannot scan itself or enter regenerated fingerprints.
     baseline_path: str | None
+    # Explicit root opt-in for a local ZIP, applied after safe materialization.
+    use_shipped_baseline: bool
     show_suppressed: bool
     suppressed_findings: list[object]
     # Kept findings as baseline suppression saw them: one per occurrence, before
@@ -485,7 +507,9 @@ class AnalyzerNodeResponse(TypedDict):
 
     findings: list[Finding]
     inspection_ledger: NotRequired[list[InspectionLedgerEvent]]
+    inspection_notices: NotRequired[list[dict[str, object]]]
     analyzer_status_events: NotRequired[list[AnalyzerStatusEvent]]
+    osv_lookup: NotRequired[dict[str, object]]
     structured_summaries: NotRequired[list[dict[str, object]]]
     # LLM-backed analyzers also report one telemetry record; static analyzers
     # omit it (NotRequired keeps the key optional for them).

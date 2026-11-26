@@ -199,6 +199,8 @@ skillspector --version
 
 The CLI passes `input_path` to the graph. The **resolve_input** node (using [input_handler.py](../src/skillspector/input_handler.py)) resolves Git URL, file URL, .zip, single .md file, or directory to a local directory and sets `skill_path` (and `temp_dir_for_cleanup` when a temp dir was created). The CLI cleans up `temp_dir_for_cleanup` after invoke. Exit code 1 if risk_score > 50; exit code 2 on error. See [Integrating SkillSpector](../README.md#integrating-skillspector) for the full exit-code and JSON contract.
 
+Git URL scans disable Git templates for the temporary clone so host-local template files stay outside the scan. A local directory scan inspects the files already present under the selected path according to the normal scan rules.
+
 ### Programmatic
 
 ```python
@@ -304,7 +306,7 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 | `NVIDIA_INFERENCE_KEY` | Credential for `nv_build`. | `nvapi-...` |
 | `OPENAI_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=openai`. Also tier-2 fallback for non-OpenAI providers. | `sk-...` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | `http://localhost:11434/v1` |
-| `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3`; other provider/model combinations keep their endpoint defaults. `gpt-6.1-sol` accepts only `low`, `medium`, `high`, `xhigh`, or `max`; any other value stops a scan before analysis (exit code 2). | `high` |
+| `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3-flash`; other provider/model combinations keep their endpoint defaults. `gpt-6.1-sol` accepts only `low`, `medium`, `high`, `xhigh`, or `max`; any other value stops a scan before analysis (exit code 2). | `high` |
 | `SKILLSPECTOR_OUTPUT_LANGUAGE` | Optional short, single-line language label (letters, numbers, spaces, `_`, or `-`; maximum 64 characters) for human-readable LLM finding text. Rule IDs, severity values, paths, code, and other machine-readable values remain unchanged. Unset, blank, or invalid values preserve the default output language. | `Japanese` |
 | `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves provider defaults. Lower values reduce variation but do not guarantee identical output. `gpt-6.1-sol` rejects every explicit value. Claude Opus 4.7 and later, Sonnet 5, Fable 5, Mythos 5 and Haiku 5 models (for example `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-5-5`) accept `1.0` on the native Anthropic endpoint only ([API compatibility rule](https://platform.claude.com/docs/en/api/messages/create)). Unsupported settings on active LLM slots stop a scan before analysis (exit code 2); static scans skip provider initialization and these checks. Leave it unset to preserve the default models’ endpoint defaults. | `0` |
 | `SKILLSPECTOR_SEED` | Optional integer sampling seed for OpenAI-compatible and Azure OpenAI providers. Provider/model support is best-effort; CLI providers ignore it. | `42` |
@@ -383,3 +385,17 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
 | **Add analyzer** | Implement node returning `{"findings": list[Finding]}`, register in `nodes/analyzers/__init__.py` |
 | **Initial checks** | `make test-unit`, `make lint`, `make format-check`; see [Testing](#7-testing) for scope |
 | **Full contributor tests** | `make test` includes integration tests that may call a configured LLM provider; review [Testing](#7-testing) and provider prerequisites first |
+
+
+### Report input origin
+
+The resolver stores sanitized `input_origin` metadata separately from `skill_path`
+(the local scan root). JSON exposes it as `skill.origin`; SARIF exposes it as
+`runs[].properties.inputOrigin`. Both contain `source` and `type` (`directory`,
+`file`, `zip`, `url`, or `git`). Terminal and Markdown display the same metadata.
+The MCP rendered report includes it; compact MCP responses omit that report as usual.
+Local input spelling, including relative paths and whitespace, is retained. URL
+userinfo, the entire query and fragments are omitted. Git scp-style inputs are
+rendered as credential-free SSH URLs. This records acquisition origin, not a
+content digest or a resolved revision. Existing working-directory sources,
+finding locations, nested provenance and cleanup retain their semantics.

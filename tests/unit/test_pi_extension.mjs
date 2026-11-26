@@ -91,6 +91,23 @@ test("uses installed absolute executable and preserves scan arguments without ou
   assert.equal(ctx.calls[0].options.cwd, ctx.workspace);
 });
 
+test("accepts a symlinked workspace without resolving target symlinks below it", async (t) => {
+  const ctx = await setup(t);
+  const alias = join(ctx.root, "workspace-alias");
+  symlinkSync(ctx.workspace, alias);
+  symlinkSync(join(ctx.workspace, "SKILL.md"), join(ctx.workspace, "linked.md"));
+  for (const [target, expected] of [
+    ["./SKILL.md", join(ctx.workspace, "SKILL.md")],
+    [".", ctx.workspace],
+    [join(alias, "SKILL.md"), join(ctx.workspace, "SKILL.md")],
+    ["linked.md", join(ctx.workspace, "linked.md")],
+  ]) {
+    await ctx.scan({ target }, { cwd: alias, hasUI: false });
+    assert.equal(ctx.calls.at(-1).args[1], expected);
+  }
+  assert.equal(ctx.prompts.length, 0);
+});
+
 test("redacts long scanner output without retrying every word character", { timeout: 5000 }, async (t) => {
   const ctx = await setup(t, () => ({
     code: 0,
@@ -208,6 +225,28 @@ test("approves canonical external scope and preserves the CLI target symlink pol
   assert.equal(ctx.calls[0].args[1], join(ctx.workspace, "external/private.md"));
   assert.equal(ctx.calls[0].args.at(-1), join(ctx.root, "rules"));
 });
+
+for (const approveResolved of [true, false]) {
+  test(`external YARA aliases require a second confirmation: approved=${approveResolved}`, async (t) => {
+    let confirmations = 0;
+    const ctx = await setup(t, undefined, async () => ++confirmations === 1 || approveResolved);
+    const rules = join(ctx.root, "rules");
+    const alias = join(ctx.root, "rules-alias");
+    mkdirSync(rules);
+    symlinkSync(rules, alias);
+    const scan = ctx.scan({ yaraRulesDir: "../rules-alias" });
+    if (approveResolved) {
+      await scan;
+      assert.equal(ctx.calls[0].args.at(-1), rules);
+    } else {
+      await assert.rejects(scan, /not approved/);
+      assert.equal(ctx.calls.length, 0);
+    }
+    assert.equal(ctx.prompts.length, 2);
+    assert.ok(ctx.prompts[0].message.includes(JSON.stringify(alias)));
+    assert.ok(ctx.prompts[1].message.includes(JSON.stringify(rules)));
+  });
+}
 
 test("treats local git@ paths as canonical local reads", async (t) => {
   const ctx = await setup(t, undefined, async () => true);

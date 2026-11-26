@@ -22,7 +22,7 @@ first-class attack surface:
   performing entirely different operations.
 
 These attacks are collectively called **tool poisoning** (MITRE ATLAS
-AML.T0080). The B.3.2 analyzer implements four complementary detection rules
+AML.T0110). The B.3.2 analyzer implements four complementary detection rules
 that cover the major tool-poisoning vectors.
 
 ---
@@ -73,7 +73,7 @@ triggers, parameter names) receive stricter checks than free-text fields
 |-------------|-----------------------------------------------------------|
 | **Severity**   | HIGH                                                   |
 | **Confidence** | 0.75 -- 0.95 (varies by technique)                     |
-| **Tags**       | ASI02, AML.T0080                                       |
+| **Tags**       | ASI02, AML.T0110                                       |
 
 **What it detects:** Five classes of hidden content in any metadata field:
 
@@ -113,7 +113,7 @@ should contain plain, visible text only.
 |-------------|-----------------------------------------------------------|
 | **Severity**   | HIGH                                                   |
 | **Confidence** | 0.80 -- 0.95 (varies by technique)                     |
-| **Tags**       | ASI02, AML.T0080                                       |
+| **Tags**       | ASI02, AML.T0110                                       |
 
 **What it detects:** Four categories of Unicode-based attacks on identifiers
 and metadata:
@@ -162,7 +162,7 @@ overrides and invisible formatting from all fields.
 |-------------|-----------------------------------------------------------|
 | **Severity**   | MEDIUM                                                 |
 | **Confidence** | 0.65 -- 0.90 (varies by pattern)                       |
-| **Tags**       | ASI02, AML.T0080                                       |
+| **Tags**       | ASI02, AML.T0110                                       |
 
 **What it detects:** Injection patterns in parameter definitions. AI agents
 read parameter descriptions as part of their tool-use context, making these
@@ -211,7 +211,7 @@ be safe, static, representative examples.
 |-------------|-----------------------------------------------------------|
 | **Severity**   | MEDIUM or HIGH (based on LLM confidence)               |
 | **Confidence** | LLM-determined (0.50 -- 1.00, threshold: 0.50)         |
-| **Tags**       | ASI02, AML.T0080                                       |
+| **Tags**       | ASI02, AML.T0110                                       |
 
 **What it detects:** Cases where the skill's declared description does not
 match what its code actually does. This is the "semantic gap" that static
@@ -304,7 +304,7 @@ The TP rule family maps to established security frameworks:
 | Tag         | Source                                                    |
 |-------------|-----------------------------------------------------------|
 | **ASI02**   | OWASP Agent Security Initiative -- Tool/Plugin Vulnerabilities |
-| **AML.T0080** | MITRE ATLAS -- MCP Tool Poisoning                      |
+| **AML.T0110** | MITRE ATLAS -- AI Agent Tool Poisoning                 |
 
 ---
 

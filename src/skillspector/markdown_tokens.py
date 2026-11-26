@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded, source-mapped CommonMark ownership for quoted list paragraphs."""
+"""Bounded, source-mapped CommonMark ownership for container paragraphs."""
 
 from __future__ import annotations
 
@@ -11,15 +11,31 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 
+import tree_sitter_bash
+from tree_sitter import Language, Parser
+
+from skillspector.inspection_ledger import (
+    ParserCause,
+    ParserCheck,
+    ParserUncheckedScope,
+    StaticParserDiagnostic,
+)
+
 _MAX_SOURCE_CHARS = 131_072
 _MAX_TOKENS = 16_384
-_LITERAL_CODE = re.compile(r"[A-Za-z0-9_./:<>=@%+,?* \t-]+\Z")
+_LITERAL_CODE = re.compile(r"[A-Za-z0-9_./:<>=@%+,?*~ \t-]+\Z")
+_NAMED_PATH = re.compile(r"\$[A-Z_][A-Z0-9_]*/[A-Za-z0-9_./-]+\Z")
+_TEMPLATE_WORD = re.compile(r"\{[A-Z_][A-Z0-9_]*\}")
+_CONTAINER_MARKER = re.compile(
+    r"(?m)(?:^|(?<=\r)) {0,3}(?:>|(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t\r\n]|$))"
+)
 
 
 @dataclass(frozen=True, slots=True)
 class QuotedListSpans:
     code: tuple[tuple[int, int, int, int], ...]
     lines: tuple[tuple[int, int], ...]
+    fence_markers: tuple[tuple[int, int], ...] = ()
 
 
 @lru_cache(maxsize=8)
@@ -47,6 +63,7 @@ def _quoted_list_spans(content: str) -> QuotedListSpans | None:
         offsets.append(offsets[-1] + len(line))
     code: list[tuple[int, int, int, int]] = []
     lines: list[tuple[int, int]] = []
+    fence_markers: list[tuple[int, int]] = []
     ancestors: list[str] = []
     for block in blocks:
         if block.nesting == 1:
@@ -55,10 +72,35 @@ def _quoted_list_spans(content: str) -> QuotedListSpans | None:
                 return None
         elif block.nesting == -1:
             ancestors.pop()
+        elif block.type == "fence" and "blockquote_open" in ancestors and block.map:
+            first, finish = block.map
+            if finish - first < 2:
+                continue
+            # Both source lines must explicitly own the same quoted container;
+            # an EOF-closed or lazily continued fence grants no source bytes.
+            marker = re.compile(r"^(?P<quote>(?: {0,3}> ?)+) {0,3}(?P<mark>`{3,}|~{3,})")
+            opened = marker.match(raw_lines[first])
+            closed = marker.match(raw_lines[finish - 1])
+            if (
+                opened
+                and closed
+                and opened["mark"] == block.markup
+                and opened["quote"].count(">") == closed["quote"].count(">")
+                and closed["mark"].startswith(block.markup)
+                and not raw_lines[finish - 1][closed.end() :].strip()
+            ):
+                for row, match in ((first, opened), (finish - 1, closed)):
+                    fence_markers.append(
+                        (offsets[row] + match.start("mark"), offsets[row] + match.end("mark"))
+                    )
         elif (
             block.type == "inline"
-            and "blockquote_open" in ancestors
-            and "list_item_open" in ancestors
+            and (
+                "blockquote_open" in ancestors
+                and "list_item_open" in ancestors
+                or "paragraph_open" in ancestors
+                and ("blockquote_open" in ancestors or "list_item_open" in ancestors)
+            )
             and block.map is not None
         ):
             start, end = block.map
@@ -69,12 +111,13 @@ def _quoted_list_spans(content: str) -> QuotedListSpans | None:
             position = 0
             for index, logical in enumerate(logical_lines, start):
                 raw = raw_lines[index].rstrip("\r\n")
-                # Lazy continuation and normalized tabs cannot prove offsets.
+                # Exact logical suffixes preserve source offsets. Quotes still
+                # require an explicit marker; normalized tabs grant no proof.
                 column = raw.rfind(logical) if logical else -1
                 if (
                     column < 0
                     or "\t" in raw[:column]
-                    or re.match(r" {0,3}>", raw) is None
+                    or ("blockquote_open" in ancestors and re.match(r" {0,3}>", raw) is None)
                     or raw[column + len(logical) :].strip()
                 ):
                     break
@@ -109,7 +152,30 @@ def _quoted_list_spans(content: str) -> QuotedListSpans | None:
                 for begin, finish, width in captured:
                     body = block.content[begin + width : finish - width]
                     if _LITERAL_CODE.fullmatch(body) is None:
-                        continue
+                        # A fixed filename may carry a template-name marker.
+                        # Parameter expansion, braces with alternatives, and
+                        # dynamic executable words keep the existing fallback.
+                        with_names = _TEMPLATE_WORD.sub("NAME", body) if "{" in body else body
+                        if (
+                            _LITERAL_CODE.fullmatch(with_names) is None
+                            and not re.fullmatch(
+                                r"#pragma +[a-zA-Z_][a-zA-Z0-9_]*(?: +[a-zA-Z0-9_]+){0,8}", body
+                            )
+                            and not (
+                                _NAMED_PATH.fullmatch(body)
+                                and (
+                                    re.search(
+                                        r"\b(?:(?:over|under|inside|in|at) +|Read +[0-9]+ +— +)$",
+                                        block.content[max(0, begin - 20) : begin],
+                                    )
+                                    or re.match(
+                                        r" is the (?:canonical |primary )?(?:source|path)\b",
+                                        block.content[finish : finish + 40],
+                                    )
+                                )
+                            )
+                        ):
+                            continue
                     index = bisect_right(starts, begin) - 1
                     low, high, absolute = mapping[index]
                     if low <= begin and finish <= high:
@@ -123,14 +189,144 @@ def _quoted_list_spans(content: str) -> QuotedListSpans | None:
                             )
                         )
                 lines.extend((absolute, absolute + high - low) for low, high, absolute in mapping)
-    return QuotedListSpans(tuple(code), tuple(lines))
+    return QuotedListSpans(tuple(code), tuple(lines), tuple(fence_markers))
 
 
 def quoted_list_spans(content: str, check_runtime: Callable[[], None]) -> QuotedListSpans | None:
     """Return exact ownership only for bounded, complete source artifacts."""
     check_runtime()
-    if len(content) > _MAX_SOURCE_CHARS or ">" not in content or "`" not in content:
+    if (
+        len(content) > _MAX_SOURCE_CHARS
+        or "`" not in content
+        or _CONTAINER_MARKER.search(content) is None
+    ):
         return None
     result = _quoted_list_spans(content)
     check_runtime()
     return result
+
+
+_BASH = Language(tree_sitter_bash.language())
+_REDIRECT_END = re.compile(rb"[ \t]*(?:[;&|)]|\r?\n|\Z)")
+_EXAMPLE_INPUT = re.compile(rb"<[A-Za-z_][A-Za-z0-9_.-]*")
+_MISSING_TARGET_EXAMPLE = re.compile(
+    r"<[A-Za-z_][A-Za-z0-9_.-]{0,127}>(?=[ \t]*(?:[;&|)]|\r?$))", re.MULTILINE
+)
+
+
+def fenced_redirect_diagnostic(
+    section: str, offset: int, check_runtime: Callable[[], None], *, stop: int | None = None
+) -> StaticParserDiagnostic | None:
+    """Refine an existing boundary warning using the literal shell in a closed fence."""
+    if len(section) > _MAX_SOURCE_CHARS:
+        return None
+    # Some readers mark the wrapper prefix up to the redirection. Others
+    # point at the operator itself. Only consider that bounded source range.
+    stop = offset if stop is None else min(stop, len(section))
+    angle_pos = section.find("<", offset, stop + 1)
+    if angle_pos < 0 or "\n" in section[offset:angle_pos].replace("\\\r\n", "").replace("\\\n", ""):
+        return None
+    check_runtime()
+    try:
+        raw = section.encode()
+        tree = Parser(_BASH, timeout_micros=100_000).parse(raw)
+    except (UnicodeError, ValueError, OverflowError):
+        return None
+    check_runtime()
+    if tree is None:
+        return None
+    at = len(section[:angle_pos].encode())
+    root = tree.root_node
+    first_error = None
+    if root.has_error:
+        # A malformed redirect can precede the clause where an existing word
+        # reader lost the command boundary. Only refine the same native list.
+        pending = [root]
+        while pending:
+            check_runtime()
+            node = pending.pop()
+            if node.is_error or node.is_missing:
+                first_error = node.start_byte
+                if node.text in {b">", b"<", b">>", b"<>"} and _REDIRECT_END.match(
+                    raw, node.end_byte
+                ):
+                    start = len(raw[: node.start_byte].decode())
+                    marker = _MISSING_TARGET_EXAMPLE.match(section, angle_pos)
+                    same_marker = marker is not None and marker.end() == start + 1
+                    statement = node.parent
+                    same_list = (
+                        statement is not None
+                        and statement.type in {"list", "pipeline"}
+                        and node.end_byte <= at <= statement.end_byte
+                    )
+                    if same_list or same_marker:
+                        return StaticParserDiagnostic(
+                            ParserCause.MALFORMED_INPUT,
+                            ParserCheck.COMMAND_REDIRECTION_TARGET,
+                            start,
+                            start + len(node.text),
+                            ParserUncheckedScope.COMMAND_ARGUMENTS,
+                        )
+                break
+            pending.extend(
+                child for child in reversed(node.children) if child.has_error or child.is_missing
+            )
+        if first_error is None or first_error <= at:
+            return None
+
+    # In a documented 'sudo <TOOL> --list', Bash redirects input from TOOL
+    # and output to --list. No word is passed to sudo to name the nested tool.
+    angle = root.descendant_for_byte_range(at, at + 1)
+    redir = angle.parent if angle is not None else None
+    if (
+        angle is None
+        or angle.type != "<"
+        or redir is None
+        or redir.type != "file_redirect"
+        or redir.start_byte != at
+        or not _EXAMPLE_INPUT.fullmatch(redir.text)
+        or raw[redir.end_byte : redir.end_byte + 1] != b">"
+    ):
+        return None
+    stmt = redir.parent
+    if stmt is None or stmt.type != "redirected_statement":
+        return None
+    if first_error is not None and (
+        stmt.has_error
+        or first_error <= stmt.end_byte
+        or re.match(rb"[ \t]*(?:;|\r?\n)", raw[stmt.end_byte : first_error]) is None
+    ):
+        return None
+    body = stmt.child_by_field_name("body")
+    if (
+        body is None
+        or body.type != "command"
+        or body.text
+        not in {
+            b"sudo",
+            b"/usr/bin/sudo",
+            b"doas",
+            b"/usr/bin/doas",
+            b"/usr/local/bin/doas",
+        }
+    ):
+        return None
+    if len(section[:offset].encode()) < body.start_byte:
+        return None
+    redirects = stmt.children_by_field_name("redirect")
+    if len(redirects) < 2 or redirects[0] != redir or redirects[1].start_byte != redir.end_byte:
+        return None
+    for item in redirects:
+        check_runtime()
+        words = item.children_by_field_name("destination")
+        # The Bash grammar attaches ordinary words following the target to
+        # the same node. Extra words may supply a real executable operand.
+        if item.type != "file_redirect" or len(words) != 1 or words[0].type != "word":
+            return None
+    return StaticParserDiagnostic(
+        ParserCause.BOUNDARY_UNRESOLVED,
+        ParserCheck.DOCUMENTED_COMMAND_OPERAND,
+        angle_pos,
+        angle_pos + len(redir.text) + 1,
+        ParserUncheckedScope.COMMAND_WORD,
+    )
