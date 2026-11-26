@@ -6335,7 +6335,7 @@ def _command_string_from_clause(
         )
 
     def next_command_word() -> tuple[str | None, bool]:
-        # Redirections may appear between command's options and executable.
+        # Redirections may appear between env or command options and executable.
         # Consume their targets without treating them as executable operands.
         nonlocal cursor
         for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
@@ -6371,6 +6371,13 @@ def _command_string_from_clause(
             lower_bound=True,
         )
         return None, True
+
+    def next_env_word() -> tuple[str | None, bool]:
+        # NAME=<value> is usually a placeholder, so a redirection attached to
+        # the previous word keeps the unresolved result.
+        if content[cursor : cursor + 1] in {"<", ">"}:
+            return next_word()
+        return next_command_word()
 
     for _ in range(32):
         while cursor < len(content) and content[cursor].isspace():
@@ -6599,13 +6606,13 @@ def _command_string_from_clause(
         if command == "env":
             wrapper_seen = True
             for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
-                option, limited = next_word()
+                option, limited = next_env_word()
                 if limited:
                     return failed()
                 if option is None:
                     return commandless_wrapper()
                 if option == "--":
-                    pending, limited = next_word()
+                    pending, limited = next_env_word()
                     if limited:
                         return failed()
                     if pending is None:
