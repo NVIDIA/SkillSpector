@@ -6325,7 +6325,7 @@ def _command_string_from_clause(
         # redirection or opening parenthesis may still hide a following one.
         ended = (
             cursor >= len(content)
-            or content[cursor] == "#"
+            or content[cursor] in "\r\n#"
             or _ends_wrapped_clause(content, cursor)
         )
         return (
@@ -6333,6 +6333,44 @@ def _command_string_from_clause(
             if ended
             else failed(ParserCause.BOUNDARY_UNRESOLVED, ParserCheck.COMMAND_WORD_BOUNDARY)
         )
+
+    def next_command_word() -> tuple[str | None, bool]:
+        # Redirections may appear between command's options and executable.
+        # Consume their targets without treating them as executable operands.
+        nonlocal cursor
+        for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
+            horizontal_gap()
+            if (
+                cursor >= len(content)
+                or content[cursor] in "\r\n#"
+                or _ends_wrapped_clause(content, cursor)
+            ):
+                return None, False
+            redirection = _SHELL_REDIRECTION_PREFIX_RE.match(content, cursor)
+            if redirection is None:
+                return next_word()
+            if "<<" in redirection.group():
+                failed(ParserCause.UNSUPPORTED_SYNTAX)
+                return None, True
+            cursor = redirection.end()
+            horizontal_gap()
+            if cursor >= len(content) or content[cursor] in "\r\n;|&()#":
+                failed(ParserCause.BOUNDARY_UNRESOLVED, ParserCheck.COMMAND_ARGUMENT_BOUNDARY)
+                return None, True
+            target, limited = next_word()
+            if limited or target is None:
+                failed(ParserCause.BOUNDARY_UNRESOLVED, ParserCheck.COMMAND_ARGUMENT_BOUNDARY)
+                return None, True
+        failed(
+            ParserCause.RESOURCE_LIMIT,
+            ParserCheck.WRAPPER_ARGUMENTS,
+            {
+                "observed_records": _SHELL_COMMAND_STRING_ARGUMENTS,
+                "limit_records": _SHELL_COMMAND_STRING_ARGUMENTS,
+            },
+            lower_bound=True,
+        )
+        return None, True
 
     for _ in range(32):
         while cursor < len(content) and content[cursor].isspace():
@@ -6605,13 +6643,13 @@ def _command_string_from_clause(
         if command in {"command", "builtin"}:
             wrapper_seen = True
             for _ in range(_SHELL_COMMAND_STRING_ARGUMENTS):
-                option, limited = next_word()
+                option, limited = next_command_word() if command == "command" else next_word()
                 if limited:
                     return failed()
                 if option is None:
                     return commandless_wrapper()
                 if option == "--":
-                    pending, limited = next_word()
+                    pending, limited = next_command_word() if command == "command" else next_word()
                     if limited:
                         return failed()
                     if pending is None:

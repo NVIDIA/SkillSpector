@@ -8,6 +8,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
 
@@ -49,6 +51,7 @@ def test_release_workflow_builds_and_attaches_supported_distributions() -> None:
 
     assert "uv run --no-sync python -m build --no-isolation" in workflow
     assert "uv run --no-sync twine check dist/*" in workflow
+    assert "check_distribution_assets.py dist/*.whl dist/*.tar.gz" in workflow
     assert "--asset dist/*.whl" in workflow
     assert "--asset dist/*.tar.gz" in workflow
 
@@ -69,3 +72,98 @@ def test_release_workflow_uses_skillspectors_locked_uv_environment() -> None:
     lockfile = (REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
     assert '"hatchling>=1.31.0"' in pyproject
     assert 'name = "hatchling"' in lockfile
+
+
+def test_index_publish_uses_only_artifacts_from_the_qualified_release_job() -> None:
+    workflow = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    assert workflow["on"]["pull_request"] == {"branches": ["main"], "types": ["closed"]}
+
+    release_job = workflow["jobs"]["publish"]
+    index_job = workflow["jobs"]["publish-index"]
+    assert index_job["needs"] == ["publish", "prepare-existing-release"]
+    assert "!cancelled()" in index_job["if"]
+    assert "needs.publish.result == 'success'" in index_job["if"]
+    assert "needs.prepare-existing-release.result == 'success'" in index_job["if"]
+    assert "github.repository == 'NVIDIA/SkillSpector'" in index_job["if"]
+
+    upload = next(
+        step for step in release_job["steps"] if "actions/upload-artifact@" in step.get("uses", "")
+    )
+    download = next(
+        step for step in index_job["steps"] if "actions/download-artifact@" in step.get("uses", "")
+    )
+    assert "github.event.pull_request.head.repo.full_name == github.repository" in index_job["if"]
+    assert upload["with"]["name"] == release_job["outputs"]["distribution-artifact"]
+    assert "github.run_attempt" in upload["with"]["name"]
+    assert download["with"]["name"] == (
+        "${{ needs.publish.outputs.distribution-artifact || "
+        "needs.prepare-existing-release.outputs.distribution-artifact }}"
+    )
+    assert upload["with"]["path"].splitlines() == ["dist/*.whl", "dist/*.tar.gz"]
+    assert download["with"]["path"] == "dist"
+
+
+def test_only_the_index_job_can_request_oidc_for_digest_checked_uploads() -> None:
+    workflow = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    assert "id-token" not in workflow["permissions"]
+    assert "id-token" not in workflow["jobs"]["publish"]["permissions"]
+
+    index_job = workflow["jobs"]["publish-index"]
+    assert index_job["permissions"] == {"id-token": "write"}
+    assert "pypi-production" in index_job["environment"]["name"]
+    assert "pypi-test" in index_job["environment"]["name"]
+    assert all("actions/checkout@" not in step.get("uses", "") for step in index_job["steps"])
+    command = index_job["steps"][-1]["run"]
+    assert "--trusted-publishing always" in command
+    assert "--check-url" in command
+
+
+def test_index_retry_keeps_the_index_selected_for_the_release_artifacts() -> None:
+    workflow = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    release_job = workflow["jobs"]["publish"]
+    index_job = workflow["jobs"]["publish-index"]
+
+    selected_index = "needs.publish.outputs.distribution-index"
+    index_setting = "vars.SKILLSPECTOR_PUBLISH_INDEX"
+    assert release_job["outputs"].get("distribution-index") == "${{ " + index_setting + " }}"
+    assert 'fromJSON(\'["pypi", "testpypi"]\')' in index_job["if"]
+    assert f"{index_setting} == ({selected_index} || " in index_job["if"]
+
+    endpoints = index_job["steps"][-1]["env"]
+    for selection in (*index_job["environment"].values(), *endpoints.values()):
+        assert selected_index in selection
+        assert index_setting not in selection
+
+
+def test_manual_index_publish_prepares_only_pinned_assets_from_main() -> None:
+    workflow = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {"release_tag", "index", "wheel_sha256", "sdist_sha256"}
+    assert all(value["required"] == "true" for value in inputs.values())
+    assert inputs["index"]["options"] == ["testpypi", "pypi"]
+
+    release_job = workflow["jobs"]["publish"]
+    assert "github.event_name == 'pull_request'" in release_job["if"]
+    replay_job = workflow["jobs"]["prepare-existing-release"]
+    assert "github.event_name == 'workflow_dispatch'" in replay_job["if"]
+    assert "github.ref == 'refs/heads/main'" in replay_job["if"]
+    assert "github.repository == 'NVIDIA/SkillSpector'" in replay_job["if"]
+    assert replay_job.get("permissions", workflow["permissions"]) == {"contents": "read"}
+    assert replay_job["outputs"]["distribution-index"] == "${{ inputs.index }}"
+
+    steps = replay_job["steps"]
+    fetch = next(
+        step for step in steps if "download_release_distributions.py" in step.get("run", "")
+    )
+    assert "${{" not in fetch["run"]
+    assert fetch["env"]["REQUESTED_INDEX"] == "${{ inputs.index }}"
+    assert fetch["env"]["CONFIGURED_INDEX"] == "${{ vars.SKILLSPECTOR_PUBLISH_INDEX }}"
+    assert '[[ "$REQUESTED_INDEX" != "$CONFIGURED_INDEX" ]]' in fetch["run"]
+    for name in ("release_tag", "wheel_sha256", "sdist_sha256"):
+        assert fetch["env"][name.upper()] == "${{ inputs." + name + " }}"
+        assert '"$' + name.upper() + '"' in fetch["run"]
+    assert not any("gh release" in step.get("run", "") for step in steps)
+
+    upload = next(step for step in steps if "actions/upload-artifact@" in step.get("uses", ""))
+    assert upload["with"]["name"] == replay_job["outputs"]["distribution-artifact"]
+    assert upload["with"]["path"].splitlines() == ["dist/*.whl", "dist/*.tar.gz"]

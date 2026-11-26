@@ -3668,6 +3668,119 @@ def test_recursive_sarif_child_without_results_still_maps_base_id(tmp_path: Path
     assert run["results"] == []
 
 
+def test_recursive_sarif_scopes_local_notification_locations(tmp_path: Path) -> None:
+    from urllib.parse import urljoin
+
+    from skillspector.nodes.report import _build_sarif
+
+    skill = SkillDirectory(tmp_path / "my+skill café", "greeting", "my_skill_café")
+    source_identity = "external/" + "a" * 64
+    completeness = {
+        "is_complete": False,
+        "status": "partial",
+        "ledger_exceptions": [
+            {"path": "scripts/greeting helper.py", "reason_code": "size_limit"},
+            {
+                "path": f"{source_identity}/scripts/greeting helper.py",
+                "reason_code": "size_limit",
+                "source_identity": source_identity,
+            },
+        ],
+        "limitations": ["Review incomplete files."],
+    }
+    child_sarif = _build_sarif([], analysis_completeness=completeness)
+    aggregate = cli._multi_skill_analysis_completeness(
+        total_skills=1,
+        complete_skills=0,
+        partial_skills=1,
+        failed_skills=0,
+        omitted_skills=0,
+        limitations=[],
+    )
+
+    payload = cli._multi_skill_sarif_report([skill], [{"sarif_report": child_sarif}], aggregate)
+
+    validate_sarif_report(payload)
+    run = payload["runs"][0]
+    bases = run["originalUriBaseIds"]
+    local, external, general = run["invocations"][0]["toolExecutionNotifications"]
+    local_artifact = local["locations"][0]["physicalLocation"]["artifactLocation"]
+    external_artifact = external["locations"][0]["physicalLocation"]["artifactLocation"]
+    assert local_artifact["uriBaseId"] == "SKILLROOT"
+    resolved = urljoin(
+        urljoin(bases["SCANROOT"]["uri"], bases["SKILLROOT"]["uri"]), local_artifact["uri"]
+    )
+    assert resolved == (skill.path / "scripts/greeting helper.py").as_uri()
+    assert external_artifact["uri"] == f"{source_identity}/scripts/greeting%20helper.py"
+    assert "uriBaseId" not in external_artifact
+    assert "locations" not in general
+    original_local = child_sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"][0]
+    assert "uriBaseId" not in original_local["locations"][0]["physicalLocation"]["artifactLocation"]
+
+
+def test_recursive_sarif_does_not_rebase_synthetic_external_diagnostics(
+    tmp_path: Path,
+) -> None:
+    from skillspector.nodes.report import _build_sarif
+
+    skill = SkillDirectory(tmp_path / "skill", "greeting", "skill")
+    source = "external/" + "a" * 64
+    failed_file = f"{source}/failed.py"
+    unaccounted_file = f"{source}/unaccounted.py"
+    completeness, _ = cli.finalize_ledger(
+        {
+            "components": [failed_file, unaccounted_file],
+            "artifact_inventory": [
+                {"path": failed_file, "disposition": "failed", "source_identity": source}
+            ],
+            "analyzer_status_events": [
+                {
+                    "analyzer_id": "test_analyzer",
+                    "source_identity": source,
+                    "planned_work": [{"work_id": "unaccounted", "path": unaccounted_file}],
+                }
+            ],
+        }
+    )
+    child_sarif = _build_sarif([], analysis_completeness=completeness, execution_successful=False)
+    aggregate = cli._multi_skill_analysis_completeness(
+        total_skills=1,
+        complete_skills=0,
+        partial_skills=0,
+        failed_skills=1,
+        omitted_skills=0,
+        limitations=[],
+    )
+
+    payload = cli._multi_skill_sarif_report([skill], [{"sarif_report": child_sarif}], aggregate)
+
+    validate_sarif_report(payload)
+    notifications = payload["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+    artifacts = {
+        artifact["uri"]: artifact
+        for notification in notifications
+        for location in notification.get("locations", [])
+        for artifact in [location["physicalLocation"]["artifactLocation"]]
+    }
+    for path in (failed_file, unaccounted_file):
+        assert artifacts[path]["properties"]["sourceIdentity"] == source
+        assert "uriBaseId" not in artifacts[path]
+
+
+def test_bounded_ledger_preserves_the_limit_event_source() -> None:
+    source = "external/" + "a" * 64
+    path = f"{source}/helper.py"
+    record = {"path": path, "source_identity": source}
+
+    capped = cli._merge_bounded_ledger([], [record, record], limit=1)
+    extended = cli._merge_bounded_ledger(capped, [record], limit=1)
+
+    for rows in (capped, extended):
+        assert len(rows) == 1
+        assert rows[0]["path"] == path
+        assert rows[0]["source_identity"] == source
+
+
 def test_recursive_sarif_labels_actual_serialized_output_cap() -> None:
     """Only a real recursive output bound uses the output-limit reason code."""
     reason = "recursive serialized report character budget 1800 reached"
@@ -3880,6 +3993,62 @@ def test_directory_discovery_warnings_do_not_corrupt_machine_stdout(
     assert result.stdout == report_body + "\n"
     assert expected_warning not in result.stdout
     assert expected_warning in result.stderr
+
+
+@pytest.mark.parametrize("output_format", list(FormatChoice))
+def test_recursive_root_scope_exclusions_are_public(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output_format: FormatChoice
+) -> None:
+    for name in (".git", ".venv", ".review-helper", "normal"):
+        child = tmp_path / name
+        child.mkdir()
+        (child / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+    (tmp_path / "node_modules").write_text("A plain file at the collection root.", encoding="utf-8")
+    scanned: list[str] = []
+
+    def scan_child(*, input_path: str, **_kwargs: object) -> dict[str, object]:
+        scanned.append(Path(input_path).name)
+        return _bounded_recursive_result("clean", finding_count=0)
+
+    monkeypatch.setattr(cli, "_scan_skill", scan_child)
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "--recursive",
+            "--no-llm",
+            "--format",
+            output_format.value,
+            "--fail-on-incomplete",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert scanned == [".review-helper", "normal"]
+    if output_format is FormatChoice.json:
+        report = json.loads(result.stdout)
+        assert report["risk_recommendation"] == "SAFE"
+        completeness = report["analysis_completeness"]
+    elif output_format is FormatChoice.sarif:
+        aggregate = json.loads(result.stdout)["runs"][-1]
+        completeness = aggregate["invocations"][0]["properties"]["analysisCompleteness"]
+    else:
+        assert "Scope exclusions" in result.stdout
+        assert ".git/" in result.stdout
+        assert ".venv/" in result.stdout
+        assert "node_modules" not in result.stdout
+        return
+    assert completeness["status"] == "complete"
+    assert completeness["coverage_percent"] == 100
+    assert completeness["limitations"] == []
+    assert [
+        (row["path"], row["outcome"], row["reason_code"])
+        for row in completeness["scope_exclusions"]
+    ] == [
+        (".git/", "out_of_scope", "excluded_directory"),
+        (".venv/", "out_of_scope", "excluded_directory"),
+    ]
 
 
 @pytest.mark.parametrize("output_format", list(FormatChoice))
@@ -7483,7 +7652,16 @@ def _assert_nonfatal_transitive_limit(result: dict[str, object], reason: str) ->
     assert any(reason in item for item in result["transitive_truncation_reasons"])
 
 
-def test_scan_transitive_reference_limit_is_incomplete_and_caution(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("limits", "resource", "has_source_scope"),
+    [
+        (transitive.ExternalReferenceLimits(max_sources=0), "sources", False),
+        (transitive.ExternalReferenceLimits(max_source_bytes=4), "source_bytes", True),
+    ],
+)
+def test_scan_transitive_reference_limit_is_incomplete_and_caution(
+    monkeypatch, limits, resource, has_source_scope
+) -> None:
     """Bounded reference extraction is visible instead of becoming an empty clean scan."""
     initial_result: dict[str, object] = {
         **_mock_graph_result(file_cache={"SKILL.md": "# provider view"}),
@@ -7497,7 +7675,7 @@ def test_scan_transitive_reference_limit_is_incomplete_and_caution(monkeypatch) 
     def limited_extract(file_cache, **kwargs):
         return original_extract(
             file_cache,
-            limits=transitive.ExternalReferenceLimits(max_sources=0),
+            limits=limits,
             **kwargs,
         )
 
@@ -7514,7 +7692,16 @@ def test_scan_transitive_reference_limit_is_incomplete_and_caution(monkeypatch) 
         visited=set(),
     )
 
-    _assert_nonfatal_transitive_limit(result, "transitive reference sources limit")
+    _assert_nonfatal_transitive_limit(result, f"transitive reference {resource} limit")
+    if has_source_scope:
+        scope = transitive.report_safe_source_scope_key(".hidden/ref.txt")
+        locations = [
+            loc["physicalLocation"]["artifactLocation"]
+            for invocation in result["sarif_report"]["runs"][0]["invocations"]
+            for item in invocation.get("toolExecutionNotifications", [])
+            for loc in item.get("locations", [])
+        ]
+        assert {"uri": scope, "properties": {"sourceIdentity": scope}} in locations
 
 
 def test_scan_transitive_plan_limit_is_incomplete_and_caution(monkeypatch) -> None:
@@ -8635,3 +8822,32 @@ def test_recursive_risk_assessment_uses_cli_verdict_hook() -> None:
         "severity": "LOW",
         "recommendation": "CAUTION",
     }
+
+
+@pytest.mark.parametrize("output_name", ["baseline.yaml", "baseline.json", "-"])
+@pytest.mark.parametrize("custom_rules", [False, True])
+def test_baseline_custom_rules_match_scan_configuration(
+    tmp_path, monkeypatch, output_name, custom_rules
+):
+    """Baseline generation must use the same normalized rule path as scan."""
+    monkeypatch.chdir(tmp_path)
+    states = []
+
+    def invoke(state):
+        states.append(state)
+        return {
+            "active_findings": [_finding("YR4", "marker")],
+            "file_cache": {"SKILL.md": "marker"},
+        }
+
+    monkeypatch.setattr(cli.graph, "invoke", invoke)
+    args = ["baseline", str(tmp_path), "--no-llm", "-o", output_name]
+    if custom_rules:
+        args += ["--yara-rules-dir", "rules"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert states[0].get("yara_rules_dir") == (str(tmp_path / "rules") if custom_rules else None)
+    data = yaml.safe_load(
+        result.stdout if output_name == "-" else (tmp_path / output_name).read_text()
+    )
+    assert len(data["fingerprints"]) == 1

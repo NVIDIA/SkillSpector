@@ -32,7 +32,7 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 - **Multi-format input**: Scan Git repos, URLs, zip files, directories, or single files
 - **71 vulnerability patterns** across 17 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
 - **Two-stage analysis**: Fast static analysis + optional LLM semantic evaluation
-- **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
+- **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with optional local snapshots and a built-in fallback
 - **Multiple output formats**: Terminal, JSON, Markdown, and SARIF reports
 - **Risk scoring**: 0-100 score with severity labels and clear recommendations
 - **Baseline / false-positive suppression**: Accept known findings via a glob-rule or fingerprint baseline so re-scans surface only *new* issues ([docs](docs/SUPPRESSION.md))
@@ -49,6 +49,18 @@ platforms. The examples below select 3.13 explicitly; see the
 For source installs, create and activate a virtual environment first (all `make`
 targets assume the venv is active). Use **uv** or **pip**; the Makefile uses `uv`
 if available, otherwise `pip`.
+
+Once a release is available on [PyPI](https://pypi.org/project/skillspector/),
+install or upgrade SkillSpector from a Python virtual environment:
+
+```bash
+python -m pip install --upgrade skillspector
+# To include the optional MCP server:
+python -m pip install --upgrade 'skillspector[mcp]'
+```
+
+Verify the installation with `skillspector --version`. The GitHub installation
+below works ahead of the first PyPI release and for users following development.
 
 **Quick install with uv (CLI-only):**
 
@@ -222,8 +234,16 @@ JSON-only. Additional outputs do not rerun analyzers or change scan limits.
 
 ### Recursive Collection Scanning
 
-`--recursive` scans immediate subdirectories containing `SKILL.md` as independent
-skills, with a default aggregate limit of **32 skills**. To raise or lower it:
+Use `--recursive` to scan a local collection's immediate child directories as
+independent skills. A child can contain `SKILL.md`, `skill.md`, or a supported
+AISOP/AISP bundle, such as `.aisop/workflow.aisop.json`.
+
+If the scan root itself contains `SKILL.md` or `skill.md`, SkillSpector scans
+that root as one skill. To scan children independently, point the command at a
+collection root without a Markdown skill manifest. Recursive output combines
+the child results in one report.
+
+The default aggregate limit is **32 skills**. To raise or lower it:
 
 ```bash
 skillspector scan ./my-skills/ --recursive --max-skills 100 --no-llm --format json
@@ -233,9 +253,9 @@ skillspector scan ./my-skills/ --recursive --max-skills 100 --no-llm --format js
 does not mean unlimited. Discovery, byte, finding-record, time and report-size
 budgets still apply, so increasing the count does not guarantee complete coverage.
 When the count limit is reached, the CLI names the limit and suggests adjusting it
-or scanning sub-skills separately. Omitted skills remain visible in the aggregate
-report and coverage stays incomplete. Use `--fail-on-incomplete` in CI to fail on
-incomplete coverage; the default exit policy is unchanged.
+or scanning sub-skills separately. The aggregate report records the omission
+count and reason, and coverage stays incomplete. Use `--fail-on-incomplete` in
+CI to fail on incomplete coverage.
 
 ### Batch Scanning
 
@@ -274,10 +294,13 @@ all matching versions are assessed. The server name remains the report source:
 skillspector scan 'ac.inference.sh/mcp' --mcp-registry --format json --output current.json
 ```
 
-Use `https://registry.modelcontextprotocol.io/v0/servers` as the input to scan
-the full catalog. Local registry captures are also supported as UTF-8 JSON,
-with or without a leading UTF-8 byte-order mark (BOM). The same encoding is
-accepted for saved Registry reports used with `--mcp-registry-compare`.
+Use `https://registry.modelcontextprotocol.io/v0.1/servers` as the input to scan
+the full catalog. Named lookups also use this stable API. The exact legacy URL
+`https://registry.modelcontextprotocol.io/v0/servers` remains supported. Other
+URLs, including URLs with queries or fragments, are rejected. Local registry
+captures are supported as UTF-8 JSON, with or without a leading UTF-8 byte-order
+mark (BOM). The same encoding is accepted for saved Registry reports used with
+`--mcp-registry-compare`.
 
 Start with raw registry payload captures (`registry-before.json` and
 `registry-after.json`). Save a scan report as `previous.json`, then compare a
@@ -606,12 +629,23 @@ claude mcp add skillspector -- skillspector mcp
 > - For remote access, put an authenticating reverse proxy (e.g. nginx + mTLS)
 >   in front of the loopback listener.
 > - Local paths and `file://` URLs are **automatically rejected** over HTTP to
->   prevent unauthenticated callers from reading arbitrary host files. Only
->   remote Git and `.zip` URLs are accepted.
+>   prevent unauthenticated callers from reading arbitrary host files.
 >
-> HTTP scans accept only credential-free `https://` targets. Git scans never use
-> the server's Git login or Git config. If a proxy or custom CA is needed, set
-> `HTTPS_PROXY`, `NO_PROXY` or `GIT_SSL_CAINFO` in the server environment.
+> HTTP scans accept only credential-free `https://` targets on allowed hosts.
+> Targets include public Git repositories, ZIP archives, and direct file URLs
+> such as a raw `SKILL.md`. These `scan_skill` arguments scan a public Markdown
+> file with static analysis:
+>
+> ```json
+> {
+>   "target": "https://raw.githubusercontent.com/NVIDIA/SkillSpector/main/tests/fixtures/safe_skill/SKILL.md",
+>   "use_llm": false
+> }
+> ```
+>
+> Git scans never use the server's Git login or Git config. If a proxy or custom
+> CA is needed, set `HTTPS_PROXY`, `NO_PROXY` or `GIT_SSL_CAINFO` in the server
+> environment.
 > Use stdio or the CLI for private repositories. Git redirects are rejected;
 > use the current repository URL after a rename or transfer.
 
@@ -796,20 +830,45 @@ All detected patterns are listed in the tables above.
 
 ### Score Calculation
 
-- **CRITICAL issues**: +50 points
-- **HIGH issues**: +25 points
-- **MEDIUM issues**: +10 points
-- **LOW issues**: +5 points
-- **Executable scripts**: 1.3x multiplier
+Each skill's score uses active findings after baseline suppression. Each
+active finding starts with base points for its severity.
+
+- **CRITICAL**: 50 points
+- **HIGH**: 25 points
+- **MEDIUM**: 10 points
+- **LOW**: 5 points
+
+The score scales each contribution by the finding's confidence, bounded
+between 0 and 1. Within each rule ID, findings with positive confidence are
+scored in descending severity order. The first three count at full, half,
+and quarter weight. Further findings with the same rule ID can still
+appear in the report without adding points.
+
+A 1.3× multiplier applies to a finding when its file is an executable
+component. The total is rounded down and capped at 100. Some conditions,
+such as an unapproved exclusion of executable content, impose a minimum score.
+
+In a single-skill JSON report, `risk_assessment.severity` is the band for
+the aggregate `risk_assessment.score`. `risk_assessment.max_issue_severity` is the highest
+severity in the report's `issues` list, or `NONE` when that list is empty.
+For example, a report with one HIGH finding at 0.4 confidence in Markdown
+can show a score of 10, an aggregate severity of LOW, and a maximum issue
+severity of HIGH.
+
+Check [scan completeness](docs/scan-completeness.md) when using a report
+to make an installation decision.
 
 ### Severity Levels
 
-| Score | Severity | Recommendation |
+| Score | Severity | Base Recommendation |
 |-------|----------|----------------|
 | 0-20 | LOW | SAFE |
 | 21-50 | MEDIUM | CAUTION |
 | 51-80 | HIGH | DO NOT INSTALL |
 | 81-100 | CRITICAL | DO NOT INSTALL |
+
+An incomplete or degraded scan can change a base recommendation of SAFE
+to CAUTION while keeping the score and severity.
 
 ## Example Output
 
@@ -917,7 +976,7 @@ Options:
   --help                                       Show this message and exit
 
 # Generate a baseline of all current findings (see docs/SUPPRESSION.md)
-skillspector baseline <path> [-o FILE] [--no-llm] [--reason TEXT]
+skillspector baseline <path> [-o FILE] [--no-llm] [--yara-rules-dir PATH] [--reason TEXT]
 ```
 
 Report files and new baselines use private permissions (0600). Existing baselines
@@ -960,9 +1019,11 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
 ```json
 {
   "skill": { "name": "...", "source": "...", "scanned_at": "<ISO 8601>" },
-  "risk_assessment": { "score": 0, "severity": "LOW", "recommendation": "SAFE" },
+  "execution_successful": true,
+  "analysis_completeness": { "status": "complete", "is_complete": true },
+  "risk_assessment": { "score": 0, "severity": "LOW", "recommendation": "SAFE", "max_issue_severity": "NONE" },
   "components": [ { "path": "...", "type": "...", "lines": 0, "executable": false, "size_bytes": 0 } ],
-  "issues": [ { "id": "...", "category": "...", "severity": "...", "confidence": 0.0, "location": { "file": "...", "start_line": 0 }, "surface": "code" } ],
+  "issues": [],
   "metadata": {
     "has_executable_scripts": false,
     "skillspector_version": "...",
@@ -988,7 +1049,8 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
 ```
 
 - `risk_assessment.severity` ∈ `LOW | MEDIUM | HIGH | CRITICAL`.
-- `risk_assessment.recommendation` ∈ `SAFE | CAUTION | DO_NOT_INSTALL`, mapped from severity: `LOW → SAFE`, `MEDIUM → CAUTION`, `HIGH`/`CRITICAL → DO_NOT_INSTALL`.
+- `risk_assessment.recommendation` ∈ `SAFE | CAUTION | DO_NOT_INSTALL`. See
+  [Severity Levels](#severity-levels) for the base mapping and coverage override.
 - `issues[].surface` and `suppressed[].surface` are advisory, heuristic labels for where a finding landed:
   `code | instructions | docs | tests | comments | config`. JSON expands compacted groups into one `issues[]` entry
   per occurrence, each with its own `surface`; SARIF emits `properties.surface` on each result. The label is
@@ -1028,7 +1090,48 @@ provenance instead of being rebased into the local skill directory.
 
 ### Recommended gate mapping
 
-When using SkillSpector as an install gate, map the recommendation to an action:
+For an install gate, check that the scan succeeded and completed the requested
+analysis before applying your recommendation policy. This example allows only
+complete, `SAFE` static scans:
+
+```bash
+python - ./my-skill <<'PYTHON'
+import json
+import subprocess
+import sys
+
+scan = subprocess.run(
+    ["skillspector", "scan", "--no-llm", "--format", "json", "--fail-on-incomplete", "--", sys.argv[1]],
+    capture_output=True,
+    text=True,
+)
+if scan.returncode not in (0, 1):
+    raise SystemExit(scan.stderr.strip() or f"SkillSpector failed (exit {scan.returncode})")
+
+try:
+    report = json.loads(scan.stdout)
+except json.JSONDecodeError:
+    raise SystemExit("SkillSpector did not return a valid JSON report")
+
+if report.get("execution_successful") is not True:
+    raise SystemExit("SkillSpector could not complete the scan")
+if report.get("metadata", {}).get("llm_requested") is not False:
+    raise SystemExit("SkillSpector did not report the requested static-only scope")
+if report.get("analysis_completeness", {}).get("is_complete") is not True:
+    raise SystemExit("SkillSpector analysis is incomplete")
+if scan.returncode != 0 or report.get("risk_assessment", {}).get("recommendation") != "SAFE":
+    raise SystemExit("SkillSpector blocked installation")
+PYTHON
+```
+
+For a semantic gate, configure your provider, omit `--no-llm`, and require
+`metadata.llm_requested` to be `true`. Keep the completeness check so a provider
+failure blocks installation. For `--recursive` scans, the combined report carries
+execution and completeness at the top level and reports the recommendation and
+analysis scope for each child under `skills`. Check each child's requested scope
+and recommendation before allowing installation.
+
+Once execution and coverage pass, map the recommendation to an action:
 
 | `recommendation` | Suggested action |
 |------------------|------------------|
@@ -1139,7 +1242,7 @@ verifies signatures, certificate chains, transparency logs, or signer identity.
 
 The LLM prompt includes anti-jailbreak protections to prevent malicious skills from manipulating the analysis.
 
-## Live Vulnerability Lookups (SC4)
+## Vulnerability Lookups (SC4)
 
 SC4 uses the [OSV.dev](https://osv.dev) API to check dependencies against the full Open Source Vulnerabilities database — covering tens of thousands of advisories across PyPI and npm.
 
@@ -1152,7 +1255,39 @@ SC4 uses the [OSV.dev](https://osv.dev) API to check dependencies against the fu
   can resolve unpinned manifest dependencies. Malformed entries and unsupported
   VCS/local sources are reported as incomplete dependency checks.
 
-The tool requires outbound HTTPS access to `api.osv.dev` for live vulnerability data. When that is not available, findings are limited to the static fallback list.
+### Offline OSV snapshots
+
+Set `SKILLSPECTOR_OSV_DB_PATH` to a directory containing the [OSV per-ecosystem
+snapshots](https://google.github.io/osv-scanner/usage/offline-mode/#manual-database-download):
+
+```text
+/opt/osv-db/
+├── PyPI/all.zip
+└── npm/all.zip
+```
+
+Provision the ecosystems you scan and refresh the archives outside SkillSpector.
+A read-only mount works. For example:
+
+```sh
+SKILLSPECTOR_OSV_DB_PATH=/opt/osv-db skillspector scan ./my-skill --no-llm --format json
+```
+
+When configured, SC4 only reads local snapshots and never calls OSV.dev,
+even if an archive is missing or unusable. It checks exact versions using
+PyPI or npm version ordering and reuses each ecosystem's index within the scan.
+JSON reports include the source, ecosystem, archive size, and file modification
+time in `metadata.osv_lookup`. File modification time reflects the local file,
+which may differ from the OSV publication date.
+
+Missing, malformed, unsupported, or truncated data is reported as incomplete
+coverage. This includes archives with records but no recognized entries for the
+requested ecosystem, and records with invalid withdrawal timestamps. The built-in
+list is used for unchecked coordinates. Unresolved
+versions may show advisory history and remain unchecked. Set
+`SKILLSPECTOR_OSV_TIMEOUT` to adjust the lookup timeout, subject to the scan's
+shared deadline. The snapshot setting only controls SC4, independently of the
+LLM provider and other features that may use the network.
 
 ## Locked npm dependency contents (opt-in)
 
@@ -1183,7 +1318,7 @@ SkillSpector is defense-in-depth, not a sandbox. Know what it does and does not 
 
 - **It never executes the scanned skill.** All analysis is static (regex, Python AST, YARA) plus optional LLM evaluation of file *contents* — the skill's code is never run.
 - **LLM analysis sends analyzer-eligible file contents to the configured provider.** When LLM analysis is enabled (the default), file contents are sent to the active `SKILLSPECTOR_PROVIDER` endpoint. DSSE payloads and readable signing metadata are included. Use `--no-llm` to keep contents local (static analysis only).
-- **SC4 sends dependency names to OSV.dev.** The supply-chain check queries [OSV.dev](https://osv.dev) with the package names and versions the skill declares, to look up known CVEs. This is fundamental to the check and runs even with `--no-llm`. It sends dependency coordinates (not file contents), requires no API key, and falls back to a bundled list when OSV.dev is unreachable.
+- **SC4 sends dependency names to OSV.dev by default.** The supply-chain check queries [OSV.dev](https://osv.dev) with the package names and versions the skill declares, to look up known CVEs. This is fundamental to the check and runs even with `--no-llm`. It sends dependency coordinates (not file contents), requires no API key, and falls back to a bundled list when OSV.dev is unreachable. Configure `SKILLSPECTOR_OSV_DB_PATH` to keep SC4 lookups local.
 - **It does not sandbox the host.** SkillSpector flags risky patterns *before* you install a skill; it does not contain or isolate a skill you choose to install anyway.
 
 ## Limitations
@@ -1207,22 +1342,29 @@ Based on research from "Agent Skills in the Wild: An Empirical Study of Security
 
 ```python
 from skillspector import graph
+from skillspector.cleanup import cleanup_result
 
 # Invoke the LangGraph workflow
 result = graph.invoke({
     "input_path": "/path/to/skill",
     "output_format": "json",   # terminal, json, markdown, or sarif
-    "use_llm": True,           # False for static-only analysis
+    "use_llm": False,          # Set True to use a configured LLM provider
 })
 
-# Access results
-print(f"Risk Score: {result['risk_score']}/100")
-print(f"Severity: {result['risk_severity']}")
-print(f"Recommendation: {result['risk_recommendation']}")
+try:
+    print(f"Risk Score: {result['risk_score']}/100")
+    print(f"Severity: {result['risk_severity']}")
+    print(f"Recommendation: {result['risk_recommendation']}")
 
-for finding in result["filtered_findings"]:
-    print(f"[{finding['severity']}] {finding['rule_id']}: {finding['message']}")
+    for finding in result["filtered_findings"]:
+        print(f"[{finding.severity}] {finding.rule_id}: {finding.message}")
+finally:
+    cleanup_result(result)
 ```
+
+The graph returns Python state, including `Finding` objects in
+`filtered_findings`. Set `output_format` to choose the rendered report in
+`result["report_body"]`.
 
 ## License
 

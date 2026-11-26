@@ -1023,6 +1023,7 @@ def _build_sarif(
         # A rule-set row's path is a label, not an artifact; giving it a
         # physical location would attribute it to any real file of that name.
         if path and not scope:
+            source_identity = exception.get("source_identity")
             region = (
                 SarifRegion(
                     startLine=int(start_line),
@@ -1034,7 +1035,12 @@ def _build_sarif(
             locations = [
                 SarifLocation(
                     physicalLocation=SarifPhysicalLocation(
-                        artifactLocation=SarifArtifactLocation(uri=quote(path, safe="/!")),
+                        artifactLocation=SarifArtifactLocation(
+                            uri=quote(path, safe="/!"),
+                            properties={"sourceIdentity": source_identity}
+                            if source_identity
+                            else None,
+                        ),
                         region=region,
                     )
                 )
@@ -1666,6 +1672,7 @@ def _format_json(
     scanned_at: datetime | None = None,
     prepared_metadata: dict[str, object] | None = None,
     origin: dict[str, str] | None = None,
+    osv_lookup: dict[str, object] | None = None,
 ) -> str:
     """Generate JSON report string."""
     suppressed = suppressed or []
@@ -1706,6 +1713,8 @@ def _format_json(
         ),
         "execution_successful": execution_successful,
     }
+    if osv_lookup is not None:
+        cast(dict[str, object], data["metadata"])["osv_lookup"] = osv_lookup
     data["analysis_completeness"] = dict(analysis_completeness or {})
     completeness = analysis_completeness or {}
     recovery_warnings = completeness.get("warnings")
@@ -2259,6 +2268,8 @@ def prepare_report(state: SkillspectorState) -> PreparedReport:
         runtime_available,
         (provider_available, provider_error),
     )
+    if state.get("osv_lookup") is not None:
+        metadata["osv_lookup"] = state["osv_lookup"]
     # Only presentation data crosses this boundary. JSON bytes make nested
     # findings, evidence, metadata and coverage immutable too; no pickle or
     # executable deserialization is used. Each format receives fresh objects.

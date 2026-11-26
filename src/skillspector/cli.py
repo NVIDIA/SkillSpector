@@ -35,7 +35,7 @@ from pathlib import Path
 from stat import S_ISDIR
 from time import monotonic
 from typing import TYPE_CHECKING, Annotated, cast
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import typer
 from click.core import ParameterSource
@@ -54,6 +54,8 @@ from skillspector.graph_proxy import graph
 from skillspector.input_handler import _normalize_root_owned_alias, validate_local_input_path
 from skillspector.inspection_ledger import (
     MAX_INSPECTION_LEDGER_EVENTS,
+    REASON_MESSAGES,
+    InspectionLedgerException,
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
@@ -648,7 +650,9 @@ def scan(
         typer.Option(
             "--recursive",
             "-r",
-            help="Scan immediate subdirectories that each contain a SKILL.md as independent skills.",
+            help="Scan immediate child directories with SKILL.md, skill.md, or a supported "
+            "AISOP/AISP bundle as independent skills. A Markdown skill manifest at the scan "
+            "root selects a single-skill scan.",
         ),
     ] = False,
     max_skills: Annotated[
@@ -1489,6 +1493,7 @@ def _transitive_limit_event(
     *,
     phase: str,
     path: str,
+    source_identity: str | None = None,
 ) -> dict[str, object]:
     observed_bytes: int | None = None
     limit_bytes: int | None = None
@@ -1514,24 +1519,25 @@ def _transitive_limit_event(
     else:
         observed_artifacts = int(limitation.observed)
         limit_artifacts = int(limitation.limit)
-    return dict(
-        ledger_event(
-            outcome=LedgerOutcome.PARTIAL,
-            record_type=LedgerRecordType.SYSTEM,
-            phase=phase,
-            path=path,
-            reason=LedgerReason.REFERENCE_EXTRACTION_LIMIT,
-            stage=limitation.resource,
-            observed_bytes=observed_bytes,
-            limit_bytes=limit_bytes,
-            observed_records=observed_records,
-            limit_records=limit_records,
-            observed_artifacts=observed_artifacts,
-            limit_artifacts=limit_artifacts,
-            observed_seconds=observed_seconds,
-            limit_seconds=limit_seconds,
-        )
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        record_type=LedgerRecordType.SYSTEM,
+        phase=phase,
+        path=path,
+        reason=LedgerReason.REFERENCE_EXTRACTION_LIMIT,
+        stage=limitation.resource,
+        observed_bytes=observed_bytes,
+        limit_bytes=limit_bytes,
+        observed_records=observed_records,
+        limit_records=limit_records,
+        observed_artifacts=observed_artifacts,
+        limit_artifacts=limit_artifacts,
+        observed_seconds=observed_seconds,
+        limit_seconds=limit_seconds,
     )
+    if source_identity is not None:
+        event["source_identity"] = source_identity
+    return dict(event)
 
 
 def _cache_transitive_result(
@@ -1624,6 +1630,7 @@ def _cache_transitive_result(
                 limitation,
                 phase="transitive_reference_extraction",
                 path=(limitation.source_scope or source_identity) + "/SKILL.md",
+                source_identity=source_identity,
             )
         )
     scoped_ledger = _merge_bounded_ledger(
@@ -2056,6 +2063,24 @@ def _status_planned_work_count(statuses: list[dict[str, object]]) -> int:
     return total
 
 
+def _ledger_output_limit_event(
+    source: dict[str, object], observed_records: int, limit_records: int
+) -> dict[str, object]:
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        record_type=LedgerRecordType.SYSTEM,
+        phase="ledger_output",
+        path=str(source.get("path", "SKILL.md")),
+        reason=LedgerReason.OUTPUT_LIMIT,
+        observed_records=observed_records,
+        limit_records=limit_records,
+    )
+    identity = source.get("source_identity")
+    if isinstance(identity, str) and identity:
+        event["source_identity"] = identity
+    return dict(event)
+
+
 def _merge_bounded_ledger(
     existing: list[dict[str, object]],
     updates: list[dict[str, object]],
@@ -2073,16 +2098,8 @@ def _merge_bounded_ledger(
         prior_observed = observed_value if isinstance(observed_value, int) else len(existing)
         return [
             *existing[:-1][: effective_limit - 1],
-            dict(
-                ledger_event(
-                    outcome=LedgerOutcome.PARTIAL,
-                    record_type=LedgerRecordType.SYSTEM,
-                    phase="ledger_output",
-                    path=str(prior.get("path", "SKILL.md")),
-                    reason=LedgerReason.OUTPUT_LIMIT,
-                    observed_records=max(prior_observed, len(existing)) + len(updates),
-                    limit_records=effective_limit,
-                )
+            _ledger_output_limit_event(
+                prior, max(prior_observed, len(existing)) + len(updates), effective_limit
             ),
         ]
     combined = [*existing, *updates]
@@ -2093,17 +2110,7 @@ def _merge_bounded_ledger(
     overflow = combined[effective_limit - 1]
     return [
         *combined[: effective_limit - 1],
-        dict(
-            ledger_event(
-                outcome=LedgerOutcome.PARTIAL,
-                record_type=LedgerRecordType.SYSTEM,
-                phase="ledger_output",
-                path=str(overflow.get("path", "SKILL.md")),
-                reason=LedgerReason.OUTPUT_LIMIT,
-                observed_records=len(combined),
-                limit_records=effective_limit,
-            )
-        ),
+        _ledger_output_limit_event(overflow, len(combined), effective_limit),
     ]
 
 
@@ -2129,15 +2136,15 @@ def _distinct_failed_ledger_events(
 
 def _transitive_child_failure_event(source_identity: str) -> dict[str, object]:
     """Return one deterministic, payload-free fatal fact for an opaque child failure."""
-    return dict(
-        ledger_event(
-            outcome=LedgerOutcome.FAILED,
-            record_type=LedgerRecordType.SYSTEM,
-            phase="transitive_child_scan",
-            path=f"{source_identity}/SKILL.md",
-            reason=LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED,
-        )
+    event = ledger_event(
+        outcome=LedgerOutcome.FAILED,
+        record_type=LedgerRecordType.SYSTEM,
+        phase="transitive_child_scan",
+        path=f"{source_identity}/SKILL.md",
+        reason=LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED,
     )
+    event["source_identity"] = source_identity
+    return dict(event)
 
 
 def _ensure_required_failure_events(
@@ -2186,21 +2193,13 @@ def _ensure_required_failure_events(
     newly_observed = (
         0 if prior_sentinel is not None and failures_already_observed else len(missing_failures)
     )
-    sentinel_path = (
-        str(prior_sentinel.get("path", "SKILL.md"))
+    sentinel_source = (
+        prior_sentinel
         if prior_sentinel is not None and failures_already_observed
-        else str((incoming_failures or required_failures)[0].get("path", "SKILL.md"))
+        else (incoming_failures or required_failures)[0]
     )
-    sentinel = dict(
-        ledger_event(
-            outcome=LedgerOutcome.PARTIAL,
-            record_type=LedgerRecordType.SYSTEM,
-            phase="ledger_output",
-            path=sentinel_path,
-            reason=LedgerReason.OUTPUT_LIMIT,
-            observed_records=max(observed_records, len(events)) + newly_observed,
-            limit_records=effective_limit,
-        )
+    sentinel = _ledger_output_limit_event(
+        sentinel_source, max(observed_records, len(events)) + newly_observed, effective_limit
     )
     failure_slots = effective_limit - 1
     if failures_already_observed:
@@ -2351,6 +2350,7 @@ def _scan_transitive(
                     limitation,
                     phase="transitive_reference_extraction",
                     path=(limitation.source_scope or "SKILL.md"),
+                    source_identity=limitation.source_scope,
                 )
             ],
             limit=traversal.budget.max_ledger_events,
@@ -2599,6 +2599,7 @@ def _scan_transitive(
                                 limitation,
                                 phase="transitive_frontier",
                                 path=cached.source_identity + "/SKILL.md",
+                                source_identity=cached.source_identity,
                             )
                         ],
                         limit=traversal.budget.max_ledger_events,
@@ -2902,6 +2903,7 @@ def _multi_skill_analysis_completeness(
     failed_skills: int,
     omitted_skills: int,
     limitations: list[str],
+    excluded_root_paths: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Build one conservative machine-readable completeness summary for recursion."""
     is_complete = (
@@ -2910,7 +2912,7 @@ def _multi_skill_analysis_completeness(
     execution_successful = failed_skills == 0
     status = "failed" if not execution_successful else "complete" if is_complete else "partial"
     denominator = max(1, total_skills)
-    return {
+    completeness: dict[str, object] = {
         "is_complete": is_complete,
         "execution_successful": execution_successful,
         "status": status,
@@ -2922,6 +2924,23 @@ def _multi_skill_analysis_completeness(
         "limitations": limitations,
         "scope": "recursive_skills",
     }
+    if excluded_root_paths:
+        reason = LedgerReason.EXCLUDED_DIRECTORY
+        exclusions: list[InspectionLedgerException] = [
+            {
+                "outcome": LedgerOutcome.OUT_OF_SCOPE,
+                "phase": "multi_skill_discovery",
+                "reason_code": reason,
+                "message": REASON_MESSAGES[reason],
+                "path": path,
+                "start_line": None,
+                "end_line": None,
+                "fatal": False,
+            }
+            for path in excluded_root_paths
+        ]
+        completeness["scope_exclusions"] = exclusions
+    return completeness
 
 
 _RECURSIVE_SERIALIZED_OUTPUT_LIMIT_PREFIX = "recursive serialized report character budget "
@@ -2987,6 +3006,10 @@ def _multi_skill_text_completeness(completeness: dict[str, object]) -> str:
     elif status == "partial" and not limitations:
         limitations.append("One or more recursive skill scans were incomplete.")
     details = "\n".join(f"- {item}" for item in limitations)
+    exclusions = cast("list[InspectionLedgerException]", completeness.get("scope_exclusions", []))
+    if exclusions:
+        scope_details = "\n".join(f"- `{row['path']}` — {row['message']}" for row in exclusions)
+        details = "\n\n".join(filter(None, (details, f"Scope exclusions\n\n{scope_details}")))
     return f"--- Recursive Inspection Completeness ---\n\nStatus: {status}\n\n{details}"
 
 
@@ -3029,6 +3052,34 @@ def _multi_skill_text_summary(
 _RECURSIVE_SARIF_URI_BASE_ID = "SKILLROOT"
 
 
+def _scope_recursive_sarif_locations(records: object) -> None:
+    """Base child-relative result and notification locations at the scanned skill."""
+    if not isinstance(records, list):
+        return
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for location in record.get("locations", []):
+            physical = location.get("physicalLocation") if isinstance(location, dict) else None
+            artifact = physical.get("artifactLocation") if isinstance(physical, dict) else None
+            if not isinstance(artifact, dict) or "uriBaseId" in artifact:
+                continue
+            provenance = artifact.get("properties")
+            if isinstance(provenance, dict) and any(
+                key in provenance
+                for key in ("sourceIdentity", "sourceUrl", "sourceDigest", "transitiveDepth")
+            ):
+                continue
+            uri = artifact.get("uri")
+            if (
+                isinstance(uri, str)
+                and uri
+                and not uri.startswith("/")
+                and not urlsplit(uri).scheme
+            ):
+                artifact["uriBaseId"] = _RECURSIVE_SARIF_URI_BASE_ID
+
+
 def _multi_skill_sarif_report(
     processed_skills: list[SkillDirectory],
     results: list[dict[str, object]],
@@ -3059,36 +3110,19 @@ def _multi_skill_sarif_report(
             }
             run["properties"] = run_properties
             # SARIF 2.1.0 sections 3.4.4 and 3.14.14: scope each child run's
-            # skill-relative URIs to its own skill directory so results from
-            # different skills stop collapsing onto one repo-root-relative
-            # path. Single-skill output is untouched: only recursive merges
-            # set uriBaseId.
+            # skill-relative URIs to its own skill directory so finding and
+            # diagnostic paths resolve to the right child.
             relative = quote(skill.path.name, safe="")
             if relative:
-                for result in run.get("results", []):
-                    if not isinstance(result, dict):
-                        continue
-                    for location in result.get("locations", []):
-                        physical = (
-                            location.get("physicalLocation") if isinstance(location, dict) else None
+                _scope_recursive_sarif_locations(run.get("results"))
+                for invocation in run.get("invocations", []):
+                    if isinstance(invocation, dict):
+                        _scope_recursive_sarif_locations(
+                            invocation.get("toolExecutionNotifications")
                         )
-                        artifact = (
-                            physical.get("artifactLocation") if isinstance(physical, dict) else None
-                        )
-                        if isinstance(artifact, dict):
-                            provenance = artifact.get("properties")
-                            if isinstance(provenance, dict) and any(
-                                key in provenance
-                                for key in (
-                                    "sourceIdentity",
-                                    "sourceUrl",
-                                    "sourceDigest",
-                                    "transitiveDepth",
-                                )
-                            ):
-                                continue
-                            artifact["uriBaseId"] = _RECURSIVE_SARIF_URI_BASE_ID
+                previous_bases = run.get("originalUriBaseIds")
                 run["originalUriBaseIds"] = {
+                    **(previous_bases if isinstance(previous_bases, dict) else {}),
                     "SCANROOT": {"uri": skill.path.parent.resolve().as_uri() + "/"},
                     _RECURSIVE_SARIF_URI_BASE_ID: {
                         "uri": f"{relative}/",
@@ -3397,6 +3431,7 @@ def _scan_multi_skill(
         failed_skills=failed_skill_count,
         omitted_skills=skills_omitted_total,
         limitations=aggregate_limitations,
+        excluded_root_paths=detection.excluded_root_paths,
     )
     analysis_incomplete = not bool(aggregate_completeness["is_complete"])
     aggregate_risk_assessment = _multi_skill_risk_assessment(
@@ -3624,7 +3659,7 @@ def _scan_multi_skill(
                 for skill, result in zip(report_skills, report_results, strict=True):
                     if "error" not in result:
                         sections.append(f"--- {skill.relative_path} ---\n\n{_result_body(result)}")
-                if analysis_incomplete:
+                if analysis_incomplete or detection.excluded_root_paths:
                     sections.append(
                         _multi_skill_text_summary(
                             aggregate_completeness,
@@ -3744,6 +3779,13 @@ def baseline(
             help="Skip LLM analysis when generating the baseline (static analysis only).",
         ),
     ] = False,
+    yara_rules_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--yara-rules-dir",
+            help="Directory containing additional YARA rule files (.yar/.yara) to load alongside built-in rules.",
+        ),
+    ] = None,
     reason: Annotated[
         str,
         typer.Option(
@@ -3779,7 +3821,12 @@ def baseline(
             set_level("DEBUG")
             err_console.print("[dim]Scanning to build baseline...[/dim]")
         # output_format is irrelevant here; we consume findings, not report_body.
-        state = _scan_state(input_path, FormatChoice.json, no_llm)
+        state = _scan_state(
+            input_path,
+            FormatChoice.json,
+            no_llm,
+            yara_rules_dir=str(yara_rules_dir.resolve()) if yara_rules_dir else None,
+        )
         if not to_stdout:
             state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)

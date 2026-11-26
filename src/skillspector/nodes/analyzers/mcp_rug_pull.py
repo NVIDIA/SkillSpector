@@ -40,6 +40,7 @@ from skillspector.logging_config import get_logger
 from skillspector.models import Finding, compute_match_fingerprint
 from skillspector.state import (
     AnalyzerNodeResponse,
+    ManifestVersionSource,
     SkillspectorState,
     transitive_remaining_seconds,
 )
@@ -674,15 +675,19 @@ def _check_rp2(manifest: dict, budget: _RugPullBudget) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _check_rp3(manifest: dict, budget: _RugPullBudget) -> None:
+def _check_rp3(
+    manifest: dict, budget: _RugPullBudget, source: ManifestVersionSource | None
+) -> None:
     """Detect when skill version is unpinned or uses broad constraints."""
-    budget.check_runtime("SKILL.md")
+    path, line = (source["path"], source["line"]) if source is not None else ("SKILL.md", 1)
+    budget.check_runtime(path)
     version_value = manifest.get("version") if isinstance(manifest, dict) else None
     if not version_value or not isinstance(version_value, str):
         return
 
     version_str = str(version_value).strip()
     version_preview = version_str[:200]
+    snippet = (source["snippet"] or version_preview) if source is not None else None
     if version_str in ("*", "latest", "any"):
         budget.emit(
             Finding(
@@ -690,8 +695,9 @@ def _check_rp3(manifest: dict, budget: _RugPullBudget) -> None:
                 message=f"Skill version is unpinned: '{version_preview}'.",
                 severity="LOW",
                 confidence=0.80,
-                file="SKILL.md",
-                start_line=1,
+                file=path,
+                start_line=line,
+                code_snippet=snippet,
                 category=_CATEGORY,
                 tags=list(_TAGS),
                 matched_text=version_preview,
@@ -710,8 +716,9 @@ def _check_rp3(manifest: dict, budget: _RugPullBudget) -> None:
                 message=f"Skill version constraint may be too broad: '{version_preview}'.",
                 severity="LOW",
                 confidence=0.40 if version_str.startswith(">=") else 0.50,
-                file="SKILL.md",
-                start_line=1,
+                file=path,
+                start_line=line,
+                code_snippet=snippet,
                 category=_CATEGORY,
                 tags=list(_TAGS),
                 matched_text=version_preview,
@@ -917,18 +924,22 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             ],
         }
 
+    version_source = state.get("manifest_version_source")
+    manifest_paths = {"SKILL.md"} if manifest else set()
+    if manifest and version_source is not None:
+        manifest_paths.add(version_source["path"])
+
     budget = _RugPullBudget(state)
     resource_limit: _RugPullResourceLimitError | None = None
     try:
         _check_rp1(manifest, file_cache, budget)
         if manifest:
             _check_rp2(manifest, budget)
-            _check_rp3(manifest, budget)
+            _check_rp3(manifest, budget, version_source)
         if manifest and previous_manifest:
             _check_manifest_changes(manifest, previous_manifest, budget)
         budget.completed_paths.update(file_cache)
-        if manifest:
-            budget.completed_paths.add("SKILL.md")
+        budget.completed_paths.update(manifest_paths)
     except _RugPullResourceLimitError as exc:
         resource_limit = exc
 
@@ -937,13 +948,13 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     for finding in findings:
         findings_by_path.setdefault(finding.file, []).append(finding.finding_id)
 
-    planned_paths = list(file_cache)
-    if manifest and "SKILL.md" not in planned_paths:
-        planned_paths.append("SKILL.md")
+    planned_paths = [*file_cache, *sorted(manifest_paths.difference(file_cache))]
     events = []
     for path in planned_paths:
         emitted_ids = findings_by_path.get(path, [])
-        if resource_limit is None or path in budget.completed_paths:
+        if resource_limit is None or (
+            path in budget.completed_paths and path not in manifest_paths
+        ):
             events.append(
                 ledger_event(
                     analyzer_id=ANALYZER_ID,

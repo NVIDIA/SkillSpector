@@ -56,6 +56,46 @@ protection enabled and submit the suspected false positive to the antivirus
 vendor for review, including the detection name, file path, revision, and file
 hash. An alert on another file or revision needs its own investigation.
 
+## Publishing releases
+
+A release PR must come from a branch in `NVIDIA/SkillSpector` and be merged
+into `main` with the `release:publish` label. Update the version in
+`pyproject.toml` and add its notes under `docs/release/` in the release PR.
+The [release workflow](.github/workflows/release.yml) builds and checks the
+wheel and source distribution from the merge commit. It verifies the metadata
+and bundled YARA rules and provider registries before attaching both artifacts
+to the GitHub release and passing them to the package index job.
+
+Before enabling uploads, configure these GitHub Actions environments with
+`main` as the deployment branch and release maintainers as required reviewers:
+
+| Index | GitHub environment | Repository variable `SKILLSPECTOR_PUBLISH_INDEX` |
+| --- | --- | --- |
+| TestPyPI | `pypi-test` | `testpypi` |
+| PyPI | `pypi-production` | `pypi` |
+
+Register a GitHub Trusted Publisher for the `skillspector` project in the
+chosen index. In each publisher registration use owner `NVIDIA`, repository
+`SkillSpector`, workflow filename `release.yml`, and the corresponding
+environment. Use the existing project on PyPI and a
+[pending publisher](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)
+on TestPyPI if it has no project yet. Package uploads remain disabled while
+the repository variable is unset. Use TestPyPI to verify the OIDC flow and
+package installation before selecting production.
+
+If an upload is interrupted, rerun the failed index job while the build
+artifact is available. The job uses the index recorded by the build and
+requires that index to match the repository variable. It skips files
+already present with identical bytes and uploads any missing files. A
+published filename with different bytes fails the upload. Ship a new
+version if the distributions need correction.
+
+To upload an existing GitHub release, set the variable to the intended index
+and run **Publish GitHub Release** manually from `main`. Supply the published
+release tag, the index, and the SHA-256 values of the approved wheel and source
+distribution. The workflow checks those values against the release metadata
+and the downloaded files before uploading the existing distributions.
+
 ## Coding Standards
 
 - Use `make format` to apply lint fixes and formatting in place before committing.

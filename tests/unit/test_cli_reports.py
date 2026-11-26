@@ -1239,6 +1239,65 @@ def test_recursive_reference_heavy_json_stops_before_parsing(tmp_path, monkeypat
         assert source.read_bytes() == b"# Preserve input\r\n"
 
 
+@pytest.mark.parametrize("primary", list(cli.FormatChoice))
+def test_upstream_osv_metadata_is_frozen_for_additional_json(tmp_path, monkeypatch, primary):
+    """Merge upstream OSV presentation data into the one-time assessment snapshot."""
+    state = scan_result(tmp_path, primary)
+    expected = {
+        "source": "local",
+        "snapshots": [{"ecosystem": "PyPI", "record_count": 2}],
+    }
+    state["osv_lookup"] = deepcopy(expected)
+    result = {**state, **report(state)}
+    module = import_module("skillspector.nodes.report")
+    monkeypatch.setattr(module, "_build_metadata", Mock(side_effect=AssertionError("reassessment")))
+    state["osv_lookup"]["snapshots"][0]["record_count"] = 999
+    for format in reversed(list(cli.FormatChoice)):
+        assert cli._render_report(result, format)["report_body"]
+        payload = json.loads(cli._render_report(result, cli.FormatChoice.json)["report_body"])
+        assert payload["metadata"]["osv_lookup"] == expected
+        payload["metadata"]["osv_lookup"]["snapshots"].clear()
+    if primary == cli.FormatChoice.json:
+        assert json.loads(result["report_body"])["metadata"]["osv_lookup"] == expected
+
+
+def test_recursive_additional_reports_preserve_upstream_scope_exclusions(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    for name in (".git", "one", "two"):
+        skill = root / name
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("# Example\n")
+    scan = Mock(side_effect=lambda input_path, format, **kw: scan_result(input_path, format))
+    monkeypatch.setattr(cli, "_scan_skill", scan)
+    outputs = {format: tmp_path / format.value for format in cli.FormatChoice}
+    args = [
+        "scan",
+        str(root),
+        "--recursive",
+        "--no-llm",
+        "--fail-on-incomplete",
+        "-f",
+        "json",
+        "-o",
+        str(tmp_path / "primary.json"),
+    ]
+    for format, path in outputs.items():
+        args.extend(["--report", f"{format.value}={path}"])
+    result = runner.invoke(cli.app, args)
+    assert result.exit_code == 0, result.output
+    assert scan.call_count == 2
+    payload = json.loads(outputs[cli.FormatChoice.json].read_text())
+    completeness = payload["analysis_completeness"]
+    assert completeness["status"] == "complete"
+    assert [row["path"] for row in completeness["scope_exclusions"]] == [".git/"]
+    for format in (cli.FormatChoice.terminal, cli.FormatChoice.markdown):
+        assert "Scope exclusions" in outputs[format].read_text()
+        assert ".git/" in outputs[format].read_text()
+    sarif = json.loads(outputs[cli.FormatChoice.sarif].read_text())
+    validate_sarif_report(sarif)
+    assert sarif["runs"][-1]["invocations"][0]["properties"]["analysisCompleteness"] == completeness
+
+
 def test_registry_additional_json_reuses_scan(tmp_path, monkeypatch):
     source = tmp_path / "registry.json"
     source.write_text("{}")
