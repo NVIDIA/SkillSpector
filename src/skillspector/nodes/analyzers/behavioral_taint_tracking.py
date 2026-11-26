@@ -27,9 +27,10 @@ from __future__ import annotations
 import ast
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import NamedTuple
+from urllib.parse import urlparse
 
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
@@ -355,6 +356,236 @@ class _TaintedVar(NamedTuple):
     lineno: int
 
 
+# ── TT3: credentials sent to their own issuer ──────────────────────────
+#
+# A credential reaching a network call is CRITICAL unless the request URL's
+# host is statically known and every environment variable the file reads is
+# named for that host's owner (``FIRECRAWL_API_KEY`` -> ``api.firecrawl.dev``).
+# The check is per file rather than per flow, so it holds however taint
+# propagates: a file that also reads any other variable, reads one by a
+# computed name, or reads the whole environment keeps every TT3 CRITICAL.
+
+# Env-var name tokens that describe the kind of secret rather than who issued it.
+_GENERIC_CREDENTIAL_TOKENS = frozenset(
+    {"KEYS", "TOKEN", "TOKENS", "SECRET", "ACCESS", "AUTH", "BEARER", "CLIENT", "PASSWORD"}
+)
+# Second-level labels that sit under a country TLD (``example.co.uk``).
+_COUNTRY_SLD_LABELS = frozenset({"co", "com", "org", "net", "gov", "ac", "edu"})
+# Network sinks whose first argument (or ``url=``) is the request URL.
+_URL_SINKS = _NETWORK_OUTPUT_SINKS - {
+    "socket.socket.send",
+    "socket.socket.sendall",
+    "socket.socket.sendto",
+}
+_ENV_READ_CALLS = frozenset({"os.getenv", "os.environ.get"})
+# Longest dotted chain an environment read can be (``os.environ.get``).
+_MAX_ENV_NAME_PARTS = 3
+# Nesting a URL expression may have before its host counts as unknown.
+_MAX_URL_DEPTH = 4
+
+_FIRST_PARTY_TT3_SEVERITY = Severity.LOW
+_FIRST_PARTY_TT3_CONFIDENCE = 0.3
+
+
+def _literal_str(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _qualified_name(node: ast.AST, aliases: dict[str, str]) -> str | None:
+    """Import-resolved name of a dotted chain no longer than ``os.environ.get``.
+
+    Aliases only lengthen a name, so a longer chain cannot be an environment
+    read; skipping it keeps the per-node work constant on long chains.
+    """
+    current = node
+    for _ in range(_MAX_ENV_NAME_PARTS):
+        if isinstance(current, ast.Name):
+            name = resolve_dotted_name(node)
+            return apply_import_aliases(name, aliases) if name is not None else None
+        if not isinstance(current, ast.Attribute):
+            return None
+        current = current.value
+    return None
+
+
+def _file_credential_keys(
+    tree: ast.AST,
+    aliases: dict[str, str],
+    check_runtime: Callable[[], None] | None = None,
+) -> frozenset[str] | None:
+    """Every environment variable *tree* reads, or None if any read is not by literal name.
+
+    ``os.getenv("K")``, ``os.environ.get("K")`` and ``os.environ["K"]`` (also with
+    ``os`` aliased) are literal reads; any other reference to ``os.environ`` or
+    ``os.getenv`` (``dict(os.environ)``, ``getenv = os.getenv``, a computed key)
+    makes the file's credentials unknowable.
+    """
+    tick = check_runtime or _noop
+    keys: set[str] = set()
+    literal: set[int] = set()
+    references: list[ast.AST] = []
+    for node in ast.walk(tree):
+        tick()
+        if isinstance(node, ast.Call) and node.args:
+            key = _literal_str(node.args[0])
+            if key is not None and _qualified_name(node.func, aliases) in _ENV_READ_CALLS:
+                keys.add(key)
+                literal.add(id(node.func))
+                if isinstance(node.func, ast.Attribute):
+                    literal.add(id(node.func.value))
+        elif isinstance(node, ast.Subscript):
+            key = _literal_str(node.slice)
+            if key is not None and _qualified_name(node.value, aliases) == "os.environ":
+                keys.add(key)
+                literal.add(id(node.value))
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            if _qualified_name(node, aliases) in _CREDENTIAL_SOURCES:
+                references.append(node)
+    if any(id(node) not in literal for node in references):
+        return None
+    return frozenset(keys)
+
+
+def _module_string_constants(
+    tree: ast.AST,
+    check_runtime: Callable[[], None] | None = None,
+) -> dict[str, str]:
+    """Module-level ``NAME = "literal"`` assignments whose name is bound nowhere else."""
+    if not isinstance(tree, ast.Module):
+        return {}
+    tick = check_runtime or _noop
+    candidates: dict[str, str] = {}
+    for stmt in tree.body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+        ):
+            value = _literal_str(stmt.value)
+            if value is not None:
+                candidates[stmt.targets[0].id] = value
+    if not candidates:
+        return {}
+    bindings: dict[str, int] = {}
+    for node in ast.walk(tree):
+        tick()
+        bound: Iterable[str] = ()
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            bound = (node.id,)
+        elif isinstance(node, ast.arg):
+            bound = (node.arg,)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound = (node.name,)
+        elif isinstance(node, ast.alias):
+            bound = (node.asname or node.name.split(".")[0],)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound = (node.name,)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound = (*node.names, *node.names)
+        for name in bound:
+            bindings[name] = bindings.get(name, 0) + 1
+    return {name: value for name, value in candidates.items() if bindings.get(name) == 1}
+
+
+def _static_url_prefix(
+    node: ast.expr, constants: dict[str, str], depth: int = 0
+) -> tuple[str, bool] | None:
+    """Literal prefix of a URL expression and whether it is the whole URL.
+
+    Known pieces are joined from the left until the first dynamic one, so
+    ``f"{BASE}/scrape"`` with ``BASE = "https://api.x.com"`` yields the full literal.
+    Returns None when no literal prefix is statically known, or when the
+    expression nests deeper than ``_MAX_URL_DEPTH``.
+    """
+    literal = _literal_str(node)
+    if literal is not None:
+        return literal, True
+    if isinstance(node, ast.Name):
+        return (constants[node.id], True) if node.id in constants else None
+    if depth >= _MAX_URL_DEPTH:
+        return None
+    if isinstance(node, ast.JoinedStr):
+        pieces: list[ast.expr] = [
+            value.value
+            if isinstance(value, ast.FormattedValue)
+            and value.conversion == -1
+            and value.format_spec is None
+            else value
+            for value in node.values
+        ]
+    elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        pieces = []
+        current: ast.expr = node
+        while isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
+            pieces.append(current.right)
+            current = current.left
+        pieces.append(current)
+        pieces.reverse()
+    else:
+        return None
+    known: list[str] = []
+    for piece in pieces:
+        resolved = _static_url_prefix(piece, constants, depth + 1)
+        if resolved is None or not resolved[1]:
+            if resolved is not None:
+                known.append(resolved[0])
+            return ("".join(known), False) if known else None
+        known.append(resolved[0])
+    return "".join(known), True
+
+
+def _sink_host(call: ast.Call, sink_name: str, constants: dict[str, str]) -> str | None:
+    """Hostname an HTTP sink sends to, if it is statically known."""
+    if sink_name not in _URL_SINKS:
+        return None
+    url_node: ast.expr | None = call.args[0] if call.args else None
+    for kw in call.keywords:
+        if kw.arg == "url":
+            url_node = kw.value
+    if url_node is None:
+        return None
+    resolved = _static_url_prefix(url_node, constants)
+    if resolved is None or "://" not in resolved[0]:
+        return None
+    prefix, complete = resolved
+    # A partial URL only pins the host once its literal part ends the authority;
+    # otherwise f"https://api.vendor.com{suffix}" could continue as ".attacker.io".
+    if not complete and not any(sep in prefix.split("://", 1)[1] for sep in "/?#"):
+        return None
+    try:
+        return urlparse(prefix).hostname
+    except ValueError:
+        return None
+
+
+def _registrable_label(host: str) -> str | None:
+    """The label a company actually owns: ``firecrawl`` for ``api.firecrawl.dev``."""
+    labels = host.lower().rstrip(".").split(".")
+    if len(labels) < 2:
+        return None
+    if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _COUNTRY_SLD_LABELS:
+        return labels[-3]
+    return labels[-2]
+
+
+def _first_party_vendor(keys: frozenset[str] | None, host: str | None) -> str | None:
+    """The host's owner when every credential in the file is named for it.
+
+    Only the registrable label is compared, never subdomains, so
+    ``api.openai.com.attacker.io`` does not match ``OPENAI_API_KEY``.
+    """
+    if not keys or host is None:
+        return None
+    owner = _registrable_label(host)
+    if owner is None or len(owner) < 4 or owner.upper() in _GENERIC_CREDENTIAL_TOKENS:
+        return None
+    if all(owner.upper() in key.upper().split("_") for key in keys):
+        return owner
+    return None
+
+
 def _is_open_for_write(node: ast.Call) -> bool:
     """Heuristic: open() is a write sink if mode arg contains 'w' or 'a'."""
     if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
@@ -393,6 +624,21 @@ def _credential_subscript(node: ast.AST, aliases: dict[str, str]) -> str | None:
     return None
 
 
+# Keyword arguments that configure how a call runs but are never sent or executed,
+# e.g. ``verify=not os.environ.get("SKIP_TLS_VERIFY")``.
+_CONTROL_KWARGS = frozenset({"verify", "timeout", "allow_redirects", "stream"})
+
+
+def _walk_sink_payload(node: ast.Call) -> Iterator[ast.AST]:
+    """``ast.walk`` over a sink call, skipping control keyword arguments."""
+    skipped = {id(kw.value) for kw in node.keywords if kw.arg in _CONTROL_KWARGS}
+    queue: deque[ast.AST] = deque([node])
+    while queue:
+        current = queue.popleft()
+        queue.extend(child for child in ast.iter_child_nodes(current) if id(child) not in skipped)
+        yield current
+
+
 def _find_nested_sources(
     node: ast.Call,
     type_map: dict[str, str] | None = None,
@@ -401,7 +647,7 @@ def _find_nested_sources(
 ) -> list[tuple[str, ast.AST]]:
     """Walk children to find source expressions nested inside a sink call."""
     results: list[tuple[str, ast.AST]] = []
-    for child in ast.walk(node):
+    for child in _walk_sink_payload(node):
         if check_runtime is not None:
             check_runtime()
         if child is node:
@@ -2093,7 +2339,7 @@ def _find_tainted_names_in_args(
     names: list[_TaintedVar] = []
     new_names: list[_TaintedVar] = []
     others: list[_TaintedVar] = []
-    for child in ast.walk(node):
+    for child in _walk_sink_payload(node):
         tick()
         if child is node:
             continue
@@ -2147,6 +2393,8 @@ def _analyze_python(
     graph.run()
     seen: set[tuple[str, ast.Call]] = set()
     contexts: dict[int, str] = {}
+    credential_keys = _file_credential_keys(tree, aliases, check_runtime)
+    url_constants = _module_string_constants(tree, check_runtime) if credential_keys else {}
 
     def context_for(lineno: int) -> str:
         context = contexts.get(lineno)
@@ -2159,8 +2407,23 @@ def _analyze_python(
         node_index: int,
         rule_id: str,
         ast_node: ast.Call,
+        sink_name: str,
         msg: str,
     ) -> None:
+        severity = _RULE_SEVERITIES[rule_id]
+        confidence = _RULE_CONFIDENCES[rule_id]
+        evidence: dict[str, object] = {}
+        if rule_id == "TT3":
+            host = _sink_host(ast_node, sink_name, url_constants)
+            vendor = _first_party_vendor(credential_keys, host)
+            if vendor is not None:
+                severity = _FIRST_PARTY_TT3_SEVERITY
+                confidence = _FIRST_PARTY_TT3_CONFIDENCE
+                evidence = {
+                    "first_party_destination": host,
+                    "credential_keys": sorted(credential_keys or ()),
+                }
+                msg = f"{msg} [every credential in this file is named for the host: {host}]"
         lineno = getattr(ast_node, "lineno", 1)
         end_lineno = getattr(ast_node, "end_lineno", None)
         start_byte_column = getattr(ast_node, "col_offset", None)
@@ -2179,7 +2442,7 @@ def _analyze_python(
         finding = AnalyzerFinding(
             rule_id=rule_id,
             message=msg,
-            severity=_RULE_SEVERITIES[rule_id],
+            severity=severity,
             location=Location(
                 file=file_path,
                 start_line=lineno,
@@ -2187,7 +2450,7 @@ def _analyze_python(
                 start_column=start_column,
                 end_column=end_column,
             ),
-            confidence=_RULE_CONFIDENCES[rule_id],
+            confidence=confidence,
             tags=[_TAG],
             context=context_for(lineno),
             matched_text=complete_match[:200],
@@ -2195,9 +2458,9 @@ def _analyze_python(
             # Evidence participates in report compaction. Keep distinct syntax
             # nodes distinguishable when their source spans are incomplete.
             evidence=(
-                {"python_ast_node_index": node_index}
+                {**evidence, "python_ast_node_index": node_index}
                 if start_column is None or end_column is None
-                else {}
+                else evidence
             ),
         )
         if budget is None:
@@ -2240,6 +2503,7 @@ def _analyze_python(
                 node_index,
                 rule,
                 ast_node,
+                sink_name,
                 f"Direct flow: {src_name} ({src_cat}) \u2192 {sink_name} ({sink_cat})",
             )
 
@@ -2251,6 +2515,7 @@ def _analyze_python(
                 node_index,
                 rule,
                 ast_node,
+                sink_name,
                 f"Tainted flow: '{tv.name}' from {tv.source_call} (line {tv.lineno}, "
                 f"{src_cat}) \u2192 {sink_name} ({sink_cat})",
             )
