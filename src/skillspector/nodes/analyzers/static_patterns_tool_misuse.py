@@ -154,6 +154,13 @@ _BOUNDED_SHELL_CLAUSE_ATOM = r"(?:\\(?:\r?\n|[^\n])|[^\\\n|;&])"
 _STATIC_BRACE_WORD_CHARS = 256
 _PRINTF_STATIC_CHARS = 256
 _PRINTF_STATIC_ARGUMENTS = 32
+# How far before a substitution the printf data-consumer proof looks for
+# the start of its clause. The proof parses at most 64 words, so a clause
+# whose start lies further back than this cannot be established and keeps
+# the existing coverage diagnostic instead of scanning to the start of a
+# large single-line document for every candidate.
+_PRINTF_CLAUSE_LOOKBACK_CHARS = 8192
+_PRINTF_CLAUSE_SEPARATOR_RE = re.compile(r"[\n\r;|&(){}]")
 _PRINTF_STATIC_WORD_RE = re.compile(r"[-A-Za-z0-9_./*?%]{0,64}")
 _PRINTF_QUOTED_WORD_RE = re.compile(r"[-A-Za-z0-9_./*?% \t\r\n]{0,64}")
 # A bounded ``printf`` format operand may also carry POSIX backslash escapes.
@@ -2459,9 +2466,22 @@ def _is_printf_data_consumer_position(
     runtime_check = check_runtime or (lambda: None)
     if start < 0 or start >= len(content):
         return False
-    segment_start = start
-    while segment_start > 0 and content[segment_start - 1] not in "\n\r;|&(){}":
-        segment_start -= 1
+    # Find the start of the current clause (just after the last clause
+    # separator before the target) inside a bounded lookback window. A
+    # clause whose start is not inside the window is unproven and keeps
+    # the existing diagnostic: host-syntax projections blank the
+    # punctuation separators, so an unbounded scan would walk to the
+    # start of a large single-line document for every candidate word.
+    window_start = max(0, start - _PRINTF_CLAUSE_LOOKBACK_CHARS)
+    segment_start = window_start
+    for match in _PRINTF_CLAUSE_SEPARATOR_RE.finditer(content, window_start, start):
+        segment_start = match.end()
+    if (
+        segment_start == window_start
+        and window_start > 0
+        and content[window_start - 1] not in "\n\r;|&(){}"
+    ):
+        return False
     cursor = segment_start
     command: str | None = None
     wrapper: str | None = None

@@ -196,6 +196,25 @@ def test_assignment_prefix_before_printf_still_completes() -> None:
     assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is False
 
 
+def test_printf_clause_beyond_lookback_keeps_coverage_warning() -> None:
+    """The data-consumer proof looks back a bounded window for the clause.
+
+    A clause whose start lies further back than the lookback cannot be
+    proven, so the substitution keeps its coverage diagnostic instead
+    of scanning to the start of the file for every candidate word. A
+    separator inside the window still proves the same clause on an
+    equally long line.
+    """
+    substitution = "\"$(printf '%s' \"$1\" | sed 's/a/b/')\""
+    long_clause = "printf '%s' '" + "a" * 9000 + "' " + substitution
+    source = "#!/bin/sh\n" + long_clause + "\n"
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is True
+
+    separated = "echo '" + "a" * 9000 + "'; printf '%s' " + substitution
+    source = "#!/bin/sh\n" + separated + "\n"
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="shell") is False
+
+
 def test_operator_scan_honors_runtime_check() -> None:
     """Review #1109: the operator scan must not bypass cancellation.
 
