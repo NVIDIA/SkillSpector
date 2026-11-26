@@ -37,7 +37,19 @@ def test_optional_command_wrappers_without_executable_are_complete(
     assert not _exhausted(source + ending, "shell")
 
 
-@pytest.mark.parametrize("wrapper", ["command", "command -p", "command --", "command -p --"])
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        "command",
+        "command -p",
+        "command --",
+        "command -p --",
+        "env",
+        "env -i",
+        "env --",
+        "env NAME=value",
+    ],
+)
 @pytest.mark.parametrize(
     "redirect", ["> /tmp/x.txt", "2>>'output log'", "<input >output", ">output # comment"]
 )
@@ -51,7 +63,10 @@ def test_command_with_only_redirections_is_complete(wrapper: str, redirect: str)
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
-@pytest.mark.parametrize("source", ["command >", "command >\necho ready", "command >'unclosed"])
+@pytest.mark.parametrize(
+    "source",
+    ["command >", "command >\necho ready", "command >'unclosed", "env >", "env -i >\necho ready"],
+)
 def test_command_redirection_requires_a_complete_target(source: str) -> None:
     assert _exhausted(source, "shell")
 
@@ -61,7 +76,9 @@ def test_command_redirection_count_is_bounded() -> None:
     assert _exhausted(source, "shell")
 
 
-@pytest.mark.parametrize("wrapper", ["command", "command --", "command -p"])
+@pytest.mark.parametrize(
+    "wrapper", ["command", "command --", "command -p", "env", "env -i", "env --"]
+)
 def test_command_redirection_keeps_following_commands_visible(wrapper: str) -> None:
     source = f"{wrapper} >output rm -rf /\n"
     assert any(f.rule_id == "TM1" for f in tm_module.analyze(source, "script.sh", "shell"))
