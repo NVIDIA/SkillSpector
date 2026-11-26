@@ -247,6 +247,18 @@ _ENV_COMMAND_INJECTION_NAMES: Final = frozenset(
 _NODE_OPTIONS_CODE_FLAGS: Final = frozenset(
     {"-r", "--require", "--import", "--loader", "--experimental-loader"}
 )
+# PATH entries that resolve inside the bundle or the working directory, so a
+# file shipped next to the settings can shadow a command the session runs. The
+# variable must be the whole first path segment: $PWD_BACKUP is a different name.
+_ENV_PATH_BUNDLE_VARIABLE = re.compile(
+    r"\A(?:\$(?:CLAUDE_PROJECT_DIR|CLAUDE_PLUGIN_ROOT|PWD)|"
+    r"\$\{(?:CLAUDE_PROJECT_DIR|CLAUDE_PLUGIN_ROOT|PWD)\})(?:\Z|[\\/])"
+)
+# Windows syntax in a PATH value: an entry, quoted or not, starts with a drive
+# letter, a UNC share or a complete %VARIABLE% reference.
+_WINDOWS_PATH_LIST = re.compile(
+    r"(?:\A|;)[ \t]*\"?(?:[A-Za-z]:[\\/]|\\\\|%[A-Za-z_][A-Za-z0-9_()]*%)"
+)
 _ANTHROPIC_DEFAULT_BASE_URL: Final = "https://api.anthropic.com"
 _HookIdentity = tuple[str, str, str]
 
@@ -1386,14 +1398,41 @@ def _env_node_options_runs_code(value: str) -> bool:
     )
 
 
+def _env_path_shadows_commands(value: str) -> bool:
+    """Return whether a POSIX PATH value has an entry inside the bundle or working directory.
+
+    An empty value, an empty entry and ``.`` mean the working directory. A
+    relative entry resolves against it, and the project, plugin and ``PWD``
+    variables point at files the bundle ships. Entries are kept as written,
+    since a leading space is part of a directory name. Absolute directories,
+    ``~`` and other variables such as ``$PATH`` or ``$HOME`` are left alone.
+
+    A value written in Windows syntax is not classified. Its separators, roots
+    and quoting differ, and reading it as a POSIX list would report every
+    drive letter as a relative directory.
+    """
+    if _WINDOWS_PATH_LIST.search(value) is not None:
+        return False
+    for entry in value.split(":"):
+        if _ENV_PATH_BUNDLE_VARIABLE.match(entry) is not None:
+            return True
+        if not entry.startswith(("/", "~", "$")):
+            return True
+    return False
+
+
 def _env_value_is_flagged(name: str, value: str) -> bool:
     """Decide whether a settings `env` entry deserves a finding.
 
     Only the documented names are classified, and only their clearly risky
     values are flagged: a base URL other than the known default, a proxy URL
-    that points at a remote host, a loader-injection flag in NODE_OPTIONS, or
-    a nonempty shell-prefix/loader/SSH-command override.
+    that points at a remote host, a loader-injection flag in NODE_OPTIONS, a
+    nonempty shell-prefix/loader/SSH-command override, or a POSIX PATH with an
+    entry inside the bundle or the working directory.
     """
+    if name == "PATH":
+        # An empty PATH is not harmless: the shell then looks in the working directory.
+        return _env_path_shadows_commands(value)
     stripped = value.strip()
     if not stripped:
         return False
@@ -1426,7 +1465,9 @@ def _settings_surface_declarations(
                 if _env_value_is_flagged(name, env[name]):
                     kind = (
                         "env_code_execution"
-                        if name in _ENV_COMMAND_INJECTION_NAMES or name == "NODE_OPTIONS"
+                        if name in _ENV_COMMAND_INJECTION_NAMES
+                        or name == "NODE_OPTIONS"
+                        or name == "PATH"
                         else "traffic_redirect"
                     )
                     declarations.append(_PermissionDeclaration(Severity.HIGH, kind))
