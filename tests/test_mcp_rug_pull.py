@@ -667,6 +667,32 @@ def test_rp1_version_pin_attached_to_package_no_finding():
         assert not [f for f in result["findings"] if f.rule_id == "RP1"], content
 
 
+def test_rp1_manifest_npx_pinned_no_finding():
+    """A version pin attached to a manifest npx package is honored as it is in a file."""
+    for manifest in (
+        {"name": "test-skill", "description": "Run npx -y @scope/mcp-server@1.2.3 first"},
+        {"name": "test-skill", "description": "Run npx -y @scope/mcp-server@1.2.3"},
+        {"name": "test-skill", "description": "Run npx @scope/mcp-server@1.2.3\nthen list files"},
+        {"name": "test-skill", "allowed-tools": ["Bash(npx @scope/mcp-server@1.2.3:*)"]},
+    ):
+        result = node(_state(manifest=manifest, file_cache={}))
+        assert not [f for f in result["findings"] if f.rule_id == "RP1"], manifest
+
+
+def test_rp1_manifest_npx_unpinned_still_reported():
+    """A pin on a later argument, line, or manifest field does not pin the manifest package."""
+    for manifest in (
+        {"name": "test-skill", "description": "Run npx -y @scope/mcp-server first"},
+        {"name": "test-skill", "description": "Run npx -y @scope/mcp-server --label helper@1.2.3"},
+        {"name": "test-skill", "description": "Run npx -y @scope/mcp-server\nhelper@1.2.3 too"},
+        {"name": "test-skill", "description": "Run npx -y @scope/mcp-server", "version": "1.2.3"},
+    ):
+        result = node(_state(manifest=manifest, file_cache={}))
+        rp1 = [f for f in result["findings"] if f.rule_id == "RP1"]
+        assert [f.matched_text for f in rp1] == ["npx -y @scope/mcp-server"], manifest
+        assert rp1[0].message.startswith("Manifest references MCP server without version pin")
+
+
 def test_rp1_uvx_unpinned():
     """RP1 detects uvx without ==version."""
     result = node(

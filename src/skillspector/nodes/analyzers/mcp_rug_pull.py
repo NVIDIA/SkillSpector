@@ -609,6 +609,11 @@ def _check_rp1(
     manifest_text = str(manifest)
     for m in _RP1_NPX_CMD.finditer(manifest_text):
         budget.check_runtime("SKILL.md")
+        # The repr writes a value's line breaks as backslash escapes, so the
+        # package operand ends at the first backslash as well as at whitespace.
+        operand_suffix = manifest_text[m.end() : m.end() + 256].split("\\", 1)[0]
+        if _VERSION_PIN_RE.search(m.group(0)) or _operand_has_version_pin(operand_suffix):
+            continue
         budget.emit(
             Finding(
                 rule_id="RP1",
