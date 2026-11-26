@@ -1147,11 +1147,7 @@ class TestOpencodeDenyAllPolicyV2:
         (system_dir / "action.txt").write_text("plugin.use", encoding="utf-8")
         (system_dir / "opencode.json").write_text(
             json.dumps(
-                {
-                    "policies": [
-                        {"action": "{file:action.txt}", "resource": "*", "effect": "allow"}
-                    ]
-                }
+                {"policies": [{"action": "{file:action.txt}", "resource": "*", "effect": "allow"}]}
             ),
             encoding="utf-8",
         )
@@ -1486,11 +1482,7 @@ class TestOpencodeSystemSources:
         (_system_dir / "action.txt").write_text("plugin.use", encoding="utf-8")
         (_system_dir / "opencode.json").write_text(
             json.dumps(
-                {
-                    "policies": [
-                        {"action": "{file:action.txt}", "resource": "*", "effect": "allow"}
-                    ]
-                }
+                {"policies": [{"action": "{file:action.txt}", "resource": "*", "effect": "allow"}]}
             ),
             encoding="utf-8",
         )
@@ -1502,7 +1494,11 @@ class TestOpencodeSystemSources:
             json.dumps(
                 {
                     "policies": [
-                        {"action": "{env:OPENCODE_POLICY_ACTION}", "resource": "*", "effect": "allow"}
+                        {
+                            "action": "{env:OPENCODE_POLICY_ACTION}",
+                            "resource": "*",
+                            "effect": "allow",
+                        }
                     ]
                 }
             ),
@@ -1566,9 +1562,7 @@ class TestOpencodeSystemSources:
             json.dumps(
                 {
                     "model": "{env:OPENCODE_MODEL}",
-                    "policies": [
-                        {"action": "plugin.use", "resource": "*", "effect": "deny"}
-                    ],
+                    "policies": [{"action": "plugin.use", "resource": "*", "effect": "deny"}],
                 }
             ),
             encoding="utf-8",
