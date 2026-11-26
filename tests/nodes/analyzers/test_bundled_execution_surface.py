@@ -1295,6 +1295,16 @@ def test_bh4_disable_all_hooks_suppresses_render_commands_only() -> None:
             "HIGH",
             "env_code_execution",
         ),
+        ({"sandbox": {"enabled": False}}, "HIGH", "sandbox_weakened"),
+        ({"sandbox": {"enabled": True, "excludedCommands": ["curl"]}}, "HIGH", "sandbox_weakened"),
+        ({"sandbox": {"excludedCommands": ["docker", "git"]}}, "HIGH", "sandbox_weakened"),
+        ({"sandbox": {"excludedCommands": ["", "curl"]}}, "HIGH", "sandbox_weakened"),
+        ({"sandbox": {"filesystem": {"disabled": True}}}, "HIGH", "sandbox_weakened"),
+        (
+            {"sandbox": {"enabled": True, "filesystem": {"disabled": True}}},
+            "HIGH",
+            "sandbox_weakened",
+        ),
         ({"enableAllProjectMcpServers": True}, "CRITICAL", "mcp_auto_approve"),
         ({"enabledMcpjsonServers": ["project-server"]}, "HIGH", "mcp_auto_approve"),
     ],
@@ -1329,6 +1339,15 @@ def test_bh3_flags_risky_settings_surface(document: dict, severity: str, grant_k
         {"env": {"GIT_SSH_COMMAND": ""}},
         {"env": {"CLAUDE_CODE_SHELL_PREFIX": ""}},
         {"env": {"SAFE_TEST_VALUE": "x"}},
+        {"sandbox": {}},
+        {"sandbox": {"enabled": True}},
+        {"sandbox": {"enabled": True, "excludedCommands": []}},
+        {"sandbox": {"enabled": True, "excludedCommands": [""]}},
+        {"sandbox": {"enabled": True, "excludedCommands": [" "]}},
+        {"sandbox": {"enabled": True, "allowUnsandboxedCommands": False}},
+        {"sandbox": {"enabled": True, "autoAllowBashIfSandboxed": True}},
+        {"sandbox": {"enabled": True, "filesystem": {"disabled": False}}},
+        {"sandbox": {"enabled": True, "network": {"allowedDomains": ["pypi.org"]}}},
         {"enableAllProjectMcpServers": False},
         {"enabledMcpjsonServers": []},
     ],
@@ -1338,6 +1357,42 @@ def test_bh3_ignores_benign_settings_surface(document: dict) -> None:
 
     assert _rules(result) == []
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "sandbox",
+    [
+        "off",
+        {"enabled": "false"},
+        {"excludedCommands": "curl"},
+        {"filesystem": True},
+        {"filesystem": {"disabled": "yes"}},
+    ],
+)
+def test_bh3_marks_malformed_sandbox_partial(sandbox: object) -> None:
+    result = _run({".claude/settings.json": {"sandbox": sandbox}})
+
+    assert _rules(result) == []
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+
+
+@pytest.mark.parametrize(
+    "sandbox",
+    [
+        {"enabled": False, "excludedCommands": ["x" * 16385]},
+        {"excludedCommands": ["git", "x" * 16385]},
+        {"excludedCommands": ["x" * 16385, "git"]},
+        {"excludedCommands": [7, "git"]},
+        {"enabled": False, "filesystem": {"disabled": "yes"}},
+        {"filesystem": {"disabled": True}, "enabled": "no"},
+    ],
+)
+def test_bh3_keeps_sandbox_finding_beside_malformed_sibling(sandbox: object) -> None:
+    result = _run({".claude/settings.json": {"sandbox": sandbox}})
+
+    assert _rules(result) == ["BH3"]
+    assert result["findings"][0].evidence["grant_kinds"] == ["sandbox_weakened"]
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
 
 
 def test_unmodeled_helper_key_does_not_make_disable_all_hooks_trustworthy() -> None:

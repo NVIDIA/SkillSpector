@@ -1448,7 +1448,58 @@ def _settings_surface_declarations(
             partial = True
         elif servers:
             declarations.append(_PermissionDeclaration(Severity.HIGH, "mcp_auto_approve"))
+    if "sandbox" in document:
+        observed += 1
+        if observed > limit:
+            return declarations, True, observed
+        weakened, malformed = _sandbox_weakening(document.get("sandbox"))
+        partial = partial or malformed
+        if weakened:
+            declarations.append(_PermissionDeclaration(Severity.HIGH, "sandbox_weakened"))
     return declarations, partial, observed
+
+
+def _sandbox_weakening(sandbox: object) -> tuple[bool, bool]:
+    """Return (weakened, malformed) for a settings ``sandbox`` block.
+
+    Only settings whose effect does not depend on an undocumented default count:
+    ``enabled: false`` turns Bash sandboxing off, ``filesystem.disabled: true``
+    turns off filesystem isolation, and an ``excludedCommands`` entry that names a
+    command runs it with no filesystem restrictions and no network proxy. Each
+    setting is judged on its own, so a malformed sibling never hides one that was
+    read.
+    """
+    if not isinstance(sandbox, dict):
+        return False, True
+    weakened = False
+    malformed = False
+    if "enabled" in sandbox:
+        enabled = sandbox.get("enabled")
+        if _is_bool(enabled):
+            weakened = weakened or enabled is False
+        else:
+            malformed = True
+    if "excludedCommands" in sandbox:
+        excluded = sandbox.get("excludedCommands")
+        if not isinstance(excluded, list):
+            malformed = True
+        else:
+            for command in excluded:
+                if _is_bounded_string(command):
+                    weakened = weakened or bool(command.strip())
+                else:
+                    malformed = True
+    if "filesystem" in sandbox:
+        filesystem = sandbox.get("filesystem")
+        if not isinstance(filesystem, dict):
+            malformed = True
+        elif "disabled" in filesystem:
+            disabled = filesystem.get("disabled")
+            if _is_bool(disabled):
+                weakened = weakened or disabled is True
+            else:
+                malformed = True
+    return weakened, malformed
 
 
 def _scan_declarations(
