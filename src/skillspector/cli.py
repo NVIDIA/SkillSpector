@@ -3456,14 +3456,25 @@ def _scan_multi_skill(
         ):
             # Each output starts from the same scan summary, not another format's fallback.
             analysis_incomplete, aggregate_completeness, aggregate_risk_assessment = report_state
-            report_results = [
-                (
+            report_results: list[dict[str, object]] = []
+            report_characters = 0
+            report_output_limited = False
+            for result in results:
+                report_result = (
                     result
                     if "error" in result or report_format == format
                     else {**result, **_render_report(result, report_format)}
                 )
-                for result in results
-            ]
+                if report_format != format:
+                    report_characters += len(_result_body(report_result))
+                    if report_characters > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
+                        # Stop before parsing/merging this format's child bodies.
+                        # A small primary does not bound alternative representations.
+                        report_output_limited = True
+                        report_results.clear()
+                        break
+                report_results.append(report_result)
+            report_skills = [] if report_output_limited else processed_skills
             if report_format == FormatChoice.json:
                 combined: dict[str, object] = {
                     "multi_skill": True,
@@ -3483,7 +3494,7 @@ def _scan_multi_skill(
                     "skills": [],
                 }
                 combined_skills = cast(list[dict[str, object]], combined["skills"])
-                for skill, result in zip(processed_skills, report_results, strict=True):
+                for skill, result in zip(report_skills, report_results, strict=True):
                     if "error" in result:
                         combined_skills.append({"name": skill.name, "error": result["error"]})
                     else:
@@ -3535,8 +3546,8 @@ def _scan_multi_skill(
                             "reason": "symlink_not_followed",
                         }
                     )
-                rendered = json.dumps(combined, indent=2)
-                if len(rendered) > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
+                rendered = "" if report_output_limited else json.dumps(combined, indent=2)
+                if report_output_limited or len(rendered) > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
                     analysis_incomplete = True
                     aggregate_completeness, aggregate_limitations = _mark_recursive_output_limited(
                         aggregate_completeness,
@@ -3577,14 +3588,16 @@ def _scan_multi_skill(
                 else:
                     sys.stdout.write(rendered)
             elif report_format == FormatChoice.sarif:
-                merged_sarif = _multi_skill_sarif_report(
-                    processed_skills,
-                    report_results,
-                    aggregate_completeness,
-                    aggregate_risk_assessment,
-                )
-                rendered = json.dumps(merged_sarif, indent=2)
-                if len(rendered) > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
+                rendered = ""
+                if not report_output_limited:
+                    merged_sarif = _multi_skill_sarif_report(
+                        report_skills,
+                        report_results,
+                        aggregate_completeness,
+                        aggregate_risk_assessment,
+                    )
+                    rendered = json.dumps(merged_sarif, indent=2)
+                if report_output_limited or len(rendered) > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
                     analysis_incomplete = True
                     aggregate_completeness, aggregate_limitations = _mark_recursive_output_limited(
                         aggregate_completeness,
@@ -3608,7 +3621,7 @@ def _scan_multi_skill(
                     sys.stdout.write(rendered)
             else:
                 sections: list[str] = []
-                for skill, result in zip(processed_skills, report_results, strict=True):
+                for skill, result in zip(report_skills, report_results, strict=True):
                     if "error" not in result:
                         sections.append(f"--- {skill.relative_path} ---\n\n{_result_body(result)}")
                 if analysis_incomplete:
@@ -3619,7 +3632,7 @@ def _scan_multi_skill(
                         )
                     )
                 rendered = "\n\n".join(sections)
-                if len(rendered) > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
+                if report_output_limited or len(rendered) > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
                     analysis_incomplete = True
                     aggregate_completeness, aggregate_limitations = _mark_recursive_output_limited(
                         aggregate_completeness,

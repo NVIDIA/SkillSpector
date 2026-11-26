@@ -1068,6 +1068,177 @@ def test_additional_recursive_report_does_not_change_other_outputs(tmp_path, mon
     assert json.loads(output.read_text()) == json.loads(copy.read_text())
 
 
+@pytest.mark.parametrize("alternative", list(cli.FormatChoice))
+@pytest.mark.parametrize("large_first", [False, True])
+@pytest.mark.parametrize(
+    "child_characters,expected_renders", [(16_667, 3), (25_000, 3), (50_001, 1)]
+)
+def test_recursive_alternative_stops_rendering_at_aggregate_limit(
+    tmp_path, monkeypatch, alternative, large_first, child_characters, expected_renders
+):
+    """An alternative's aggregate work bound must stop later children, not scanning."""
+    root = tmp_path / "skills"
+    inputs = {}
+    for name in ("one", "two", "three", "four", "five"):
+        skill = root / name
+        skill.mkdir(parents=True)
+        source = skill / "SKILL.md"
+        source.write_bytes(b"# Preserve input\r\n")
+        inputs[source] = source.read_bytes()
+    primary = (
+        cli.FormatChoice.terminal if alternative == cli.FormatChoice.json else cli.FormatChoice.json
+    )
+    other = (
+        cli.FormatChoice.markdown
+        if alternative != cli.FormatChoice.markdown
+        else cli.FormatChoice.sarif
+    )
+    scan = Mock(side_effect=lambda input_path, format, **kw: scan_result(input_path, format))
+    monkeypatch.setattr(cli, "_scan_skill", scan)
+    monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_REPORT_CHARACTERS", 50_000)
+    render = cli._render_report
+
+    def padded_render(state, format):
+        rendered = render(state, format)
+        if format == alternative:
+            if format in (cli.FormatChoice.json, cli.FormatChoice.sarif):
+                payload = json.loads(rendered["report_body"])
+                padding_container = (
+                    payload["runs"][0].setdefault("properties", {})
+                    if format == cli.FormatChoice.sarif
+                    else payload["metadata"]
+                )
+                padding_container["padding"] = ""
+                padding_container["padding"] = "x" * (
+                    child_characters - len(json.dumps(payload, indent=2))
+                )
+                rendered["report_body"] = json.dumps(payload, indent=2)
+                if format == cli.FormatChoice.sarif:
+                    rendered["sarif_report"] = payload
+            else:
+                rendered["report_body"] += "x" * (child_characters - len(rendered["report_body"]))
+            assert len(rendered["report_body"]) == child_characters
+        return rendered
+
+    rendering = Mock(side_effect=padded_render)
+    monkeypatch.setattr(cli, "_render_report", rendering)
+    parse = Mock(wraps=cli._recursive_json_payload)
+    monkeypatch.setattr(cli, "_recursive_json_payload", parse)
+    merge_sarif = Mock(wraps=cli._multi_skill_sarif_report)
+    monkeypatch.setattr(cli, "_multi_skill_sarif_report", merge_sarif)
+    output = tmp_path / "primary"
+    copy = tmp_path / "copy"
+    limited = tmp_path / "limited"
+    small = tmp_path / "small"
+    declarations = [
+        f"{alternative.value}={limited}",
+        f"{primary.value}={copy}",
+        f"{other.value}={small}",
+    ]
+    if not large_first:
+        declarations.reverse()
+    args = [
+        "scan",
+        str(root),
+        "--recursive",
+        "--no-llm",
+        "--fail-on-incomplete",
+        "-f",
+        primary.value,
+        "-o",
+        str(output),
+    ]
+    for declaration in declarations:
+        args.extend(["--report", declaration])
+    result = runner.invoke(cli.app, args)
+    assert result.exit_code == 0, result.output
+    assert scan.call_count == len(inputs)
+    assert output.read_bytes() == copy.read_bytes()
+    assert small.read_text()
+    assert sum(call.args[1] == alternative for call in rendering.call_args_list) == expected_renders
+    assert sum(call.args[1] == other for call in rendering.call_args_list) == len(inputs)
+    limited_body = limited.read_text()
+    assert len(limited_body) <= 50_000
+    assert "recursive serialized report character budget" in limited_body
+    # Oversized bodies must never be parsed or merged into a full aggregate.
+    assert all(len(call.args[0]["report_body"]) < child_characters for call in parse.call_args_list)
+    if alternative == cli.FormatChoice.json:
+        payload = json.loads(limited_body)
+        assert payload["skills_output_omitted"] == len(inputs)
+        assert payload["analysis_completeness"]["status"] == "partial"
+    elif alternative == cli.FormatChoice.sarif:
+        assert merge_sarif.call_args.args[:2] == ([], [])
+        validate_sarif_report(json.loads(limited_body))
+    for source, original in inputs.items():
+        assert source.read_bytes() == original
+
+
+def test_recursive_reference_heavy_json_stops_before_parsing(tmp_path, monkeypatch):
+    """Real JSON includes all components while the terminal primary shows only 15."""
+    root = tmp_path / "skills"
+    states = {}
+    for name in ("one", "two", "three", "four", "five"):
+        skill = root / name
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_bytes(b"# Preserve input\r\n")
+        state = {
+            "skill_path": str(skill),
+            "manifest": {"name": name},
+            "findings": [],
+            "components": [f"references/{index:03}-{'x' * 80}.md" for index in range(100)],
+            "use_llm": False,
+            "llm_requested": False,
+            "output_format": "terminal",
+        }
+        state["component_metadata"] = [
+            {"path": path, "type": "markdown", "lines": 1, "size_bytes": 10}
+            for path in state["components"]
+        ]
+        states[str(skill)] = {**state, **report(state)}
+    sample = next(iter(states.values()))
+    json_body = cli._render_report(sample, cli.FormatChoice.json)["report_body"]
+    assert len(json.loads(json_body)["components"]) == 100
+    budget = 2 * max(
+        len(cli._render_report(state, cli.FormatChoice.json)["report_body"])
+        for state in states.values()
+    )
+    assert sum(len(state["report_body"]) for state in states.values()) < budget
+    monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_REPORT_CHARACTERS", budget)
+    scan = Mock(side_effect=lambda input_path, **kw: states[input_path])
+    monkeypatch.setattr(cli, "_scan_skill", scan)
+    primary = tmp_path / "primary"
+    args = [
+        "scan",
+        str(root),
+        "--recursive",
+        "--no-llm",
+        "--fail-on-incomplete",
+        "-o",
+        str(primary),
+    ]
+    baseline_run = runner.invoke(cli.app, args)
+    assert baseline_run.exit_code == 0, baseline_run.output
+    primary_bytes = primary.read_bytes()
+    scan.reset_mock()
+    render = Mock(wraps=cli._render_report)
+    monkeypatch.setattr(cli, "_render_report", render)
+    parse = Mock(wraps=cli._recursive_json_payload)
+    monkeypatch.setattr(cli, "_recursive_json_payload", parse)
+    alternative = tmp_path / "alternative.json"
+    result = runner.invoke(cli.app, [*args, "--report", f"json={alternative}"])
+    assert result.exit_code == baseline_run.exit_code, result.output
+    assert primary.read_bytes() == primary_bytes
+    assert scan.call_count == len(states)
+    assert render.call_count == 3
+    parse.assert_not_called()
+    payload = json.loads(alternative.read_text())
+    assert payload["skills_output_omitted"] == len(states)
+    assert payload["analysis_completeness"]["status"] == "partial"
+    assert len(alternative.read_text()) <= budget
+    for source in root.glob("*/SKILL.md"):
+        assert source.read_bytes() == b"# Preserve input\r\n"
+
+
 def test_registry_additional_json_reuses_scan(tmp_path, monkeypatch):
     source = tmp_path / "registry.json"
     source.write_text("{}")
