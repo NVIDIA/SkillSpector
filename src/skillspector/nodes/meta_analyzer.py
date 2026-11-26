@@ -600,9 +600,11 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
                 continue
             explanation = (assessment.get("explanation") or "").strip()
             remediation = (assessment.get("remediation") or "").strip()
-            # Resolve SC4's evidence-specific fallback per matched finding,
-            # including when one coarse assessment confirms multiple findings.
-            if f.rule_id == "SC4":
+            # Resolve per-call guidance before the rule defaults. AST4 and SC4
+            # attach text that depends on the matched call/evidence (shell mode,
+            # evidence detail), so dropping it would replace specific advice with
+            # a generic default. Other rules keep their rule-level fallback.
+            if f.rule_id in {"AST4", "SC4"}:
                 explanation = explanation or (f.explanation or "").strip()
                 remediation = remediation or (f.remediation or "").strip()
             explanation = explanation or get_explanation(f.rule_id)
