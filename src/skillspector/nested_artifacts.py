@@ -46,6 +46,7 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.passive_svg import is_structurally_valid_passive_svg
 from skillspector.python_ast import PythonSourceClassification, classify_python_source
+from skillspector.references import _MAX_INLINE_IMAGE_BYTES, _MAX_INLINE_IMAGES
 from skillspector.resource_limits import bounded_capacity
 
 ARCHIVE_MAX_DEPTH = 3
@@ -120,6 +121,19 @@ _EXPECTED_SUFFIXES: dict[str, frozenset[str]] = {
     "gzip": frozenset({".gz", ".tgz"}),
 }
 
+_DATA_IMAGE_URI_RE = re.compile(r"data:image/[^;\s\"'<>]+;base64,[A-Za-z0-9+/=_-]*")
+
+
+def _extract_data_image_uris(text: str) -> list[str]:
+    """Extract data:image/ URIs from arbitrary text content.
+
+    Returns a list of matching URIs (may contain duplicates if the same URI
+    appears multiple times). The regex is intentionally permissive on the
+    MIME subtype and base64 payload; downstream size/quantity bounds apply
+    when adding to the inventory.
+    """
+    return _DATA_IMAGE_URI_RE.findall(text)
+
 
 @dataclass
 class NestedInspectionResult:
@@ -148,6 +162,10 @@ class NestedInspectionResult:
     disk_container_events: list[InspectionLedgerEvent] = field(default_factory=list)
     _active_disk_path: str | None = None
     uncompressed_bytes: int = 0
+    # Inline data:image/ URIs keyed by the member virtual path that carries
+    # them (provenance), plus members whose URI list hit the root's bounds.
+    inline_data_images: dict[str, list[str]] = field(default_factory=dict)
+    inline_data_images_truncated: set[str] = field(default_factory=set)
     # Exceptions can target a top-level container before a virtual artifact row
     # exists. Preserve their canonical disposition so build_context can apply
     # the same accounting to the outer bundle inventory.
@@ -820,6 +838,15 @@ def _record_member(
     result.components.append(virtual_path)
     result.file_cache[virtual_path] = data.decode("utf-8", errors="replace")
     result.raw_file_cache[virtual_path] = data
+    # Inline URIs from text members only; containers and binaries are never
+    # folded by the runner. Same 8-per-source / 1 MB caps as the root manifest.
+    if virtual_type != "binary" and nested_type is None:
+        uris = _extract_data_image_uris(result.file_cache[virtual_path])
+        kept = [uri for uri in uris if len(uri) <= _MAX_INLINE_IMAGE_BYTES][:_MAX_INLINE_IMAGES]
+        if kept:
+            result.inline_data_images[virtual_path] = kept
+        if len(kept) != len(uris):
+            result.inline_data_images_truncated.add(virtual_path)
     result.python_source_classifications[virtual_path] = source_classification
     result.artifact_inventory.append(classify_artifact(virtual_path, data))
     if not complete_content:
