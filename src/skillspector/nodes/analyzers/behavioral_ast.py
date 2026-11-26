@@ -252,6 +252,18 @@ _AST4_BATCH_FILE_REMEDIATION = (
     "the system shell. Resolve the batch file to a trusted path and avoid passing untrusted "
     "arguments, or launch a non-batch executable or explicit interpreter instead."
 )
+_AST4_BATCH_FILE_DYNAMIC_EXPLANATION = (
+    "Batch-file target with a dynamic argument vector: subprocess names a .cmd/.bat file with "
+    "shell=False, but at least one argument is caller-controlled rather than a literal value. "
+    "CPython documents that Windows may launch these files through the system command shell "
+    "regardless of the shell flag, so those dynamic values can still be subject to shell parsing. "
+    "This call does not prove that shell parsing is impossible."
+)
+_AST4_BATCH_FILE_DYNAMIC_REMEDIATION = (
+    "Keep shell=False and validate or allowlist every dynamic argument before launch. Do not treat "
+    "shell=False as proof that a .cmd/.bat target cannot be parsed by the system shell. Resolve the "
+    "batch file to a trusted path, or launch a non-batch executable or explicit interpreter instead."
+)
 _AST4_SHELL_BUILD_EXPLANATION = (
     "Shell command construction: subprocess runs a command string with shell=True, so "
     "concatenated input and shell metacharacters can change the invocation or inject additional "
@@ -608,7 +620,12 @@ def _ast4_guidance(node: ast.Call, attr: str) -> tuple[str, str]:
     if _is_shell_interpreter_name(executable.name):
         return _AST4_SHELL_STRING_EXPLANATION, _AST4_SHELL_STRING_REMEDIATION
     if _is_batch_file_name(executable.name):
-        return _AST4_BATCH_FILE_EXPLANATION, _AST4_BATCH_FILE_REMEDIATION
+        # The literal-argument wording is only true when every element is a
+        # constant; a caller-controlled argument keeps the Windows shell warning
+        # but must not be described as a fixed vector of literals.
+        if _is_fixed_argv(command):
+            return _AST4_BATCH_FILE_EXPLANATION, _AST4_BATCH_FILE_REMEDIATION
+        return _AST4_BATCH_FILE_DYNAMIC_EXPLANATION, _AST4_BATCH_FILE_DYNAMIC_REMEDIATION
     if _is_fixed_argv(command):
         return _AST4_FIXED_ARGV_EXPLANATION, _AST4_FIXED_ARGV_REMEDIATION
     return _AST4_UNKNOWN_EXPLANATION, _AST4_UNKNOWN_REMEDIATION

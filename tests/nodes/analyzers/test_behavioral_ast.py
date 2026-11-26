@@ -380,6 +380,52 @@ class TestSubprocessGuidance:
         assert "shell expansion is disabled" not in explanation
         assert "do not treat it as proof" in remediation
 
+    @pytest.mark.parametrize(
+        ("code", "label"),
+        [
+            pytest.param(
+                "import subprocess\n"
+                "value = get_argument()\n"
+                "subprocess.run(['build.cmd', value], shell=False)\n",
+                "dynamic-argv-element",
+                id="dynamic-argv-element",
+            ),
+            pytest.param(
+                "import subprocess\n"
+                "cmd = build_command()\n"
+                "subprocess.run([cmd, 'release'], executable=r'C:\\tools\\build.cmd', shell=False)\n",
+                "dynamic-executable-override-vector",
+                id="dynamic-executable-override-vector",
+            ),
+        ],
+    )
+    def test_batch_target_with_dynamic_arguments_is_qualified(self, code, label):
+        """A caller-controlled argument must not be described as a literal fixed vector."""
+        finding = next(f for f in _run(code) if f.rule_id == "AST4")
+
+        explanation = (finding.explanation or "").lower()
+        remediation = (finding.remediation or "").lower()
+
+        assert "batch-file target" in explanation
+        assert "dynamic argument vector" in explanation
+        assert "system command shell" in explanation
+        assert "caller-controlled" in explanation
+        assert "fixed argument vector" not in explanation
+        assert "literal arguments" not in explanation
+        assert "does not prove that shell parsing is impossible" in explanation
+        assert "shell=false" in remediation
+        assert "do not treat" in remediation
+
+    def test_literal_batch_target_keeps_literal_wording(self):
+        """The literal control must still say the arguments are literals."""
+        code = 'import subprocess\nsubprocess.run(["build.cmd", "release"], shell=False)\n'
+        finding = next(f for f in _run(code) if f.rule_id == "AST4")
+
+        explanation = (finding.explanation or "").lower()
+
+        assert "literal arguments" in explanation
+        assert "dynamic argument vector" not in explanation
+
     def test_popen_positional_shell_executable_uses_shell_guidance(self):
         """`Popen` accepts `executable` as its third positional argument."""
         code = (
