@@ -223,14 +223,19 @@ app(prog_name="skillspector")
 
 
 @pytest.mark.parametrize("entry_module", ["skillspector.cli_entry", "skillspector.cli"])
-def test_registry_scan_does_not_import_scanner(tmp_path: Path, entry_module: str) -> None:
+@pytest.mark.parametrize("additional_report", [False, True])
+def test_registry_scan_does_not_import_scanner(
+    tmp_path: Path, entry_module: str, additional_report: bool
+) -> None:
     payload = tmp_path / "registry.json"
     payload.write_text(
         '{"servers": [{"server": {"name": "example/demo", "version": "1.0.0"}}]}', encoding="utf-8"
     )
     report = tmp_path / "report.json"
+    additional = tmp_path / "additional.json"
+    options = ["--report", f"json={additional}"] if additional_report else []
     result = _run_without_scanner(
-        ["scan", str(payload), "--mcp-registry", "-f", "JSON", "-o", str(report)],
+        ["scan", str(payload), "--mcp-registry", "-f", "JSON", "-o", str(report), *options],
         entry_module=entry_module,
     )
     assert result.returncode == 0, result.stderr
@@ -238,7 +243,11 @@ def test_registry_scan_does_not_import_scanner(tmp_path: Path, entry_module: str
     assert data["mcp_registry"] is True
     assert len(data["servers"]) == 1
     assert data["servers"][0]["snapshot"]["name"] == "example/demo"
-    assert result.stderr == ""
+    if additional_report:
+        assert json.loads(additional.read_text()) == data
+        assert "Report saved to" in result.stderr
+    else:
+        assert result.stderr == ""
 
 
 @pytest.mark.parametrize(

@@ -1829,10 +1829,9 @@ def test_cli_scan_preserves_baseline_at_normalized_report_destination(
     )
 
     assert result.exit_code == 2
-    expected_error = (
-        "Not a directory" if alias == "file-parent" else "--output points to the input file"
-    )
-    assert expected_error in result.output
+    # The multi-report branch normalizes all writer destinations before preflight,
+    # so even a file/.. alias reports the baseline collision rather than ENOTDIR.
+    assert "--output points to the input file" in result.output
     assert baseline.read_bytes() == original
     assert not (skill / "missing").exists()
     scan.assert_not_called()
