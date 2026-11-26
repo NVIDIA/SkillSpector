@@ -2253,6 +2253,7 @@ def _printf_invocation_has_following_operator(
                 return False
             return inner[cursor] in ";|&()<>"
 
+
 def _shell_operator_at(text: str, cursor: int) -> tuple[str, int] | None:
     """Return the shell operator spelling at ``cursor`` and its end offset."""
     if cursor >= len(text):
@@ -2296,9 +2297,7 @@ def _is_safe_sed_script(script: str) -> bool:
     if script.startswith("/") and script.endswith("/d") and len(script) >= 4:
         pattern = script[1:-2]
         return (
-            0 < len(pattern) <= 128
-            and "/" not in pattern.replace("\\/", "")
-            and ";" not in pattern
+            0 < len(pattern) <= 128 and "/" not in pattern.replace("\\/", "") and ";" not in pattern
         )
     return False
 
@@ -2369,8 +2368,7 @@ def _is_bounded_printf_pipeline(
     if first and first[0] == "env":
         first = first[1:]
         while first and (
-            first[0] in {"-i", "--"}
-            or _SHELL_ASSIGNMENT_PREFIX_RE.match(first[0]) is not None
+            first[0] in {"-i", "--"} or _SHELL_ASSIGNMENT_PREFIX_RE.match(first[0]) is not None
         ):
             first = first[1:]
     if not first or first[0] != "printf":
@@ -2399,8 +2397,7 @@ def _is_bounded_printf_pipeline(
             return False
     for segment in segments[1:]:
         if not segment or any(
-            _DYNAMIC_SHELL_WORD_SENTINEL in word
-            or _RUNTIME_SHELL_PARAMETER_SENTINEL in word
+            _DYNAMIC_SHELL_WORD_SENTINEL in word or _RUNTIME_SHELL_PARAMETER_SENTINEL in word
             for word in segment
         ):
             return False
@@ -2419,8 +2416,7 @@ def _is_bounded_printf_pipeline(
             pattern = args[-1]
             flags = args[:-1]
             if len(flags) > 4 or any(
-                re.fullmatch(r"-(?:[EFiqvx]{1,8}|m[1-9][0-9]{0,2})", flag) is None
-                for flag in flags
+                re.fullmatch(r"-(?:[EFiqvx]{1,8}|m[1-9][0-9]{0,2})", flag) is None for flag in flags
             ):
                 return False
             if not 1 <= len(pattern) <= 128 or pattern.startswith("-"):
@@ -2556,10 +2552,7 @@ def _is_printf_data_consumer_position(
                 continue
             if word.startswith("-"):
                 return False
-            if (
-                _DYNAMIC_SHELL_WORD_SENTINEL in word
-                or _RUNTIME_SHELL_PARAMETER_SENTINEL in word
-            ):
+            if _DYNAMIC_SHELL_WORD_SENTINEL in word or _RUNTIME_SHELL_PARAMETER_SENTINEL in word:
                 return False
             if not word or len(word) > 128:
                 return False
@@ -2584,9 +2577,7 @@ def _is_printf_data_consumer_position(
     ):
         return False
     if (
-        re.search(
-            r"(?:^|[;\n])\s*(?:function\s+)?(?:printf|sed|tr|head|grep)\s*\(\s*\)", content
-        )
+        re.search(r"(?:^|[;\n])\s*(?:function\s+)?(?:printf|sed|tr|head|grep)\s*\(\s*\)", content)
         is not None
     ):
         return False
