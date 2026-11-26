@@ -18,9 +18,10 @@
 Builds flat ScanContext fields (components, file_cache, manifest, etc.)
 from a local skill directory.
 
-Known limit: nested-manifest inputs have no root primary text to
-inventory, so inline ``data:`` image URIs are neither decoded nor
-scanned; their local image files are still cached and extracted.
+Nested-manifest inline ``data:`` image URIs are now extracted from text
+members, inventoried in ``inline_data_images`` keyed by member virtual
+path, and routed through the same bounded decode/extract/scan flow as
+root manifest inline images (via ``_extract_inline_image_text``).
 """
 
 from __future__ import annotations
@@ -2760,6 +2761,37 @@ def _unsupported_primary_bytes(
     )
 
 
+def _extract_inline_image_text(uris: list[str], *, deadline: float) -> tuple[str, bool, str | None]:
+    """Decode and extract metadata text from inline ``data:`` URIs, bounded.
+
+    Returns ``(text, truncated, reason)``. Truncation covers both a capped
+    text layer and an expired deadline; a decode failure yields the
+    ``inline_image_decode_error`` reason with no text.
+    """
+    parts: list[str] = []
+    truncated = False
+    reason: str | None = None
+    for uri in uris:
+        if monotonic() >= deadline:
+            truncated = True
+            break
+        header, _, data = uri.partition(",")
+        try:
+            if header.rstrip().lower().endswith(";base64"):
+                inline_raw = base64.b64decode(data, validate=True)
+            else:
+                # RFC 2397 default encoding: percent-escaped bytes.
+                inline_raw = unquote_to_bytes(data)
+        except ValueError:
+            reason = LedgerReason.INLINE_IMAGE_DECODE_ERROR.value
+            continue
+        text, capped = extract_image_text_detailed(inline_raw)
+        truncated = truncated or capped
+        if text:
+            parts.append(text)
+    return "\n".join(parts), truncated, reason
+
+
 def build_context(state: SkillspectorState) -> dict[str, object]:
     """Build flat ScanContext fields from state skill_path (local directory).
 
@@ -3184,30 +3216,12 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 and has_image_magic(raw)
             ):
                 image_text_cache[path] = extract_image_text_detailed(raw)
-        inline_parts: list[str] = []
-        inline_truncated = False
-        inline_reason: str | None = None
-        for uri in image_inventory["inline_images"]:
-            if monotonic() >= processing_deadline:
-                inline_truncated = True
-                break
-            header, _, data = uri.partition(",")
-            try:
-                if header.rstrip().lower().endswith(";base64"):
-                    inline_raw = base64.b64decode(data, validate=True)
-                else:
-                    # RFC 2397 default encoding: percent-escaped bytes.
-                    inline_raw = unquote_to_bytes(data)
-            except ValueError:
-                inline_reason = LedgerReason.INLINE_IMAGE_DECODE_ERROR.value
-                continue
-            text, capped = extract_image_text_detailed(inline_raw)
-            inline_truncated = inline_truncated or capped
-            if text:
-                inline_parts.append(text)
-        if primary_path is not None and (inline_parts or inline_truncated or inline_reason):
+        inline_text, inline_truncated, inline_reason = _extract_inline_image_text(
+            image_inventory["inline_images"], deadline=processing_deadline
+        )
+        if primary_path is not None and (inline_text or inline_truncated or inline_reason):
             image_inline_text_cache[primary_path] = (
-                "\n".join(inline_parts),
+                inline_text,
                 inline_truncated,
                 inline_reason,
             )
@@ -3548,6 +3562,15 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 _image_runtime_limit_row(path)
                 break
             image_text_cache[path] = extract_image_text_detailed(raw)
+    # Inline URIs found inside archive members fold into that member's own
+    # static row, exactly like the root manifest's inline text.
+    for member_path, uris in nested.inline_data_images.items():
+        if member_path not in ordinary_nested_components:
+            continue
+        text, truncated, reason = _extract_inline_image_text(uris, deadline=processing_deadline)
+        truncated = truncated or member_path in nested.inline_data_images_truncated
+        if text or truncated or reason:
+            image_inline_text_cache[member_path] = (text, truncated, reason)
     artifact_inventory.extend(
         item for item in nested.artifact_inventory if item["path"] not in reserved_paths
     )

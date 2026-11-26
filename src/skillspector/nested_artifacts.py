@@ -46,6 +46,7 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.passive_svg import is_structurally_valid_passive_svg
 from skillspector.python_ast import PythonSourceClassification, classify_python_source
+from skillspector.references import _MAX_INLINE_IMAGE_BYTES, _MAX_INLINE_IMAGES
 from skillspector.resource_limits import bounded_capacity
 
 ARCHIVE_MAX_DEPTH = 3
@@ -161,8 +162,10 @@ class NestedInspectionResult:
     disk_container_events: list[InspectionLedgerEvent] = field(default_factory=list)
     _active_disk_path: str | None = None
     uncompressed_bytes: int = 0
-    # Inline data:image/ URIs found in nested text files.
-    inline_data_images: list[str] = field(default_factory=list)
+    # Inline data:image/ URIs keyed by the member virtual path that carries
+    # them (provenance), plus members whose URI list hit the root's bounds.
+    inline_data_images: dict[str, list[str]] = field(default_factory=dict)
+    inline_data_images_truncated: set[str] = field(default_factory=set)
     # Exceptions can target a top-level container before a virtual artifact row
     # exists. Preserve their canonical disposition so build_context can apply
     # the same accounting to the outer bundle inventory.
@@ -832,8 +835,15 @@ def _record_member(
     result.components.append(virtual_path)
     result.file_cache[virtual_path] = data.decode("utf-8", errors="replace")
     result.raw_file_cache[virtual_path] = data
-    # Extract inline data:image/ URIs from text members of any container kind.
-    result.inline_data_images.extend(_extract_data_image_uris(result.file_cache[virtual_path]))
+    # Inline URIs from text members only; containers and binaries are never
+    # folded by the runner. Same 8-per-source / 1 MB caps as the root manifest.
+    if virtual_type != "binary" and nested_type is None:
+        uris = _extract_data_image_uris(result.file_cache[virtual_path])
+        kept = [uri for uri in uris if len(uri) <= _MAX_INLINE_IMAGE_BYTES][:_MAX_INLINE_IMAGES]
+        if kept:
+            result.inline_data_images[virtual_path] = kept
+        if len(kept) != len(uris):
+            result.inline_data_images_truncated.add(virtual_path)
     result.python_source_classifications[virtual_path] = source_classification
     result.artifact_inventory.append(classify_artifact(virtual_path, data))
     if not complete_content:
@@ -2056,16 +2066,5 @@ def inspect_nested_artifacts(
     result._active_disk_path = None
     result.components = list(dict.fromkeys(result.components))
     result.uncompressed_bytes = budget.uncompressed_bytes
-    # Emit ledger events for inline data:image/ URIs found in nested text files.
-    for uri in result.inline_data_images:
-        result.ledger_events.append(
-            ledger_event(
-                outcome=LedgerOutcome.COMPLETED,
-                record_type=LedgerRecordType.SYSTEM,
-                phase="nested_artifact_inspection",
-                path=uri,
-                reason=LedgerReason.INLINE_DATA_IMAGE,
-            )
-        )
     _apply_inventory_overrides(result)
     return result

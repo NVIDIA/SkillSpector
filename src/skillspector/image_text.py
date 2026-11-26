@@ -13,11 +13,11 @@ Bounds are truncation-honest, never silent: every cap reports whether
 text may have been lost, so callers record ``PARTIAL`` instead of
 claiming ``COMPLETED``. Text caps apply to text bytes (per-chunk and
 global), GIF walks to a sub-block budget, so padding cannot hide a
-later payload. Oversized text yields its bounded prefix. Known limits:
-a PNG chunk length that overruns the file ends the walk silently (see
-``_png_text``), because the chunks already read were complete; such
-inputs may therefore remain silently ``COMPLETED``. Nested-manifest
-inline ``data:`` URIs never reach this module and remain unscanned.
+later payload. Oversized text yields its bounded prefix. A PNG chunk
+length that overruns the file now sets ``truncated = True`` and callers
+report ``PARTIAL`` (fix in ``_png_text``). Nested-manifest inline
+``data:`` URIs are routed through the shared bounded decode/extract/scan
+flow in ``build_context`` and ``nested_artifacts``.
 """
 
 from __future__ import annotations

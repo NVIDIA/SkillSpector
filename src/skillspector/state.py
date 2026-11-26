@@ -283,7 +283,7 @@ class SkillspectorState(TypedDict, total=False):
     # re-extracting outside the deadline. Tuples arrive as lists after a
     # checkpoint round-trip; runners coerce both shapes.
     image_text_cache: dict[str, tuple[str, bool]]
-    image_inline_text_cache: dict[str, tuple[str, bool]]
+    image_inline_text_cache: dict[str, tuple[str, bool, str | None]]
     # Retained for compatibility with the persisted workflow-state schema.
     ast_cache: dict[str, str]
     # Key for the process-local parsed-AST cache.  The ASTs themselves stay
