@@ -474,6 +474,28 @@ def test_baseline_from_dict_rejects_non_mapping() -> None:
         baseline_from_dict(["not", "a", "mapping"])  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("rule", "field"),
+    [
+        ({"id": 123, "path": "*"}, "id"),
+        ({"rule_id": ["P1"], "path": "*"}, "rule_id"),
+        ({"id": "P1", "path": 7}, "path"),
+        ({"id": "P1", "file": 8}, "file"),
+        ({"id": "P1", "message": 42}, "message"),
+        ({"id": 0, "path": "*"}, "id"),
+        ({"id": "P1", "path": False}, "path"),
+        ({"rule_id": [], "path": "*"}, "rule_id"),
+        ({"id": "P1", "message": 0}, "message"),
+        ({"id": "P1", "rule_id": 5}, "rule_id"),
+    ],
+)
+def test_baseline_from_dict_rejects_non_string_rule_selectors(
+    rule: dict[str, object], field: str
+) -> None:
+    with pytest.raises(ValueError, match=rf"baseline rule {field} must be a string"):
+        baseline_from_dict({"version": 2, "rules": [{**rule, "reason": "invalid selector"}]})
+
+
 @pytest.mark.parametrize("field", ["rules", "fingerprints"])
 @pytest.mark.parametrize("value", [{}, "", 0, False])
 def test_baseline_from_dict_rejects_falsy_non_list_collections(field: str, value: object) -> None:

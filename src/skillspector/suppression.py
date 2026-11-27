@@ -418,6 +418,10 @@ def baseline_from_dict(data: dict[str, Any]) -> Baseline:
         reason = raw.get("reason", "")
         if version == BASELINE_VERSION and (not isinstance(reason, str) or not reason.strip()):
             raise ValueError("each v2 suppression rule must have a non-empty reason")
+        for key in ("id", "rule_id", "path", "file", "message"):
+            value = raw.get(key)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"baseline rule {key} must be a string, got: {value!r}")
         rule = SuppressionRule(
             rule_id=raw.get("id") or raw.get("rule_id"),
             path=raw.get("path") or raw.get("file"),
