@@ -1,0 +1,74 @@
+# Third-Party Notices
+
+This project includes content derived from third-party work, used under the terms of its original license.
+
+## Impeccable
+
+Copyright 2025 Paul Bakaus.
+Original work: https://github.com/pbakaus/impeccable
+Original license: Apache-2.0 (included in LICENSE).
+
+Uizze modifies and redistributes design guidance, including creation, craft,
+refinement, web and native audits, and Overdrive, under Uizze product terminology.
+This is an adaptation, not an endorsement by the original author.
+See MODIFICATIONS.md and MANIFEST.json in each package for pinned sources.
+
+## Platform Design Skills
+
+The `reference/ios.md` playbook includes material distilled from ehmo's
+`platform-design-skills` (Apple Human Interface Guidelines).
+
+**Original work:** https://github.com/ehmo/platform-design-skills
+**Original license:** MIT
+**Author:** ehmo
+
+MIT License
+
+Copyright (c) 2026
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+## Appllama
+
+Research playbooks and craft guidance adapted from https://github.com/Appllama/appllama-skills
+Pinned revision: dd5caaec3d5d50ad7fc0324da238119c6b7c3707.
+The original MIT notice applies to this material; it is not replaced by the package Apache-2.0 license.
+
+MIT License
+
+Copyright (c) 2026 Antmind Ventures Private Limited (appllama.io)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
