@@ -1,0 +1,4 @@
+interface:
+  display_name: "UI Design by UX Pilot"
+  short_description: "Design real screens on a canvas, then build them in your code"
+  default_prompt: "Use $ui-design to design the screens for my app with UX Pilot, then build them in this project."
