@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from bisect import bisect_left
 from collections.abc import Callable, Iterator
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from html.parser import HTMLParser
 
@@ -2778,6 +2779,232 @@ def _implicit_template_callback(
     return None
 
 
+_PROXY_TRAPS = frozenset(
+    {
+        "apply",
+        "construct",
+        "defineProperty",
+        "deleteProperty",
+        "get",
+        "getOwnPropertyDescriptor",
+        "getPrototypeOf",
+        "has",
+        "isExtensible",
+        "ownKeys",
+        "preventExtensions",
+        "set",
+        "setPrototypeOf",
+    }
+)
+
+
+def _template_invoked_hooks(
+    program: JavaScriptProgram, check_runtime: Callable[[], None]
+) -> set[int]:
+    """Hook functions that evaluating a template substitution can invoke.
+
+    A getter, setter, coercion method, or Proxy trap on a const-bound object
+    runs when a template reads that object. Calls inside such a hook are
+    reachable from template evaluation even though no template reaches them
+    as an argument, so they keep the execution barrier. Registered callback
+    identifiers are handled by ``_implicit_template_callback`` instead.
+    """
+    receivers: dict[tuple[int, str], list[tuple[int, str, str | None]]] = {}
+    for node in program.nodes:
+        check_runtime()
+        if node.type != "variable_declarator":
+            continue
+        name_node = node.child_by_field_name("name")
+        value = node.child_by_field_name("value")
+        declaration = node.parent
+        if (
+            name_node is None
+            or name_node.type != "identifier"
+            or value is None
+            or declaration is None
+            or declaration.type != "lexical_declaration"
+            or declaration.children[0].type != "const"
+            or declaration.parent is None
+        ):
+            continue
+        proxy = value.type == "new_expression"
+        if proxy:
+            constructor = value.child_by_field_name("constructor")
+            args = value.child_by_field_name("arguments")
+            if (
+                constructor is None
+                or program.text(constructor) != "Proxy"
+                or args is None
+                or len(args.named_children) != 2
+            ):
+                continue
+            value = args.named_children[1]
+        if value.type != "object":
+            continue
+        hooks: list[tuple[int, str, str | None]] = []
+        for field in value.named_children:
+            check_runtime()
+            func: Node | None = None
+            prop: str | None = None
+            trigger: str | None = None
+            key: Node | None = None
+            if field.type == "method_definition":
+                func = field
+                key = field.child_by_field_name("name")
+                accessor = bool(field.children) and field.children[0].type in {"get", "set"}
+                if key is not None and key.type != "computed_property_name":
+                    prop = program.text(key).strip("\"'")
+                    if accessor:
+                        trigger = "accessor"
+                    elif prop in {"toString", "valueOf"}:
+                        trigger = "coercion"
+                    elif proxy and prop in _PROXY_TRAPS:
+                        trigger = "proxy"
+            elif field.type == "pair":
+                key = field.child_by_field_name("key")
+                candidate = field.child_by_field_name("value")
+                if candidate is None or candidate.type not in {
+                    "arrow_function",
+                    "function_expression",
+                    "generator_function",
+                }:
+                    continue
+                func = candidate
+                if key is not None and key.type != "computed_property_name":
+                    prop = program.text(key).strip("\"'")
+                    if prop in {"toString", "valueOf"}:
+                        trigger = "coercion"
+                    elif proxy and prop in _PROXY_TRAPS:
+                        trigger = "proxy"
+            if (
+                key is not None
+                and key.type == "computed_property_name"
+                and key.named_child_count == 1
+            ):
+                member = key.named_children[0]
+                owner = (
+                    member.child_by_field_name("object")
+                    if member.type == "member_expression"
+                    else None
+                )
+                if (
+                    owner is not None
+                    and program.text(owner) == "Symbol"
+                    and _callable_member(program, member) == "toPrimitive"
+                ):
+                    trigger = "coercion"
+            if func is not None and trigger is not None:
+                hooks.append((func.id, trigger, prop))
+        if hooks:
+            receivers[(declaration.parent.id, program.text(name_node))] = hooks
+    if not receivers:
+        return set()
+    invoked: set[int] = set()
+    for node in program.nodes:
+        check_runtime()
+        if node.type != "template_substitution" or node.named_child_count != 1:
+            continue
+        expression = node.named_children[0]
+        props: set[str] = set()
+        root = expression
+        while root.type in {"member_expression", "subscript_expression"}:
+            check_runtime()
+            prop_node = root.child_by_field_name("property")
+            if prop_node is not None:
+                props.add(program.text(prop_node))
+            receiver = root.child_by_field_name("object")
+            if receiver is None:
+                break
+            root = receiver
+        if root.type != "identifier":
+            continue
+        scope = node.parent
+        while scope is not None and scope.type not in {"program", "statement_block"}:
+            check_runtime()
+            scope = scope.parent
+        if scope is None:
+            continue
+        for func_id, trigger, hook_prop in receivers.get((scope.id, program.text(root)), ()):
+            if (
+                trigger == "proxy"
+                or (trigger == "coercion" and expression == root)
+                or (trigger == "accessor" and hook_prop in props)
+            ):
+                invoked.add(func_id)
+    return invoked
+
+
+def _is_module_wrapper_init_call(program: JavaScriptProgram, node: Node) -> bool:
+    """Recognize the bundler module-initialization call shape.
+
+    These calls keep the execution barrier so that dynamic markup witnesses
+    are still preferred over the initialization call itself.
+    """
+    callee = node.child_by_field_name("function")
+    args = node.child_by_field_name("arguments")
+    if callee is None or callee.type != "identifier" or args is None:
+        return False
+    values = args.named_children
+    if (
+        len(values) != 2
+        or values[1].type != "identifier"
+        or _callable_member(program, values[0]) != "exports"
+    ):
+        return False
+    receiver = values[0].child_by_field_name("object")
+    if (
+        receiver is None
+        or receiver.type != "parenthesized_expression"
+        or len(receiver.named_children) != 1
+    ):
+        return False
+    assign = receiver.named_children[0]
+    target = assign.child_by_field_name("left")
+    # The assigned value may be a literal exports object or a call that
+    # produces one; markup preference separately requires the literal form.
+    return (
+        assign.type == "assignment_expression"
+        and target is not None
+        and program.text(target) == program.text(values[1])
+        and assign.child_by_field_name("right") is not None
+    )
+
+
+def _call_receives_template(
+    program: JavaScriptProgram,
+    arguments: Node,
+    template_values: AbstractSet[str],
+    check_runtime: Callable[[], None],
+    skip: AbstractSet[int] = frozenset(),
+) -> bool:
+    """Whether a template or template-valued alias reaches a call's arguments."""
+    pending = [arg for arg in arguments.named_children if arg.id not in skip]
+    while pending:
+        check_runtime()
+        argument = pending.pop()
+        if argument.type == "template_string" or (
+            argument.type == "identifier" and program.text(argument) in template_values
+        ):
+            return True
+        pending.extend(argument.named_children)
+    return False
+
+
+def _inside_invoked_hook(
+    node: Node, invoked_hooks: AbstractSet[int], check_runtime: Callable[[], None]
+) -> bool:
+    """Whether a call sits inside a hook that template evaluation can invoke."""
+    if not invoked_hooks:
+        return False
+    ancestor = node.parent
+    while ancestor is not None:
+        check_runtime()
+        if ancestor.id in invoked_hooks:
+            return True
+        ancestor = ancestor.parent
+    return False
+
+
 def _has_shell_execution_call(
     program: JavaScriptProgram, check_runtime: Callable[[], None]
 ) -> Node | None:
@@ -2893,6 +3120,14 @@ def _has_shell_execution_call(
                 if alias not in names:
                     names.add(alias)
                     pending_names.append(alias)
+    invoked_hooks = (
+        _template_invoked_hooks(program, check_runtime)
+        if any(
+            hook in program.content
+            for hook in ("Proxy", "toString", "valueOf", "toPrimitive", "get ", "set ")
+        )
+        else set()
+    )
     for node in program.nodes:
         check_runtime()
         if node.type in {"identifier", "shorthand_property_identifier"} or (
@@ -2961,7 +3196,18 @@ def _has_shell_execution_call(
                     origin.id in callable_ids
                     and name in uncertain_bindings
                     and origin.id not in ordinary_identifiers
+                    and (
+                        _call_receives_template(program, arguments, template_values, check_runtime)
+                        or _inside_invoked_hook(node, invoked_hooks, check_runtime)
+                        or _is_module_wrapper_init_call(program, node)
+                    )
                 ):
+                    # An unknown callable, including one bound by a parameter,
+                    # is an execution surface only for a template that reaches
+                    # it, or that can invoke it while being evaluated. A bare
+                    # call through an injected helper does not make an
+                    # unrelated template elsewhere in the file runtime
+                    # dependent; known shell names are caught separately above.
                     return node
             elif origin.type in {"call_expression", "new_expression"}:
                 # Unknown call results, including bound functions, cannot
@@ -2990,15 +3236,10 @@ def _has_shell_execution_call(
             # An unresolved imported function may execute its argument. Keep
             # direct template arguments and simple local aliases unowned;
             # this does not claim interprocedural argument-flow analysis.
-            pending = [arg for arg in arguments.named_children if arg.id not in native_paths]
-            while pending:
-                check_runtime()
-                argument = pending.pop()
-                if argument.type == "template_string" or (
-                    argument.type == "identifier" and program.text(argument) in template_values
-                ):
-                    return node
-                pending.extend(argument.named_children)
+            if _call_receives_template(
+                program, arguments, template_values, check_runtime, native_paths
+            ):
+                return node
         if selected_names & {"require", "import"} or callee.type == "import":
             args = arguments.named_children
             if (

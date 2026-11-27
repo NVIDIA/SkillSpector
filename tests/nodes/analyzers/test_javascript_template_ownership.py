@@ -199,6 +199,210 @@ def test_uncertain_parameter_calls_keep_template_files_partial(source: str) -> N
     )
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "export function retry(sleep) {\n  sleep(1);\n  return `a/${1}`;\n}\n",
+            id="same-function",
+        ),
+        pytest.param(
+            "export function retry(sleep) {\n  sleep(1);\n}\nexport const u = (id) => `a/${id}`;\n",
+            id="different-functions",
+        ),
+        pytest.param(
+            "export function createClient({ fetch, sleep } = {}) {\n"
+            "  sleep(1);\n  return `a/${1}`;\n}\n",
+            id="destructured-dependency-injection",
+        ),
+        pytest.param(
+            "export const retry = (sleep) => { sleep(1); return `a/${1}`; };\n",
+            id="arrow-function-parameter",
+        ),
+        pytest.param(
+            "export const o = { retry(sleep) { sleep(1); return `a/${1}`; } };\n",
+            id="method-parameter",
+        ),
+        pytest.param(
+            "export class C { retry(sleep) { sleep(1); return `a/${1}`; } }\n",
+            id="class-method-parameter",
+        ),
+        pytest.param(
+            "export function outer(a) {\n"
+            "  function inner(sleep) { sleep(1); return `a/${1}`; }\n"
+            "  return inner;\n}\n",
+            id="nested-function-parameter",
+        ),
+        pytest.param(
+            "const u = `a/${id}`;\nfunction go(sleep) { sleep(1); }\n",
+            id="template-before-call",
+        ),
+        pytest.param(
+            "function go(sleep) { sleep.call(null, 1); return `a/${x}`; }\n",
+            id="call-helper-with-data-arguments",
+        ),
+        pytest.param(
+            "function go(Handler) { new Handler(1); return `a/${x}`; }\n",
+            id="constructor-parameter-with-data-arguments",
+        ),
+        pytest.param(
+            "try { risky(); } catch (handler) { handler(1); } const t = `a/${x}`;\n",
+            id="catch-binding-call",
+        ),
+        pytest.param(
+            "for (const handler of handlers) { handler(1); } const t = `a/${x}`;\n",
+            id="for-of-binding-call",
+        ),
+    ],
+)
+def test_parameter_bound_calls_do_not_make_unrelated_templates_runtime_dependent(
+    source: str,
+) -> None:
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="javascript")
+        is False
+    )
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is None
+    assert javascript_template_spans(source, lambda: None)
+
+
+@pytest.mark.parametrize("dialect", ["typescript", "tsx"])
+def test_parameter_bound_call_unrelated_template_in_typed_dialects(dialect: str) -> None:
+    source = (
+        "export function retry(sleep: (ms: number) => Promise<void>): string {\n"
+        "  sleep(1);\n  return `a/${1}`;\n}\n"
+        if dialect == "typescript"
+        else "export function retry(sleep) {\n  sleep(1);\n  return `a/${1}`;\n}\n"
+    )
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type=dialect) is None
+    assert javascript_template_spans(source, lambda: None, dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "export function retry(sleep) {\n  sleep(`a/${1}`);\n}\n",
+            id="direct-template-argument",
+        ),
+        pytest.param(
+            "const cmd = `${tool} -rf /`;\nfunction go(runner) { runner(cmd); }\n",
+            id="template-valued-alias-argument",
+        ),
+        pytest.param(
+            "const cmd = `${tool} -rf /`;\nconst alias = cmd;\n"
+            "function go(runner) { runner(alias); }\n",
+            id="template-alias-chain-argument",
+        ),
+        pytest.param(
+            "function go(runner) { runner(format(`a/${x}`)); }\n",
+            id="nested-template-argument",
+        ),
+        pytest.param(
+            "function go(runner) { runner({cmd: `a/${x}`}); }\n",
+            id="object-template-argument",
+        ),
+        pytest.param(
+            "function go(sleep) { sleep.call(null, `a/${x}`); }\n",
+            id="call-helper-template-argument",
+        ),
+        pytest.param(
+            "function go(Handler) { new Handler(`a/${x}`); }\n",
+            id="constructor-template-argument",
+        ),
+        pytest.param(
+            "function go(sleep) { sleep`a/${x}`; }\n",
+            id="tagged-template-on-parameter",
+        ),
+        pytest.param(
+            "function go(exec) { exec(1); return `a/${x}`; }\n",
+            id="shell-named-parameter",
+        ),
+        pytest.param(
+            "function invoke(go = tool.exec) { go(1); return `a/${x}`; }\n",
+            id="parameter-defaulting-to-shell-member",
+        ),
+    ],
+)
+def test_parameter_bound_calls_receiving_templates_stay_partial(source: str) -> None:
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert diagnostic is not None
+    assert diagnostic.check == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="javascript") is True
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "export function fail(read, value) { const info = "
+            "{ get detail() { return read(value); } }; "
+            "throw new Error(`bad ${info.detail.name}`); }",
+            id="chained-getter-read",
+        ),
+        pytest.param(
+            "export function fail(read, value) { const info = "
+            "{ toString: function() { return read(value); } }; "
+            "throw new Error(`bad ${info}`); }",
+            id="function-valued-tostring",
+        ),
+        pytest.param(
+            "export function fail(read, value) { const info = "
+            "{ valueOf: () => read(value) }; "
+            "throw new Error(`bad ${info}`); }",
+            id="arrow-valued-valueof",
+        ),
+    ],
+)
+def test_template_evaluation_hooks_keep_unknown_calls_partial(source: str) -> None:
+    diagnostic = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
+    assert diagnostic is not None
+    assert diagnostic.check == tm.ParserCheck.COMMAND_STRING_RUNTIME
+    assert diagnostic.start == source.index("read(value)")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "export function fail(read, value) { const info = "
+            "{ get detail() { return read(value); } }; return `bad ${7}`; }",
+            id="unread-getter",
+        ),
+        pytest.param(
+            "export function fail(read, value) { const info = "
+            "{ toString() { return read(value); } }; return `bad ${7}`; }",
+            id="unread-tostring",
+        ),
+        pytest.param(
+            "export function fail(read, value) { const info = "
+            "{ set detail(v) { read(v); } }; return `bad ${info}`; }",
+            id="setter-not-invoked-by-read",
+        ),
+        pytest.param(
+            "function helper(v) { return v; } export function fail(value) { const info = "
+            "{ get detail() { return helper(value); } }; "
+            "throw new Error(`bad ${info.detail}`); }",
+            id="getter-calling-known-local",
+        ),
+    ],
+)
+def test_uninvoked_hooks_do_not_make_templates_runtime_dependent(source: str) -> None:
+    assert tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript") is None
+    assert javascript_template_spans(source, lambda: None)
+
+
+def test_ledger_completes_parameter_bound_call_template() -> None:
+    path = "scripts/retry.mjs"
+    source = "export function retry(sleep) {\n  sleep(1);\n  return `a/${1}`;\n}\n" + _PADDING
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: source}}, [tm]
+    )
+    row = result["inspection_ledger"][0]
+    assert row["outcome"] is LedgerOutcome.COMPLETED
+    assert "reason_code" not in row
+
+
 def test_ledger_completes_parameter_default_value_template() -> None:
     path = "scripts/check.mjs"
     source = (
@@ -1283,12 +1487,19 @@ def test_type_annotations_preserve_uncertain_runtime_callables(source):
 
 
 def test_native_promise_settlers_own_data_but_unknown_callbacks_stay_visible():
-    source = "new Promise((send, fail) => { try { send(1); } catch (e) { fail(e); } }); const label = `count: ${n}`;"
+    source = "new Promise((send, fail) => { try { send(`count: ${n}`); } catch (e) { fail(e); } }); const label = `count: ${n}`;"
     assert javascript_template_spans(source, lambda: None)
     for prefix in ("const Promise = makeRunner(); ", "globalThis.Promise = runner; "):
         assert javascript_template_spans(prefix + source, lambda: None) is None
-    for body in ("send = other; send(1)", "function nested(send) {send(1)}", "eval(arg); send(1)"):
-        assert javascript_template_spans(source.replace("send(1)", body), lambda: None) is None
+    for body in (
+        "send = other; send(`count: ${n}`)",
+        "function nested(send) {send(`count: ${n}`)}",
+        "eval(arg); send(`count: ${n}`)",
+    ):
+        assert (
+            javascript_template_spans(source.replace("send(`count: ${n}`)", body), lambda: None)
+            is None
+        )
 
 
 @pytest.mark.parametrize(
@@ -1447,9 +1658,9 @@ def test_interpolation_keeps_plain_and_overridden_properties(initializer):
 
 
 def test_a_thrown_literal_does_not_clear_an_independent_call():
-    source = "export function fail(read) { read(7); throw new Error(`bad ${7}`); }"
+    source = "export function fail(read) { read(`value ${x}`); throw new Error(`bad ${7}`); }"
     result = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
-    assert result is not None and result.start == source.index("read(7)")
+    assert result is not None and result.start == source.index("read(`value")
 
 
 def test_dynamic_evaluator_is_attributed_even_after_a_regex_match():
@@ -1500,8 +1711,8 @@ def test_markup_parameter_preserves_dynamic_calls_and_tracks_multiple_attributes
 def test_local_helper_and_regex_do_not_mask_runtime_call_locations():
     sources = [
         (
-            "function first(helper) { return helper(x); } function more() { const helper = x => [x]; helper(1); } const msg = `ok ${x}`;",
-            "helper(x)",
+            "function first(helper) { return helper(`ok ${x}`); } function more() { const helper = x => [x]; helper(1); } const msg = `ok ${x}`;",
+            "helper(`ok",
         ),
         (
             "other(/x/); /r/.exec(value); function work(id, data) { return run(id, `item ${data}`); }",
@@ -1540,19 +1751,19 @@ def test_private_calls_use_source_bound_arguments(definition, call):
     ],
 )
 def test_private_callback_proof_requires_every_actual_caller(tail):
-    source = "export const label = `item ${i}`; function sample(get) {return get(1)}; sample(i => coords[i]); "
+    source = "export const label = `item ${i}`; function sample(get) {return get(`item ${i}`)}; sample(i => coords[i]); "
     assert javascript_template_spans(source + tail, lambda: None) is None
 
 
 def test_private_calls_preserve_writes_guards_and_import_barriers():
     for source in [
-        "function f(get) {get=other;return get(1)} f(x=>values[x])",
-        "function f(get) {arguments[0]=other;return get(1)} f(x=>values[x])",
-        "function f(a, record) {if (!record) record(a)} f(1)",
-        "function f(Kind) {return new Kind(4)} const Float64Array=ext; f(Float64Array)",
+        "function f(get) {get=other;return get(`item ${n}`)} f(x=>values[x])",
+        "function f(get) {arguments[0]=other;return get(`item ${n}`)} f(x=>values[x])",
+        "function f(a, record) {if (!record) record(`item ${n}`)} f(1)",
+        "function f(Kind) {return new Kind(`item ${n}`)} const Float64Array=ext; f(Float64Array)",
         "import * as v from './v.js'; const f=v.runJob; f(`x ${arg}`)",
         "import * as v from './v.js'; const f=v.exec; f(arg)",
-        "const v=runtime; const f=v.method; f(arg)",
+        "const v=runtime; const f=v.method; f(`item ${n}`)",
     ]:
         assert (
             javascript_template_spans("export const label=`item ${n}`;" + source, lambda: None)
@@ -1564,11 +1775,11 @@ def test_public_callback_witness_uses_exported_option_source():
     source = (
         "function elsewhere(a) {const step = x => [x]; step(3)} "
         "function dummy(step){step(1)} "
-        "function mount({onChange=null}={}){ if (onChange) onChange(2); } "
+        "function mount({onChange=null}={}){ if (onChange) onChange(`item ${val}`); } "
         "export const API={mount:mount};const label=`item ${val}`;"
     )
     hit = tm.bounded_parse_diagnostic(source, lambda: None, file_type="javascript")
-    assert hit and hit.start == source.index("onChange(2)")
+    assert hit and hit.start == source.index("onChange(`item")
 
 
 def test_module_initialization_prefers_dynamic_markup_but_keeps_runtime_controls():
