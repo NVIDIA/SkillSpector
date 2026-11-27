@@ -1001,6 +1001,55 @@ def _markdown_fence_states(
     return states, transitions
 
 
+_WindowSecurityViewBuilder = Callable[[str, Callable[[], None]], tuple[SecurityTextView, ...]]
+# Cap copied maps at the size of one raw window's offset map.
+_MAX_SHARED_WINDOW_OFFSET_BYTES = SECURITY_VIEW_WINDOW_CHARS * array("I").itemsize
+
+
+def _share_single_window_security_views() -> _WindowSecurityViewBuilder:
+    """Reuse an exact window's completed views between the two artifact passes."""
+    saved: tuple[str, tuple[SecurityTextView, ...]] | None = None
+
+    def build(text: str, check_runtime: Callable[[], None]) -> tuple[SecurityTextView, ...]:
+        nonlocal saved
+        if saved is not None:
+            check_runtime()
+            saved_text, saved_views = saved
+            saved = None
+            if text == saved_text:
+                check_runtime()
+                return saved_views
+            return security_text_views(text, check_runtime=check_runtime)
+
+        views = security_text_views(text, check_runtime=check_runtime)
+        offset_bytes = sum(
+            len(offsets) * offsets.itemsize
+            for view in views
+            for offsets in (view.source_offsets, view.source_end_offsets)
+            if offsets is not None
+        )
+        if offset_bytes > _MAX_SHARED_WINDOW_OFFSET_BYTES:
+            return views
+        # Give each pass its own offset arrays even though the view is frozen.
+        saved_views = tuple(
+            replace(
+                view,
+                source_offsets=view.source_offsets[:] if view.source_offsets is not None else None,
+                source_end_offsets=(
+                    view.source_end_offsets[:] if view.source_end_offsets is not None else None
+                ),
+            )
+            if view.source_offsets is not None or view.source_end_offsets is not None
+            else view
+            for view in views
+        )
+        check_runtime()
+        saved = (text, saved_views)
+        return views
+
+    return build
+
+
 def _window_view_with_markdown_context(
     view: SecurityTextView, prefix_length: int
 ) -> SecurityTextView:
@@ -2937,6 +2986,7 @@ def _scan_declared_marker_views(
     owned_starts: tuple[int, ...],
     raw_starts: tuple[int, ...],
     source_context: _WindowSourceContext,
+    security_views_for_window: _WindowSecurityViewBuilder,
     python_source: bool,
     defer_projected_output_limit: bool,
     complete_context: bool,
@@ -3053,10 +3103,7 @@ def _scan_declared_marker_views(
         check_runtime()
         full_views = tuple(
             _window_view_with_markdown_context(full_view, len(context_prefix))
-            for full_view in security_text_views(
-                context_prefix + raw_window,
-                check_runtime=check_runtime,
-            )
+            for full_view in security_views_for_window(context_prefix + raw_window, check_runtime)
         )
         if json_ownership is not None and json_ownership.decoded is not None:
             full_views += json_ownership.decoded.window_views(
@@ -3482,6 +3529,7 @@ def _scan_all_views_with_parser_diagnostics(
     raw_starts: tuple[int, ...] = ()
     source_context: _WindowSourceContext | None = None
     whole_artifact_window = False
+    security_views_for_window: _WindowSecurityViewBuilder = security_text_views
     prepared_analyses: dict[int, object] = {}
     prepared_sources: dict[int, object] = {}
     parser_analyses: dict[int, object] = {}
@@ -3563,6 +3611,8 @@ def _scan_all_views_with_parser_diagnostics(
             for owned_start in marker_owned_starts
         )
         whole_artifact_window = len(content) <= SECURITY_VIEW_WINDOW_CHARS
+        if whole_artifact_window and len(marker_owned_starts) == 1:
+            security_views_for_window = _share_single_window_security_views()
         raw_owned_starts = (
             (0,)
             if whole_artifact_window
@@ -3665,6 +3715,7 @@ def _scan_all_views_with_parser_diagnostics(
                 owned_starts=marker_owned_starts,
                 raw_starts=marker_raw_starts,
                 source_context=source_context,
+                security_views_for_window=security_views_for_window,
                 python_source=python_source,
                 defer_projected_output_limit=coalesce is not None,
                 complete_context=whole_artifact_window,
@@ -3920,9 +3971,8 @@ def _scan_all_views_with_parser_diagnostics(
             try:
                 full_views = tuple(
                     _window_view_with_markdown_context(full_view, len(context_prefix))
-                    for full_view in security_text_views(
-                        context_prefix + raw_window,
-                        check_runtime=finding_budget.check_runtime,
+                    for full_view in security_views_for_window(
+                        context_prefix + raw_window, finding_budget.check_runtime
                     )
                 )
                 if json_ownership is not None and json_ownership.decoded is not None:
