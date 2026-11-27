@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import time
+from array import array
 
 import pytest
 
@@ -60,6 +61,26 @@ def test_preparation_is_once_and_every_view_uses_absolute_source_offsets(
     assert any(name.startswith(expected_view) for name, _, _ in module.calls)
 
 
+def test_static_passes_build_single_window_views_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    content = "Garden plot Ａ\nNEEDLE\n"
+    original = runner.security_text_views
+    built: list[str] = []
+
+    def track(text, check_runtime=None):
+        built.append(text)
+        return original(text, check_runtime=check_runtime)
+
+    monkeypatch.setattr(runner, "security_text_views", track)
+    module = _PreparedRecorder()
+
+    findings, reason, _ = runner._scan_all_views_detailed("SKILL.md", content, [module], None)
+
+    assert not findings
+    assert reason is None
+    assert built.count(content) == 1
+    assert ("normalized", content.index("NEEDLE"), len(content)) in module.calls
+
+
 def test_preparation_obeys_artifact_runtime_limit() -> None:
     class SlowPreparation:
         def prepare_analysis(self, *, content, file_type, check_runtime):
@@ -99,6 +120,65 @@ def test_whitespace_projection_never_reaches_modules_without_explicit_opt_in() -
         "SKILL.md", content, [leakage, BoundedGapRecorder()], None
     )
     assert reason is None
+
+
+def test_shared_single_window_keeps_separate_offset_arrays() -> None:
+    build = runner._share_single_window_security_views()
+    content = "Garden plot Ａ"
+    first = next(view for view in build(content, lambda: None) if view.name == "normalized")
+    assert first.source_offsets is not None
+    before = first.source_offset(0)
+    first.source_offsets[0] = before + 1
+
+    second = next(view for view in build(content, lambda: None) if view.name == "normalized")
+
+    assert second.source_offset(0) == before
+
+
+def test_shared_single_window_does_not_copy_large_offset_maps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "a" * (runner.SECURITY_VIEW_WINDOW_CHARS // 2 + 1)
+    starts = array("I", range(len(text)))
+    ends = array("I", range(1, len(text) + 1))
+    view = SecurityTextView("normalized", text, starts, source_end_offsets=ends)
+    calls = 0
+
+    def track(text, check_runtime=None):
+        nonlocal calls
+        calls += 1
+        return (view,)
+
+    monkeypatch.setattr(runner, "security_text_views", track)
+    build = runner._share_single_window_security_views()
+
+    assert build(text, lambda: None) == (view,)
+    assert build(text, lambda: None) == (view,)
+    assert calls == 2
+
+
+def test_shared_single_window_rechecks_deadline_before_returning_views() -> None:
+    build = runner._share_single_window_security_views()
+    content = "Garden plot Ａ"
+    build(content, lambda: None)
+    checks = 0
+
+    def check_runtime():
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise TimeoutError("view budget expired")
+
+    with pytest.raises(TimeoutError, match="view budget expired"):
+        build(content, check_runtime)
+
+
+def test_shared_single_window_builds_a_different_input() -> None:
+    build = runner._share_single_window_security_views()
+    build("Garden plot Ａ", lambda: None)
+
+    different = "Garden plot Ｂ"
+    assert build(different, lambda: None) == runner.security_text_views(different)
 
 
 def test_bounded_identity_slices_retain_offsets_in_parent_view() -> None:
