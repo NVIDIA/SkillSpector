@@ -129,9 +129,9 @@ def test_json_quote_caller_requires_complete_markdown_context(
     calls: list[str] = []
     real_validation = tm_module.validated_json_string_spans
 
-    def record(text: str, check_runtime):
+    def record(text: str, check_runtime, **kwargs):
         calls.append(text)
-        return real_validation(text, check_runtime)
+        return real_validation(text, check_runtime, **kwargs)
 
     monkeypatch.setattr(tm_module, "validated_json_string_spans", record)
     exhausted = tm_module.has_bounded_parse_exhaustion(

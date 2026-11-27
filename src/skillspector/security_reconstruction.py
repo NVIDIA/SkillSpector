@@ -952,14 +952,35 @@ def _json_string_spans(
 
 
 def validated_json_string_spans(
-    text: str, check_runtime: Callable[[], None] | None
+    text: str,
+    check_runtime: Callable[[], None] | None,
+    *,
+    literal_key_spans: list[tuple[int, int]] | None = None,
 ) -> list[tuple[int, int]]:
-    """Return exact string spans owned by complete JSON values, including both quotes."""
+    """Return exact string spans, optionally identifying keys in literal JSON examples."""
     ranges = _validated_json_ranges(text, check_runtime)
     spans: list[tuple[int, int]] = []
     for start, end in ranges:
+        # Markdown has no decoded JSON finding view. A container with a possible
+        # escape or expansion must retain the original conservative analysis.
+        own_keys = literal_key_spans is not None and all(
+            text.find(marker, start, end) < 0 for marker in "\\$`"
+        )
         for string_start, string_end in _json_string_spans(text[start:end], check_runtime):
-            spans.append((start + string_start, start + string_end))
+            span = (start + string_start, start + string_end)
+            spans.append(span)
+            if not own_keys:
+                continue
+            cursor = span[1]
+            while cursor < end and text[cursor] in " \t\r\n":
+                if check_runtime is not None and cursor % 1024 == 0:
+                    check_runtime()
+                cursor += 1
+            # Only the already validated container can prove this colon owns
+            # the preceding string. Prefixes or text outside it grant no role.
+            if cursor < end and text[cursor] == ":":
+                assert literal_key_spans is not None
+                literal_key_spans.append(span)
     return spans
 
 
