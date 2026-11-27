@@ -49,10 +49,11 @@ def test_dense_owned_json_strings_have_bounded_total_parse_spans(
     real_parser = tm_module._parse_shell_command_word
     real_exhaustion = tm_module._has_shell_command_word_exhaustion
 
-    def owned_spans(text, check_runtime):
+    def owned_spans(text, check_runtime, *, literal_key_spans=None):
         # Column recognition has separate tests. Supply exact ownership here so
         # a missing tab-container proof cannot hide overlapping parser work.
         assert text == source
+        assert literal_key_spans == []
         check_runtime()
         return spans
 

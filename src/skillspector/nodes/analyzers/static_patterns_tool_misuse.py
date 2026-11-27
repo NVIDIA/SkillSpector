@@ -15196,6 +15196,7 @@ def _has_bounded_parse_exhaustion(
     shell_fence_ranges: list[tuple[int, int]] = []
     json_strings: list[tuple[int, int]] = []
     json_operand_spans: list[tuple[int, int]] = []
+    markdown_json_keys: list[tuple[int, int]] = []
     python_source = None
     javascript_source = None
     unresolved_executables: list[int] = []
@@ -15232,7 +15233,22 @@ def _has_bounded_parse_exhaustion(
         structural_quote_closers = json_projection.closers
         structural_quote_openers = json_projection.openers
     elif file_type in {"json", "markdown"} and complete_context:
-        json_strings = validated_json_string_spans(content, check_runtime)
+        json_strings = validated_json_string_spans(
+            content,
+            check_runtime,
+            literal_key_spans=(
+                markdown_json_keys
+                if file_type == "markdown" and (source_view is None or source_view.name == "raw")
+                else None
+            ),
+        )
+        # A bare property name has no shell operands. Keep compound names,
+        # expansions and executable-looking text on the existing analysis path.
+        markdown_json_keys = [
+            (start, end)
+            for start, end in markdown_json_keys
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", content[start + 1 : end - 1])
+        ]
         structural_quote_closers = {end - 1 for _, end in json_strings}
         structural_quote_openers = {start for start, _ in json_strings}
     proven_decoded_json = (
@@ -15402,7 +15418,9 @@ def _has_bounded_parse_exhaustion(
         # Only validated host punctuation terminates command words. Every byte
         # inside strings stays in the parser and original finding views remain raw.
         shell_word_content = json_projection.text
-    json_keys = frozenset(json_projection.key_spans) if json_projection is not None else frozenset()
+    json_keys = frozenset(
+        json_projection.key_spans if json_projection is not None else markdown_json_keys
+    )
     native_backtick_bounds: dict[int, _NativeBacktickOperandBounds] = {}
     json_word_roles = (
         {
@@ -15413,6 +15431,8 @@ def _has_bounded_parse_exhaustion(
             "native_backtick_bounds": native_backtick_bounds,
         }
         if json_projection is not None
+        else {"json_key_spans": tuple(markdown_json_keys)}
+        if markdown_json_keys
         else {}
     )
     quote_limits = None
