@@ -131,6 +131,10 @@ _PROMPT_REVEAL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _PROMPT_CONTEXT_BYTES = 2_052  # More than 512 complete UTF-8 characters per side.
+_METADATA_POISONING_NAMESPACE = "agent_skills"
+_METADATA_POISONING_RULE = "agent_skill_mcp_tool_poisoning_metadata"
+_METADATA_INJECTION_IDENTIFIER = "$param_injection"
+_METADATA_SCHEMA_IDENTIFIERS = frozenset({"$schema_tools", "$schema_parameters"})
 MAX_YARA_MATCH_INSTANCES_PER_RULE = 4_096
 MAX_YARA_RULE_FILES = 1_024
 MAX_YARA_RULE_DIRECTORY_ENTRIES = 10_000
@@ -1047,6 +1051,55 @@ def _filter_prohibited_prompt_reveals(
     return [item for item in retained if item[0] != "$agent_context"], False
 
 
+def _filter_benign_metadata_transfer_instances(
+    match: yara.Match, instances: list[tuple[str, object]], data: bytes
+) -> list[tuple[str, object]]:
+    """Drop weak transfer phrases that are benign inside their own description.
+
+    This only applies to the built-in metadata-poisoning rule when its only
+    non-schema evidence is ``$param_injection``. Hidden markup, encoded blobs,
+    invisible characters, strong injection phrases, and manifests that cannot
+    be fully parsed keep the original high-severity finding.
+    """
+    if match.namespace != _METADATA_POISONING_NAMESPACE or match.rule != _METADATA_POISONING_RULE:
+        return instances
+    if not any(identifier == _METADATA_INJECTION_IDENTIFIER for identifier, _ in instances):
+        return instances
+    if any(
+        identifier not in _METADATA_SCHEMA_IDENTIFIERS
+        and identifier != _METADATA_INJECTION_IDENTIFIER
+        for identifier, _ in instances
+    ):
+        return instances
+
+    from .mcp_tool_poisoning import (
+        extract_json_tool_descriptions,
+        has_genuine_metadata_transfer,
+        has_strong_metadata_injection,
+    )
+
+    descriptions = extract_json_tool_descriptions(data)
+    if descriptions is None:
+        return instances
+    if any(
+        has_strong_metadata_injection(text) or has_genuine_metadata_transfer(text)
+        for text in descriptions
+    ):
+        return instances
+    for identifier, instance in instances:
+        if identifier != _METADATA_INJECTION_IDENTIFIER:
+            continue
+        matched = getattr(instance, "matched_data", None)
+        if not isinstance(matched, bytes):
+            return instances
+        matched_text = matched.decode("utf-8", errors="replace")
+        if has_strong_metadata_injection(matched_text) or has_genuine_metadata_transfer(
+            matched_text
+        ):
+            return instances
+    return []
+
+
 def _parse_meta(match: yara.Match) -> tuple[str, Severity, float, str | None]:
     """Extract rule_id, severity, confidence, and description from a YARA match's meta."""
     meta: dict[str, object] = match.meta or {}
@@ -1160,6 +1213,10 @@ def _match_file(
         ):
             instances, prompt_limited = _filter_prohibited_prompt_reveals(instances, data)
             instance_limited = instance_limited or prompt_limited
+            if not instances:
+                continue
+        if not limited:
+            instances = _filter_benign_metadata_transfer_instances(match, instances, data)
             if not instances:
                 continue
         if (

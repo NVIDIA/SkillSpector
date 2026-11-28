@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import re
@@ -29,6 +30,7 @@ from typing import cast
 
 from pydantic import BaseModel, Field, field_validator
 
+from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES
 from skillspector.inference_usage import InferenceUsageRecord
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
@@ -236,6 +238,91 @@ def _extract_metadata_texts(manifest: dict) -> list[tuple[str, str, bool]]:
             results.append((pdesc, f"parameters[{i}].description", False))
 
     return results
+
+
+def extract_json_tool_descriptions(data: bytes) -> list[str] | None:
+    """Extract description strings from a JSON tool or plugin manifest.
+
+    Returns ``None`` when the bytes cannot be fully interpreted as a bounded
+    JSON manifest, so callers can keep conservative YARA evidence instead of
+    suppressing a match they cannot re-evaluate.
+    """
+    if len(data) > MAX_ANALYZABLE_FILE_BYTES:
+        return None
+    try:
+        manifest = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
+        return None
+
+    descriptions: list[str] = []
+    stack: list[object] = [manifest]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "description" and isinstance(value, str):
+                    descriptions.append(value)
+                    if len(descriptions) > _MAX_TOOL_DESCRIPTIONS:
+                        return None
+                elif isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(node, list):
+            for value in node:
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+    return descriptions
+
+
+_METADATA_TRANSFER_CONTEXT_CHARS = 240
+# Past this bound the file cannot be re-evaluated completely, so the extractor
+# returns None and the caller keeps the original YARA finding.
+_MAX_TOOL_DESCRIPTIONS = 4_096
+_METADATA_TRANSFER_PHRASE_RE = re.compile(r"\b(?:send\s+to|transmit)\b", re.IGNORECASE)
+_METADATA_TRANSFER_OBJECT_RE = re.compile(
+    r"\b(?:api[ _-]?keys?|access[ _-]?tokens?|auth(?:orization)?[ _-]?tokens?|tokens?|"
+    r"credentials?|secrets?|passwords?|private[ _-]?keys?|ssh[ _-]?keys?|"
+    r"conversation(?:[ _-]?(?:history|context|data|log))?|chat[ _-]?history|"
+    r"message(?:s|[ _-]?history)?|session[ _-]?(?:data|state|history|token|memory)|"
+    r"environment[ _-]?vars?|env[ _-]?vars?|"
+    r"(?:sensitive|user|private|internal|source)[ _-]?data|"
+    r"config(?:uration)?[ _-]?(?:files?|data|secrets?)|"
+    r"file[ _-]?contents?|database|db[ _-]?credentials?)\b",
+    re.IGNORECASE,
+)
+_METADATA_TRANSFER_TARGET_RE = re.compile(
+    r"\b(?:external|remote|attacker|webhook|third[ _-]?party|outbound|untrusted)\b"
+    r"|https?://"
+    r"|\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}\b",
+    re.IGNORECASE,
+)
+_METADATA_STRONG_INJECTION_RE = re.compile(
+    r"ignore\s+previous|override\s+safety|exfiltrate|SYSTEM:",
+    re.IGNORECASE,
+)
+
+
+def _genuine_metadata_transfer_match(description: str) -> re.Match[str] | None:
+    """Return a transfer phrase backed by sensitive data or an external target."""
+    for match in _METADATA_TRANSFER_PHRASE_RE.finditer(description):
+        start = max(0, match.start() - _METADATA_TRANSFER_CONTEXT_CHARS)
+        end = min(len(description), match.end() + _METADATA_TRANSFER_CONTEXT_CHARS)
+        context = description[start:end]
+        if _METADATA_TRANSFER_OBJECT_RE.search(context) or _METADATA_TRANSFER_TARGET_RE.search(
+            context
+        ):
+            return match
+    return None
+
+
+def has_genuine_metadata_transfer(description: str) -> bool:
+    """Whether an isolated description gives a weak transfer phrase a data-flow role."""
+    return _genuine_metadata_transfer_match(description) is not None
+
+
+def has_strong_metadata_injection(description: str) -> bool:
+    """Whether a description carries a strong injection phrase independent of transfer verbs."""
+    return _METADATA_STRONG_INJECTION_RE.search(description) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -720,9 +807,10 @@ _TP3_SYSTEM_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Exfiltration patterns
+# Exfiltration patterns. The weak "send to" and "transmit" verbs are evaluated
+# per description above, where their surrounding data-flow context is available.
 _TP3_EXFILTRATION_RE = re.compile(
-    r"send\s+to|transmit|upload\s+conversation|exfiltrate",
+    r"upload\s+conversation|exfiltrate",
     re.IGNORECASE,
 )
 
@@ -816,6 +904,8 @@ def _check_tp3(
 
             # Exfiltration
             m3 = _TP3_EXFILTRATION_RE.search(description)
+            if m3 is None:
+                m3 = _genuine_metadata_transfer_match(description)
             if m3:
                 findings.append(
                     Finding(
