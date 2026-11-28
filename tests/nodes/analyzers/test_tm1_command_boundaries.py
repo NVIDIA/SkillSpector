@@ -452,3 +452,30 @@ def test_bash_braces_do_not_hide_real_command_separators(fenced):
         f.rule_id == "TM1"
         for f in tm.analyze(source, "commands", "markdown" if fenced else "shell")
     )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_docker_rm_flag_is_not_a_destructive_command(newline):
+    one_line = 'docker run --rm -v "$PWD:/scan" skillspector scan ./my-skill/ --no-llm'
+    continued = (
+        "docker run \\" + newline + '  --rm -v "$PWD:/scan" skillspector scan ./my-skill/ --no-llm'
+    )
+    assert not tm1(one_line)
+    assert not tm1(continued)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_real_rm_after_docker_rm_flag_is_still_detected(newline):
+    source = "docker run \\" + newline + "  --rm -v /:/host ubuntu rm -rf /host"
+    findings = tm1(source)
+    assert any("rm -rf /host" in f.matched_text for f in findings)
+
+
+@pytest.mark.parametrize("command", ["rm", "del", "erase"])
+def test_destructive_command_names_still_match_at_a_word_start(command):
+    assert tm1(command + " -rf /")
+
+
+@pytest.mark.parametrize("prefix", ["--", "my-"])
+def test_hyphenated_rm_is_not_a_destructive_command(prefix):
+    assert not tm1(prefix + "rm -rf /tmp/scratch")

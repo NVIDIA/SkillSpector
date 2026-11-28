@@ -494,12 +494,15 @@ TM1_CODE_PATTERNS = [
     (_VARIABLE_SHELL_FLAG_PATTERN, 0.8),
     # Bound command names on both sides so prefixes such as rmm/ (RAPIDS
     # Memory Manager headers) are not interpreted as destructive commands.
+    # A leading hyphen is excluded as well: ``docker run --rm`` is a flag, not
+    # an invocation of ``rm``, even when the option is separated from the
+    # command by a line continuation.
     # Keep the scan within one bounded shell command.  The former ``[^|]*``
     # crossed newlines/``;``/``&`` and rescanned the remainder of a document
     # for every prose mention of ``rm``, making repeated documentation
     # quadratic.  Escaped newlines remain valid shell continuations.
     (
-        rf"\b(?:rm|del|erase)\b{_SHELL_HORIZONTAL_OR_CONTINUED_GAP}"
+        rf"(?<![-\w])(?:rm|del|erase)\b{_SHELL_HORIZONTAL_OR_CONTINUED_GAP}"
         rf"{_BOUNDED_SHELL_CLAUSE_ATOM}{{0,{_ROOT_GLOB_COMMAND_CHARS}}}"
         rf"(?:\\)?-(?:rf|fr|r){_SHELL_HORIZONTAL_OR_CONTINUED_GAP}[/~]",
         0.9,
@@ -514,9 +517,10 @@ TM1_CODE_PATTERNS = [
     # Dangerous globs and wildcards in destructive commands
     # Match a path in the actual rm argument token. Stop at whitespace and shell
     # redirection operators so `rm "$VAR" 2>/dev/null` does not borrow the slash
-    # from the redirection target.
+    # from the redirection target.  The leading lookbehind rejects a hyphen so
+    # the Docker `--rm` flag is not read as an `rm` invocation.
     (
-        r"\brm\b\s+(?:-[A-Za-z]+\s+)*(?:--\s+)?"
+        r"(?<![-\w])rm\b\s+(?:-[A-Za-z]+\s+)*(?:--\s+)?"
         r"(?:['\"][^'\"]*/[^'\"]*['\"]|[^\s|;&>]*/[^\s|;&>]*)",
         0.85,
     ),
