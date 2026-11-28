@@ -194,6 +194,15 @@ def typescript_template_spans(
         """
         return word.casefold() in _SHELL_EXECUTION_CALLS and word != _DECLARATION_KEYWORD
 
+    def keyword_role(word: str | None, keywords: frozenset[str]) -> bool:
+        """Whether *word* is an exact-case keyword, independent of execution names.
+
+        TypeScript keywords are case-sensitive. A mixed-case spelling such as
+        ``If`` or ``Return`` is an ordinary identifier, even though execution
+        names are compared case-insensitively above.
+        """
+        return word is not None and word in keywords
+
     def brace_member() -> bool | None:
         """Whether a template right after ``{`` sits where a command runs.
 
@@ -212,7 +221,7 @@ def typescript_template_spans(
         if last_kind == "identifier":
             if last_member:
                 return False
-            return last_value.casefold() in _EXPRESSION_PREFIX_WORDS
+            return keyword_role(last_value, _EXPRESSION_PREFIX_WORDS)
         if last_kind in {"number", "string", "template", "regex", "postfix"}:
             return False
         if last_kind != "punct":
@@ -260,7 +269,7 @@ def typescript_template_spans(
         # ``import ... from`` is a module clause, not a tag; ``import()`` and a
         # bare ``import`` tag are not.
         if last_kind == "identifier" and last_value not in _FORM_KEYWORDS:
-            return last_value.casefold() not in _EXPRESSION_PREFIX_WORDS
+            return not keyword_role(last_value, _EXPRESSION_PREFIX_WORDS)
         if last_kind in {"number", "string", "template", "regex", "postfix"}:
             return True
         return last_kind == "punct" and last_value in _TAG_PUNCTUATION
@@ -449,7 +458,7 @@ def typescript_template_spans(
                 paren_stack.append(
                     last_kind == "identifier"
                     and not last_member
-                    and last_value.casefold() in _CONTROL_WORDS
+                    and keyword_role(last_value, _CONTROL_WORDS)
                 )
                 callee = last_value if last_kind == "identifier" else None
                 delimiters.append(("(", ")"))
@@ -574,7 +583,7 @@ def typescript_template_spans(
                 # ``if (...)`` reaches a statement head, so only a control
                 # keyword followed by an argument list is a call here.
                 if execution_name(word) and not (
-                    word.casefold() in _CONTROL_WORDS and content.startswith("(", identifier.end())
+                    keyword_role(word, _CONTROL_WORDS) and content.startswith("(", identifier.end())
                 ):
                     return None
                 member = last_kind == "punct" and last_value in {".", "#"}

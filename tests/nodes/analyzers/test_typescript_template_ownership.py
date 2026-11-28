@@ -441,6 +441,67 @@ def test_ledger_keeps_partial_status_for_a_member_control_call_division() -> Non
     assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("const label = `${If() / eval(input) / 2}`;", id="If-control-head"),
+        pytest.param("const label = `${Return / eval(input) / 2}`;", id="Return-expression-prefix"),
+    ],
+)
+def test_mixed_case_keyword_before_a_slash_does_not_open_a_regex(source: str) -> None:
+    # ``If`` and ``Return`` are ordinary identifiers, not lowercase TypeScript
+    # keywords. A casefolded keyword role would read the first slash as a regex
+    # and skip the ``eval`` call that must keep this template unproven.
+    assert typescript_template_spans(source, lambda: None) is None
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="typescript")
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("const label = `${If() / eval(input) / 2}`;", id="If-control-head"),
+        pytest.param("const label = `${Return / eval(input) / 2}`;", id="Return-expression-prefix"),
+    ],
+)
+def test_ledger_keeps_partial_status_for_a_mixed_case_keyword_division(source: str) -> None:
+    path = "scripts/run.ts"
+
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: source + _PADDING}}, [tm]
+    )
+
+    row = result["inspection_ledger"][0]
+    assert row["outcome"] is LedgerOutcome.PARTIAL
+    assert row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "if (ok) /`/.test(value);\nconst label = `${item.name}`;", id="lowercase-if-control"
+        ),
+        pytest.param(
+            "function f() { return /`/.test(value); }\nconst label = `${item.name}`;",
+            id="lowercase-return-regex",
+        ),
+    ],
+)
+def test_lowercase_keywords_still_open_a_regex(source: str) -> None:
+    # Exact-case roles must not stop real lowercase keywords from opening a
+    # regex. The backtick inside that regex is not a template, so only the
+    # later genuine template is owned.
+    starts, _ = typescript_template_spans(source, lambda: None) or ((), ())
+    assert starts == (source.index("`", source.index("const label")),)
+    assert (
+        tm.has_bounded_parse_exhaustion(source + _PADDING, lambda: None, file_type="typescript")
+        is False
+    )
+
+
 def test_a_genuine_control_head_still_opens_a_regex() -> None:
     # The member-role check must not suppress the regex after a real
     # ``if (...)`` statement head.
