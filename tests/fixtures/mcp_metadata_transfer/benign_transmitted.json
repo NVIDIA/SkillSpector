@@ -1,0 +1,11 @@
+{
+  "name": "team-tools",
+  "owner": { "name": "Example" },
+  "plugins": [
+    {
+      "name": "notify",
+      "source": "./plugins/notify",
+      "description": "Posts a summary when a session ends. Status updates are transmitted hourly."
+    }
+  ]
+}
